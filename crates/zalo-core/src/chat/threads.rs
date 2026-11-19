@@ -1323,6 +1323,110 @@ pub async fn fetch_user_profile(
     })
 }
 
+pub async fn sync_pin_thread(
+    session: &Session,
+    thread_id: &str,
+    kind: ThreadKind,
+    pinned: bool,
+) -> Result<()> {
+    if !session.is_authenticated() || session.domains.conversation.is_empty() {
+        return Ok(());
+    }
+    let conv_id = if kind == ThreadKind::Group {
+        format!("g{}", clean_group_id(thread_id))
+    } else {
+        thread_id.to_string()
+    };
+    let body = obj(&[
+        ("actionType", json!(if pinned { 1 } else { 2 })),
+        ("conversations", json!([conv_id])),
+        ("imei", json!(session.imei)),
+    ]);
+    let params = session.encoded_params(&body)?;
+    let url = format!(
+        "{}/api/pinconvers/updatev2?{}",
+        session.domains.conversation.trim_end_matches('/'),
+        session.common_params()
+    );
+    let raw = session.post_form(&url, format!("params={params}")).await?;
+    let dec = session.maybe_decrypt(raw, session.session_key_bytes());
+    ensure_not_expired(&dec)
+}
+
+pub async fn sync_unread_mark(
+    session: &Session,
+    thread_id: &str,
+    kind: ThreadKind,
+    unread: bool,
+) -> Result<()> {
+    if !session.is_authenticated() || session.domains.conversation.is_empty() {
+        return Ok(());
+    }
+    let is_group = kind == ThreadKind::Group;
+    let id_val = if is_group {
+        clean_group_id(thread_id).to_string()
+    } else {
+        thread_id.to_string()
+    };
+    let ts_str = chrono::Utc::now().timestamp_millis().to_string();
+    let entry = json!({ "id": id_val, "ts": ts_str });
+    let inner = json!({
+        "convsGroup": if is_group { json!([entry]) } else { json!([]) },
+        "convsUser": if is_group { json!([]) } else { json!([entry]) },
+        "imei": session.imei,
+    });
+    let body = obj(&[("param", json!(inner.to_string()))]);
+    let params = session.encoded_params(&body)?;
+    let endpoint = if unread {
+        "add-unread-mark"
+    } else {
+        "remove-unread-mark"
+    };
+    let url = format!(
+        "{}/api/convers/{endpoint}?{}",
+        session.domains.conversation.trim_end_matches('/'),
+        session.common_params()
+    );
+    let raw = session.post_form(&url, format!("params={params}")).await?;
+    let dec = session.maybe_decrypt(raw, session.session_key_bytes());
+    ensure_not_expired(&dec)
+}
+
+pub async fn sync_mute_thread(
+    session: &Session,
+    thread_id: &str,
+    kind: ThreadKind,
+    muted: bool,
+) -> Result<()> {
+    if !session.is_authenticated() || session.domains.profile.is_empty() {
+        return Ok(());
+    }
+    let is_group = kind == ThreadKind::Group;
+    let toid = if is_group {
+        clean_group_id(thread_id).to_string()
+    } else {
+        thread_id.to_string()
+    };
+    let now_sec = chrono::Utc::now().timestamp();
+    let body = obj(&[
+        ("toid", json!(toid)),
+        ("duration", json!(-1)),
+        ("action", json!(if muted { 1 } else { 3 })),
+        ("startTime", json!(now_sec)),
+        ("muteType", json!(if is_group { 2 } else { 1 })),
+        ("imei", json!(session.imei)),
+    ]);
+    let params = session.encoded_params(&body)?;
+    let url = format!(
+        "{}/api/social/profile/setmute?{}",
+        session.domains.profile.trim_end_matches('/'),
+        session.common_params()
+    );
+    let raw = session.post_form(&url, format!("params={params}")).await?;
+    let dec = session.maybe_decrypt(raw, session.session_key_bytes());
+    ensure_not_expired(&dec)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

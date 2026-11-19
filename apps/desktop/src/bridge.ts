@@ -4,6 +4,7 @@ import type {
   AttachmentMeta,
   FolderFilter,
   MessageDto,
+  StickerItem,
   ThreadDetailsDto,
   ThreadDto,
   TranslateConfigSummary,
@@ -513,5 +514,88 @@ export const bridge = {
       targetLang: targetLang ?? null,
       provider: provider ?? null,
     });
+  },
+  async saveRemoteFile(url: string, suggestedName: string): Promise<string | null> {
+    if (!isTauri()) {
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = suggestedName || "download";
+      a.target = "_blank";
+      a.rel = "noreferrer";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      return null;
+    }
+    return invoke<string | null>("save_remote_file", { url, suggestedName });
+  },
+  async fetchImageDataUrl(url: string): Promise<string> {
+    if (!isTauri() || url.startsWith("data:image/")) {
+      return url;
+    }
+    return invoke<string>("fetch_image_data_url", { url });
+  },
+  async togglePinMessage(
+    threadId: string,
+    msgId: string,
+    pinned: boolean,
+  ): Promise<MessageDto> {
+    if (!isTauri()) {
+      const list = DEMO_MESSAGES[threadId] ?? [];
+      const target = list.find((m) => m.msg_id === msgId);
+      if (!target) throw new Error("Message not found");
+      target.is_pinned = pinned;
+      return { ...target };
+    }
+    return invoke<MessageDto>("message_toggle_pin", { threadId, msgId, pinned });
+  },
+  async listStickers(): Promise<StickerItem[]> {
+    if (!isTauri()) {
+      const glyphs = ["😀", "🎉", "❤️", "👍", "🔥", "😂", "🥳", "✨", "🤩", "🙏", "☕", "🚀"];
+      return glyphs.map((glyph, idx) => {
+        const id = idx + 1;
+        const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="120" height="120" viewBox="0 0 120 120"><rect width="120" height="120" rx="24" fill="#1e293b"/><text x="60" y="76" text-anchor="middle" font-size="60">${glyph}</text></svg>`;
+        return {
+          id,
+          cate_id: 0,
+          sticker_type: 1,
+          url: `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`,
+        };
+      });
+    }
+    return invoke<StickerItem[]>("stickers_list");
+  },
+  async sendSticker(threadId: string, sticker: StickerItem): Promise<MessageDto> {
+    if (!isTauri()) {
+      const msg: MessageDto = {
+        msg_id: `preview-stk-${Date.now()}`,
+        thread_id: threadId,
+        sender_id: "me",
+        sender_name: "Bạn",
+        text: "[Nhãn dán]",
+        msg_type: "chat.sticker",
+        ts: Date.now(),
+        is_outgoing: true,
+        is_recalled: false,
+        is_pinned: false,
+        quote: null,
+        reactions: [],
+        attachment_url: sticker.url,
+        attachment_name: `sticker_${sticker.cate_id}_${sticker.id}.png`,
+      };
+      DEMO_MESSAGES[threadId] = [...(DEMO_MESSAGES[threadId] ?? []), msg];
+      touchDemoThread(threadId, "[Nhãn dán]", msg.ts);
+      return msg;
+    }
+    return invoke<MessageDto>("message_send_sticker", {
+      threadId,
+      stickerId: sticker.id,
+      cateId: sticker.cate_id,
+      stickerType: sticker.sticker_type,
+    });
+  },
+  async setCloseToTray(enabled: boolean): Promise<void> {
+    if (!isTauri()) return;
+    return invoke("app_set_close_to_tray", { enabled });
   },
 };

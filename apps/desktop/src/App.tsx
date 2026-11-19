@@ -5,12 +5,13 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
-  ArrowDownToLine,
   Bell,
   BellOff,
   Bookmark,
   ChevronDown,
+  ChevronUp,
   FileText,
+  Forward,
   Image as ImageIcon,
   Info,
   Languages,
@@ -23,8 +24,8 @@ import {
   RefreshCw,
   Search,
   Settings,
-  Sparkles,
   Sun,
+  Trash2,
   UploadCloud,
   User,
   Users,
@@ -39,13 +40,19 @@ import {
   isBuzzMessage,
   playBuzzSound,
 } from "./utils/buzz";
+import { playMessageSound, showDesktopNotification } from "./utils/notify";
 import { Composer } from "./components/Composer";
 import { ForwardModal } from "./components/ForwardModal";
-import { MediaLightbox } from "./components/MediaLightbox";
+import { MediaLightbox, type LightboxItem } from "./components/MediaLightbox";
 import { MessageBubble, type MessageTranslationState } from "./components/MessageBubble";
 import { QrLoginModal } from "./components/QrLoginModal";
 import { QuickSearchModal } from "./components/QuickSearchModal";
 import { ReplyThreadPanel } from "./components/ReplyThreadPanel";
+import {
+  SettingsModal,
+  type DensityMode,
+  type FontSizeScale,
+} from "./components/SettingsModal";
 import { ThreadAvatar } from "./components/ThreadAvatar";
 import {
   TRANSLATE_LANG_OPTIONS,
@@ -60,6 +67,7 @@ import type {
   FolderFilter,
   MessageDto,
   PendingAttachment,
+  StickerItem,
   ThemeMode,
   ThreadDetailsDto,
   ThreadDto,
@@ -195,7 +203,10 @@ export default function App() {
   });
   const [pendingAttachment, setPendingAttachment] = useState<PendingAttachment | null>(null);
   const [highlightedId, setHighlightedId] = useState<string | null>(null);
-  const [lightbox, setLightbox] = useState<{ url: string; title: string } | null>(null);
+  const [lightboxState, setLightboxState] = useState<{
+    items: LightboxItem[];
+    index: number;
+  } | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(true);
   const [quickSearchOpen, setQuickSearchOpen] = useState(false);
   const [threadDetails, setThreadDetails] = useState<ThreadDetailsDto | null>(null);
@@ -206,7 +217,11 @@ export default function App() {
   );
   const [myProfile, setMyProfile] = useState<AccountProfile | null>(null);
   const [profileUid, setProfileUid] = useState<string | null>(null);
-  const [forwardMsg, setForwardMsg] = useState<MessageDto | null>(null);
+  const [forwardMessages, setForwardMessages] = useState<MessageDto[]>([]);
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedMsgIds, setSelectedMsgIds] = useState<Set<string>>(() => new Set());
+  const [pinnedIdx, setPinnedIdx] = useState(0);
+  const [threadRenderLimit, setThreadRenderLimit] = useState(100);
   const [translateCfg, setTranslateCfg] = useState<TranslateConfigSummary | null>(null);
   const [translateModalOpen, setTranslateModalOpen] = useState(false);
   const [translationsByMsg, setTranslationsByMsg] = useState<
@@ -218,6 +233,35 @@ export default function App() {
   const [showScrollDown, setShowScrollDown] = useState(false);
   const [unreadBelow, setUnreadBelow] = useState(0);
   const [dragHover, setDragHover] = useState(false);
+  const [fontSize, setFontSize] = useState<FontSizeScale>(() => {
+    const raw = localStorage.getItem("litechat.fontSize");
+    return raw === "sm" || raw === "lg" ? raw : "md";
+  });
+  const [density, setDensity] = useState<DensityMode>(() =>
+    localStorage.getItem("litechat.density") === "compact" ? "compact" : "comfortable",
+  );
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [desktopNotifyEnabled, setDesktopNotifyEnabled] = useState<boolean>(
+    () => localStorage.getItem("litechat.notify") !== "0",
+  );
+  const [soundEnabled, setSoundEnabled] = useState<boolean>(
+    () => localStorage.getItem("litechat.sound") !== "0",
+  );
+  const [closeToTray, setCloseToTray] = useState<boolean>(
+    () => localStorage.getItem("litechat.closeToTray") !== "0",
+  );
+  const [inChatSearchOpen, setInChatSearchOpen] = useState(false);
+  const [inChatSearchQuery, setInChatSearchQuery] = useState("");
+  const [inChatMatchIdx, setInChatMatchIdx] = useState(0);
+  const [unreadDividerCount, setUnreadDividerCount] = useState(0);
+  const [draftsByThread, setDraftsByThread] = useState<Record<string, string>>(() => {
+    try {
+      const raw = localStorage.getItem("litechat.drafts");
+      return raw ? (JSON.parse(raw) as Record<string, string>) : {};
+    } catch {
+      return {};
+    }
+  });
   const [buzzEnabled, setBuzzEnabled] = useState<boolean>(
     () => localStorage.getItem("litechat.buzz") !== "0",
   );
@@ -243,7 +287,12 @@ export default function App() {
   const selectedIdRef = useRef<string | null>(null);
   const folderRef = useRef<FolderFilter>(folder);
   const threadsRef = useRef<ThreadDto[]>(threads);
+  const visibleThreadsRef = useRef<ThreadDto[]>([]);
   const buzzEnabledRef = useRef<boolean>(buzzEnabled);
+  const desktopNotifyRef = useRef<boolean>(desktopNotifyEnabled);
+  const soundEnabledRef = useRef<boolean>(soundEnabled);
+  const activeThreadRootIdRef = useRef<string | null>(activeThreadRootId);
+  const inChatSearchInputRef = useRef<HTMLInputElement | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const pendingJumpRef = useRef<{ threadId: string; msgId: string; ts: number } | null>(null);
@@ -255,6 +304,9 @@ export default function App() {
   folderRef.current = folder;
   threadsRef.current = threads;
   buzzEnabledRef.current = buzzEnabled;
+  desktopNotifyRef.current = desktopNotifyEnabled;
+  soundEnabledRef.current = soundEnabled;
+  activeThreadRootIdRef.current = activeThreadRootId;
   translationsRef.current = translationsByMsg;
 
   useEffect(() => {
@@ -263,12 +315,64 @@ export default function App() {
   }, [theme]);
 
   useEffect(() => {
+    document.documentElement.setAttribute("data-font-size", fontSize);
+    localStorage.setItem("litechat.fontSize", fontSize);
+  }, [fontSize]);
+
+  useEffect(() => {
+    document.documentElement.setAttribute("data-density", density);
+    localStorage.setItem("litechat.density", density);
+  }, [density]);
+
+  useEffect(() => {
     localStorage.setItem("litechat.fx", fxEnabled ? "1" : "0");
   }, [fxEnabled]);
 
   useEffect(() => {
     localStorage.setItem("litechat.buzz", buzzEnabled ? "1" : "0");
   }, [buzzEnabled]);
+
+  useEffect(() => {
+    localStorage.setItem("litechat.notify", desktopNotifyEnabled ? "1" : "0");
+  }, [desktopNotifyEnabled]);
+
+  useEffect(() => {
+    localStorage.setItem("litechat.sound", soundEnabled ? "1" : "0");
+  }, [soundEnabled]);
+
+  useEffect(() => {
+    localStorage.setItem("litechat.closeToTray", closeToTray ? "1" : "0");
+    void bridge.setCloseToTray(closeToTray);
+  }, [closeToTray]);
+
+  useEffect(() => {
+    const totalUnread = threads.reduce((acc, t) => acc + (t.is_muted ? 0 : t.unread_count), 0);
+    const title = totalUnread > 0 ? `(${totalUnread}) litechat` : "litechat";
+    document.title = title;
+    if (isTauri()) {
+      void getCurrentWindow()
+        .setTitle(title)
+        .catch(() => undefined);
+    }
+  }, [threads]);
+
+  const setDraftForThread = useCallback((tid: string, val: string) => {
+    setDraftsByThread((prev) => {
+      const next = { ...prev };
+      if (!val) {
+        delete next[tid];
+      } else {
+        next[tid] = val;
+      }
+      try {
+        const entries = Object.entries(next).slice(-80);
+        localStorage.setItem("litechat.drafts", JSON.stringify(Object.fromEntries(entries)));
+      } catch {
+        // Ignore storage quota errors
+      }
+      return next;
+    });
+  }, []);
 
   const checkForUpdates = useCallback(async (silent = false) => {
     if (!isTauri()) {
@@ -322,11 +426,42 @@ export default function App() {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
         setQuickSearchOpen((v) => !v);
+      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
+        if (selectedIdRef.current && !activeThreadRootIdRef.current) {
+          e.preventDefault();
+          setInChatSearchOpen(true);
+          setTimeout(() => inChatSearchInputRef.current?.focus(), 20);
+        }
+      } else if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+        const list = visibleThreadsRef.current;
+        if (list.length === 0) return;
+        e.preventDefault();
+        const curIdx = list.findIndex((t) => t.id === selectedIdRef.current);
+        const delta = e.key === "ArrowDown" ? 1 : -1;
+        const nextIdx =
+          curIdx < 0 ? 0 : (curIdx + delta + list.length) % list.length;
+        setSelectedId(list[nextIdx].id);
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
+
+  useEffect(() => {
+    if (!selectMode || forwardMessages.length > 0) return;
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setSelectMode(false);
+        setSelectedMsgIds(new Set());
+      }
+    };
+    window.addEventListener("keydown", onEsc);
+    return () => window.removeEventListener("keydown", onEsc);
+  }, [selectMode, forwardMessages.length]);
+
+  useEffect(() => {
+    setThreadRenderLimit(100);
+  }, [folder, filterText]);
 
   const showError = useCallback((err: unknown) => {
     setToastError(String(err));
@@ -349,7 +484,11 @@ export default function App() {
   const resetSessionUi = useCallback(() => {
     setMyProfile(null);
     setProfileUid(null);
-    setForwardMsg(null);
+    setForwardMessages([]);
+    setSelectMode(false);
+    setSelectedMsgIds(new Set());
+    setPinnedIdx(0);
+    setThreadRenderLimit(100);
     setTranslationsByMsg({});
     setThreadAutoTranslate({});
     setThreads([]);
@@ -587,9 +726,9 @@ export default function App() {
               setUnreadBelow((n) => n + 1);
             }
           }
+          const matchedThread = threadsRef.current.find((t) => t.id === msg.thread_id);
+          const isRecent = Math.abs(Date.now() - msg.ts) < 90_000;
           if (!msg.is_outgoing && isBuzzMessage(msg) && buzzEnabledRef.current) {
-            const matchedThread = threadsRef.current.find((t) => t.id === msg.thread_id);
-            const isRecent = Math.abs(Date.now() - msg.ts) < 90_000;
             if (!matchedThread?.is_muted && isRecent) {
               playBuzzSound();
               setBuzzShaking(true);
@@ -604,6 +743,21 @@ export default function App() {
                 void getCurrentWindow()
                   .requestUserAttention(2)
                   .catch(() => undefined);
+              }
+            }
+          } else if (!msg.is_outgoing && !matchedThread?.is_muted && isRecent) {
+            const away = !document.hasFocus() || msg.thread_id !== selectedIdRef.current;
+            if (away) {
+              if (soundEnabledRef.current) {
+                playMessageSound();
+              }
+              if (desktopNotifyRef.current && !document.hasFocus()) {
+                const threadTitle = matchedThread?.title || msg.sender_name || "Tin nhắn mới";
+                const body = msg.text.trim() || msg.attachment_name || "[Tệp đính kèm]";
+                void showDesktopNotification(
+                  threadTitle,
+                  matchedThread?.kind === "group" ? `${msg.sender_name}: ${body}` : body,
+                );
               }
             }
           }
@@ -648,8 +802,13 @@ export default function App() {
     });
   }, [authed, folder]);
 
+  const activeThreadKind = useMemo(
+    () => threads.find((t) => t.id === selectedId)?.kind ?? null,
+    [threads, selectedId],
+  );
+
   useEffect(() => {
-    if (!authed || !drawerOpen || !selectedId) {
+    if (!authed || !selectedId || (!drawerOpen && activeThreadKind !== "group")) {
       return;
     }
     let cancelled = false;
@@ -668,7 +827,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [authed, drawerOpen, selectedId]);
+  }, [authed, drawerOpen, selectedId, activeThreadKind]);
 
   useEffect(() => {
     if (!threadMenu) return;
@@ -771,6 +930,14 @@ export default function App() {
   useEffect(() => {
     if (!authed || !selectedId) return;
     let cancelled = false;
+    const initUnread = threadsRef.current.find((t) => t.id === selectedId)?.unread_count ?? 0;
+    setUnreadDividerCount(initUnread);
+    setInChatSearchOpen(false);
+    setInChatSearchQuery("");
+    setInChatMatchIdx(0);
+    setSelectMode(false);
+    setSelectedMsgIds(new Set());
+    setPinnedIdx(0);
     setReplyTo(null);
     setActiveThreadRootId(null);
     setPendingAttachment(null);
@@ -878,11 +1045,65 @@ export default function App() {
     const base = q ? threads.filter((t) => t.title.toLowerCase().includes(q)) : [...threads];
     return base.sort(compareThreads);
   }, [threads, filterText]);
+  visibleThreadsRef.current = visibleThreads;
 
   const activeThread = useMemo(
     () => threads.find((t) => t.id === selectedId) ?? null,
     [threads, selectedId],
   );
+
+  const inChatMatches = useMemo(() => {
+    const q = inChatSearchQuery.trim().toLowerCase();
+    if (!inChatSearchOpen || !q) return [];
+    const norm = (s: string) =>
+      s
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .replace(/đ/g, "d")
+        .replace(/Đ/g, "d")
+        .toLowerCase();
+    const nq = norm(q);
+    return messages
+      .filter(
+        (m) =>
+          !m.is_recalled &&
+          (norm(m.text).includes(nq) ||
+            norm(m.sender_name).includes(nq) ||
+            (m.attachment_name ? norm(m.attachment_name).includes(nq) : false)),
+      )
+      .map((m) => m.msg_id);
+  }, [inChatSearchOpen, inChatSearchQuery, messages]);
+
+  const inChatActiveMatchId =
+    inChatMatches.length > 0
+      ? inChatMatches[Math.min(inChatMatchIdx, inChatMatches.length - 1)]
+      : null;
+
+  useEffect(() => {
+    if (inChatMatches.length === 0) {
+      setInChatMatchIdx(0);
+    } else if (inChatMatchIdx >= inChatMatches.length) {
+      setInChatMatchIdx(inChatMatches.length - 1);
+    }
+  }, [inChatMatches, inChatMatchIdx]);
+
+  useEffect(() => {
+    if (!inChatActiveMatchId) return;
+    const el = document.getElementById(`msg-${inChatActiveMatchId}`);
+    el?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [inChatActiveMatchId]);
+
+  const firstUnreadMsgId = useMemo(() => {
+    if (unreadDividerCount <= 0 || messages.length === 0) return null;
+    let rem = unreadDividerCount;
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (!messages[i].is_outgoing) {
+        rem -= 1;
+        if (rem <= 0) return messages[i].msg_id;
+      }
+    }
+    return messages.find((m) => !m.is_outgoing)?.msg_id ?? null;
+  }, [unreadDividerCount, messages]);
 
   const handleTogglePin = async (target: ThreadDto) => {
     const nextPinned = !target.is_pinned;
@@ -923,33 +1144,153 @@ export default function App() {
     }
   };
 
-  const handleSendText = async (text: string) => {
-    if (!selectedId) return;
-    try {
-      const msg = replyTo
-        ? await bridge.sendQuote(selectedId, text, replyTo)
-        : await bridge.sendText(selectedId, text);
-      setReplyTo(null);
-      setMessages((prev) => upsertMsg(prev, msg));
-      setThreads((prev) => bumpThreadList(prev, msg, false));
-      setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
-    } catch (err) {
-      showError(err);
-    }
+  const sendTextInternal = useCallback(
+    async (targetThreadId: string, text: string, quoteTarget: MessageDto | null): Promise<boolean> => {
+      const tempId = `opt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const quoteSnap = quoteTarget
+        ? {
+            msg_id: quoteTarget.msg_id,
+            sender_name: quoteTarget.sender_name,
+            snippet: quoteTarget.text,
+          }
+        : null;
+      const optimistic: MessageDto = {
+        msg_id: tempId,
+        thread_id: targetThreadId,
+        sender_id: myProfile?.uid || "me",
+        sender_name: "Bạn",
+        text,
+        msg_type: "chat.text",
+        ts: Date.now(),
+        is_outgoing: true,
+        is_recalled: false,
+        is_pinned: false,
+        quote: quoteSnap,
+        reactions: [],
+        attachment_url: null,
+        attachment_name: null,
+        send_status: "sending",
+      };
+      if (selectedIdRef.current === targetThreadId) {
+        setMessages((prev) => upsertMsg(prev, optimistic));
+        setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 30);
+      }
+      try {
+        const msg = quoteTarget
+          ? await bridge.sendQuote(targetThreadId, text, quoteTarget)
+          : await bridge.sendText(targetThreadId, text);
+        if (selectedIdRef.current === targetThreadId) {
+          setMessages((prev) => upsertMsg(prev.filter((m) => m.msg_id !== tempId), msg));
+          setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
+        }
+        setThreads((prev) => bumpThreadList(prev, msg, false));
+        return true;
+      } catch (err) {
+        const errMsg = String(err);
+        if (selectedIdRef.current === targetThreadId) {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.msg_id === tempId ? { ...m, send_status: "failed", send_error: errMsg } : m,
+            ),
+          );
+        }
+        showError(err);
+        return true;
+      }
+    },
+    [myProfile?.uid, showError],
+  );
+
+  const handleSendText = async (text: string): Promise<boolean> => {
+    if (!selectedId) return false;
+    const q = replyTo;
+    setReplyTo(null);
+    setUnreadDividerCount(0);
+    return await sendTextInternal(selectedId, text, q);
   };
 
   const handleSendThreadReply = useCallback(
-    async (text: string, quoteTarget: MessageDto) => {
-      if (!selectedId) return;
-      try {
-        const msg = await bridge.sendQuote(selectedId, text, quoteTarget);
-        setMessages((prev) => upsertMsg(prev, msg));
-        setThreads((prev) => bumpThreadList(prev, msg, false));
-      } catch (err) {
-        showError(err);
+    async (text: string, quoteTarget: MessageDto): Promise<boolean> => {
+      if (!selectedId) return false;
+      return await sendTextInternal(selectedId, text, quoteTarget);
+    },
+    [selectedId, sendTextInternal],
+  );
+
+  const handleDiscardFailedMessage = useCallback((msgId: string) => {
+    setMessages((prev) => prev.filter((m) => m.msg_id !== msgId));
+  }, []);
+
+  const handleRetryFailedMessage = useCallback(
+    (failedMsg: MessageDto) => {
+      setMessages((prev) => prev.filter((m) => m.msg_id !== failedMsg.msg_id));
+      const quoteTarget = failedMsg.quote
+        ? messages.find((m) => m.msg_id === failedMsg.quote?.msg_id) ?? {
+            ...failedMsg,
+            msg_id: failedMsg.quote.msg_id,
+            sender_name: failedMsg.quote.sender_name,
+            text: failedMsg.quote.snippet,
+          }
+        : null;
+      void sendTextInternal(failedMsg.thread_id, failedMsg.text, quoteTarget);
+    },
+    [messages, sendTextInternal],
+  );
+
+  const avatarByUserId = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const t of threads) {
+      if (t.kind === "direct" && t.avatar) {
+        map.set(t.id, t.avatar);
+      }
+    }
+    if (threadDetails?.members) {
+      for (const mem of threadDetails.members) {
+        if (mem.id && mem.avatar) {
+          map.set(mem.id, mem.avatar);
+        }
+      }
+    }
+    return map;
+  }, [threads, threadDetails]);
+
+  const handleSaveRemoteFile = useCallback(
+    (url: string, suggestedName: string) => {
+      void bridge.saveRemoteFile(url, suggestedName).catch(showError);
+    },
+    [showError],
+  );
+
+  const openLightboxForUrl = useCallback(
+    (url: string, title: string) => {
+      const gallery: LightboxItem[] = messages
+        .filter(
+          (m) =>
+            !m.is_recalled &&
+            !!m.attachment_url &&
+            !m.msg_type.includes("sticker") &&
+            m.msg_type !== "5" &&
+            !m.msg_type.includes("voice") &&
+            m.msg_type !== "3" &&
+            !m.msg_type.includes("video") &&
+            m.msg_type !== "4" &&
+            (m.msg_type.includes("photo") ||
+              m.msg_type === "2" ||
+              m.attachment_url.startsWith("data:image/") ||
+              /\.(png|jpe?g|webp|gif|bmp)(\?|$)/i.test(m.attachment_url)),
+        )
+        .map((m) => ({
+          url: m.attachment_url!,
+          title: m.attachment_name || "Hình ảnh",
+        }));
+      const foundIdx = gallery.findIndex((item) => item.url === url);
+      if (foundIdx >= 0) {
+        setLightboxState({ items: gallery, index: foundIdx });
+      } else {
+        setLightboxState({ items: [{ url, title }], index: 0 });
       }
     },
-    [selectedId, showError],
+    [messages],
   );
 
   const handleReactMessage = useCallback(
@@ -984,6 +1325,82 @@ export default function App() {
     },
     [selectedId, showError],
   );
+
+  const handleTogglePinMessage = useCallback(
+    (target: MessageDto) => {
+      const tid = selectedIdRef.current;
+      if (!tid) return;
+      void bridge
+        .togglePinMessage(tid, target.msg_id, !target.is_pinned)
+        .then((updated) => setMessages((list) => upsertMsg(list, updated)))
+        .catch(showError);
+    },
+    [showError],
+  );
+
+  const handleSendSticker = useCallback(
+    async (sticker: StickerItem) => {
+      const tid = selectedIdRef.current;
+      if (!tid) return;
+      setUnreadDividerCount(0);
+      try {
+        const sent = await bridge.sendSticker(tid, sticker);
+        setMessages((prev) => upsertMsg(prev, sent));
+        setThreads((prev) => bumpThreadList(prev, sent, false));
+        setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
+      } catch (err) {
+        showError(err);
+      }
+    },
+    [showError],
+  );
+
+  const handleToggleSelectMsg = useCallback((msgId: string) => {
+    setSelectedMsgIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(msgId)) next.delete(msgId);
+      else next.add(msgId);
+      return next;
+    });
+  }, []);
+
+  const handleStartSelect = useCallback((msgId: string) => {
+    setSelectMode(true);
+    setSelectedMsgIds(new Set([msgId]));
+  }, []);
+
+  const handleBulkDeleteSelected = useCallback(async () => {
+    const tid = selectedIdRef.current;
+    const ids = Array.from(selectedMsgIds);
+    if (!tid || ids.length === 0) return;
+    try {
+      for (const id of ids) {
+        await bridge.deleteMessageLocal(tid, id);
+      }
+      const deletedSet = new Set(ids);
+      setMessages((prev) => prev.filter((m) => !deletedSet.has(m.msg_id)));
+      setSelectMode(false);
+      setSelectedMsgIds(new Set());
+    } catch (err) {
+      showError(err);
+    }
+  }, [selectedMsgIds, showError]);
+
+  const activeMentionMembers = useMemo(
+    () =>
+      activeThread?.kind === "group" && threadDetails?.thread_id === activeThread.id
+        ? threadDetails.members
+        : [],
+    [activeThread, threadDetails],
+  );
+
+  const pinnedMessages = useMemo(
+    () => messages.filter((m) => m.is_pinned && !m.is_recalled),
+    [messages],
+  );
+
+  const currentPinned =
+    pinnedMessages.length > 0 ? pinnedMessages[pinnedIdx % pinnedMessages.length] : null;
 
   const replyGraph = useMemo(() => {
     const byId = new Map<string, MessageDto>();
@@ -1167,7 +1584,7 @@ export default function App() {
       <TriforceEffects enabled={fxEnabled} />
       {/* Column 1: Folder Rail */}
       <aside
-        className="relative z-10 flex w-[78px] shrink-0 flex-col items-center justify-between py-3 backdrop-blur-md"
+        className="relative z-10 flex w-[78px] shrink-0 flex-col items-center justify-between overflow-y-auto py-3"
         style={{ background: "var(--bg-rail)", borderRight: "1px solid var(--border-subtle)" }}
       >
         <div className="flex w-full flex-col items-center gap-1.5 px-1.5">
@@ -1226,47 +1643,19 @@ export default function App() {
             <Wifi className="h-4 w-4" />
           </div>
           <button
-            onClick={() => setBuzzEnabled((v) => !v)}
-            title={
-              buzzEnabled
-                ? "Âm thanh & rung khi nhận BUZZ: Bật (nhấn để tắt)"
-                : "Âm thanh & rung khi nhận BUZZ: Tắt (nhấn để bật)"
-            }
-            className="hover-rail rounded-lg p-2 transition"
-            style={{ color: buzzEnabled ? "#f59e0b" : "var(--rail-text)" }}
-          >
-            <Zap className="h-5 w-5" />
-          </button>
-          <button
-            onClick={() => setTranslateModalOpen(true)}
-            title="Cài đặt dịch thuật tin nhắn (DeepL / Gemini / Azure)"
-            className="hover-rail rounded-lg p-2 transition"
-            style={{ color: "var(--rail-text)" }}
-          >
-            <Languages className="h-5 w-5" />
-          </button>
-          <button
-            onClick={() => setUpdateModalOpen(true)}
+            onClick={() => setSettingsOpen(true)}
             title={
               availableUpdate
-                ? `Có bản cập nhật mới v${availableUpdate.version} — Nhấn để cập nhật`
-                : `Kiểm tra cập nhật (hiện tại v${appVersion})`
+                ? `Cài đặt LiteChat (có bản cập nhật v${availableUpdate.version})`
+                : "Cài đặt LiteChat"
             }
             className="hover-rail relative rounded-lg p-2 transition"
             style={{ color: availableUpdate ? "var(--accent)" : "var(--rail-text)" }}
           >
-            <ArrowDownToLine className="h-5 w-5" />
+            <Settings className="h-5 w-5" />
             {availableUpdate && (
               <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-emerald-400" />
             )}
-          </button>
-          <button
-            onClick={() => setFxEnabled((v) => !v)}
-            title={fxEnabled ? "Hiệu ứng tiên sáng: Bật (nhấn để tắt)" : "Hiệu ứng tiên sáng: Tắt (nhấn để bật)"}
-            className="hover-rail rounded-lg p-2 transition"
-            style={{ color: fxEnabled ? "var(--rail-text-active)" : "var(--rail-text)" }}
-          >
-            <Sparkles className="h-5 w-5" />
           </button>
           <button
             onClick={cycleTheme}
@@ -1303,7 +1692,7 @@ export default function App() {
 
       {/* Column 2: Resizable Thread List */}
       <section
-        className="relative z-10 flex shrink-0 flex-col backdrop-blur-md"
+        className="relative z-10 flex shrink-0 flex-col"
         style={{
           width: `${sidebarWidth}px`,
           background: "var(--bg-sidebar)",
@@ -1341,7 +1730,18 @@ export default function App() {
           </button>
         </div>
 
-        <div className="flex-1 overflow-y-auto px-2 pb-2">
+        <div
+          className="flex-1 overflow-y-auto px-2 pb-2"
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            if (
+              visibleThreads.length > threadRenderLimit &&
+              el.scrollHeight - el.scrollTop - el.clientHeight < 240
+            ) {
+              setThreadRenderLimit((prev) => prev + 100);
+            }
+          }}
+        >
           {visibleThreads.length === 0 ? (
             <div className="px-4 py-12 text-center text-[13px]" style={{ color: "var(--text-secondary)" }}>
               {filterText.trim()
@@ -1351,9 +1751,10 @@ export default function App() {
                   : "Chưa có cuộc hội thoại nào"}
             </div>
           ) : (
-            visibleThreads.map((t) => {
+            visibleThreads.slice(0, threadRenderLimit).map((t) => {
               const active = t.id === selectedId;
               const unread = t.unread_count > 0;
+              const draftText = draftsByThread[t.id]?.trim() || "";
               const fallbackPreview =
                 t.kind === "group"
                   ? "Nhóm trò chuyện"
@@ -1376,10 +1777,11 @@ export default function App() {
                     e.preventDefault();
                     setThreadMenu({ thread: t, x: e.clientX, y: e.clientY });
                   }}
-                  className={`tf-row mb-0.5 flex w-full cursor-pointer items-center gap-3 rounded-xl px-2.5 py-2.5 text-left transition ${
+                  className={`tf-row thread-row-perf mb-0.5 flex w-full cursor-pointer items-center gap-3 rounded-xl px-2.5 text-left transition ${
                     active ? "" : "hover-surface"
                   }`}
                   style={{
+                    paddingBlock: "var(--row-py)",
                     background: active ? "var(--bg-active)" : undefined,
                     color: active ? "var(--text-on-active)" : "var(--text-primary)",
                   }}
@@ -1402,7 +1804,7 @@ export default function App() {
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center justify-between gap-2">
                       <span
-                        className={`truncate text-[15px] ${unread ? "font-bold" : "font-semibold"}`}
+                        className={`list-title-text truncate ${unread ? "font-bold" : "font-semibold"}`}
                         style={{
                           color: active
                             ? "var(--text-on-active)"
@@ -1435,7 +1837,16 @@ export default function App() {
                               : "var(--text-secondary)",
                         }}
                       >
-                        {t.last_preview || fallbackPreview}
+                        {draftText && !active ? (
+                          <>
+                            <span style={{ color: "var(--danger-text)", fontWeight: 600 }}>
+                              [Nháp]{" "}
+                            </span>
+                            {draftText}
+                          </>
+                        ) : (
+                          t.last_preview || fallbackPreview
+                        )}
                       </span>
                       {unread && (
                         <span
@@ -1461,6 +1872,16 @@ export default function App() {
                 </div>
               );
             })
+          )}
+          {visibleThreads.length > threadRenderLimit && (
+            <button
+              type="button"
+              onClick={() => setThreadRenderLimit((prev) => prev + 100)}
+              className="hover-surface mt-1 w-full rounded-xl py-2 text-center text-xs font-medium transition"
+              style={{ color: "var(--accent)" }}
+            >
+              Tải thêm ({visibleThreads.length - threadRenderLimit} hội thoại)
+            </button>
           )}
         </div>
 
@@ -1550,12 +1971,16 @@ export default function App() {
               onSendThreadAttachment={handleSendThreadAttachment}
               onBuzz={handleSendBuzz}
               buzzCooldownSec={buzzCooldownSec}
+              getSenderAvatar={(uid) => avatarByUserId.get(uid)}
+              onSaveFile={handleSaveRemoteFile}
+              onRetrySend={handleRetryFailedMessage}
+              onDiscardFailed={handleDiscardFailedMessage}
               onReact={handleReactMessage}
               onRecall={handleRecallMessage}
               onDeleteLocal={handleDeleteLocalMessage}
-              onOpenImage={(url, title) => setLightbox({ url, title })}
+              onOpenImage={openLightboxForUrl}
               onOpenProfile={(uid) => setProfileUid(uid)}
-              onForward={(target) => setForwardMsg(target)}
+              onForward={(target) => setForwardMessages([target])}
               onTranslate={handleTranslateSingle}
               onHideTranslation={(msgId) =>
                 setTranslationsByMsg((prev) => {
@@ -1564,6 +1989,9 @@ export default function App() {
                   return next;
                 })
               }
+              mentionMembers={activeMentionMembers}
+              onSendSticker={handleSendSticker}
+              onTogglePin={handleTogglePinMessage}
               onError={showError}
             />
           ) : (
@@ -1626,9 +2054,19 @@ export default function App() {
                   <Languages className="h-4 w-4" />
                 </button>
                 <button
-                  onClick={() => setQuickSearchOpen(true)}
+                  onClick={() => {
+                    setInChatSearchOpen((v) => {
+                      const next = !v;
+                      if (next) setTimeout(() => inChatSearchInputRef.current?.focus(), 20);
+                      return next;
+                    });
+                  }}
+                  title="Tìm trong hội thoại (Ctrl+F)"
                   className="rounded-lg p-2 hover:opacity-80"
-                  style={{ color: "var(--text-secondary)" }}
+                  style={{
+                    color: inChatSearchOpen ? "var(--accent)" : "var(--text-secondary)",
+                    background: inChatSearchOpen ? "var(--accent-soft)" : "transparent",
+                  }}
                 >
                   <Search className="h-4 w-4" />
                 </button>
@@ -1651,6 +2089,142 @@ export default function App() {
                 </button>
               </div>
             </header>
+
+            {currentPinned && (
+              <div
+                className="flex shrink-0 items-center justify-between gap-3 px-4 py-2 text-[13px]"
+                style={{
+                  background: "var(--bg-surface)",
+                  borderBottom: "1px solid var(--border-subtle)",
+                }}
+              >
+                <button
+                  type="button"
+                  onClick={() => void jumpToMsg(currentPinned.msg_id)}
+                  className="flex min-w-0 flex-1 items-center gap-2.5 text-left transition hover:opacity-85"
+                >
+                  <Pin
+                    className="h-4 w-4 shrink-0 rotate-45"
+                    style={{ color: "var(--accent)" }}
+                  />
+                  <div
+                    className="min-w-0 flex-1 border-l-2 pl-2"
+                    style={{ borderColor: "var(--accent)" }}
+                  >
+                    <div
+                      className="flex items-center gap-1.5 text-xs font-semibold"
+                      style={{ color: "var(--accent)" }}
+                    >
+                      <span>Tin nhắn đã ghim</span>
+                      {pinnedMessages.length > 1 && (
+                        <span>
+                          ({(pinnedIdx % pinnedMessages.length) + 1}/{pinnedMessages.length})
+                        </span>
+                      )}
+                    </div>
+                    <div className="truncate" style={{ color: "var(--text-primary)" }}>
+                      {currentPinned.sender_name}:{" "}
+                      {currentPinned.text || currentPinned.attachment_name || "[Đính kèm]"}
+                    </div>
+                  </div>
+                </button>
+                <div className="flex shrink-0 items-center gap-1">
+                  {pinnedMessages.length > 1 && (
+                    <button
+                      type="button"
+                      onClick={() => setPinnedIdx((i) => (i + 1) % pinnedMessages.length)}
+                      title="Xem tin ghim tiếp theo"
+                      className="hover-menu rounded-lg p-1.5"
+                      style={{ color: "var(--text-secondary)" }}
+                    >
+                      <ChevronDown className="h-4 w-4" />
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => handleTogglePinMessage(currentPinned)}
+                    title="Bỏ ghim tin nhắn này"
+                    className="hover-menu rounded-lg p-1.5"
+                    style={{ color: "var(--text-secondary)" }}
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {inChatSearchOpen && (
+              <div
+                className="flex shrink-0 items-center gap-2 px-4 py-2 text-[13.5px]"
+                style={{
+                  background: "var(--bg-surface)",
+                  borderBottom: "1px solid var(--border-subtle)",
+                }}
+              >
+                <Search className="h-4 w-4 shrink-0" style={{ color: "var(--text-secondary)" }} />
+                <input
+                  ref={inChatSearchInputRef}
+                  value={inChatSearchQuery}
+                  onChange={(e) => {
+                    setInChatSearchQuery(e.target.value);
+                    setInChatMatchIdx(0);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") {
+                      setInChatSearchOpen(false);
+                    } else if (e.key === "Enter" && inChatMatches.length > 0) {
+                      e.preventDefault();
+                      setInChatMatchIdx((i) =>
+                        e.shiftKey
+                          ? (i - 1 + inChatMatches.length) % inChatMatches.length
+                          : (i + 1) % inChatMatches.length,
+                      );
+                    }
+                  }}
+                  placeholder="Tìm tin nhắn trong hội thoại này (Enter tiếp, Shift+Enter trước, Esc đóng)..."
+                  className="min-w-0 flex-1 bg-transparent text-[14px] outline-none"
+                />
+                {inChatSearchQuery.trim() && (
+                  <span className="shrink-0 text-xs font-mono" style={{ color: "var(--text-secondary)" }}>
+                    {inChatMatches.length > 0
+                      ? `${Math.min(inChatMatchIdx, inChatMatches.length - 1) + 1}/${inChatMatches.length}`
+                      : "0/0"}
+                  </span>
+                )}
+                <button
+                  type="button"
+                  disabled={inChatMatches.length === 0}
+                  onClick={() =>
+                    setInChatMatchIdx(
+                      (i) => (i - 1 + inChatMatches.length) % inChatMatches.length,
+                    )
+                  }
+                  title="Kết quả trước"
+                  className="hover-menu rounded p-1 disabled:opacity-35"
+                >
+                  <ChevronUp className="h-4 w-4" />
+                </button>
+                <button
+                  type="button"
+                  disabled={inChatMatches.length === 0}
+                  onClick={() =>
+                    setInChatMatchIdx((i) => (i + 1) % inChatMatches.length)
+                  }
+                  title="Kết quả sau"
+                  className="hover-menu rounded p-1 disabled:opacity-35"
+                >
+                  <ChevronDown className="h-4 w-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setInChatSearchOpen(false)}
+                  title="Đóng tìm kiếm (Esc)"
+                  className="hover-menu rounded p-1"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            )}
 
             {activeThreadLang && (
               <div
@@ -1776,22 +2350,41 @@ export default function App() {
                         </span>
                       </div>
                     )}
+                    {firstUnreadMsgId === m.msg_id && unreadDividerCount > 0 && (
+                      <div className="my-3 flex items-center gap-3">
+                        <div className="h-px flex-1" style={{ background: "var(--accent)", opacity: 0.35 }} />
+                        <span
+                          className="rounded-full px-3 py-0.5 text-xs font-semibold"
+                          style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
+                        >
+                          {unreadDividerCount} tin nhắn chưa đọc
+                        </span>
+                        <div className="h-px flex-1" style={{ background: "var(--accent)", opacity: 0.35 }} />
+                      </div>
+                    )}
                     <MessageBubble
                       msg={m}
                       threadKind={activeThread.kind}
                       groupedWithPrev={groupedWithPrev}
-                      highlighted={highlightedId === m.msg_id}
+                      highlighted={highlightedId === m.msg_id || inChatActiveMatchId === m.msg_id}
+                      senderAvatar={avatarByUserId.get(m.sender_id)}
                       translation={translationsByMsg[m.msg_id]}
                       replaceWithTranslation={Boolean(activeThreadLang)}
                       replyCount={replyGraph.repliesByRoot[m.msg_id]?.length ?? 0}
+                      highlightQuery={inChatSearchOpen ? inChatSearchQuery : ""}
+                      selectMode={selectMode}
+                      selected={selectedMsgIds.has(m.msg_id)}
+                      onToggleSelect={handleToggleSelectMsg}
+                      onStartSelect={handleStartSelect}
+                      onTogglePin={handleTogglePinMessage}
                       onReply={(target) => setReplyTo(target)}
                       onReact={handleReactMessage}
                       onRecall={handleRecallMessage}
                       onDeleteLocal={handleDeleteLocalMessage}
                       onJumpToMsg={(msgId) => void jumpToMsg(msgId)}
-                      onOpenImage={(url, title) => setLightbox({ url, title })}
+                      onOpenImage={openLightboxForUrl}
                       onOpenProfile={(uid) => setProfileUid(uid)}
-                      onForward={(target) => setForwardMsg(target)}
+                      onForward={(target) => setForwardMessages([target])}
                       onTranslate={handleTranslateSingle}
                       onHideTranslation={(msgId) =>
                         setTranslationsByMsg((prev) => {
@@ -1801,6 +2394,9 @@ export default function App() {
                         })
                       }
                       onOpenThread={handleOpenReplyThread}
+                      onRetrySend={handleRetryFailedMessage}
+                      onDiscardFailed={handleDiscardFailedMessage}
+                      onSaveFile={handleSaveRemoteFile}
                     />
                   </div>
                 );
@@ -1836,17 +2432,81 @@ export default function App() {
               </button>
             )}
 
-            <Composer
-              replyTo={replyTo}
-              pendingAttachment={pendingAttachment}
-              onPendingAttachmentChange={setPendingAttachment}
-              onCancelReply={() => setReplyTo(null)}
-              onSendText={handleSendText}
-              onSendAttachment={handleSendAttachment}
-              onBuzz={handleSendBuzz}
-              buzzCooldownSec={buzzCooldownSec}
-              onError={showError}
-            />
+            {selectMode ? (
+              <footer
+                className="flex shrink-0 flex-wrap items-center justify-between gap-3 px-4 py-3"
+                style={{
+                  background: "var(--bg-sidebar)",
+                  borderTop: "1px solid var(--border-subtle)",
+                }}
+              >
+                <div className="text-[14px] font-medium">
+                  Đã chọn{" "}
+                  <span className="font-bold" style={{ color: "var(--accent)" }}>
+                    {selectedMsgIds.size}
+                  </span>{" "}
+                  tin nhắn
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={selectedMsgIds.size === 0}
+                    onClick={() => {
+                      const list = messages.filter(
+                        (x) =>
+                          selectedMsgIds.has(x.msg_id) &&
+                          !x.is_recalled &&
+                          !x.send_status,
+                      );
+                      if (list.length > 0) setForwardMessages(list);
+                    }}
+                    className="tf-btn flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-[13.5px] font-semibold disabled:cursor-not-allowed disabled:opacity-45"
+                  >
+                    <Forward className="h-4 w-4" />
+                    <span>Chuyển tiếp</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={selectedMsgIds.size === 0}
+                    onClick={() => void handleBulkDeleteSelected()}
+                    className="flex items-center gap-1.5 rounded-xl bg-rose-600/90 px-3.5 py-2 text-[13.5px] font-semibold text-white transition hover:bg-rose-600 disabled:cursor-not-allowed disabled:opacity-45"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                    <span>Xóa trên máy</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectMode(false);
+                      setSelectedMsgIds(new Set());
+                    }}
+                    className="hover-surface rounded-xl px-3 py-2 text-[13.5px] font-medium transition"
+                    style={{
+                      background: "var(--bg-surface)",
+                      color: "var(--text-secondary)",
+                    }}
+                  >
+                    Hủy
+                  </button>
+                </div>
+              </footer>
+            ) : (
+              <Composer
+                replyTo={replyTo}
+                draft={draftsByThread[activeThread.id] ?? ""}
+                onDraftChange={(val) => setDraftForThread(activeThread.id, val)}
+                pendingAttachment={pendingAttachment}
+                onPendingAttachmentChange={setPendingAttachment}
+                mentionMembers={activeMentionMembers}
+                onSendSticker={handleSendSticker}
+                onCancelReply={() => setReplyTo(null)}
+                onSendText={handleSendText}
+                onSendAttachment={handleSendAttachment}
+                onBuzz={handleSendBuzz}
+                buzzCooldownSec={buzzCooldownSec}
+                onError={showError}
+              />
+            )}
           </>
           )
         ) : (
@@ -1862,7 +2522,7 @@ export default function App() {
       {/* Right Info Drawer */}
       {drawerOpen && activeThread && (
         <aside
-          className="fixed inset-y-0 right-0 z-30 flex w-80 shrink-0 flex-col overflow-hidden p-4 shadow-2xl backdrop-blur-md lg:static lg:z-10 lg:shadow-none"
+          className="fixed inset-y-0 right-0 z-30 flex w-80 shrink-0 flex-col overflow-hidden p-4 shadow-2xl lg:static lg:z-10 lg:shadow-none"
           style={{
             background: "var(--bg-sidebar)",
             borderLeft: "1px solid var(--border-subtle)",
@@ -2044,10 +2704,10 @@ export default function App() {
                         type="button"
                         onClick={() =>
                           item.attachment_url &&
-                          setLightbox({
-                            url: item.attachment_url,
-                            title: item.attachment_name || "Hình ảnh",
-                          })
+                          openLightboxForUrl(
+                            item.attachment_url,
+                            item.attachment_name || "Hình ảnh",
+                          )
                         }
                         className="aspect-square overflow-hidden rounded-lg bg-black/25"
                       >
@@ -2154,6 +2814,32 @@ export default function App() {
         </div>
       )}
 
+      <SettingsModal
+        open={settingsOpen}
+        theme={theme}
+        onThemeChange={setTheme}
+        fontSize={fontSize}
+        onFontSizeChange={setFontSize}
+        density={density}
+        onDensityChange={setDensity}
+        fxEnabled={fxEnabled}
+        onFxChange={setFxEnabled}
+        buzzEnabled={buzzEnabled}
+        onBuzzChange={setBuzzEnabled}
+        desktopNotifyEnabled={desktopNotifyEnabled}
+        onDesktopNotifyChange={setDesktopNotifyEnabled}
+        soundEnabled={soundEnabled}
+        onSoundChange={setSoundEnabled}
+        closeToTray={closeToTray}
+        onCloseToTrayChange={setCloseToTray}
+        translateCfg={translateCfg}
+        onOpenTranslateModal={() => setTranslateModalOpen(true)}
+        appVersion={appVersion}
+        availableUpdate={availableUpdate}
+        onOpenUpdateModal={() => setUpdateModalOpen(true)}
+        onClose={() => setSettingsOpen(false)}
+      />
+
       <UpdateModal
         open={updateModalOpen}
         currentVersion={appVersion}
@@ -2189,22 +2875,28 @@ export default function App() {
       />
 
       <ForwardModal
-        message={forwardMsg}
+        messages={forwardMessages}
         threads={threads}
-        onClose={() => setForwardMsg(null)}
-        onForwardTo={async (targetThreadId, msg) => {
-          const content =
-            msg.attachment_url && /^https:\/\//i.test(msg.attachment_url)
-              ? `${msg.text ? `${msg.text}\n` : ""}${msg.attachment_url}`
-              : msg.text;
-          if (!content.trim()) return;
+        onClose={() => setForwardMessages([])}
+        onForwardTo={async (targetThreadId, msgs) => {
           try {
-            const sent = await bridge.sendText(targetThreadId, content);
-            setThreads((prev) => bumpThreadList(prev, sent, false));
+            for (const msg of msgs) {
+              const content =
+                msg.attachment_url && /^https:\/\//i.test(msg.attachment_url)
+                  ? `${msg.text ? `${msg.text}\n` : ""}${msg.attachment_url}`
+                  : msg.text;
+              if (!content.trim()) continue;
+              const sent = await bridge.sendText(targetThreadId, content);
+              setThreads((prev) => bumpThreadList(prev, sent, false));
+              if (targetThreadId === selectedIdRef.current) {
+                setMessages((prev) => upsertMsg(prev, sent));
+              }
+            }
             if (targetThreadId === selectedIdRef.current) {
-              setMessages((prev) => upsertMsg(prev, sent));
               setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
             }
+            setSelectMode(false);
+            setSelectedMsgIds(new Set());
           } catch (err) {
             showError(err);
           }
@@ -2212,15 +2904,19 @@ export default function App() {
       />
 
       <MediaLightbox
-        url={lightbox?.url ?? null}
-        title={lightbox?.title ?? ""}
-        onClose={() => setLightbox(null)}
+        items={lightboxState?.items ?? []}
+        activeIndex={lightboxState?.index ?? null}
+        onIndexChange={(idx) =>
+          setLightboxState((prev) => (prev ? { ...prev, index: idx } : null))
+        }
+        onClose={() => setLightboxState(null)}
+        onNotify={showError}
       />
 
       <UserProfileModal
         userId={profileUid}
         onClose={() => setProfileUid(null)}
-        onOpenImage={(url, title) => setLightbox({ url, title })}
+        onOpenImage={openLightboxForUrl}
         onStartChat={(profile) => {
           setThreads((prev) => {
             if (prev.some((t) => t.id === profile.uid)) return prev;

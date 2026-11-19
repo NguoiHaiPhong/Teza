@@ -1,5 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
+  Check,
+  CheckSquare,
   Copy,
   CornerUpLeft,
   Download,
@@ -8,6 +10,7 @@ import {
   Languages,
   Loader2,
   MessagesSquare,
+  Pin,
   RotateCcw,
   Smile,
   Trash2,
@@ -15,6 +18,7 @@ import {
 } from "lucide-react";
 import type { MessageDto, ThreadKind } from "../types";
 import { isBuzzMessage } from "../utils/buzz";
+import { ThreadAvatar } from "./ThreadAvatar";
 
 export interface MessageTranslationState {
   text?: string;
@@ -31,10 +35,17 @@ interface Props {
   threadKind: ThreadKind;
   groupedWithPrev: boolean;
   highlighted: boolean;
+  senderAvatar?: string;
   translation?: MessageTranslationState;
   replaceWithTranslation?: boolean;
   replyCount?: number;
   hideQuote?: boolean;
+  highlightQuery?: string;
+  selectMode?: boolean;
+  selected?: boolean;
+  onToggleSelect?: (msgId: string) => void;
+  onStartSelect?: (msgId: string) => void;
+  onTogglePin?: (msg: MessageDto) => void;
   onReply: (msg: MessageDto) => void;
   onReact: (msg: MessageDto, emoji: string) => void;
   onRecall: (msg: MessageDto) => void;
@@ -46,6 +57,9 @@ interface Props {
   onTranslate?: (msg: MessageDto) => void;
   onHideTranslation?: (msgId: string) => void;
   onOpenThread?: (msg: MessageDto) => void;
+  onRetrySend?: (msg: MessageDto) => void;
+  onDiscardFailed?: (msgId: string) => void;
+  onSaveFile?: (url: string, name: string) => void;
 }
 
 function formatClock(ts: number): string {
@@ -74,7 +88,47 @@ function isVideoAttachment(msg: MessageDto): boolean {
   );
 }
 
-function renderLinkedText(text: string, isOutgoing: boolean) {
+function renderHighlightedPlain(text: string, query?: string) {
+  const q = query?.trim();
+  if (!q) return text;
+  const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`(${escaped})`, "gi");
+  const segments = text.split(re);
+  if (segments.length <= 1) return text;
+  const qLower = q.toLowerCase();
+  return segments.map((seg, i) =>
+    seg.toLowerCase() === qLower ? (
+      <mark key={i} className="rounded bg-amber-400/35 px-0.5 text-inherit">
+        {seg}
+      </mark>
+    ) : (
+      seg
+    ),
+  );
+}
+
+function renderMentionsAndSearch(text: string, isOutgoing: boolean, highlightQuery?: string) {
+  const parts = text.split(/((?:^|\s)@[^\s@<>]+)/g);
+  return parts.map((part, idx) => {
+    const m = part.match(/^(\s*)(@[^\s@<>]+)$/);
+    if (m) {
+      return (
+        <span key={idx}>
+          {m[1]}
+          <span
+            className="font-semibold"
+            style={{ color: isOutgoing ? "var(--link-out)" : "var(--accent)" }}
+          >
+            {renderHighlightedPlain(m[2], highlightQuery)}
+          </span>
+        </span>
+      );
+    }
+    return <span key={idx}>{renderHighlightedPlain(part, highlightQuery)}</span>;
+  });
+}
+
+function renderLinkedText(text: string, isOutgoing: boolean, highlightQuery?: string) {
   const parts = text.split(/(https:\/\/[^\s<>"]+)/gi);
   return parts.map((part, idx) =>
     /^https:\/\//i.test(part) ? (
@@ -89,7 +143,7 @@ function renderLinkedText(text: string, isOutgoing: boolean) {
         {part}
       </a>
     ) : (
-      part
+      <span key={idx}>{renderMentionsAndSearch(part, isOutgoing, highlightQuery)}</span>
     ),
   );
 }
@@ -107,10 +161,17 @@ export function MessageBubble({
   threadKind,
   groupedWithPrev,
   highlighted,
+  senderAvatar,
   translation,
   replaceWithTranslation = false,
   replyCount = 0,
   hideQuote = false,
+  highlightQuery = "",
+  selectMode = false,
+  selected = false,
+  onToggleSelect,
+  onStartSelect,
+  onTogglePin,
   onReply,
   onReact,
   onRecall,
@@ -122,8 +183,11 @@ export function MessageBubble({
   onTranslate,
   onHideTranslation,
   onOpenThread,
+  onRetrySend,
+  onDiscardFailed,
+  onSaveFile,
 }: Props) {
-  const [menuOpen, setMenuOpen] = useState(false);
+  const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [mediaError, setMediaError] = useState(false);
   const [showOriginal, setShowOriginal] = useState(false);
@@ -147,27 +211,84 @@ export function MessageBubble({
       ? msg.attachment_url
       : null;
 
+  useEffect(() => {
+    if (!menuPos && !pickerOpen) return;
+    const close = () => {
+      setMenuPos(null);
+      setPickerOpen(false);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("contextmenu", close);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("contextmenu", close);
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [menuPos, pickerOpen]);
+
   const handleCopy = () => {
     void navigator.clipboard?.writeText(msg.text);
-    setMenuOpen(false);
+    setMenuPos(null);
   };
 
   return (
     <div
       id={`msg-${msg.msg_id}`}
+      onClick={selectMode && !msg.send_status ? () => onToggleSelect?.(msg.msg_id) : undefined}
       className={`group relative flex ${msg.is_outgoing ? "justify-end" : "justify-start"} ${
         groupedWithPrev ? "mt-0.5" : "mt-2.5"
-      }`}
-      onMouseLeave={() => {
-        setPickerOpen(false);
-        setMenuOpen(false);
-      }}
+      } ${selectMode ? "cursor-pointer rounded-xl px-1.5 py-0.5 transition" : ""}`}
+      style={selectMode && selected ? { background: "var(--accent-soft)" } : undefined}
     >
+      {selectMode && (
+        <div className="order-0 mr-2.5 flex items-center self-center">
+          <div
+            className={`flex h-5 w-5 items-center justify-center rounded-full border transition ${
+              msg.send_status ? "opacity-35" : ""
+            }`}
+            style={{
+              background: selected ? "var(--accent)" : "transparent",
+              borderColor: selected ? "var(--accent)" : "var(--text-secondary)",
+            }}
+          >
+            {selected && <Check className="h-3 w-3 text-white" />}
+          </div>
+        </div>
+      )}
+
+      {!msg.is_outgoing && threadKind === "group" && (
+        <div className="order-1 mr-2 mt-0.5 flex w-7 shrink-0 items-start justify-center self-start">
+          {!groupedWithPrev && (
+            <button
+              type="button"
+              disabled={!onOpenProfile || !msg.sender_id}
+              onClick={() => msg.sender_id && onOpenProfile?.(msg.sender_id)}
+              title="Xem thông tin tài khoản"
+              className="rounded-full transition hover:opacity-85"
+            >
+              <ThreadAvatar
+                avatar={senderAvatar || ""}
+                title={msg.sender_name}
+                kind="direct"
+                size="xs"
+              />
+            </button>
+          )}
+        </div>
+      )}
+
       {/* Quick hover actions (left side for outgoing, right side for incoming) */}
-      {!msg.is_recalled && (
+      {!selectMode && !msg.is_recalled && !msg.send_status && (
         <div
+          onClick={(e) => e.stopPropagation()}
           className={`flex items-center gap-1 self-center opacity-0 transition group-hover:opacity-100 ${
-            msg.is_outgoing ? "order-1 mr-2" : "order-2 ml-2"
+            msg.is_outgoing ? "order-1 mr-2" : "order-3 ml-2"
           }`}
         >
           <button
@@ -265,16 +386,33 @@ export function MessageBubble({
       <div
         onContextMenu={(e) => {
           e.preventDefault();
-          setMenuOpen((v) => !v);
+          e.stopPropagation();
+          setPickerOpen(false);
+          setMenuPos({
+            x: Math.min(e.clientX, window.innerWidth - 210),
+            y: Math.min(e.clientY, window.innerHeight - 360),
+          });
         }}
-        className={`selectable-text wrap-anywhere relative min-w-0 max-w-[72%] rounded-2xl px-3.5 py-2 shadow-sm transition ${
-          msg.is_outgoing ? "order-2 rounded-br-md" : "order-1 rounded-bl-md"
-        } ${highlighted ? "ring-2 ring-sky-400" : ""}`}
+        onDoubleClick={(e) => {
+          if (selectMode || msg.is_recalled || msg.send_status) return;
+          const el = e.target instanceof Element ? e.target : null;
+          if (el?.closest("a, button, input, textarea, audio, video")) return;
+          onReply(msg);
+        }}
+        className={`selectable-text wrap-anywhere relative order-2 min-w-0 max-w-[72%] rounded-2xl px-3.5 shadow-sm transition ${
+          msg.is_outgoing ? "rounded-br-md" : "rounded-bl-md"
+        } ${highlighted ? "ring-2 ring-sky-400" : ""} ${
+          msg.send_status === "sending" ? "opacity-80" : ""
+        }`}
         style={{
+          paddingBlock: "var(--bubble-py)",
           background: msg.is_outgoing ? "var(--bg-bubble-out)" : "var(--bg-bubble-in)",
-          border: msg.is_outgoing
-            ? "1px solid var(--bubble-out-border)"
-            : "1px solid var(--bubble-in-border)",
+          border:
+            msg.send_status === "failed"
+              ? "1px solid var(--danger-text)"
+              : msg.is_outgoing
+                ? "1px solid var(--bubble-out-border)"
+                : "1px solid var(--bubble-in-border)",
         }}
       >
         {!msg.is_outgoing && threadKind === "group" && !groupedWithPrev && (
@@ -377,19 +515,30 @@ export function MessageBubble({
                 Tệp đính kèm
               </div>
             </div>
-            {safeDownloadUrl && (
-              <a
-                href={safeDownloadUrl}
-                target="_blank"
-                rel="noreferrer"
-                download={msg.attachment_name || undefined}
-                title="Tải xuống tệp"
-                className="hover-menu rounded-lg p-1.5 transition"
-                style={{ color: msg.is_outgoing ? "var(--link-out)" : "var(--accent)" }}
-              >
-                <Download className="h-4 w-4" />
-              </a>
-            )}
+            {safeDownloadUrl &&
+              (onSaveFile ? (
+                <button
+                  type="button"
+                  onClick={() => onSaveFile(safeDownloadUrl, msg.attachment_name || "download")}
+                  title="Lưu tệp về máy..."
+                  className="hover-menu rounded-lg p-1.5 transition"
+                  style={{ color: msg.is_outgoing ? "var(--link-out)" : "var(--accent)" }}
+                >
+                  <Download className="h-4 w-4" />
+                </button>
+              ) : (
+                <a
+                  href={safeDownloadUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  download={msg.attachment_name || undefined}
+                  title="Tải xuống tệp"
+                  className="hover-menu rounded-lg p-1.5 transition"
+                  style={{ color: msg.is_outgoing ? "var(--link-out)" : "var(--accent)" }}
+                >
+                  <Download className="h-4 w-4" />
+                </a>
+              ))}
           </div>
         )}
 
@@ -401,13 +550,14 @@ export function MessageBubble({
         ) : (
           !(isSticker && msg.text === "[Nhãn dán]") && (
             <div
-              className={`whitespace-pre-wrap wrap-anywhere text-[15.5px] leading-[1.55] ${
+              className={`msg-body-text whitespace-pre-wrap wrap-anywhere leading-[1.55] ${
                 msg.is_recalled ? "italic opacity-65" : ""
               } ${replaceWithTranslation && translation?.loading ? "opacity-75" : ""}`}
             >
               {renderLinkedText(
                 isReplaced && translation?.text ? translation.text : msg.text,
                 msg.is_outgoing,
+                highlightQuery,
               )}
             </div>
           )
@@ -513,10 +663,55 @@ export function MessageBubble({
               <span>Đã dịch · Gốc</span>
             </button>
           )}
-          <span className="text-xs" style={{ color: "var(--text-secondary)" }}>
-            {formatClock(msg.ts)}
+          <span className="flex items-center gap-1 text-xs" style={{ color: "var(--text-secondary)" }}>
+            {msg.is_pinned && (
+              <span title="Tin nhắn đã ghim" className="inline-flex items-center">
+                <Pin
+                  className="h-3 w-3 rotate-45"
+                  style={{ color: msg.is_outgoing ? "var(--link-out)" : "var(--accent)" }}
+                />
+              </span>
+            )}
+            <span>{formatClock(msg.ts)}</span>
+            {msg.is_outgoing && !msg.is_recalled && msg.send_status === "sending" && (
+              <span title="Đang gửi...">
+                <Loader2 className="h-3 w-3 animate-spin" />
+              </span>
+            )}
+            {msg.is_outgoing && !msg.is_recalled && !msg.send_status && (
+              <span title="Đã gửi">
+                <Check className="h-3 w-3 opacity-80" />
+              </span>
+            )}
           </span>
         </div>
+
+        {msg.send_status === "failed" && (
+          <div className="mt-1.5 flex items-center justify-end gap-2 text-xs">
+            <span style={{ color: "var(--danger-text)" }}>
+              {msg.send_error || "Gửi thất bại"}
+            </span>
+            {onRetrySend && (
+              <button
+                type="button"
+                onClick={() => onRetrySend(msg)}
+                className="font-semibold underline hover:opacity-80"
+                style={{ color: "var(--accent)" }}
+              >
+                Thử lại
+              </button>
+            )}
+            {onDiscardFailed && (
+              <button
+                type="button"
+                onClick={() => onDiscardFailed(msg.msg_id)}
+                className="opacity-75 underline hover:opacity-100"
+              >
+                Xóa
+              </button>
+            )}
+          </div>
+        )}
 
         {replyCount > 0 && onOpenThread && (
           <button
@@ -536,30 +731,34 @@ export function MessageBubble({
           </button>
         )}
 
-        {/* Context menu */}
-        {menuOpen && (
+        {/* Fixed viewport-clamped Context menu */}
+        {menuPos && (
           <div
-            className={`absolute top-full z-30 mt-1 w-48 rounded-xl py-1 shadow-2xl ${
-              msg.is_outgoing ? "right-0" : "left-0"
-            }`}
-            style={{ background: "var(--bg-sidebar)", border: "1px solid var(--border-subtle)" }}
+            onClick={(e) => e.stopPropagation()}
+            className="fixed z-50 w-52 rounded-xl py-1 shadow-2xl"
+            style={{
+              left: `${menuPos.x}px`,
+              top: `${menuPos.y}px`,
+              background: "var(--bg-sidebar)",
+              border: "1px solid var(--border-subtle)",
+            }}
           >
-            {!msg.is_recalled && (
+            {!msg.is_recalled && !msg.send_status && (
               <button
                 onClick={() => {
                   onReply(msg);
-                  setMenuOpen(false);
+                  setMenuPos(null);
                 }}
                 className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
               >
                 <CornerUpLeft className="h-3.5 w-3.5" /> Trả lời
               </button>
             )}
-            {!msg.is_recalled && onOpenThread && (
+            {!msg.is_recalled && !msg.send_status && onOpenThread && (
               <button
                 onClick={() => {
                   onOpenThread(msg);
-                  setMenuOpen(false);
+                  setMenuPos(null);
                 }}
                 className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
               >
@@ -568,6 +767,7 @@ export function MessageBubble({
               </button>
             )}
             {!msg.is_recalled &&
+              !msg.send_status &&
               onTranslate &&
               msg.text.trim() &&
               !(isSticker && msg.text === "[Nhãn dán]") && (
@@ -580,7 +780,7 @@ export function MessageBubble({
                     } else {
                       onTranslate(msg);
                     }
-                    setMenuOpen(false);
+                    setMenuPos(null);
                   }}
                   className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
                 >
@@ -594,15 +794,38 @@ export function MessageBubble({
                       : "Dịch tin nhắn"}
                 </button>
               )}
-            {!msg.is_recalled && onForward && (
+            {!msg.is_recalled && !msg.send_status && onTogglePin && (
+              <button
+                onClick={() => {
+                  onTogglePin(msg);
+                  setMenuPos(null);
+                }}
+                className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
+              >
+                <Pin className="h-3.5 w-3.5" />{" "}
+                {msg.is_pinned ? "Bỏ ghim tin nhắn" : "Ghim tin nhắn"}
+              </button>
+            )}
+            {!msg.is_recalled && !msg.send_status && onForward && (
               <button
                 onClick={() => {
                   onForward(msg);
-                  setMenuOpen(false);
+                  setMenuPos(null);
                 }}
                 className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
               >
                 <Forward className="h-3.5 w-3.5" /> Chuyển tiếp
+              </button>
+            )}
+            {!msg.send_status && onStartSelect && (
+              <button
+                onClick={() => {
+                  onStartSelect(msg.msg_id);
+                  setMenuPos(null);
+                }}
+                className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
+              >
+                <CheckSquare className="h-3.5 w-3.5" /> Chọn nhiều tin
               </button>
             )}
             <button
@@ -611,11 +834,11 @@ export function MessageBubble({
             >
               <Copy className="h-3.5 w-3.5" /> Sao chép
             </button>
-            {msg.is_outgoing && !msg.is_recalled && (
+            {msg.is_outgoing && !msg.is_recalled && !msg.send_status && (
               <button
                 onClick={() => {
                   onRecall(msg);
-                  setMenuOpen(false);
+                  setMenuPos(null);
                 }}
                 className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px] text-amber-500"
               >
@@ -624,8 +847,12 @@ export function MessageBubble({
             )}
             <button
               onClick={() => {
-                onDeleteLocal(msg);
-                setMenuOpen(false);
+                if (msg.send_status && onDiscardFailed) {
+                  onDiscardFailed(msg.msg_id);
+                } else {
+                  onDeleteLocal(msg);
+                }
+                setMenuPos(null);
               }}
               className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px] text-rose-500"
             >

@@ -259,9 +259,28 @@ export function TriforceEffects({ enabled }: Props) {
     };
     fit();
 
+    // Pre-render one reusable radial dust sprite instead of recreating gradients every frame
+    const sprite = document.createElement("canvas");
+    sprite.width = 32;
+    sprite.height = 32;
+    const sCtx = sprite.getContext("2d");
+    if (sCtx) {
+      const grad = sCtx.createRadialGradient(16, 16, 0, 16, 16, 16);
+      grad.addColorStop(0, "rgba(255,244,204,1)");
+      grad.addColorStop(0.35, "rgba(247,220,140,0.45)");
+      grad.addColorStop(1, "rgba(247,220,140,0)");
+      sCtx.fillStyle = grad;
+      sCtx.fillRect(0, 0, 32, 32);
+    }
+
+    const MIN_FRAME_MS = 40;
     const stepDust = (t: number) => {
       if (!ctx || !visible) return;
-      const dt = lastDust ? Math.min(60, t - lastDust) : 16;
+      if (lastDust && t - lastDust < MIN_FRAME_MS) {
+        dustRaf = requestAnimationFrame(stepDust);
+        return;
+      }
+      const dt = lastDust ? Math.min(80, t - lastDust) : 40;
       lastDust = t;
       ctx.clearRect(0, 0, w, h);
       for (const p of particles) {
@@ -273,16 +292,12 @@ export function TriforceEffects({ enabled }: Props) {
         const gx = (p.x + Math.sin(t * 0.00022 + p.s) * 0.012 * p.z) * w;
         const gy = p.y * h;
         const rad = p.r * p.z * dpr * 1.4;
+        const size = rad * 6.0;
         const alpha = p.a * (0.55 + 0.45 * Math.sin(t * 0.0011 + p.s * 3));
-        const g = ctx.createRadialGradient(gx, gy, 0, gx, gy, rad * 3.0);
-        g.addColorStop(0, `rgba(255,244,204,${alpha.toFixed(3)})`);
-        g.addColorStop(0.35, `rgba(247,220,140,${(alpha * 0.45).toFixed(3)})`);
-        g.addColorStop(1, "rgba(247,220,140,0)");
-        ctx.fillStyle = g;
-        ctx.beginPath();
-        ctx.arc(gx, gy, rad * 3.0, 0, 6.283);
-        ctx.fill();
+        ctx.globalAlpha = alpha;
+        ctx.drawImage(sprite, gx - size * 0.5, gy - size * 0.5, size, size);
       }
+      ctx.globalAlpha = 1;
       dustRaf = requestAnimationFrame(stepDust);
     };
 

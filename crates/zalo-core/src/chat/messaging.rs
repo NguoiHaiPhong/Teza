@@ -9,9 +9,143 @@ use md5::{Digest, Md5};
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
 
-use crate::chat::parser::{clean_group_id, pick_str};
+use crate::chat::parser::{clean_group_id, pick_str, sticker_image_url};
 use crate::chat::{MessageDto, QuoteRef, ThreadKind};
 use crate::session::{Session, SessionError};
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StickerItem {
+    pub id: u64,
+    pub cate_id: u64,
+    pub sticker_type: u64,
+    pub url: String,
+}
+
+pub fn default_stickers() -> Vec<StickerItem> {
+    (1_u64..=30)
+        .filter_map(|id| {
+            sticker_image_url(id, 0).map(|url| StickerItem {
+                id,
+                cate_id: 0,
+                sticker_type: 1,
+                url,
+            })
+        })
+        .collect()
+}
+
+pub async fn list_stickers(session: &Session) -> Result<Vec<StickerItem>> {
+    let mut out = default_stickers();
+    if !session.is_authenticated() {
+        return Ok(out);
+    }
+    let mut seen: std::collections::HashSet<u64> = out.iter().map(|s| s.id).collect();
+    let body = obj(&[("keyword", json!("")), ("imei", json!(session.imei))]);
+    if let Ok(params) = session.encoded_params(&body) {
+        let base = session.domains.sticker.trim_end_matches('/');
+        if !base.is_empty() {
+            let url = format!("{base}/api/message/sticker/suggest?{}&params={params}", session.common_params());
+            if let Ok(raw) = session.get_json(&url).await {
+                let dec = session.maybe_decrypt(raw, session.session_key_bytes());
+                let arr = dec
+                    .get("data")
+                    .and_then(|d| d.get("suggSticker").or(Some(d)))
+                    .and_then(Value::as_array);
+                if let Some(items) = arr {
+                    for it in items {
+                        let id = it.get("stickerId").or_else(|| it.get("id")).and_then(Value::as_u64).unwrap_or(0);
+                        let cate_id = it.get("cateId").and_then(Value::as_u64).unwrap_or(0);
+                        let st_type = it.get("type").and_then(Value::as_u64).unwrap_or(1);
+                        if id > 0 && seen.insert(id) {
+                            if let Some(img_url) = sticker_image_url(id, cate_id) {
+                                out.push(StickerItem {
+                                    id,
+                                    cate_id,
+                                    sticker_type: st_type,
+                                    url: img_url,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub async fn send_sticker(
+    session: &Session,
+    thread_id: &str,
+    kind: ThreadKind,
+    sticker_id: u64,
+    cate_id: u64,
+    sticker_type: u64,
+) -> Result<MessageDto> {
+    if !session.is_authenticated() {
+        anyhow::bail!("Chưa đăng nhập");
+    }
+    let client_id = next_client_id();
+    let is_group = kind == ThreadKind::Group;
+    let (url, body) = if is_group {
+        let grid = clean_group_id(thread_id);
+        let body = obj(&[
+            ("grid", json!(grid)),
+            ("stickerId", json!(sticker_id)),
+            ("cateId", json!(cate_id)),
+            ("type", json!(sticker_type)),
+            ("clientId", json!(client_id)),
+            ("imei", json!(session.imei)),
+            ("zsource", json!(101)),
+        ]);
+        let url = format!(
+            "{}/api/group/sticker?{}",
+            session.domains.group.trim_end_matches('/'),
+            session.common_params()
+        );
+        (url, body)
+    } else {
+        let host = resolve_chat_host(session);
+        let body = obj(&[
+            ("toid", json!(thread_id)),
+            ("stickerId", json!(sticker_id)),
+            ("cateId", json!(cate_id)),
+            ("type", json!(sticker_type)),
+            ("clientId", json!(client_id)),
+            ("imei", json!(session.imei)),
+            ("zsource", json!(101)),
+        ]);
+        let url = format!("{host}/api/message/sticker?{}", session.common_params());
+        (url, body)
+    };
+
+    let params = session.encoded_params(&body)?;
+    let raw = session.post_form(&url, format!("params={params}")).await?;
+    let dec = session.maybe_decrypt(raw, session.session_key_bytes());
+    check_error_code(&dec)?;
+
+    let msg_id = dec
+        .get("data")
+        .and_then(|d| pick_str(d, &["msgId", "globalMsgId"]))
+        .unwrap_or_else(|| client_id.to_string());
+
+    Ok(MessageDto {
+        msg_id,
+        thread_id: thread_id.to_string(),
+        sender_id: session.profile.uid.clone(),
+        sender_name: "Bạn".into(),
+        text: "[Nhãn dán]".into(),
+        msg_type: "chat.sticker".into(),
+        ts: client_id as i64,
+        is_outgoing: true,
+        is_recalled: false,
+        is_pinned: false,
+        quote: None,
+        reactions: Vec::new(),
+        attachment_url: sticker_image_url(sticker_id, cate_id),
+        attachment_name: Some(format!("sticker_{cate_id}_{sticker_id}.png")),
+    })
+}
 
 /// Maximum file / image attachment size accepted by Zalo Web (100 MiB).
 pub const MAX_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;

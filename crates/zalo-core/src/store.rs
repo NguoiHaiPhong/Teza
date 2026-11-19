@@ -715,6 +715,22 @@ impl MessageStore {
         Ok(affected > 0)
     }
 
+    pub fn set_message_pinned(
+        &self,
+        thread_id: &str,
+        msg_id: &str,
+        pinned: bool,
+    ) -> Result<Option<MessageDto>> {
+        let affected = self.conn.execute(
+            "UPDATE messages SET is_pinned = ?3 WHERE thread_id = ?1 AND msg_id = ?2",
+            params![thread_id, msg_id, pinned as i64],
+        )?;
+        if affected == 0 {
+            return Ok(None);
+        }
+        self.get_message(thread_id, msg_id)
+    }
+
     pub fn apply_reaction(
         &mut self,
         thread_id: &str,
@@ -1430,6 +1446,41 @@ mod tests {
             0
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn message_pin_persists_in_store() {
+        let dir = std::env::temp_dir().join(format!("litechat-store-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("pin.db");
+        let mut store = MessageStore::open(&db_path).unwrap();
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "pm1".into(),
+                thread_id: "t1".into(),
+                sender_id: "u1".into(),
+                sender_name: "An".into(),
+                text: "Thong bao quan trong".into(),
+                msg_type: "chat.text".into(),
+                ts: 1_700_000_010_000,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+
+        let pinned = store.set_message_pinned("t1", "pm1", true).unwrap().unwrap();
+        assert!(pinned.is_pinned);
+        let reloaded = store.get_message("t1", "pm1").unwrap().unwrap();
+        assert!(reloaded.is_pinned);
+
+        let unpinned = store.set_message_pinned("t1", "pm1", false).unwrap().unwrap();
+        assert!(!unpinned.is_pinned);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

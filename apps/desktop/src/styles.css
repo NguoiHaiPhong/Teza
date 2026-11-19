@@ -26,6 +26,12 @@
   --bg-hover: rgba(229, 195, 108, 0.07);
   --bg-active: rgba(207, 161, 58, 0.19);
   --border-subtle: rgba(207, 161, 58, 0.16);
+  --border: var(--border-subtle);
+
+  --msg-size: 15.5px;
+  --list-title-size: 15px;
+  --row-py: 10px;
+  --bubble-py: 8px;
 
   --text-primary: #c2b9aa;
   --list-title: #afa698;
@@ -74,6 +80,7 @@
   --bg-hover: rgba(148, 163, 184, 0.09);
   --bg-active: #244568;
   --border-subtle: rgba(148, 163, 184, 0.12);
+  --border: var(--border-subtle);
 
   --text-primary: #b6c2d0;
   --list-title: #a2b0c0;
@@ -122,6 +129,7 @@
   --bg-hover: rgba(255, 255, 255, 0.06);
   --bg-active: #342663;
   --border-subtle: rgba(255, 255, 255, 0.09);
+  --border: var(--border-subtle);
 
   --text-primary: #bdbdc7;
   --list-title: #a8a8b4;
@@ -170,6 +178,7 @@
   --bg-hover: rgba(40, 34, 26, 0.06);
   --bg-active: #2e6da4;
   --border-subtle: #d6cfc2;
+  --border: var(--border-subtle);
 
   --text-primary: #2a251f;
   --list-title: #2a251f;
@@ -193,6 +202,34 @@
 
   --danger-bg: rgba(185, 28, 28, 0.1);
   --danger-text: #991b1b;
+}
+
+[data-font-size="sm"] {
+  --msg-size: 14px;
+  --list-title-size: 14px;
+}
+
+[data-font-size="lg"] {
+  --msg-size: 17px;
+  --list-title-size: 16.5px;
+}
+
+[data-density="compact"] {
+  --row-py: 6px;
+  --bubble-py: 5px;
+}
+
+.msg-body-text {
+  font-size: var(--msg-size);
+}
+
+.list-title-text {
+  font-size: var(--list-title-size);
+}
+
+.thread-row-perf {
+  content-visibility: auto;
+  contain-intrinsic-size: 64px;
 }
 
 * {

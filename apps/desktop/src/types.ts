@@ -105,6 +105,8 @@ export interface MessageDto {
   reactions: ReactionSummary[];
   attachment_url: string | null;
   attachment_name: string | null;
+  send_status?: "sending" | "failed";
+  send_error?: string;
 }
 
 export interface AccountProfile {
@@ -112,6 +114,13 @@ export interface AccountProfile {
   display_name: string;
   avatar: string;
   send2me_id?: string;
+}
+
+export interface StickerItem {
+  id: number;
+  cate_id: number;
+  sticker_type: number;
+  url: string;
 }
 
 export interface AttachmentMeta {

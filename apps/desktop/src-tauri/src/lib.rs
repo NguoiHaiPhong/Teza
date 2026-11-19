@@ -3,17 +3,21 @@
 mod file_dialog;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::ipc::InvokeBody;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use zalo_core::chat::messaging;
 use zalo_core::chat::parser::{
-    format_thread_preview, is_raw_numeric_id, parse_ws_event, pick_str, WsParsedAction,
+    format_thread_preview, is_raw_numeric_id, parse_ws_event, pick_str, sticker_image_url,
+    WsParsedAction,
 };
 use zalo_core::chat::threads;
 use zalo_core::chat::{
@@ -37,6 +41,8 @@ pub struct AppState {
     pub qr_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     pub active_thread_id: Arc<Mutex<Option<String>>>,
     pub translate_cfg: Arc<Mutex<TranslateConfig>>,
+    pub close_to_tray: Arc<AtomicBool>,
+    pub allow_exit: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -524,18 +530,63 @@ async fn threads_list(
     store.list_threads(folder).map_err(|e| e.to_string())
 }
 
+fn spawn_best_effort_thread_sync<F>(
+    app: AppHandle,
+    state: &State<'_, AppState>,
+    fut_fn: impl FnOnce(Session) -> F + Send + 'static,
+) where
+    F: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    let sess_arc = state.session.clone();
+    let ws_arc = state.ws_task.clone();
+    let paths = state.paths.clone();
+    tauri::async_runtime::spawn(async move {
+        let sess_snapshot = {
+            let sess = sess_arc.lock().await;
+            sess.clone_shallow()
+        };
+        if !sess_snapshot.is_authenticated() {
+            return;
+        }
+        if let Err(e) = fut_fn(sess_snapshot).await {
+            if let Some(code) = expired_code(&e) {
+                let reason = format!(
+                    "Phiên đăng nhập đã hết hạn (mã {code}). Vui lòng quét lại mã QR."
+                );
+                clear_expired_session(&app, &sess_arc, Some(&ws_arc), &paths, reason, true).await;
+            }
+        }
+    });
+}
+
 #[tauri::command]
 async fn thread_mark_read(
+    app: AppHandle,
     state: State<'_, AppState>,
     thread_id: String,
 ) -> Result<(), String> {
     *state.active_thread_id.lock().await = Some(thread_id.clone());
-    let store = state.store.lock().await;
-    store.mark_thread_read(&thread_id).map_err(|e| e.to_string())
+    let kind = {
+        let store = state.store.lock().await;
+        store.mark_thread_read(&thread_id).map_err(|e| e.to_string())?;
+        store
+            .get_thread_kind(&thread_id)
+            .ok()
+            .flatten()
+            .unwrap_or(ThreadKind::Direct)
+    };
+    if thread_id != "cloud-me" {
+        let tid = thread_id.clone();
+        spawn_best_effort_thread_sync(app, &state, move |sess| async move {
+            threads::sync_unread_mark(&sess, &tid, kind, false).await
+        });
+    }
+    Ok(())
 }
 
 #[tauri::command]
 async fn thread_mark_unread(
+    app: AppHandle,
     state: State<'_, AppState>,
     thread_id: String,
 ) -> Result<(), String> {
@@ -545,28 +596,78 @@ async fn thread_mark_unread(
             *active = None;
         }
     }
-    let store = state.store.lock().await;
-    store.set_thread_unread(&thread_id, 1).map_err(|e| e.to_string())
+    let kind = {
+        let store = state.store.lock().await;
+        store
+            .set_thread_unread(&thread_id, 1)
+            .map_err(|e| e.to_string())?;
+        store
+            .get_thread_kind(&thread_id)
+            .ok()
+            .flatten()
+            .unwrap_or(ThreadKind::Direct)
+    };
+    if thread_id != "cloud-me" {
+        let tid = thread_id.clone();
+        spawn_best_effort_thread_sync(app, &state, move |sess| async move {
+            threads::sync_unread_mark(&sess, &tid, kind, true).await
+        });
+    }
+    Ok(())
 }
 
 #[tauri::command]
 async fn thread_toggle_pin(
+    app: AppHandle,
     state: State<'_, AppState>,
     thread_id: String,
     pinned: bool,
 ) -> Result<(), String> {
-    let store = state.store.lock().await;
-    store.set_thread_pinned(&thread_id, pinned).map_err(|e| e.to_string())
+    let kind = {
+        let store = state.store.lock().await;
+        store
+            .set_thread_pinned(&thread_id, pinned)
+            .map_err(|e| e.to_string())?;
+        store
+            .get_thread_kind(&thread_id)
+            .ok()
+            .flatten()
+            .unwrap_or(ThreadKind::Direct)
+    };
+    if thread_id != "cloud-me" {
+        let tid = thread_id.clone();
+        spawn_best_effort_thread_sync(app, &state, move |sess| async move {
+            threads::sync_pin_thread(&sess, &tid, kind, pinned).await
+        });
+    }
+    Ok(())
 }
 
 #[tauri::command]
 async fn thread_toggle_mute(
+    app: AppHandle,
     state: State<'_, AppState>,
     thread_id: String,
     muted: bool,
 ) -> Result<(), String> {
-    let store = state.store.lock().await;
-    store.set_thread_muted(&thread_id, muted).map_err(|e| e.to_string())
+    let kind = {
+        let store = state.store.lock().await;
+        store
+            .set_thread_muted(&thread_id, muted)
+            .map_err(|e| e.to_string())?;
+        store
+            .get_thread_kind(&thread_id)
+            .ok()
+            .flatten()
+            .unwrap_or(ThreadKind::Direct)
+    };
+    if thread_id != "cloud-me" {
+        let tid = thread_id.clone();
+        spawn_best_effort_thread_sync(app, &state, move |sess| async move {
+            threads::sync_mute_thread(&sess, &tid, kind, muted).await
+        });
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1102,6 +1203,110 @@ async fn message_delete_local(
     Ok(())
 }
 
+#[tauri::command]
+async fn message_toggle_pin(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    msg_id: String,
+    pinned: bool,
+) -> Result<MessageDto, String> {
+    let store = state.store.lock().await;
+    let updated = store
+        .set_message_pinned(&thread_id, &msg_id, pinned)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Không tìm thấy tin nhắn để ghim".to_string())?;
+    let _ = app.emit("core://message-updated", &updated);
+    Ok(updated)
+}
+
+#[tauri::command]
+async fn stickers_list(state: State<'_, AppState>) -> Result<Vec<messaging::StickerItem>, String> {
+    let sess_snapshot = {
+        let sess = state.session.lock().await;
+        sess.clone_shallow()
+    };
+    messaging::list_stickers(&sess_snapshot)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn message_send_sticker(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    sticker_id: u64,
+    cate_id: u64,
+    sticker_type: u64,
+) -> Result<MessageDto, String> {
+    let kind = {
+        let store = state.store.lock().await;
+        store
+            .get_thread_kind(&thread_id)
+            .ok()
+            .flatten()
+            .unwrap_or(ThreadKind::Direct)
+    };
+    let sess_snapshot = {
+        let sess = state.session.lock().await;
+        sess.clone_shallow()
+    };
+
+    let msg = if sess_snapshot.is_authenticated() {
+        match messaging::send_sticker(
+            &sess_snapshot,
+            &thread_id,
+            kind,
+            sticker_id,
+            cate_id,
+            sticker_type,
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                if let Some(code) = expired_code(&e) {
+                    let reason = format!(
+                        "Phiên đăng nhập đã hết hạn (mã {code}). Vui lòng quét lại mã QR."
+                    );
+                    clear_expired_session(
+                        &app,
+                        &state.session,
+                        Some(&state.ws_task),
+                        &state.paths,
+                        reason.clone(),
+                        true,
+                    )
+                    .await;
+                    return Err(reason);
+                }
+                return Err(format!("Gửi nhãn dán thất bại: {e}"));
+            }
+        }
+    } else {
+        let now_ms = chrono_now_ms();
+        MessageDto {
+            msg_id: format!("local-{now_ms}"),
+            thread_id: thread_id.clone(),
+            sender_id: "me".into(),
+            sender_name: "Bạn".into(),
+            text: "[Nhãn dán]".into(),
+            msg_type: "chat.sticker".into(),
+            ts: now_ms,
+            is_outgoing: true,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
+            reactions: Vec::new(),
+            attachment_url: sticker_image_url(sticker_id, cate_id),
+            attachment_name: Some(format!("sticker_{cate_id}_{sticker_id}.png")),
+        }
+    };
+
+    persist_and_emit_sent_message(&app, &state, msg).await
+}
+
 fn attachment_meta_from_path(path: &std::path::Path) -> Result<AttachmentMetaDto, String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("Không đọc được tệp: {e}"))?;
     if !meta.is_file() {
@@ -1205,21 +1410,81 @@ async fn persist_and_emit_sent_message(
 
 #[tauri::command]
 async fn pick_attachment_file(app: AppHandle) -> Result<Option<AttachmentMetaDto>, String> {
-    #[cfg(target_os = "windows")]
-    let owner_hwnd = app
-        .get_webview_window("main")
-        .and_then(|w| w.hwnd().ok())
-        .map(|h| h.0 as usize);
-    #[cfg(not(target_os = "windows"))]
-    let owner_hwnd = {
-        let _ = app;
-        None
-    };
+    let owner_hwnd = main_window_hwnd(&app);
 
     let selected = tokio::task::spawn_blocking(move || file_dialog::pick_single_file(owner_hwnd))
         .await
         .map_err(|e| format!("Lỗi tác vụ chọn tệp: {e}"))??;
     selected.map(|p| attachment_meta_from_path(&p)).transpose()
+}
+
+fn main_window_hwnd(app: &AppHandle) -> Option<usize> {
+    #[cfg(target_os = "windows")]
+    {
+        app.get_webview_window("main")
+            .and_then(|w| w.hwnd().ok())
+            .map(|h| h.0 as usize)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app;
+        None
+    }
+}
+
+#[tauri::command]
+async fn save_remote_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    url: String,
+    suggested_name: String,
+) -> Result<Option<String>, String> {
+    let bytes = if url.trim_start().starts_with("data:") {
+        let (data, _) = zalo_core::session::decode_data_url_bytes(&url, 25 * 1024 * 1024)
+            .map_err(|e| e.to_string())?;
+        data
+    } else {
+        let sess_snapshot = {
+            let sess = state.session.lock().await;
+            sess.clone_shallow()
+        };
+        let (data, _) = sess_snapshot
+            .download_media_bytes(&url, 100 * 1024 * 1024)
+            .await
+            .map_err(|e| e.to_string())?;
+        data
+    };
+
+    let owner_hwnd = main_window_hwnd(&app);
+    let suggested = suggested_name;
+    let target = tokio::task::spawn_blocking(move || file_dialog::pick_save_file(owner_hwnd, &suggested))
+        .await
+        .map_err(|e| format!("Lỗi hộp thoại lưu tệp: {e}"))??;
+    let Some(path) = target else {
+        return Ok(None);
+    };
+    tokio::fs::write(&path, &bytes)
+        .await
+        .map_err(|e| format!("Không ghi được tệp: {e}"))?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+async fn fetch_image_data_url(
+    state: State<'_, AppState>,
+    url: String,
+) -> Result<String, String> {
+    if url.trim_start().starts_with("data:image/") {
+        return Ok(url);
+    }
+    let sess_snapshot = {
+        let sess = state.session.lock().await;
+        sess.clone_shallow()
+    };
+    sess_snapshot
+        .download_media_data_url(&url, 15 * 1024 * 1024)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1396,6 +1661,12 @@ async fn translate_messages(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn app_set_close_to_tray(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    state.close_to_tray.store(enabled, Ordering::SeqCst);
+    Ok(())
+}
+
 fn chrono_now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1422,6 +1693,8 @@ pub fn run() {
     let ws_task_arc = Arc::new(Mutex::new(None));
     let qr_task_arc = Arc::new(Mutex::new(None));
 
+    let close_to_tray = Arc::new(AtomicBool::new(true));
+    let allow_exit = Arc::new(AtomicBool::new(false));
     let state = AppState {
         paths,
         session: sess_arc,
@@ -1430,9 +1703,22 @@ pub fn run() {
         qr_task: qr_task_arc,
         active_thread_id: Arc::new(Mutex::new(None)),
         translate_cfg: Arc::new(Mutex::new(translate_cfg)),
+        close_to_tray: close_to_tray.clone(),
+        allow_exit: allow_exit.clone(),
     };
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = w.show();
+            let _ = w.unminimize();
+            let _ = w.set_focus();
+        }
+    }));
+
+    builder
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(state)
@@ -1456,7 +1742,12 @@ pub fn run() {
             message_react,
             message_recall,
             message_delete_local,
+            message_toggle_pin,
+            stickers_list,
+            message_send_sticker,
             pick_attachment_file,
+            save_remote_file,
+            fetch_image_data_url,
             inspect_attachment_path,
             message_send_attachment_path,
             message_send_raw_attachment,
@@ -1464,10 +1755,60 @@ pub fn run() {
             translate_get_config,
             translate_save_config,
             translate_messages,
+            app_set_close_to_tray,
         ])
         .setup(move |app| {
             let _ = app.get_webview_window("main");
+            let open_item = MenuItem::with_id(app, "open", "Mở litechat", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Thoát litechat", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open_item, &quit_item])?;
+            let exit_flag = allow_exit.clone();
+            let mut tray = TrayIconBuilder::new()
+                .tooltip("litechat")
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(move |app_handle, event| {
+                    if event.id() == "open" {
+                        if let Some(w) = app_handle.get_webview_window("main") {
+                            let _ = w.show();
+                            let _ = w.unminimize();
+                            let _ = w.set_focus();
+                        }
+                    } else if event.id() == "quit" {
+                        exit_flag.store(true, Ordering::SeqCst);
+                        app_handle.exit(0);
+                    }
+                })
+                .on_tray_icon_event(|tray_icon, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        if let Some(w) = tray_icon.app_handle().get_webview_window("main") {
+                            let _ = w.show();
+                            let _ = w.unminimize();
+                            let _ = w.set_focus();
+                        }
+                    }
+                });
+            if let Some(icon) = app.default_window_icon().cloned() {
+                tray = tray.icon(icon);
+            }
+            let _ = tray.build(app)?;
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let st = window.state::<AppState>();
+                if st.close_to_tray.load(Ordering::SeqCst)
+                    && !st.allow_exit.load(Ordering::SeqCst)
+                {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .run(tauri::generate_context!())
         .expect("error while running litechat");

@@ -36,7 +36,7 @@ pub enum SessionStatus {
     Unreachable,
 }
 
-/// Returns `true` only for official Zalo domains (`*.zalo.me`, `*.zaloapp.com`).
+/// Returns `true` only for official domains (`*.zalo.me`, `*.zaloapp.com`).
 pub fn is_allowed_zalo_host(host: &str) -> bool {
     let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
     if h.is_empty() {
@@ -48,7 +48,19 @@ pub fn is_allowed_zalo_host(host: &str) -> bool {
         || h.ends_with(".zaloapp.com")
 }
 
-fn is_allowed_zalo_url_with_scheme(raw: &str, expected_scheme: &str) -> bool {
+/// Returns `true` for trusted media/CDN hosts (`*.zalo.me`, `*.zaloapp.com`, `*.zdn.vn`, `*.zadn.vn`, `*.zalo.vn`).
+pub fn is_allowed_media_host(host: &str) -> bool {
+    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    is_allowed_zalo_host(&h)
+        || h == "zdn.vn"
+        || h.ends_with(".zdn.vn")
+        || h == "zadn.vn"
+        || h.ends_with(".zadn.vn")
+        || h == "zalo.vn"
+        || h.ends_with(".zalo.vn")
+}
+
+fn is_allowed_url_with(raw: &str, expected_scheme: &str, host_check: fn(&str) -> bool) -> bool {
     let Ok(url) = reqwest::Url::parse(raw.trim()) else {
         return false;
     };
@@ -63,15 +75,47 @@ fn is_allowed_zalo_url_with_scheme(raw: &str, expected_scheme: &str) -> bool {
             return false;
         }
     }
-    url.host_str().is_some_and(is_allowed_zalo_host)
+    url.host_str().is_some_and(host_check)
 }
 
 pub fn is_allowed_zalo_http_url(raw: &str) -> bool {
-    is_allowed_zalo_url_with_scheme(raw, "https")
+    is_allowed_url_with(raw, "https", is_allowed_zalo_host)
+}
+
+pub fn is_allowed_media_url(raw: &str) -> bool {
+    is_allowed_url_with(raw, "https", is_allowed_media_host)
 }
 
 pub fn is_allowed_zalo_ws_url(raw: &str) -> bool {
-    is_allowed_zalo_url_with_scheme(raw, "wss")
+    is_allowed_url_with(raw, "wss", is_allowed_zalo_host)
+}
+
+/// Decode a `data:<mime>;base64,<payload>` URL with a strict size limit.
+pub fn decode_data_url_bytes(raw: &str, max_bytes: usize) -> Result<(Vec<u8>, String)> {
+    let rest = raw
+        .trim()
+        .strip_prefix("data:")
+        .context("URL data không hợp lệ")?;
+    let (meta, payload) = rest
+        .split_once(',')
+        .context("Định dạng data URL không hợp lệ")?;
+    if !meta.to_ascii_lowercase().ends_with(";base64") {
+        anyhow::bail!("Chỉ hỗ trợ data URL dạng base64");
+    }
+    let mime = meta
+        .split(';')
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let bytes = B64
+        .decode(payload.trim())
+        .context("Không giải mã được dữ liệu base64")?;
+    if bytes.len() > max_bytes {
+        anyhow::bail!("Dữ liệu vượt quá giới hạn cho phép");
+    }
+    Ok((bytes, mime))
 }
 
 #[derive(Debug, Error)]
@@ -931,6 +975,77 @@ impl Session {
             Err(_) => v,
         }
     }
+
+    pub async fn download_media_bytes(&self, url: &str, max_bytes: usize) -> Result<(Vec<u8>, String)> {
+        if !is_allowed_media_url(url) {
+            anyhow::bail!("Từ chối tải tệp từ URL không nằm trong danh sách CDN tin cậy");
+        }
+        let redirect_policy = redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                attempt.stop()
+            } else if is_allowed_media_url(attempt.url().as_str()) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        });
+        let client = Client::builder()
+            .redirect(redirect_policy)
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) LiteChat/0.1.0 Safari/537.36")
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .context("Không khởi tạo được HTTP client tải tệp")?;
+
+        let mut resp = client
+            .get(url.trim())
+            .header(REFERER, "https://chat.zalo.me/")
+            .send()
+            .await
+            .map_err(|e| SessionError::Network(e.to_string()))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("Tải tệp thất bại (HTTP {})", status.as_u16());
+        }
+        if let Some(len) = resp.content_length() {
+            if len as usize > max_bytes {
+                anyhow::bail!("Kích thước tệp vượt quá giới hạn cho phép");
+            }
+        }
+
+        let mime = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(';').next())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+
+        let mut buf = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| SessionError::Network(e.to_string()))?
+        {
+            if buf.len().saturating_add(chunk.len()) > max_bytes {
+                anyhow::bail!("Kích thước tệp vượt quá giới hạn cho phép");
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        Ok((buf, mime))
+    }
+
+    pub async fn download_media_data_url(&self, url: &str, max_bytes: usize) -> Result<String> {
+        let (bytes, mime) = self.download_media_bytes(url, max_bytes).await?;
+        let final_mime = if mime.starts_with("image/") {
+            mime
+        } else {
+            "image/png".to_string()
+        };
+        Ok(format!("data:{final_mime};base64,{}", B64.encode(&bytes)))
+    }
 }
 
 fn value_as_nonempty_str(v: Option<&Value>) -> Option<String> {
@@ -1157,5 +1272,16 @@ mod tests {
         assert!(is_session_expired_code(102));
         assert!(!is_session_expired_code(0));
         assert!(!is_session_expired_code(500));
+    }
+
+    #[test]
+    fn media_url_allowlist_checks_cdn_hosts() {
+        assert!(is_allowed_media_url("https://f10-zpc.zdn.vn/photo.jpg"));
+        assert!(is_allowed_media_url("https://s120-ava-talk.zadn.vn/avatar.png"));
+        assert!(is_allowed_media_url("https://api.zaloapp.com/api/emoticon/sticker/webpc?eid=1"));
+        assert!(!is_allowed_media_url("http://f10-zpc.zdn.vn/photo.jpg"));
+        assert!(!is_allowed_media_url("https://evil.example/a.png"));
+        assert!(!is_allowed_media_url("https://f-zdn.vn/a.png"));
+        assert!(!is_allowed_media_url("https://f10-zpc.zdn.vn.evil.com/a.png"));
     }
 }

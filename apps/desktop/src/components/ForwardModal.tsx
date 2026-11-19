@@ -4,18 +4,20 @@ import type { MessageDto, ThreadDto } from "../types";
 import { ThreadAvatar } from "./ThreadAvatar";
 
 interface Props {
-  message: MessageDto | null;
+  messages: MessageDto[];
   threads: ThreadDto[];
   onClose: () => void;
-  onForwardTo: (targetThreadId: string, msg: MessageDto) => Promise<void>;
+  onForwardTo: (targetThreadId: string, messages: MessageDto[]) => Promise<void>;
 }
 
-export function ForwardModal({ message, threads, onClose, onForwardTo }: Props) {
+export function ForwardModal({ messages, threads, onClose, onForwardTo }: Props) {
   const [query, setQuery] = useState("");
   const [sendingId, setSendingId] = useState<string | null>(null);
 
+  const active = messages.length > 0;
+
   useEffect(() => {
-    if (!message) {
+    if (!active) {
       setQuery("");
       setSendingId(null);
       return;
@@ -25,7 +27,7 @@ export function ForwardModal({ message, threads, onClose, onForwardTo }: Props) 
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [message, onClose]);
+  }, [active, onClose]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -34,7 +36,9 @@ export function ForwardModal({ message, threads, onClose, onForwardTo }: Props) 
       .slice(0, 40);
   }, [threads, query]);
 
-  if (!message) return null;
+  if (!active) return null;
+
+  const first = messages[0];
 
   return (
     <div
@@ -52,7 +56,11 @@ export function ForwardModal({ message, threads, onClose, onForwardTo }: Props) 
         >
           <div className="flex items-center gap-2 text-[15px] font-semibold">
             <Forward className="h-4 w-4" style={{ color: "var(--accent)" }} />
-            <span>Chuyển tiếp tin nhắn</span>
+            <span>
+              {messages.length > 1
+                ? `Chuyển tiếp ${messages.length} tin nhắn`
+                : "Chuyển tiếp tin nhắn"}
+            </span>
           </div>
           <button type="button" onClick={onClose} className="hover-menu rounded-lg p-1">
             <X className="h-4 w-4" style={{ color: "var(--text-secondary)" }} />
@@ -65,9 +73,9 @@ export function ForwardModal({ message, threads, onClose, onForwardTo }: Props) 
             style={{ background: "var(--quote-bg)", color: "var(--text-secondary)" }}
           >
             <span className="font-semibold" style={{ color: "var(--text-primary)" }}>
-              Nội dung:{" "}
+              {messages.length > 1 ? `Đã chọn ${messages.length} tin:` : "Nội dung:"}{" "}
             </span>
-            <span className="line-clamp-2">{message.text || message.attachment_name}</span>
+            <span className="line-clamp-2">{first.text || first.attachment_name}</span>
           </div>
 
           <div
@@ -98,7 +106,7 @@ export function ForwardModal({ message, threads, onClose, onForwardTo }: Props) 
                 disabled={sendingId === t.id}
                 onClick={() => {
                   setSendingId(t.id);
-                  void onForwardTo(t.id, message).finally(() => {
+                  void onForwardTo(t.id, messages).finally(() => {
                     setSendingId(null);
                     onClose();
                   });

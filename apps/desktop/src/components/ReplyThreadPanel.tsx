@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, Info, LocateFixed, MessagesSquare } from "lucide-react";
-import type { MessageDto, PendingAttachment, ThreadKind } from "../types";
+import type { MessageDto, PendingAttachment, StickerItem, ThreadKind, ThreadMemberDto } from "../types";
 import { Composer } from "./Composer";
 import { MessageBubble, type MessageTranslationState } from "./MessageBubble";
 
@@ -33,10 +33,14 @@ interface Props {
   onToggleDrawer: () => void;
   onClose: () => void;
   onJumpToMsgInMainChat: (msgId: string) => void;
-  onSendThreadReply: (text: string, quoteTarget: MessageDto) => Promise<void>;
+  onSendThreadReply: (text: string, quoteTarget: MessageDto) => Promise<boolean | void>;
   onSendThreadAttachment: (att: PendingAttachment, caption: string, rootMsgId: string) => Promise<void>;
   onBuzz: () => Promise<void>;
   buzzCooldownSec: number;
+  getSenderAvatar?: (senderId: string) => string | undefined;
+  onSaveFile?: (url: string, name: string) => void;
+  onRetrySend?: (msg: MessageDto) => void;
+  onDiscardFailed?: (msgId: string) => void;
   onReact: (msg: MessageDto, emoji: string) => void;
   onRecall: (msg: MessageDto) => void;
   onDeleteLocal: (msg: MessageDto) => void;
@@ -45,6 +49,9 @@ interface Props {
   onForward: (msg: MessageDto) => void;
   onTranslate: (msg: MessageDto) => void;
   onHideTranslation: (msgId: string) => void;
+  mentionMembers?: ThreadMemberDto[];
+  onSendSticker?: (sticker: StickerItem) => Promise<void>;
+  onTogglePin?: (msg: MessageDto) => void;
   onError: (err: unknown) => void;
 }
 
@@ -65,6 +72,10 @@ export function ReplyThreadPanel({
   onSendThreadAttachment,
   onBuzz,
   buzzCooldownSec,
+  getSenderAvatar,
+  onSaveFile,
+  onRetrySend,
+  onDiscardFailed,
   onReact,
   onRecall,
   onDeleteLocal,
@@ -73,6 +84,9 @@ export function ReplyThreadPanel({
   onForward,
   onTranslate,
   onHideTranslation,
+  mentionMembers,
+  onSendSticker,
+  onTogglePin,
   onError,
 }: Props) {
   const [replyTarget, setReplyTarget] = useState<MessageDto>(rootMessage);
@@ -278,6 +292,7 @@ export function ReplyThreadPanel({
                   threadKind={threadKind}
                   groupedWithPrev={grouped}
                   highlighted={threadHighlightId === m.msg_id}
+                  senderAvatar={getSenderAvatar?.(m.sender_id)}
                   translation={translationsByMsg[m.msg_id]}
                   replaceWithTranslation={replaceWithTranslation}
                   hideQuote={m.quote?.msg_id === rootMessage.msg_id}
@@ -291,6 +306,10 @@ export function ReplyThreadPanel({
                   onForward={onForward}
                   onTranslate={onTranslate}
                   onHideTranslation={onHideTranslation}
+                  onTogglePin={onTogglePin}
+                  onSaveFile={onSaveFile}
+                  onRetrySend={onRetrySend}
+                  onDiscardFailed={onDiscardFailed}
                 />
               </div>
             );
@@ -299,11 +318,13 @@ export function ReplyThreadPanel({
         <div ref={listBottomRef} />
       </div>
 
-      {/* Full Composer inside Thread (text + emoji + images/files + buzz) */}
+      {/* Full Composer inside Thread (text + emoji/stickers + images/files + @mention + buzz) */}
       <Composer
         replyTo={replyTarget.msg_id !== rootMessage.msg_id ? replyTarget : null}
         pendingAttachment={pendingAttachment}
         onPendingAttachmentChange={onPendingAttachmentChange}
+        mentionMembers={mentionMembers}
+        onSendSticker={onSendSticker}
         onCancelReply={() => setReplyTarget(rootMessage)}
         onSendText={async (text) => {
           await onSendThreadReply(text, replyTarget);
