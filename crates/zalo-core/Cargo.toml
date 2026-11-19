@@ -1,0 +1,28 @@
+[package]
+name = "zalo-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless protocol, cryptography, session, and SQLite FTS5 storage core for litechat"
+
+[dependencies]
+aes = "0.8"
+aes-gcm = "0.10"
+anyhow = "1"
+base64 = "0.22"
+cbc = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+cipher = "0.4"
+flate2 = "1"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+generic-array = "0.14"
+getrandom = { version = "0.3", features = ["std"] }
+md-5 = "0.10"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+reqwest = { version = "0.12", default-features = false, features = ["cookies", "json", "multipart", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "rt-multi-thread", "macros", "time", "net", "io-util", "sync"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }

@@ -1,0 +1,41 @@
+# Build artifacts
+/target/
+**/target/
+dist/
+build/
+*.exe
+*.msi
+*.dll
+*.pdb
+
+# Frontend / Node
+node_modules/
+apps/desktop/dist/
+apps/desktop/.vite/
+*.tsbuildinfo
+.pnpm-store/
+
+# Runtime user data & secrets (NEVER COMMIT)
+session.json
+session*.json
+translate.json
+*.key
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+threads_cache.json
+stickers_cache/
+autoreply_rules.json
+sync_v2_keys.json
+dump/
+captures/
+*.log
+.env
+.env.*
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
