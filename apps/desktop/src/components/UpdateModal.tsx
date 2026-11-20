@@ -1,12 +1,14 @@
 import { useState } from "react";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ArrowDownToLine, CheckCircle2, RefreshCw, Sparkles, X } from "lucide-react";
-import type { Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { bridge } from "../bridge";
+import type { AppUpdateInfo } from "../types";
 
 interface Props {
   open: boolean;
   currentVersion: string;
-  availableUpdate: Update | null;
+  availableUpdate: AppUpdateInfo | null;
   checking: boolean;
   errorText: string | null;
   lastCheckedAt: number | null;
@@ -44,21 +46,29 @@ export function UpdateModal({
     setDownloadedBytes(0);
     setTotalBytes(null);
     setStageText("Đang tải bản cập nhật...");
+    let unlisten: UnlistenFn | null = null;
     try {
-      await availableUpdate.downloadAndInstall((event) => {
-        if (event.event === "Started") {
-          setTotalBytes(event.data.contentLength ?? null);
-          setStageText("Đang tải gói cài đặt...");
-        } else if (event.event === "Progress") {
-          setDownloadedBytes((prev) => prev + event.data.chunkLength);
-        } else if (event.event === "Finished") {
-          setStageText("Đang hoàn tất cài đặt và khởi động lại...");
-        }
-      });
+      unlisten = await listen<{ event: string; total?: number | null; chunk?: number }>(
+        "core://update-progress",
+        (ev) => {
+          const p = ev.payload;
+          if (p.event === "started") {
+            setTotalBytes(p.total ?? null);
+            setStageText("Đang tải gói cài đặt...");
+          } else if (p.event === "progress" && p.chunk) {
+            setDownloadedBytes((prev) => prev + (p.chunk ?? 0));
+          } else if (p.event === "finished") {
+            setStageText("Đang hoàn tất cài đặt và khởi động lại...");
+          }
+        },
+      );
+      await bridge.installAppUpdate();
       await relaunch();
     } catch (err) {
       setInstallError(String(err));
       setInstalling(false);
+    } finally {
+      unlisten?.();
     }
   };
 

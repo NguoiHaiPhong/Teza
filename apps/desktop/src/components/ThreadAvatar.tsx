@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Bookmark, Users } from "lucide-react";
 import type { ThreadKind } from "../types";
+import { useResolvedMediaUrl } from "../utils/mediaCache";
 
 interface Props {
   avatar: string;
@@ -52,24 +53,31 @@ function SingleImg({
   className: string;
   fallback: React.ReactNode;
 }) {
+  const { src: resolvedSrc, requestFallback } = useResolvedMediaUrl(src);
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
     setFailed(false);
   }, [src]);
 
-  if (!src || failed) {
+  if (!src || failed || !resolvedSrc) {
     return <>{fallback}</>;
   }
 
   return (
     <img
-      src={src}
+      src={resolvedSrc}
       alt={alt}
       loading="lazy"
       decoding="async"
       referrerPolicy="no-referrer"
-      onError={() => setFailed(true)}
+      onError={() => {
+        if (resolvedSrc === src && /^https:\/\//i.test(src)) {
+          requestFallback();
+        } else {
+          setFailed(true);
+        }
+      }}
       className={className}
     />
   );

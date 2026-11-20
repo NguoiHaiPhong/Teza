@@ -1,9 +1,12 @@
-import { QrCode, RefreshCw } from "lucide-react";
+import { Network, QrCode, RefreshCw } from "lucide-react";
+import type { RelayConfigSummary } from "../types";
 
 interface Props {
   qrSvg: string;
   statusText: string;
   errorText: string | null;
+  relayCfg?: RelayConfigSummary | null;
+  onOpenRelaySettings?: () => void;
   onRefresh: () => void;
   onEnterDemo: () => void;
 }
@@ -12,6 +15,8 @@ export function QrLoginModal({
   qrSvg,
   statusText,
   errorText,
+  relayCfg,
+  onOpenRelaySettings,
   onRefresh,
   onEnterDemo,
 }: Props) {
@@ -43,6 +48,11 @@ export function QrLoginModal({
         <p className="text-sm font-medium" style={{ color: "var(--accent)" }}>
           {statusText}
         </p>
+        {relayCfg?.enabled && (
+          <p className="mt-1.5 text-xs font-medium text-emerald-400">
+            Đang kết nối qua Relay ({relayCfg.mode.toUpperCase()} · {relayCfg.host}:{relayCfg.port})
+          </p>
+        )}
         {errorText && (
           <p
             className="mt-2 rounded-lg px-3 py-2 text-xs"
@@ -52,7 +62,7 @@ export function QrLoginModal({
           </p>
         )}
 
-        <div className="mt-6 flex items-center justify-center gap-3">
+        <div className="mt-6 flex flex-wrap items-center justify-center gap-2.5">
           <button
             onClick={onRefresh}
             className="tf-btn inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold"
@@ -60,9 +70,24 @@ export function QrLoginModal({
             <RefreshCw className="h-4 w-4" />
             Tạo lại QR
           </button>
+          {onOpenRelaySettings && (
+            <button
+              type="button"
+              onClick={onOpenRelaySettings}
+              className="inline-flex items-center gap-1.5 rounded-lg px-3.5 py-2 text-sm font-medium transition hover:opacity-85"
+              style={{
+                background: "var(--bg-surface)",
+                color: relayCfg?.enabled ? "var(--accent)" : "var(--text-primary)",
+                border: "1px solid var(--border-subtle)",
+              }}
+            >
+              <Network className="h-4 w-4" />
+              Mạng Relay
+            </button>
+          )}
           <button
             onClick={onEnterDemo}
-            className="rounded-lg px-4 py-2 text-sm font-medium transition hover:opacity-80"
+            className="rounded-lg px-3.5 py-2 text-sm font-medium transition hover:opacity-80"
             style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
           >
             Xem trước giao diện

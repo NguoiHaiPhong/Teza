@@ -1,6 +1,26 @@
-import { ArrowDownToLine, Bell, Languages, Palette, Sparkles, Volume2, X, Zap } from "lucide-react";
-import type { Update } from "@tauri-apps/plugin-updater";
-import type { ThemeMode, TranslateConfigSummary } from "../types";
+import { useEffect, useRef, useState } from "react";
+import {
+  ArrowDownToLine,
+  Bell,
+  CheckCircle2,
+  Languages,
+  Loader2,
+  Network,
+  Palette,
+  RefreshCw,
+  Sparkles,
+  Volume2,
+  X,
+  Zap,
+} from "lucide-react";
+import { bridge } from "../bridge";
+import type {
+  AppUpdateInfo,
+  RelayConfigSummary,
+  RelayMode,
+  ThemeMode,
+  TranslateConfigSummary,
+} from "../types";
 
 export type FontSizeScale = "sm" | "md" | "lg";
 export type DensityMode = "comfortable" | "compact";
@@ -25,8 +45,11 @@ interface Props {
   onCloseToTrayChange: (v: boolean) => void;
   translateCfg: TranslateConfigSummary | null;
   onOpenTranslateModal: () => void;
+  relayCfg: RelayConfigSummary | null;
+  onRelaySaved: (cfg: RelayConfigSummary) => void;
+  focusRelay?: boolean;
   appVersion: string;
-  availableUpdate: Update | null;
+  availableUpdate: AppUpdateInfo | null;
   onOpenUpdateModal: () => void;
   onClose: () => void;
 }
@@ -96,12 +119,99 @@ export function SettingsModal({
   onCloseToTrayChange,
   translateCfg,
   onOpenTranslateModal,
+  relayCfg,
+  onRelaySaved,
+  focusRelay = false,
   appVersion,
   availableUpdate,
   onOpenUpdateModal,
   onClose,
 }: Props) {
+  const [relayEnabled, setRelayEnabled] = useState(false);
+  const [relayMode, setRelayMode] = useState<RelayMode>("socks5");
+  const [relayHost, setRelayHost] = useState("");
+  const [relayPort, setRelayPort] = useState("1088");
+  const [relayUser, setRelayUser] = useState("");
+  const [relayPassword, setRelayPassword] = useState("");
+  const [clearRelayPw, setClearRelayPw] = useState(false);
+  const [routeMedia, setRouteMedia] = useState(true);
+  const [relayTesting, setRelayTesting] = useState(false);
+  const [relaySaving, setRelaySaving] = useState(false);
+  const [relayFeedback, setRelayFeedback] = useState<{ ok: boolean; text: string } | null>(null);
+  const relaySectionRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    setRelayEnabled(relayCfg?.enabled ?? false);
+    setRelayMode(relayCfg?.mode ?? "socks5");
+    setRelayHost(relayCfg?.host ?? "");
+    setRelayPort(String(relayCfg?.port || 1088));
+    setRelayUser(relayCfg?.username ?? "");
+    setRelayPassword("");
+    setClearRelayPw(false);
+    setRouteMedia(relayCfg?.route_webview_media ?? true);
+    setRelayFeedback(null);
+    if (focusRelay) {
+      setTimeout(() => {
+        relaySectionRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+      }, 40);
+    }
+  }, [open, relayCfg, focusRelay]);
+
   if (!open) return null;
+
+  const buildRelayPayload = () => {
+    const parsedPort = Number(relayPort.trim());
+    const safePort = Number.isInteger(parsedPort) && parsedPort >= 1 && parsedPort <= 65535 ? parsedPort : 0;
+    return {
+      enabled: relayEnabled,
+      mode: relayMode,
+      host: relayHost.trim(),
+      port: safePort,
+      username: relayUser.trim(),
+      password: relayPassword || undefined,
+      clear_password: clearRelayPw,
+      route_webview_media: routeMedia,
+    };
+  };
+
+  const handleTestRelay = async () => {
+    setRelayTesting(true);
+    setRelayFeedback(null);
+    try {
+      const payload = { ...buildRelayPayload(), enabled: true };
+      const res = await bridge.testRelayConnection(payload);
+      setRelayFeedback({
+        ok: true,
+        text: `Kết nối thành công tới ${payload.host}:${payload.port} (${res.latency_ms} ms)`,
+      });
+    } catch (err) {
+      setRelayFeedback({ ok: false, text: String(err) });
+    } finally {
+      setRelayTesting(false);
+    }
+  };
+
+  const handleSaveRelay = async () => {
+    setRelaySaving(true);
+    setRelayFeedback(null);
+    try {
+      const saved = await bridge.saveRelayConfig(buildRelayPayload());
+      onRelaySaved(saved);
+      setRelayPassword("");
+      setClearRelayPw(false);
+      setRelayFeedback({
+        ok: true,
+        text: saved.enabled
+          ? `Đã bật & lưu Relay (${saved.mode.toUpperCase()} · ${saved.host}:${saved.port})`
+          : "Đã tắt & lưu cấu hình Relay (kết nối trực tiếp)",
+      });
+    } catch (err) {
+      setRelayFeedback({ ok: false, text: String(err) });
+    } finally {
+      setRelaySaving(false);
+    }
+  };
 
   return (
     <div
@@ -274,6 +384,209 @@ export function SettingsModal({
                 checked={closeToTray}
                 onChange={onCloseToTrayChange}
               />
+            </div>
+          </section>
+
+          {/* Mạng nội bộ / Relay */}
+          <section ref={relaySectionRef} className="space-y-2.5">
+            <h4
+              className="text-xs font-semibold uppercase tracking-wider"
+              style={{ color: "var(--text-secondary)" }}
+            >
+              Mạng nội bộ / Máy chủ Relay
+            </h4>
+            <div className="space-y-3 rounded-xl p-3" style={{ background: "var(--bg-surface)" }}>
+              <ToggleRow
+                icon={<Network className="h-4 w-4" />}
+                label="Sử dụng mạng Relay nội bộ"
+                desc="Đi qua máy trung gian (ví dụ 10.7.12.233) cho máy không có Internet"
+                checked={relayEnabled}
+                onChange={(v) => {
+                  setRelayEnabled(v);
+                  setRelayFeedback(null);
+                }}
+              />
+
+              <div className="space-y-2.5 border-t pt-2.5" style={{ borderColor: "var(--border-subtle)" }}>
+                <div>
+                  <div className="mb-1 text-xs font-medium" style={{ color: "var(--text-secondary)" }}>
+                    Giao thức đường truyền
+                  </div>
+                  <div
+                    className="grid grid-cols-2 gap-1 rounded-xl p-1"
+                    style={{ background: "var(--bg-sidebar)" }}
+                  >
+                    {(
+                      [
+                        { id: "socks5", label: "SOCKS5h (DNS từ xa)" },
+                        { id: "http", label: "HTTP CONNECT" },
+                      ] as const
+                    ).map((opt) => (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => setRelayMode(opt.id)}
+                        className="rounded-lg py-1.5 text-xs font-medium transition"
+                        style={{
+                          background: relayMode === opt.id ? "var(--accent)" : "transparent",
+                          color:
+                            relayMode === opt.id
+                              ? "var(--text-on-accent)"
+                              : "var(--text-secondary)",
+                        }}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-3 gap-2">
+                  <div className="col-span-2">
+                    <label className="mb-1 block text-xs font-medium" style={{ color: "var(--text-secondary)" }}>
+                      Máy chủ Relay (IP / Hostname)
+                    </label>
+                    <input
+                      value={relayHost}
+                      onChange={(e) => setRelayHost(e.target.value)}
+                      placeholder="10.7.12.233"
+                      className="w-full rounded-lg px-2.5 py-1.5 text-[13.5px] outline-none"
+                      style={{
+                        background: "var(--bg-sidebar)",
+                        border: "1px solid var(--border-subtle)",
+                      }}
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-xs font-medium" style={{ color: "var(--text-secondary)" }}>
+                      Cổng
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={65535}
+                      value={relayPort}
+                      onChange={(e) => setRelayPort(e.target.value)}
+                      placeholder="1088"
+                      className="w-full rounded-lg px-2.5 py-1.5 text-[13.5px] outline-none"
+                      style={{
+                        background: "var(--bg-sidebar)",
+                        border: "1px solid var(--border-subtle)",
+                      }}
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="mb-1 block text-xs font-medium" style={{ color: "var(--text-secondary)" }}>
+                      Tài khoản (nếu có)
+                    </label>
+                    <input
+                      value={relayUser}
+                      onChange={(e) => setRelayUser(e.target.value)}
+                      placeholder="litechat"
+                      className="w-full rounded-lg px-2.5 py-1.5 text-[13.5px] outline-none"
+                      style={{
+                        background: "var(--bg-sidebar)",
+                        border: "1px solid var(--border-subtle)",
+                      }}
+                    />
+                  </div>
+                  <div>
+                    <div className="mb-1 flex items-center justify-between">
+                      <label className="text-xs font-medium" style={{ color: "var(--text-secondary)" }}>
+                        Mật khẩu
+                      </label>
+                      {relayCfg?.has_password && !clearRelayPw && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setClearRelayPw(true);
+                            setRelayPassword("");
+                          }}
+                          className="text-[11px] underline hover:opacity-80"
+                          style={{ color: "var(--danger-text)" }}
+                        >
+                          Xóa MK
+                        </button>
+                      )}
+                    </div>
+                    <input
+                      type="password"
+                      value={relayPassword}
+                      onChange={(e) => {
+                        setRelayPassword(e.target.value);
+                        if (e.target.value) setClearRelayPw(false);
+                      }}
+                      placeholder={
+                        relayCfg?.has_password && !clearRelayPw
+                          ? "Đã lưu (để trống giữ nguyên)"
+                          : "Mật khẩu Relay"
+                      }
+                      className="w-full rounded-lg px-2.5 py-1.5 text-[13.5px] outline-none"
+                      style={{
+                        background: "var(--bg-sidebar)",
+                        border: "1px solid var(--border-subtle)",
+                      }}
+                    />
+                  </div>
+                </div>
+
+                <label className="flex cursor-pointer items-center justify-between gap-2 pt-0.5 text-[13px]">
+                  <span style={{ color: "var(--text-secondary)" }}>
+                    Định tuyến tải ảnh, avatar & nhãn dán qua Relay
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={routeMedia}
+                    onChange={(e) => setRouteMedia(e.target.checked)}
+                    className="h-4 w-4 cursor-pointer accent-[var(--accent)]"
+                  />
+                </label>
+
+                {relayFeedback && (
+                  <div
+                    className="flex items-start gap-2 rounded-lg px-3 py-2 text-xs"
+                    style={{
+                      background: relayFeedback.ok ? "rgba(16,185,129,0.12)" : "var(--danger-bg)",
+                      color: relayFeedback.ok ? "#34d399" : "var(--danger-text)",
+                    }}
+                  >
+                    {relayFeedback.ok && <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />}
+                    <span>{relayFeedback.text}</span>
+                  </div>
+                )}
+
+                <div className="flex items-center justify-end gap-2 pt-1">
+                  <button
+                    type="button"
+                    disabled={relayTesting || relaySaving || !relayHost.trim()}
+                    onClick={() => void handleTestRelay()}
+                    className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium disabled:opacity-50"
+                    style={{
+                      background: "var(--bg-sidebar)",
+                      border: "1px solid var(--border-subtle)",
+                    }}
+                  >
+                    {relayTesting ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCw className="h-3.5 w-3.5" />
+                    )}
+                    <span>Kiểm tra kết nối</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={relaySaving || relayTesting}
+                    onClick={() => void handleSaveRelay()}
+                    className="tf-btn flex items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-xs font-semibold disabled:opacity-50"
+                  >
+                    {relaySaving && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                    <span>Lưu cấu hình Relay</span>
+                  </button>
+                </div>
+              </div>
             </div>
           </section>
 

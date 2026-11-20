@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { Calendar, Check, Copy, MessageSquare, Phone, RefreshCw, User, X } from "lucide-react";
 import { bridge } from "../bridge";
 import type { UserProfileDto } from "../types";
+import { copyTextReliable } from "../utils/clipboard";
+import { RelayImage } from "./RelayImage";
 import { ThreadAvatar } from "./ThreadAvatar";
 
 interface Props {
@@ -56,7 +58,7 @@ export function UserProfileModal({ userId, onClose, onStartChat, onOpenImage }: 
 
   const handleCopyUid = () => {
     const uid = profile?.uid || userId;
-    void navigator.clipboard?.writeText(uid);
+    void copyTextReliable(uid).catch(() => undefined);
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
   };
@@ -78,7 +80,7 @@ export function UserProfileModal({ userId, onClose, onStartChat, onOpenImage }: 
           }}
         >
           {profile?.cover && /^https:\/\//i.test(profile.cover) && (
-            <img
+            <RelayImage
               src={profile.cover}
               alt="Ảnh bìa"
               referrerPolicy="no-referrer"
@@ -156,15 +158,15 @@ export function UserProfileModal({ userId, onClose, onStartChat, onOpenImage }: 
             profile && (
               <>
                 <div className="mt-3">
-                  <h3 className="text-[17px] font-bold">{profile.display_name}</h3>
+                  <h3 className="selectable-text text-[17px] font-bold">{profile.display_name}</h3>
                   {profile.zalo_name && profile.zalo_name !== profile.display_name && (
-                    <div className="text-[13px]" style={{ color: "var(--text-secondary)" }}>
+                    <div className="selectable-text text-[13px]" style={{ color: "var(--text-secondary)" }}>
                       Tên gốc: {profile.zalo_name}
                     </div>
                   )}
                   {profile.status && (
                     <p
-                      className="mt-2 rounded-xl px-3 py-2 text-[13px] italic"
+                      className="selectable-text mt-2 rounded-xl px-3 py-2 text-[13px] italic"
                       style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
                     >
                       "{profile.status}"
@@ -173,7 +175,7 @@ export function UserProfileModal({ userId, onClose, onStartChat, onOpenImage }: 
                 </div>
 
                 <div
-                  className="mt-4 space-y-2 rounded-xl p-3 text-[13px]"
+                  className="selectable-text mt-4 space-y-2 rounded-xl p-3 text-[13px]"
                   style={{ background: "var(--bg-surface)" }}
                 >
                   {genderLabel && (

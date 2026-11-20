@@ -3,7 +3,6 @@ import { getVersion } from "@tauri-apps/api/app";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
   Bell,
   BellOff,
@@ -40,6 +39,7 @@ import {
   isBuzzMessage,
   playBuzzSound,
 } from "./utils/buzz";
+import { setRelayMediaRouting } from "./utils/mediaCache";
 import { playMessageSound, showDesktopNotification } from "./utils/notify";
 import { Composer } from "./components/Composer";
 import { ForwardModal } from "./components/ForwardModal";
@@ -47,6 +47,7 @@ import { MediaLightbox, type LightboxItem } from "./components/MediaLightbox";
 import { MessageBubble, type MessageTranslationState } from "./components/MessageBubble";
 import { QrLoginModal } from "./components/QrLoginModal";
 import { QuickSearchModal } from "./components/QuickSearchModal";
+import { RelayImage } from "./components/RelayImage";
 import { ReplyThreadPanel } from "./components/ReplyThreadPanel";
 import {
   SettingsModal,
@@ -63,10 +64,12 @@ import { UpdateModal } from "./components/UpdateModal";
 import { UserProfileModal } from "./components/UserProfileModal";
 import type {
   AccountProfile,
+  AppUpdateInfo,
   ConnectionStatus,
   FolderFilter,
   MessageDto,
   PendingAttachment,
+  RelayConfigSummary,
   StickerItem,
   ThemeMode,
   ThreadDetailsDto,
@@ -273,12 +276,14 @@ export default function App() {
   } | null>(null);
   const [buzzCooldownUntil, setBuzzCooldownUntil] = useState<Record<string, number>>({});
   const [buzzNow, setBuzzNow] = useState(() => Date.now());
-  const [appVersion, setAppVersion] = useState("0.1.0");
+  const [appVersion, setAppVersion] = useState("0.2.2");
   const [updateModalOpen, setUpdateModalOpen] = useState(false);
-  const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
+  const [availableUpdate, setAvailableUpdate] = useState<AppUpdateInfo | null>(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
   const [lastUpdateCheckAt, setLastUpdateCheckAt] = useState<number | null>(null);
+  const [relayCfg, setRelayCfg] = useState<RelayConfigSummary | null>(null);
+  const [focusRelaySettings, setFocusRelaySettings] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
     const raw = Number(localStorage.getItem("litechat.sidebarWidth"));
     return Number.isFinite(raw) && raw >= 240 && raw <= 440 ? raw : 308;
@@ -299,6 +304,7 @@ export default function App() {
   const bootedRef = useRef(false);
   const translationsRef = useRef(translationsByMsg);
   const inFlightTranslateRef = useRef<Set<string>>(new Set());
+  const prevConnStatusRef = useRef<ConnectionStatus>(connStatus);
 
   selectedIdRef.current = selectedId;
   folderRef.current = folder;
@@ -374,6 +380,18 @@ export default function App() {
     });
   }, []);
 
+  const applyRelaySummary = useCallback((cfg: RelayConfigSummary) => {
+    setRelayCfg(cfg);
+    setRelayMediaRouting(Boolean(cfg.enabled && cfg.route_webview_media));
+  }, []);
+
+  useEffect(() => {
+    void bridge
+      .getRelayConfig()
+      .then(applyRelaySummary)
+      .catch(() => undefined);
+  }, [applyRelaySummary]);
+
   const checkForUpdates = useCallback(async (silent = false) => {
     if (!isTauri()) {
       if (!silent) {
@@ -384,7 +402,7 @@ export default function App() {
     setCheckingUpdate(true);
     if (!silent) setUpdateError(null);
     try {
-      const update = await check();
+      const update = await bridge.checkAppUpdate();
       setAvailableUpdate(update);
       setLastUpdateCheckAt(Date.now());
     } catch (err) {
@@ -709,13 +727,41 @@ export default function App() {
           void refreshQr();
         }),
         listen<ConnectionStatus>("core://connection-status", (ev) => {
+          const prev = prevConnStatusRef.current;
+          prevConnStatusRef.current = ev.payload;
           setConnStatus(ev.payload);
+          if (prev === "reconnecting" && ev.payload === "connected") {
+            void syncRemoteThreads();
+            const curTid = selectedIdRef.current;
+            if (curTid) {
+              void bridge
+                .loadMessages(curTid, undefined, true)
+                .then((page) => {
+                  if (selectedIdRef.current !== curTid) return;
+                  setMessages((prevMsgs) => {
+                    let next = prevMsgs;
+                    for (const m of page.messages) {
+                      next = upsertMsg(next, m);
+                    }
+                    return next;
+                  });
+                })
+                .catch(() => undefined);
+            }
+          }
         }),
         listen<MessageDto>("core://message-new", (ev) => {
           const msg = ev.payload;
+          const hasThread = threadsRef.current.some((t) => t.id === msg.thread_id);
           setThreads((prev) =>
             bumpThreadList(prev, msg, msg.thread_id !== selectedIdRef.current && !msg.is_outgoing),
           );
+          if (!hasThread) {
+            void bridge
+              .listThreads(folderRef.current)
+              .then(setThreads)
+              .catch(() => undefined);
+          }
           if (msg.thread_id === selectedIdRef.current) {
             setMessages((prev) => upsertMsg(prev, msg));
             const el = scrollContainerRef.current;
@@ -776,6 +822,22 @@ export default function App() {
         listen("core://threads-updated", () => {
           void bridge.listThreads(folderRef.current).then(setThreads);
         }),
+        listen<{ thread_id: string; messages: MessageDto[] }>(
+          "core://thread-messages-synced",
+          (ev) => {
+            if (ev.payload.thread_id !== selectedIdRef.current) return;
+            setMessages((prev) => {
+              let next = prev;
+              for (const m of ev.payload.messages) {
+                next = upsertMsg(next, m);
+              }
+              return next;
+            });
+          },
+        ),
+        listen<RelayConfigSummary>("core://relay-updated", (ev) => {
+          applyRelaySummary(ev.payload);
+        }),
       ]);
 
       if (cancelled) {
@@ -790,7 +852,7 @@ export default function App() {
       cancelled = true;
       unlisteners.forEach((fn) => fn());
     };
-  }, [syncRemoteThreads, refreshQr]);
+  }, [syncRemoteThreads, refreshQr, applyRelaySummary]);
 
   useEffect(() => {
     if (!authed) return;
@@ -1547,6 +1609,74 @@ export default function App() {
     );
   };
 
+  const utilityModals = (
+    <>
+      <SettingsModal
+        open={settingsOpen}
+        theme={theme}
+        onThemeChange={setTheme}
+        fontSize={fontSize}
+        onFontSizeChange={setFontSize}
+        density={density}
+        onDensityChange={setDensity}
+        fxEnabled={fxEnabled}
+        onFxChange={setFxEnabled}
+        buzzEnabled={buzzEnabled}
+        onBuzzChange={setBuzzEnabled}
+        desktopNotifyEnabled={desktopNotifyEnabled}
+        onDesktopNotifyChange={setDesktopNotifyEnabled}
+        soundEnabled={soundEnabled}
+        onSoundChange={setSoundEnabled}
+        closeToTray={closeToTray}
+        onCloseToTrayChange={setCloseToTray}
+        translateCfg={translateCfg}
+        onOpenTranslateModal={() => setTranslateModalOpen(true)}
+        relayCfg={relayCfg}
+        onRelaySaved={(cfg) => {
+          applyRelaySummary(cfg);
+          if (!authed) {
+            void refreshQr();
+          }
+        }}
+        focusRelay={focusRelaySettings}
+        appVersion={appVersion}
+        availableUpdate={availableUpdate}
+        onOpenUpdateModal={() => setUpdateModalOpen(true)}
+        onClose={() => {
+          setSettingsOpen(false);
+          setFocusRelaySettings(false);
+        }}
+      />
+
+      <UpdateModal
+        open={updateModalOpen}
+        currentVersion={appVersion}
+        availableUpdate={availableUpdate}
+        checking={checkingUpdate}
+        errorText={updateError}
+        lastCheckedAt={lastUpdateCheckAt}
+        onCheckNow={() => checkForUpdates(false)}
+        onClose={() => setUpdateModalOpen(false)}
+      />
+
+      <TranslateSettingsModal
+        open={translateModalOpen}
+        config={translateCfg}
+        onClose={() => setTranslateModalOpen(false)}
+        onSaved={(cfg) => {
+          setTranslateCfg(cfg);
+          setTranslationsByMsg({});
+          if (selectedId && threadAutoTranslate[selectedId]) {
+            setThreadAutoTranslate((prev) => ({
+              ...prev,
+              [selectedId]: cfg.target_lang || "VI",
+            }));
+          }
+        }}
+      />
+    </>
+  );
+
   if (authChecking) {
     return (
       <>
@@ -1571,9 +1701,15 @@ export default function App() {
             qrSvg={qrSvg}
             statusText={qrStatus}
             errorText={qrError}
+            relayCfg={relayCfg}
+            onOpenRelaySettings={() => {
+              setFocusRelaySettings(true);
+              setSettingsOpen(true);
+            }}
             onRefresh={() => void refreshQr()}
             onEnterDemo={() => setAuthed(true)}
           />
+          {utilityModals}
         </div>
       </>
     );
@@ -2397,6 +2533,7 @@ export default function App() {
                       onRetrySend={handleRetryFailedMessage}
                       onDiscardFailed={handleDiscardFailedMessage}
                       onSaveFile={handleSaveRemoteFile}
+                      onCopyError={showError}
                     />
                   </div>
                 );
@@ -2504,6 +2641,7 @@ export default function App() {
                 onSendAttachment={handleSendAttachment}
                 onBuzz={handleSendBuzz}
                 buzzCooldownSec={buzzCooldownSec}
+                globalPasteFallback={!activeThreadRootId}
                 onError={showError}
               />
             )}
@@ -2712,7 +2850,7 @@ export default function App() {
                         className="aspect-square overflow-hidden rounded-lg bg-black/25"
                       >
                         {item.attachment_url && (
-                          <img
+                          <RelayImage
                             src={item.attachment_url}
                             alt={item.attachment_name || "Media"}
                             referrerPolicy="no-referrer"
@@ -2736,6 +2874,19 @@ export default function App() {
                           ? item.attachment_url
                           : undefined
                       }
+                      onClick={(e) => {
+                        if (
+                          relayCfg?.enabled &&
+                          item.attachment_url &&
+                          /^https:\/\//i.test(item.attachment_url)
+                        ) {
+                          e.preventDefault();
+                          handleSaveRemoteFile(
+                            item.attachment_url,
+                            item.attachment_name || "attachment",
+                          );
+                        }
+                      }}
                       target="_blank"
                       rel="noreferrer"
                       className="hover-menu flex items-center gap-2 rounded-lg px-2 py-1.5 text-xs transition"
@@ -2814,58 +2965,7 @@ export default function App() {
         </div>
       )}
 
-      <SettingsModal
-        open={settingsOpen}
-        theme={theme}
-        onThemeChange={setTheme}
-        fontSize={fontSize}
-        onFontSizeChange={setFontSize}
-        density={density}
-        onDensityChange={setDensity}
-        fxEnabled={fxEnabled}
-        onFxChange={setFxEnabled}
-        buzzEnabled={buzzEnabled}
-        onBuzzChange={setBuzzEnabled}
-        desktopNotifyEnabled={desktopNotifyEnabled}
-        onDesktopNotifyChange={setDesktopNotifyEnabled}
-        soundEnabled={soundEnabled}
-        onSoundChange={setSoundEnabled}
-        closeToTray={closeToTray}
-        onCloseToTrayChange={setCloseToTray}
-        translateCfg={translateCfg}
-        onOpenTranslateModal={() => setTranslateModalOpen(true)}
-        appVersion={appVersion}
-        availableUpdate={availableUpdate}
-        onOpenUpdateModal={() => setUpdateModalOpen(true)}
-        onClose={() => setSettingsOpen(false)}
-      />
-
-      <UpdateModal
-        open={updateModalOpen}
-        currentVersion={appVersion}
-        availableUpdate={availableUpdate}
-        checking={checkingUpdate}
-        errorText={updateError}
-        lastCheckedAt={lastUpdateCheckAt}
-        onCheckNow={() => checkForUpdates(false)}
-        onClose={() => setUpdateModalOpen(false)}
-      />
-
-      <TranslateSettingsModal
-        open={translateModalOpen}
-        config={translateCfg}
-        onClose={() => setTranslateModalOpen(false)}
-        onSaved={(cfg) => {
-          setTranslateCfg(cfg);
-          setTranslationsByMsg({});
-          if (selectedId && threadAutoTranslate[selectedId]) {
-            setThreadAutoTranslate((prev) => ({
-              ...prev,
-              [selectedId]: cfg.target_lang || "VI",
-            }));
-          }
-        }}
-      />
+      {utilityModals}
 
       <QuickSearchModal
         open={quickSearchOpen}

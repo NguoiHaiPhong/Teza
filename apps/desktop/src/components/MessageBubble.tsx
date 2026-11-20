@@ -7,6 +7,7 @@ import {
   Download,
   FileText,
   Forward,
+  Image as ImageIcon,
   Languages,
   Loader2,
   MessagesSquare,
@@ -18,6 +19,8 @@ import {
 } from "lucide-react";
 import type { MessageDto, ThreadKind } from "../types";
 import { isBuzzMessage } from "../utils/buzz";
+import { copyImageReliable, copyTextReliable } from "../utils/clipboard";
+import { RelayImage } from "./RelayImage";
 import { ThreadAvatar } from "./ThreadAvatar";
 
 export interface MessageTranslationState {
@@ -60,6 +63,7 @@ interface Props {
   onRetrySend?: (msg: MessageDto) => void;
   onDiscardFailed?: (msgId: string) => void;
   onSaveFile?: (url: string, name: string) => void;
+  onCopyError?: (err: unknown) => void;
 }
 
 function formatClock(ts: number): string {
@@ -186,6 +190,7 @@ export function MessageBubble({
   onRetrySend,
   onDiscardFailed,
   onSaveFile,
+  onCopyError,
 }: Props) {
   const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -233,8 +238,16 @@ export function MessageBubble({
   }, [menuPos, pickerOpen]);
 
   const handleCopy = () => {
-    void navigator.clipboard?.writeText(msg.text);
+    const textToCopy = isReplaced && translation?.text ? translation.text : msg.text;
+    void copyTextReliable(textToCopy).catch((err) => onCopyError?.(err));
     setMenuPos(null);
+  };
+
+  const handleCopyImage = () => {
+    if (!msg.attachment_url) return;
+    const url = msg.attachment_url;
+    setMenuPos(null);
+    void copyImageReliable(url).catch((err) => onCopyError?.(err));
   };
 
   return (
@@ -390,11 +403,12 @@ export function MessageBubble({
           setPickerOpen(false);
           setMenuPos({
             x: Math.min(e.clientX, window.innerWidth - 210),
-            y: Math.min(e.clientY, window.innerHeight - 360),
+            y: Math.min(e.clientY, window.innerHeight - 390),
           });
         }}
         onDoubleClick={(e) => {
           if (selectMode || msg.is_recalled || msg.send_status) return;
+          if ((window.getSelection()?.toString().trim().length ?? 0) > 0) return;
           const el = e.target instanceof Element ? e.target : null;
           if (el?.closest("a, button, input, textarea, audio, video")) return;
           onReply(msg);
@@ -451,11 +465,11 @@ export function MessageBubble({
         )}
 
         {isSticker && msg.attachment_url && (
-          <img
+          <RelayImage
             src={msg.attachment_url}
             alt="Nhãn dán"
             referrerPolicy="no-referrer"
-            onError={() => setMediaError(true)}
+            onFallbackFail={() => setMediaError(true)}
             className="mb-1 h-28 w-28 object-contain"
             loading="lazy"
           />
@@ -487,11 +501,11 @@ export function MessageBubble({
             onClick={() => onOpenImage(msg.attachment_url!, msg.attachment_name || "Hình ảnh")}
             className="mb-1.5 block overflow-hidden rounded-xl"
           >
-            <img
+            <RelayImage
               src={msg.attachment_url}
               alt={msg.attachment_name || "Hình ảnh"}
               referrerPolicy="no-referrer"
-              onError={() => setMediaError(true)}
+              onFallbackFail={() => setMediaError(true)}
               className="max-h-72 w-auto rounded-xl object-cover transition hover:brightness-95"
               loading="lazy"
             />
@@ -826,6 +840,14 @@ export function MessageBubble({
                 className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
               >
                 <CheckSquare className="h-3.5 w-3.5" /> Chọn nhiều tin
+              </button>
+            )}
+            {isImage && msg.attachment_url && (
+              <button
+                onClick={handleCopyImage}
+                className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
+              >
+                <ImageIcon className="h-3.5 w-3.5" /> Sao chép hình ảnh
               </button>
             )}
             <button

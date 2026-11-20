@@ -12,11 +12,12 @@ use futures_util::{SinkExt, StreamExt};
 use generic_array::typenum::U16;
 use serde::Serialize;
 use serde_json::{json, Value};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{HeaderValue, COOKIE, ORIGIN, USER_AGENT};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{connect_async, WebSocketStream};
 
 use crate::session::{truncate, Session};
 
@@ -330,7 +331,7 @@ async fn run_once(
     if !crate::session::is_allowed_zalo_ws_url(&url) {
         return Ok(WsRunOutcome::UntrustedHost);
     }
-    let mut req = url.into_client_request()?;
+    let mut req = url.clone().into_client_request()?;
     {
         let h = req.headers_mut();
         if let Some(sek) = sess
@@ -348,7 +349,43 @@ async fn run_once(
         h.insert(USER_AGENT, HeaderValue::from_static(BROWSER_UA));
     }
 
-    let (mut ws, _resp) = connect_async(req).await?;
+    if sess.relay.enabled {
+        let parsed = reqwest::Url::parse(&url)?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| anyhow!("Thiếu hostname WebSocket"))?
+            .to_string();
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        let tls_stream = sess.relay.connect_tls(&host, port).await?;
+        let (ws, _resp) = tokio_tungstenite::client_async(req, tls_stream).await?;
+        ws_loop(ws, tx).await
+    } else {
+        let (ws, _resp) = connect_async(req).await?;
+        ws_loop(ws, tx).await
+    }
+}
+
+fn unwrap_data_str(mut v: Value) -> Value {
+    if let Some(d_str) = v.get("data").and_then(Value::as_str) {
+        let trimmed = d_str.trim();
+        if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+            || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+        {
+            if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                v["data"] = parsed;
+            }
+        }
+    }
+    v
+}
+
+async fn ws_loop<S>(
+    mut ws: WebSocketStream<S>,
+    tx: &mpsc::UnboundedSender<WsSignal>,
+) -> Result<WsRunOutcome>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut cipher_key: Option<Vec<u8>> = None;
     let mut authed = false;
     let mut req_id = 0u64;
@@ -397,7 +434,7 @@ async fn run_once(
                     }
                     let raw = envelope.get("data").and_then(Value::as_str).unwrap_or_default();
                     let plain = decrypt_payload(cipher_key.as_deref(), encrypt, raw)?;
-                    let auth: Value = serde_json::from_slice(&plain)?;
+                    let auth: Value = unwrap_data_str(serde_json::from_slice(&plain)?);
                     let code = auth.get("error_code").and_then(Value::as_i64).unwrap_or(0);
                     if code != 0 {
                         if crate::session::is_session_expired_code(code) || code == 401 || code == 403 {
@@ -422,7 +459,7 @@ async fn run_once(
                     continue;
                 }
 
-                let payload = if encrypt == 0 {
+                let raw_payload = if encrypt == 0 {
                     envelope
                 } else {
                     match envelope.get("data").and_then(Value::as_str) {
@@ -433,11 +470,15 @@ async fn run_once(
                         None => envelope,
                     }
                 };
+                let payload = unwrap_data_str(raw_payload);
 
                 if cmd == CMD_HAS_MSG {
                     if let (Some(qid), Some(ids)) = (
                         payload.pointer("/data/queueId").cloned(),
-                        payload.pointer("/data/ids").cloned(),
+                        payload
+                            .pointer("/data/ids")
+                            .or_else(|| payload.pointer("/data/msgIds"))
+                            .cloned(),
                     ) {
                         let id = format!("req_{req_id}");
                         req_id += 1;
@@ -493,5 +534,15 @@ mod tests {
     #[test]
     fn gcm_rejects_short_blob() {
         assert!(gcm_decrypt(&[0u8; 32], &[0u8; 16]).is_err());
+    }
+
+    #[test]
+    fn unwraps_stringified_ws_data_json() {
+        let v = json!({
+            "data": "{\"queueId\":\"q1\",\"ids\":[101,102]}"
+        });
+        let unwrapped = unwrap_data_str(v);
+        assert_eq!(unwrapped.pointer("/data/queueId").unwrap(), "q1");
+        assert_eq!(unwrapped.pointer("/data/ids/0").unwrap(), 101);
     }
 }

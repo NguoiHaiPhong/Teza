@@ -10,6 +10,7 @@ pub mod endpoints;
 pub mod login;
 pub mod param_cipher;
 pub mod qr;
+pub mod relay;
 pub mod session;
 pub mod socket;
 pub mod store;

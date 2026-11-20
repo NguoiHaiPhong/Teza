@@ -45,6 +45,10 @@ impl StoragePaths {
         self.root.join("translate.json")
     }
 
+    pub fn relay_file(&self) -> PathBuf {
+        self.root.join("relay.json")
+    }
+
     pub fn history_db(&self, uin: Option<&str>) -> PathBuf {
         match uin.filter(|u| !u.trim().is_empty()) {
             Some(id) => {

@@ -11,6 +11,8 @@ import {
   ZoomOut,
 } from "lucide-react";
 import { bridge } from "../bridge";
+import { copyImageReliable } from "../utils/clipboard";
+import { RelayImage } from "./RelayImage";
 
 export interface LightboxItem {
   url: string;
@@ -23,29 +25,6 @@ interface Props {
   onIndexChange: (index: number) => void;
   onClose: () => void;
   onNotify?: (msg: string) => void;
-}
-
-async function imageUrlToPngBlob(url: string): Promise<Blob> {
-  const dataUrl = await bridge.fetchImageDataUrl(url);
-  const img = await new Promise<HTMLImageElement>((resolve, reject) => {
-    const el = new Image();
-    el.crossOrigin = "anonymous";
-    el.onload = () => resolve(el);
-    el.onerror = () => reject(new Error("Không tải được dữ liệu ảnh để sao chép"));
-    el.src = dataUrl;
-  });
-  const canvas = document.createElement("canvas");
-  canvas.width = img.naturalWidth || img.width;
-  canvas.height = img.naturalHeight || img.height;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("Không khởi tạo được bộ đệm sao chép ảnh");
-  ctx.drawImage(img, 0, 0);
-  return await new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob(
-      (b) => (b ? resolve(b) : reject(new Error("Không chuyển đổi được ảnh PNG"))),
-      "image/png",
-    );
-  });
 }
 
 export function MediaLightbox({
@@ -99,8 +78,7 @@ export function MediaLightbox({
   const handleCopyImage = async () => {
     if (!canExport || copied) return;
     try {
-      const blob = await imageUrlToPngBlob(current.url);
-      await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+      await copyImageReliable(current.url);
       setCopied(true);
       setTimeout(() => setCopied(false), 1800);
     } catch (err) {
@@ -222,7 +200,7 @@ export function MediaLightbox({
           </button>
         )}
 
-        <img
+        <RelayImage
           src={current.url}
           alt={current.title}
           referrerPolicy="no-referrer"

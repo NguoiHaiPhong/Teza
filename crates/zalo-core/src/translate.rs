@@ -8,6 +8,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::relay::RelayConfig;
 use crate::{data_dir, dpapi};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -276,6 +277,16 @@ pub async fn translate_batch(
     target_lang_override: Option<&str>,
     provider_override: Option<TranslateProvider>,
 ) -> Result<Vec<TranslationResult>> {
+    translate_batch_with_relay(cfg, &RelayConfig::default(), items, target_lang_override, provider_override).await
+}
+
+pub async fn translate_batch_with_relay(
+    cfg: &TranslateConfig,
+    relay: &RelayConfig,
+    items: &[TranslateInputItem],
+    target_lang_override: Option<&str>,
+    provider_override: Option<TranslateProvider>,
+) -> Result<Vec<TranslationResult>> {
     let filtered: Vec<&TranslateInputItem> = items
         .iter()
         .filter(|it| !is_non_translatable_placeholder(&it.text))
@@ -291,8 +302,8 @@ pub async fn translate_batch(
         .unwrap_or(cfg.target_lang.as_str())
         .to_ascii_uppercase();
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(20))
+    let client = relay
+        .apply_to_client_builder(Client::builder().timeout(Duration::from_secs(20)))?
         .build()
         .context("Không khởi tạo được HTTP client dịch thuật")?;
 

@@ -148,6 +148,7 @@ impl MessageStore {
         let (cipher, _had_key_file) = DbCipher::load_or_create(path)?;
 
         let conn = Connection::open(path)?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.pragma_update(None, "secure_delete", "ON")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -844,6 +845,26 @@ impl MessageStore {
         inc_unread: bool,
         clear_unread: bool,
     ) -> Result<()> {
+        let _ = self.update_thread_preview_returning_created(
+            thread_id,
+            preview,
+            ts,
+            inc_unread,
+            clear_unread,
+        )?;
+        Ok(())
+    }
+
+    /// Updates thread preview & unread counters, returning `true` when a brand-new thread row
+    /// was inserted locally because `thread_id` did not exist in SQLite yet.
+    pub fn update_thread_preview_returning_created(
+        &self,
+        thread_id: &str,
+        preview: &str,
+        ts: i64,
+        inc_unread: bool,
+        clear_unread: bool,
+    ) -> Result<bool> {
         let ts = normalize_ts_ms(ts);
         let enc_preview = self.cipher.encrypt_str(&thread_aad(thread_id), preview)?;
         let updated = self.conn.execute(
@@ -875,8 +896,9 @@ impl MessageStore {
                 is_pinned: false,
                 is_muted: false,
             })?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     pub fn mark_thread_read(&self, thread_id: &str) -> Result<()> {

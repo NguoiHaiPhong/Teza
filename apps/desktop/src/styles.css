@@ -249,7 +249,10 @@ body,
   user-select: none;
 }
 
-.selectable-text {
+.selectable-text,
+.selectable-text *,
+input,
+textarea {
   user-select: text;
 }
 

@@ -1,9 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AccountProfile,
+  AppUpdateInfo,
   AttachmentMeta,
   FolderFilter,
   MessageDto,
+  RelayConfigSummary,
+  RelayConfigUpdate,
+  RelayTestResult,
   StickerItem,
   ThreadDetailsDto,
   ThreadDto,
@@ -593,6 +597,50 @@ export const bridge = {
       cateId: sticker.cate_id,
       stickerType: sticker.sticker_type,
     });
+  },
+  async getRelayConfig(): Promise<RelayConfigSummary> {
+    if (!isTauri()) {
+      return {
+        enabled: false,
+        mode: "socks5",
+        host: "10.7.12.233",
+        port: 1088,
+        username: "litechat",
+        has_password: false,
+        password_preview: "",
+        route_webview_media: true,
+      };
+    }
+    return invoke<RelayConfigSummary>("relay_get_config");
+  },
+  async saveRelayConfig(update: RelayConfigUpdate): Promise<RelayConfigSummary> {
+    if (!isTauri()) {
+      return {
+        enabled: update.enabled,
+        mode: update.mode,
+        host: update.host,
+        port: update.port,
+        username: update.username,
+        has_password: !!update.password && !update.clear_password,
+        password_preview: update.password && !update.clear_password ? "••••••••" : "",
+        route_webview_media: update.route_webview_media ?? true,
+      };
+    }
+    return invoke<RelayConfigSummary>("relay_save_config", { update });
+  },
+  async testRelayConnection(update?: RelayConfigUpdate): Promise<RelayTestResult> {
+    if (!isTauri()) {
+      return { latency_ms: 28 };
+    }
+    return invoke<RelayTestResult>("relay_test_connection", { update: update ?? null });
+  },
+  async checkAppUpdate(): Promise<AppUpdateInfo | null> {
+    if (!isTauri()) return null;
+    return invoke<AppUpdateInfo | null>("app_check_update");
+  },
+  async installAppUpdate(): Promise<void> {
+    if (!isTauri()) return;
+    return invoke("app_install_update");
   },
   async setCloseToTray(enabled: boolean): Promise<void> {
     if (!isTauri()) return;

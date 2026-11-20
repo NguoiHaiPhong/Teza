@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { CornerUpLeft, FileText, Image as ImageIcon, Loader2, Paperclip, Send, Smile, X, Zap } from "lucide-react";
 import { bridge, isTauri, MAX_ATTACHMENT_BYTES } from "../bridge";
 import type { MessageDto, PendingAttachment, StickerItem, ThreadMemberDto } from "../types";
+import { RelayImage } from "./RelayImage";
 import { ThreadAvatar } from "./ThreadAvatar";
 
 const EMOJI_GROUPS: { label: string; items: string[] }[] = [
@@ -33,6 +34,7 @@ interface Props {
   onBuzz?: () => Promise<void>;
   buzzCooldownSec?: number;
   placeholder?: string;
+  globalPasteFallback?: boolean;
   onError: (err: unknown) => void;
 }
 
@@ -40,6 +42,54 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function extFromMime(mime: string): string {
+  switch (mime.toLowerCase()) {
+    case "image/jpeg":
+    case "image/jpg":
+      return "jpg";
+    case "image/webp":
+      return "webp";
+    case "image/gif":
+      return "gif";
+    case "image/bmp":
+      return "bmp";
+    default:
+      return "png";
+  }
+}
+
+function extractAttachmentFromClipboard(cd: DataTransfer | null): File | null {
+  if (!cd) return null;
+  const fromItems: File[] = [];
+  if (cd.items) {
+    for (const item of Array.from(cd.items)) {
+      if (item.kind === "file") {
+        const f = item.getAsFile();
+        if (f) fromItems.push(f);
+      }
+    }
+  }
+  const candidates = fromItems.length > 0 ? fromItems : Array.from(cd.files ?? []);
+  if (candidates.length === 0) return null;
+
+  const plainText = cd.getData("text/plain");
+  const uriList = cd.getData("text/uri-list");
+  // Word/Excel/browsers often place both text AND an auto-rendered snapshot image on the clipboard;
+  // prefer pasting text unless the clipboard actually holds non-image files or no text.
+  if (
+    plainText.trim().length > 0 &&
+    !uriList &&
+    candidates.every(
+      (f) =>
+        f.type.startsWith("image/") &&
+        (!f.name || /^image\.(png|jpe?g|bmp|webp|gif)$/i.test(f.name)),
+    )
+  ) {
+    return null;
+  }
+  return candidates[0];
 }
 
 export function Composer({
@@ -56,6 +106,7 @@ export function Composer({
   onBuzz,
   buzzCooldownSec = 0,
   placeholder,
+  globalPasteFallback = false,
   onError,
 }: Props) {
   const [localDraft, setLocalDraft] = useState("");
@@ -179,7 +230,7 @@ export function Composer({
       );
       return;
     }
-    const fileName = file.name || `clipboard-${Date.now()}.png`;
+    const fileName = file.name || `clipboard-${Date.now()}.${extFromMime(file.type)}`;
     const isImage =
       file.type.startsWith("image/") || /\.(png|jpe?g|webp|gif|bmp)$/i.test(fileName);
     const previewUrl = isImage ? URL.createObjectURL(file) : null;
@@ -192,6 +243,36 @@ export function Composer({
       previewUrl,
     });
   };
+
+  const attachRawFileRef = useRef(attachRawFile);
+  attachRawFileRef.current = attachRawFile;
+
+  useEffect(() => {
+    if (!globalPasteFallback) return;
+    const onWindowPaste = (e: ClipboardEvent) => {
+      if (e.defaultPrevented) return;
+      const active = document.activeElement;
+      if (
+        active instanceof HTMLElement &&
+        (active.tagName === "INPUT" ||
+          active.tagName === "TEXTAREA" ||
+          active.tagName === "SELECT" ||
+          active.isContentEditable)
+      ) {
+        return;
+      }
+      const target = e.target instanceof Element ? e.target : null;
+      if (target?.closest("input, textarea, select, [contenteditable]")) return;
+
+      const file = extractAttachmentFromClipboard(e.clipboardData);
+      if (file) {
+        e.preventDefault();
+        attachRawFileRef.current(file);
+      }
+    };
+    window.addEventListener("paste", onWindowPaste);
+    return () => window.removeEventListener("paste", onWindowPaste);
+  }, [globalPasteFallback]);
 
   const handleAttachClick = async () => {
     if (!onPendingAttachmentChange || !onSendAttachment) return;
@@ -481,7 +562,7 @@ export function Composer({
                     }}
                     className="hover-surface flex items-center justify-center rounded-xl p-1.5 transition hover:scale-105"
                   >
-                    <img
+                    <RelayImage
                       src={s.url}
                       alt={`Sticker ${s.id}`}
                       loading="lazy"
@@ -591,17 +672,10 @@ export function Composer({
             setCursorPos(e.currentTarget.selectionStart ?? e.currentTarget.value.length);
           }}
           onPaste={(e) => {
-            const items = e.clipboardData?.items;
-            if (!items) return;
-            for (const item of items) {
-              if (item.kind === "file") {
-                const file = item.getAsFile();
-                if (file) {
-                  e.preventDefault();
-                  attachRawFile(file);
-                  return;
-                }
-              }
+            const pastedFile = extractAttachmentFromClipboard(e.clipboardData);
+            if (pastedFile) {
+              e.preventDefault();
+              attachRawFile(pastedFile);
             }
           }}
           onCompositionStart={() => {

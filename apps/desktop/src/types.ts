@@ -123,6 +123,41 @@ export interface StickerItem {
   url: string;
 }
 
+export type RelayMode = "socks5" | "http";
+
+export interface RelayConfigSummary {
+  enabled: boolean;
+  mode: RelayMode;
+  host: string;
+  port: number;
+  username: string;
+  has_password: boolean;
+  password_preview: string;
+  route_webview_media: boolean;
+}
+
+export interface RelayConfigUpdate {
+  enabled: boolean;
+  mode: RelayMode;
+  host: string;
+  port: number;
+  username: string;
+  password?: string;
+  clear_password?: boolean;
+  route_webview_media?: boolean;
+}
+
+export interface RelayTestResult {
+  latency_ms: number;
+}
+
+export interface AppUpdateInfo {
+  version: string;
+  current_version: string;
+  body: string | null;
+  date: string | null;
+}
+
 export interface AttachmentMeta {
   path: string;
   file_name: string;

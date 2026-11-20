@@ -1,5 +1,6 @@
 //! Tauri v2 CoreBridge connecting `zalo-core` to the Telegram-inspired React UI.
 
+mod clipboard;
 mod file_dialog;
 
 use std::path::PathBuf;
@@ -11,6 +12,7 @@ use tauri::ipc::InvokeBody;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
@@ -25,11 +27,12 @@ use zalo_core::chat::{
 };
 use zalo_core::data_dir::StoragePaths;
 use zalo_core::qr::{self, QrTicket};
+use zalo_core::relay::{RelayConfig, RelayConfigSummary, RelayConfigUpdate, RelayMode};
 use zalo_core::session::{AccountProfile, Session, SessionError, SessionStatus};
 use zalo_core::socket::{self, WsSignal};
 use zalo_core::store::MessageStore;
 use zalo_core::translate::{
-    translate_batch, TranslateConfig, TranslateConfigSummary, TranslateConfigUpdate,
+    translate_batch_with_relay, TranslateConfig, TranslateConfigSummary, TranslateConfigUpdate,
     TranslateInputItem, TranslateProvider, TranslationResult,
 };
 
@@ -41,6 +44,8 @@ pub struct AppState {
     pub qr_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     pub active_thread_id: Arc<Mutex<Option<String>>>,
     pub translate_cfg: Arc<Mutex<TranslateConfig>>,
+    pub relay_cfg: Arc<Mutex<RelayConfig>>,
+    pub pending_update: Arc<Mutex<Option<tauri_plugin_updater::Update>>>,
     pub close_to_tray: Arc<AtomicBool>,
     pub allow_exit: Arc<AtomicBool>,
 }
@@ -64,6 +69,12 @@ pub struct QrStartDto {
 pub struct MessagesPageDto {
     pub messages: Vec<MessageDto>,
     pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ThreadMessagesSyncedPayload {
+    pub thread_id: String,
+    pub messages: Vec<MessageDto>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -96,7 +107,7 @@ async fn clear_expired_session(
     }
     {
         let mut sess = sess_arc.lock().await;
-        if let Ok(fresh) = Session::new() {
+        if let Ok(fresh) = Session::new_with_relay(sess.relay.clone()) {
             *sess = fresh;
         } else {
             sess.zpw_sek = None;
@@ -247,14 +258,18 @@ async fn restart_ws_worker(
                                         && active_id.as_deref() != Some(msg.thread_id.as_str());
                                     let clear_unread = msg.is_outgoing
                                         || active_id.as_deref() == Some(msg.thread_id.as_str());
-                                    let _ = store.update_thread_preview_with_unread(
-                                        &msg.thread_id,
-                                        &preview,
-                                        msg.ts,
-                                        inc_unread,
-                                        clear_unread,
-                                    );
-                                    threads_touched = true;
+                                    let created = store
+                                        .update_thread_preview_returning_created(
+                                            &msg.thread_id,
+                                            &preview,
+                                            msg.ts,
+                                            inc_unread,
+                                            clear_unread,
+                                        )
+                                        .unwrap_or(false);
+                                    if created {
+                                        threads_touched = true;
+                                    }
                                     let _ = app.emit("core://message-new", &*msg);
                                     if !missing_uids.is_empty()
                                         && missing_uids.iter().any(|u| u == &msg.sender_id)
@@ -462,6 +477,10 @@ async fn auth_start_qr(
                 let profile = sess_snapshot.profile.clone();
                 {
                     let mut guard = sess_arc.lock().await;
+                    let latest_relay = guard.relay.clone();
+                    if sess_snapshot.relay != latest_relay {
+                        let _ = sess_snapshot.set_relay(latest_relay);
+                    }
                     *guard = sess_snapshot;
                 }
 
@@ -505,7 +524,7 @@ async fn auth_logout(state: State<'_, AppState>) -> Result<(), String> {
     *state.active_thread_id.lock().await = None;
     {
         let mut sess = state.session.lock().await;
-        *sess = Session::new().map_err(|e| e.to_string())?;
+        *sess = Session::new_with_relay(sess.relay.clone()).map_err(|e| e.to_string())?;
     }
     let path = state.paths.session_file();
     if path.exists() {
@@ -766,6 +785,126 @@ async fn user_get_profile(
         .map_err(|e| format!("Không tra được thông tin tài khoản: {e}"))
 }
 
+struct RemoteThreadSyncCtx {
+    app: AppHandle,
+    store: Arc<Mutex<MessageStore>>,
+    session: Arc<Mutex<Session>>,
+    ws_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    paths: StoragePaths,
+    sess: Session,
+    thread_id: String,
+    kind: ThreadKind,
+    limit: usize,
+}
+
+fn message_sync_sig(m: &MessageDto) -> (String, i64, bool, bool, usize, String, String) {
+    (
+        m.msg_id.clone(),
+        m.ts,
+        m.is_recalled,
+        m.is_pinned,
+        m.reactions.len(),
+        m.text.clone(),
+        m.sender_name.clone(),
+    )
+}
+
+async fn sync_remote_thread_history(ctx: &RemoteThreadSyncCtx) -> bool {
+    match threads::fetch_thread_history(&ctx.sess, &ctx.thread_id, ctx.kind, ctx.limit as u32).await
+    {
+        Ok(mut remote_msgs) if !remote_msgs.is_empty() => {
+            let mut known_titles = {
+                let store = ctx.store.lock().await;
+                store.resolve_known_titles().unwrap_or_default()
+            };
+            let unresolved_senders: Vec<String> = remote_msgs
+                .iter()
+                .filter(|m| {
+                    !m.is_outgoing
+                        && !m.sender_id.is_empty()
+                        && (m.sender_name == m.sender_id || is_raw_numeric_id(&m.sender_name))
+                        && !known_titles.contains_key(&m.sender_id)
+                })
+                .map(|m| m.sender_id.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .take(50)
+                .collect();
+            if !unresolved_senders.is_empty() {
+                if let Ok(mp) = threads::get_mini_profiles(&ctx.sess, &unresolved_senders).await {
+                    for (uid, p) in mp {
+                        if let Some(name) =
+                            pick_str(&p, &["displayName", "zaloName", "name", "display_name"])
+                        {
+                            known_titles.insert(uid, name);
+                        }
+                    }
+                }
+            }
+
+            let mut store = ctx.store.lock().await;
+            for m in &mut remote_msgs {
+                if !m.is_outgoing
+                    && (m.sender_name == m.sender_id || is_raw_numeric_id(&m.sender_name))
+                {
+                    if let Some(name) = known_titles.get(&m.sender_id) {
+                        m.sender_name = name.clone();
+                    }
+                }
+                let _ = store.upsert_message(m);
+            }
+            if let Some(newest) = remote_msgs.iter().max_by_key(|m| m.ts) {
+                let raw_text = if newest.text.is_empty() {
+                    newest
+                        .attachment_name
+                        .as_deref()
+                        .map(|n| format!("[Tệp: {n}]"))
+                        .unwrap_or_else(|| format!("[{}]", newest.msg_type))
+                } else {
+                    newest.text.clone()
+                };
+                let preview = format_thread_preview(
+                    &raw_text,
+                    newest.is_outgoing,
+                    &newest.sender_name,
+                    ctx.kind == ThreadKind::Group,
+                );
+                let created = store
+                    .update_thread_preview_returning_created(
+                        &ctx.thread_id,
+                        &preview,
+                        newest.ts,
+                        false,
+                        newest.is_outgoing,
+                    )
+                    .unwrap_or(false);
+                if created {
+                    let _ = ctx.app.emit("core://threads-updated", ());
+                }
+            }
+            true
+        }
+        Err(e) => {
+            if let Some(code) = expired_code(&e) {
+                let reason = format!(
+                    "Phiên đăng nhập đã hết hạn (mã {code}). Vui lòng quét lại mã QR."
+                );
+                clear_expired_session(
+                    &ctx.app,
+                    &ctx.session,
+                    Some(&ctx.ws_task),
+                    &ctx.paths,
+                    reason,
+                    true,
+                )
+                .await;
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
 #[tauri::command]
 async fn messages_load(
     app: AppHandle,
@@ -803,98 +942,62 @@ async fn messages_load(
                 .unwrap_or(ThreadKind::Direct)
         };
 
-        if before_ts.is_none() && (cached.is_empty() || sync_remote == Some(true)) {
-            match threads::fetch_thread_history(&sess, &thread_id, kind, limit as u32).await {
-                Ok(mut remote_msgs) if !remote_msgs.is_empty() => {
-                    let mut known_titles = {
-                        let store = state.store.lock().await;
-                        store.resolve_known_titles().unwrap_or_default()
-                    };
-                    let unresolved_senders: Vec<String> = remote_msgs
-                        .iter()
-                        .filter(|m| {
-                            !m.is_outgoing
-                                && !m.sender_id.is_empty()
-                                && (m.sender_name == m.sender_id
-                                    || is_raw_numeric_id(&m.sender_name))
-                                && !known_titles.contains_key(&m.sender_id)
-                        })
-                        .map(|m| m.sender_id.clone())
-                        .collect::<std::collections::HashSet<_>>()
-                        .into_iter()
-                        .take(50)
-                        .collect();
-                    if !unresolved_senders.is_empty() {
-                        if let Ok(mp) = threads::get_mini_profiles(&sess, &unresolved_senders).await {
-                            for (uid, p) in mp {
-                                if let Some(name) = pick_str(
-                                    &p,
-                                    &["displayName", "zaloName", "name", "display_name"],
-                                ) {
-                                    known_titles.insert(uid, name);
-                                }
-                            }
-                        }
-                    }
-
-                    let mut store = state.store.lock().await;
-                    for m in &mut remote_msgs {
-                        if !m.is_outgoing
-                            && (m.sender_name == m.sender_id || is_raw_numeric_id(&m.sender_name))
-                        {
-                            if let Some(name) = known_titles.get(&m.sender_id) {
-                                m.sender_name = name.clone();
-                            }
-                        }
-                        let _ = store.upsert_message(m);
-                    }
-                    if let Some(newest) = remote_msgs.iter().max_by_key(|m| m.ts) {
-                        let raw_text = if newest.text.is_empty() {
-                            newest
-                                .attachment_name
-                                .as_deref()
-                                .map(|n| format!("[Tệp: {n}]"))
-                                .unwrap_or_else(|| format!("[{}]", newest.msg_type))
-                        } else {
-                            newest.text.clone()
-                        };
-                        let preview = format_thread_preview(
-                            &raw_text,
-                            newest.is_outgoing,
-                            &newest.sender_name,
-                            kind == ThreadKind::Group,
-                        );
-                        let _ = store.update_thread_preview_with_unread(
-                            &thread_id,
-                            &preview,
-                            newest.ts,
-                            false,
-                            newest.is_outgoing,
-                        );
-                        let _ = app.emit("core://threads-updated", ());
-                    }
-                    cached = store
-                        .load_messages(&thread_id, None, limit + 1)
-                        .map_err(|e| e.to_string())?;
-                }
-                Err(e) => {
-                    if let Some(code) = expired_code(&e) {
-                        let reason = format!(
-                            "Phiên đăng nhập đã hết hạn (mã {code}). Vui lòng quét lại mã QR."
-                        );
-                        clear_expired_session(
-                            &app,
-                            &state.session,
-                            Some(&state.ws_task),
-                            &state.paths,
-                            reason,
-                            true,
-                        )
-                        .await;
-                    }
-                }
-                _ => {}
+        if before_ts.is_none() && cached.is_empty() {
+            let ctx = RemoteThreadSyncCtx {
+                app: app.clone(),
+                store: Arc::clone(&state.store),
+                session: Arc::clone(&state.session),
+                ws_task: Arc::clone(&state.ws_task),
+                paths: state.paths.clone(),
+                sess,
+                thread_id: thread_id.clone(),
+                kind,
+                limit,
+            };
+            if sync_remote_thread_history(&ctx).await {
+                let store = state.store.lock().await;
+                cached = store
+                    .load_messages(&thread_id, None, limit + 1)
+                    .map_err(|e| e.to_string())?;
             }
+        } else if before_ts.is_none() && sync_remote == Some(true) {
+            let mut snapshot = cached.clone();
+            if snapshot.len() > limit {
+                let excess = snapshot.len() - limit;
+                snapshot.drain(0..excess);
+            }
+            let prev_sigs: Vec<_> = snapshot.iter().map(message_sync_sig).collect();
+            let ctx = RemoteThreadSyncCtx {
+                app: app.clone(),
+                store: Arc::clone(&state.store),
+                session: Arc::clone(&state.session),
+                ws_task: Arc::clone(&state.ws_task),
+                paths: state.paths.clone(),
+                sess,
+                thread_id: thread_id.clone(),
+                kind,
+                limit,
+            };
+            tokio::spawn(async move {
+                if sync_remote_thread_history(&ctx).await {
+                    let latest = {
+                        let store = ctx.store.lock().await;
+                        store.load_messages(&ctx.thread_id, None, ctx.limit).ok()
+                    };
+                    if let Some(msgs) = latest {
+                        let next_sigs: Vec<_> = msgs.iter().map(message_sync_sig).collect();
+                        if next_sigs != prev_sigs {
+                            let _ = ctx.app.emit(
+                                "core://thread-messages-synced",
+                                ThreadMessagesSyncedPayload {
+                                    thread_id: ctx.thread_id.clone(),
+                                    messages: msgs,
+                                },
+                            );
+                        }
+                    }
+                }
+            });
         } else if before_ts.is_some() && cached.len() < limit {
             if let Some(cursor_id) = before_msg_id.as_deref().filter(|s| !s.is_empty()) {
                 match threads::fetch_older_thread_history(
@@ -1040,13 +1143,7 @@ async fn message_send_text(
         }
     };
 
-    let mut store = state.store.lock().await;
-    store.upsert_message(&msg).map_err(|e| e.to_string())?;
-    let preview = format_thread_preview(&msg.text, true, "", false);
-    let _ = store.update_thread_preview_with_unread(&msg.thread_id, &preview, msg.ts, false, true);
-    let _ = app.emit("core://message-new", &msg);
-    let _ = app.emit("core://threads-updated", ());
-    Ok(msg)
+    persist_and_emit_sent_message(&app, &state, msg).await
 }
 
 #[tauri::command]
@@ -1115,13 +1212,7 @@ async fn message_send_quote(
         }
     };
 
-    let mut store = state.store.lock().await;
-    store.upsert_message(&msg).map_err(|e| e.to_string())?;
-    let preview = format_thread_preview(&msg.text, true, "", false);
-    let _ = store.update_thread_preview_with_unread(&msg.thread_id, &preview, msg.ts, false, true);
-    let _ = app.emit("core://message-new", &msg);
-    let _ = app.emit("core://threads-updated", ());
-    Ok(msg)
+    persist_and_emit_sent_message(&app, &state, msg).await
 }
 
 #[tauri::command]
@@ -1431,9 +1522,13 @@ async fn persist_and_emit_sent_message(
     let mut store = state.store.lock().await;
     store.upsert_message(&msg).map_err(|e| e.to_string())?;
     let preview = format_thread_preview(&msg.text, true, "", false);
-    let _ = store.update_thread_preview_with_unread(&msg.thread_id, &preview, msg.ts, false, true);
+    let created = store
+        .update_thread_preview_returning_created(&msg.thread_id, &preview, msg.ts, false, true)
+        .unwrap_or(false);
     let _ = app.emit("core://message-new", &msg);
-    let _ = app.emit("core://threads-updated", ());
+    if created {
+        let _ = app.emit("core://threads-updated", ());
+    }
     Ok(msg)
 }
 
@@ -1685,15 +1780,199 @@ async fn translate_messages(
     provider: Option<TranslateProvider>,
 ) -> Result<Vec<TranslationResult>, String> {
     let cfg = state.translate_cfg.lock().await.clone();
-    translate_batch(&cfg, &items, target_lang.as_deref(), provider)
+    let relay = state.relay_cfg.lock().await.clone();
+    translate_batch_with_relay(&cfg, &relay, &items, target_lang.as_deref(), provider)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RelayTestDto {
+    latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AppUpdateDto {
+    version: String,
+    current_version: String,
+    body: Option<String>,
+    date: Option<String>,
+}
+
+#[tauri::command]
+async fn relay_get_config(state: State<'_, AppState>) -> Result<RelayConfigSummary, String> {
+    let cfg = state.relay_cfg.lock().await;
+    Ok(cfg.summary())
+}
+
+#[tauri::command]
+async fn relay_save_config(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    update: RelayConfigUpdate,
+) -> Result<RelayConfigSummary, String> {
+    let next_cfg = {
+        let cfg = state.relay_cfg.lock().await;
+        cfg.with_update(update).map_err(|e| e.to_string())?
+    };
+    next_cfg
+        .save_to_file(&state.paths.relay_file())
+        .map_err(|e| format!("Không lưu được cấu hình Relay: {e}"))?;
+
+    let is_authed = {
+        let mut sess = state.session.lock().await;
+        sess.set_relay(next_cfg.clone())
+            .map_err(|e| format!("Không áp dụng được Relay cho HTTP client: {e}"))?;
+        sess.is_authenticated()
+    };
+
+    let summary = {
+        let mut cfg = state.relay_cfg.lock().await;
+        *cfg = next_cfg;
+        cfg.summary()
+    };
+
+    if is_authed {
+        restart_ws_worker(
+            app.clone(),
+            state.session.clone(),
+            state.store.clone(),
+            state.ws_task.clone(),
+            state.active_thread_id.clone(),
+            state.paths.clone(),
+        )
+        .await;
+    }
+    let _ = app.emit("core://relay-updated", &summary);
+    Ok(summary)
+}
+
+#[tauri::command]
+async fn relay_test_connection(
+    state: State<'_, AppState>,
+    update: Option<RelayConfigUpdate>,
+) -> Result<RelayTestDto, String> {
+    let candidate = {
+        let cfg = state.relay_cfg.lock().await;
+        match update {
+            Some(upd) => cfg.with_update(upd).map_err(|e| e.to_string())?,
+            None => cfg.clone(),
+        }
+    };
+    let latency_ms = candidate.test_connection().await.map_err(|e| e.to_string())?;
+    Ok(RelayTestDto { latency_ms })
+}
+
+#[tauri::command]
+async fn app_check_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<AppUpdateDto>, String> {
+    let relay_cfg = state.relay_cfg.lock().await.clone();
+    let mut builder = app
+        .updater_builder()
+        .timeout(std::time::Duration::from_secs(20));
+
+    if relay_cfg.enabled {
+        let mut http_relay = relay_cfg;
+        http_relay.mode = RelayMode::Http;
+        if let Some(proxy_str) = http_relay.proxy_url_string().map_err(|e| e.to_string())? {
+            let proxy_url = tauri::Url::parse(&proxy_str).map_err(|e| e.to_string())?;
+            builder = builder.proxy(proxy_url);
+        }
+    }
+
+    let updater = builder.build().map_err(|e| e.to_string())?;
+    let found = updater.check().await.map_err(|e| e.to_string())?;
+    let mut pending = state.pending_update.lock().await;
+    if let Some(upd) = found {
+        let dto = AppUpdateDto {
+            version: upd.version.clone(),
+            current_version: upd.current_version.clone(),
+            body: upd.body.clone(),
+            date: upd.date.map(|d| d.to_string()),
+        };
+        *pending = Some(upd);
+        Ok(Some(dto))
+    } else {
+        *pending = None;
+        Ok(None)
+    }
+}
+
+#[tauri::command]
+async fn app_install_update(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let upd = state
+        .pending_update
+        .lock()
+        .await
+        .take()
+        .ok_or_else(|| "Không có bản cập nhật nào đang chờ cài đặt".to_string())?;
+
+    let app_c = app.clone();
+    let app_d = app.clone();
+    let mut started = false;
+    upd.download_and_install(
+        move |chunk_len, content_len| {
+            if !started {
+                started = true;
+                let _ = app_c.emit(
+                    "core://update-progress",
+                    serde_json::json!({ "event": "started", "total": content_len }),
+                );
+            }
+            let _ = app_c.emit(
+                "core://update-progress",
+                serde_json::json!({ "event": "progress", "chunk": chunk_len }),
+            );
+        },
+        move || {
+            let _ = app_d.emit(
+                "core://update-progress",
+                serde_json::json!({ "event": "finished" }),
+            );
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn app_set_close_to_tray(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
     state.close_to_tray.store(enabled, Ordering::SeqCst);
     Ok(())
+}
+
+#[tauri::command]
+async fn clipboard_copy_text(text: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || clipboard::copy_text_native(&text))
+        .await
+        .map_err(|e| format!("Lỗi tác vụ clipboard: {e}"))?
+}
+
+#[tauri::command]
+async fn clipboard_copy_rgba_image(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    let width = request
+        .headers()
+        .get("x-width")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u32>().ok())
+        .ok_or_else(|| "Thiếu chiều rộng ảnh để sao chép".to_string())?;
+    let height = request
+        .headers()
+        .get("x-height")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u32>().ok())
+        .ok_or_else(|| "Thiếu chiều cao ảnh để sao chép".to_string())?;
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(raw) => raw.clone(),
+        tauri::ipc::InvokeBody::Json(_) => {
+            return Err("Định dạng dữ liệu ảnh clipboard không hợp lệ".into());
+        }
+    };
+    tokio::task::spawn_blocking(move || clipboard::copy_rgba_image_native(width, height, &bytes))
+        .await
+        .map_err(|e| format!("Lỗi tác vụ clipboard ảnh: {e}"))?
 }
 
 fn chrono_now_ms() -> i64 {
@@ -1705,9 +1984,12 @@ fn chrono_now_ms() -> i64 {
 
 pub fn run() {
     let paths = StoragePaths::resolve_default(None).expect("Failed to resolve storage directory");
+    let relay_cfg = RelayConfig::load_from_file(&paths.relay_file());
     let session_path = paths.session_file();
-    let session = Session::load_from_file(&session_path)
-        .unwrap_or_else(|_| Session::new().expect("Failed to initialize session"));
+    let session = Session::load_from_file_with_relay(&session_path, relay_cfg.clone())
+        .unwrap_or_else(|_| {
+            Session::new_with_relay(relay_cfg.clone()).expect("Failed to initialize session")
+        });
     let uid = if session.profile.uid.is_empty() {
         None
     } else {
@@ -1732,6 +2014,8 @@ pub fn run() {
         qr_task: qr_task_arc,
         active_thread_id: Arc::new(Mutex::new(None)),
         translate_cfg: Arc::new(Mutex::new(translate_cfg)),
+        relay_cfg: Arc::new(Mutex::new(relay_cfg)),
+        pending_update: Arc::new(Mutex::new(None)),
         close_to_tray: close_to_tray.clone(),
         allow_exit: allow_exit.clone(),
     };
@@ -1784,7 +2068,14 @@ pub fn run() {
             translate_get_config,
             translate_save_config,
             translate_messages,
+            relay_get_config,
+            relay_save_config,
+            relay_test_connection,
+            app_check_update,
+            app_install_update,
             app_set_close_to_tray,
+            clipboard_copy_text,
+            clipboard_copy_rgba_image,
         ])
         .setup(move |app| {
             let _ = app.get_webview_window("main");

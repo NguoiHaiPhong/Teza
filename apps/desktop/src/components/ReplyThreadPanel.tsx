@@ -3,6 +3,7 @@ import { ArrowLeft, Info, LocateFixed, MessagesSquare } from "lucide-react";
 import type { MessageDto, PendingAttachment, StickerItem, ThreadKind, ThreadMemberDto } from "../types";
 import { Composer } from "./Composer";
 import { MessageBubble, type MessageTranslationState } from "./MessageBubble";
+import { RelayImage } from "./RelayImage";
 
 function dayKey(ts: number): string {
   const d = new Date(ts > 1e12 ? ts : ts * 1000);
@@ -228,7 +229,7 @@ export function ReplyThreadPanel({
               }
               className="h-12 w-12 shrink-0 overflow-hidden rounded-lg"
             >
-              <img
+              <RelayImage
                 src={rootMessage.attachment_url}
                 alt={rootMessage.attachment_name || "Ảnh"}
                 referrerPolicy="no-referrer"
@@ -249,7 +250,7 @@ export function ReplyThreadPanel({
               </button>
               <span style={{ color: "var(--text-secondary)" }}>Tin nhắn gốc</span>
             </div>
-            <div className="line-clamp-3 whitespace-pre-wrap wrap-anywhere text-[14.5px] leading-relaxed">
+            <div className="selectable-text line-clamp-3 whitespace-pre-wrap wrap-anywhere text-[14.5px] leading-relaxed">
               {rootText}
             </div>
           </div>
@@ -310,6 +311,7 @@ export function ReplyThreadPanel({
                   onSaveFile={onSaveFile}
                   onRetrySend={onRetrySend}
                   onDiscardFailed={onDiscardFailed}
+                  onCopyError={onError}
                 />
               </div>
             );

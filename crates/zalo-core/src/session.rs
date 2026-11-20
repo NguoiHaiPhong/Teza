@@ -20,6 +20,7 @@ use crate::data_dir;
 use crate::dpapi;
 use crate::endpoints;
 use crate::param_cipher::ParamCipher;
+use crate::relay::RelayConfig;
 
 pub const ZPW_VER: &str = "694";
 pub const ZPW_TYPE: &str = "30";
@@ -394,25 +395,33 @@ pub struct Session {
     pub secret_key: Option<Vec<u8>>,
     pub domains: Domains,
     pub profile: AccountProfile,
+    pub relay: RelayConfig,
     pub jar: Arc<Jar>,
     pub http: Client,
+    pub media_http: Client,
 }
 
-/// Redacted `Debug` implementation: never prints `zpw_sek` or `secret_key`.
+/// Redacted `Debug` implementation: never prints `zpw_sek`, `secret_key`, or relay password.
 impl fmt::Debug for Session {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Session")
             .field("uid", &self.profile.uid)
             .field("has_zpw_sek", &self.zpw_sek.is_some())
             .field("has_secret_key", &self.secret_key.is_some())
+            .field("relay_enabled", &self.relay.enabled)
             .finish()
     }
 }
 
 impl Session {
     pub fn new() -> Result<Self> {
+        Self::new_with_relay(RelayConfig::default())
+    }
+
+    pub fn new_with_relay(relay: RelayConfig) -> Result<Self> {
         let jar = Arc::new(Jar::default());
-        let http = build_http_client(jar.clone())?;
+        let http = build_http_client(jar.clone(), &relay)?;
+        let media_http = build_media_http_client(&relay)?;
         let imei = generate_imei()?;
         let computer_name = detect_computer_name();
         let now_ms = chrono::Utc::now().timestamp_millis();
@@ -424,9 +433,20 @@ impl Session {
             secret_key: None,
             domains: Domains::default(),
             profile: AccountProfile::default(),
+            relay,
             jar,
             http,
+            media_http,
         })
+    }
+
+    pub fn set_relay(&mut self, relay: RelayConfig) -> Result<()> {
+        let next_http = build_http_client(self.jar.clone(), &relay)?;
+        let next_media = build_media_http_client(&relay)?;
+        self.relay = relay;
+        self.http = next_http;
+        self.media_http = next_media;
+        Ok(())
     }
 
     pub fn set_zpw_sek(&mut self, sek: String) {
@@ -497,8 +517,10 @@ impl Session {
             secret_key: self.secret_key.clone(),
             domains: self.domains.clone(),
             profile: self.profile.clone(),
+            relay: self.relay.clone(),
             jar: self.jar.clone(),
             http: self.http.clone(),
+            media_http: self.media_http.clone(),
         }
     }
 
@@ -636,13 +658,18 @@ impl Session {
     }
 
     pub fn load_from_file(path: &Path) -> Result<Self> {
+        Self::load_from_file_with_relay(path, RelayConfig::default())
+    }
+
+    pub fn load_from_file_with_relay(path: &Path, relay: RelayConfig) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("Không đọc được {}", path.display()))?;
         let saved: SavedSession = serde_json::from_str(&text)
             .context("Định dạng session.json không hợp lệ")?;
 
         let jar = Arc::new(Jar::default());
-        let http = build_http_client(jar.clone())?;
+        let http = build_http_client(jar.clone(), &relay)?;
+        let media_http = build_media_http_client(&relay)?;
         let mut domains = saved.domains;
         domains.heal_from_verified();
 
@@ -677,8 +704,10 @@ impl Session {
             secret_key,
             domains,
             profile: saved.profile,
+            relay,
             jar,
             http,
+            media_http,
         })
     }
 
@@ -980,23 +1009,8 @@ impl Session {
         if !is_allowed_media_url(url) {
             anyhow::bail!("Từ chối tải tệp từ URL không nằm trong danh sách CDN tin cậy");
         }
-        let redirect_policy = redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 5 {
-                attempt.stop()
-            } else if is_allowed_media_url(attempt.url().as_str()) {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        });
-        let client = Client::builder()
-            .redirect(redirect_policy)
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) LiteChat/0.1.0 Safari/537.36")
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .context("Không khởi tạo được HTTP client tải tệp")?;
-
-        let mut resp = client
+        let mut resp = self
+            .media_http
             .get(url.trim())
             .header(REFERER, "https://chat.zalo.me/")
             .send()
@@ -1056,7 +1070,7 @@ fn value_as_nonempty_str(v: Option<&Value>) -> Option<String> {
     }
 }
 
-fn build_http_client(jar: Arc<Jar>) -> Result<Client> {
+fn build_http_client(jar: Arc<Jar>, relay: &RelayConfig) -> Result<Client> {
     let mut headers = HeaderMap::new();
     headers.insert(ORIGIN, HeaderValue::from_static("https://chat.zalo.me"));
     headers.insert(REFERER, HeaderValue::from_static("https://chat.zalo.me/"));
@@ -1069,14 +1083,40 @@ fn build_http_client(jar: Arc<Jar>) -> Result<Client> {
             attempt.stop()
         }
     });
-    Client::builder()
+    let builder = Client::builder()
         .cookie_provider(jar)
         .default_headers(headers)
         .redirect(redirect_policy)
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) ZaloPC/26.10.11 Chrome/122.0.0.0 Electron/29.0.0 Safari/537.36")
-        .timeout(std::time::Duration::from_secs(35))
+        .timeout(std::time::Duration::from_secs(35));
+    relay
+        .apply_to_client_builder(builder)?
         .build()
         .context("Không khởi tạo được HTTP client")
+}
+
+fn build_media_http_client(relay: &RelayConfig) -> Result<Client> {
+    let redirect_policy = redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 5 {
+            attempt.stop()
+        } else if is_allowed_media_url(attempt.url().as_str()) {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    });
+    let builder = Client::builder()
+        .redirect(redirect_policy)
+        .user_agent(concat!(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) LiteChat/",
+            env!("CARGO_PKG_VERSION"),
+            " Safari/537.36"
+        ))
+        .timeout(std::time::Duration::from_secs(60));
+    relay
+        .apply_to_client_builder(builder)?
+        .build()
+        .context("Không khởi tạo được HTTP client tải tệp")
 }
 
 pub fn seed_zpw_sek_cookies(jar: &Jar, sek: &str) {
