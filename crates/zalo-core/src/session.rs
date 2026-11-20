@@ -1324,4 +1324,30 @@ mod tests {
         assert!(!is_allowed_media_url("https://f-zdn.vn/a.png"));
         assert!(!is_allowed_media_url("https://f10-zpc.zdn.vn.evil.com/a.png"));
     }
+
+    #[test]
+    fn data_url_decoder_and_session_relay_update_work() {
+        let (bytes, mime) = decode_data_url_bytes("data:image/png;base64,aGVsbG8=", 32).unwrap();
+        assert_eq!(bytes, b"hello");
+        assert_eq!(mime, "image/png");
+        assert!(decode_data_url_bytes("data:image/png;base64,aGVsbG8=", 4).is_err());
+        assert!(decode_data_url_bytes("data:text/plain,hello", 32).is_err());
+
+        let mut sess = Session::new().unwrap();
+        assert!(!sess.relay.enabled);
+        let cfg = RelayConfig {
+            enabled: true,
+            mode: crate::relay::RelayMode::Socks5,
+            host: "10.7.12.233".into(),
+            port: 1088,
+            username: "u".into(),
+            password: "p".into(),
+            route_webview_media: true,
+        };
+        sess.set_relay(cfg).unwrap();
+        assert!(sess.relay.enabled);
+        let cloned = sess.clone_shallow();
+        assert!(cloned.relay.enabled);
+        assert_eq!(cloned.relay.host, "10.7.12.233");
+    }
 }

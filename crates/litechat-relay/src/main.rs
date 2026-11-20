@@ -97,6 +97,9 @@ fn is_forbidden_ip(ip: IpAddr) -> bool {
                 || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64) // CGNAT 100.64.0.0/10
         }
         IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_forbidden_ip(IpAddr::V4(v4));
+            }
             v6.is_loopback()
                 || v6.is_multicast()
                 || v6.is_unspecified()
@@ -193,6 +196,15 @@ async fn handle_client(client: TcpStream, peer: SocketAddr, cfg: Arc<RelayServer
     }
 }
 
+async fn reply_and_close(stream: &mut TcpStream, bytes: &[u8]) {
+    let _ = stream.write_all(bytes).await;
+    let _ = stream.shutdown().await;
+    // Drain small unread request bytes (e.g. SOCKS5 dst addr or HTTP body) so Windows
+    // Winsock does not emit TCP RST on closesocket() before the client reads the reply.
+    let mut drain = [0u8; 512];
+    let _ = tokio::time::timeout(Duration::from_millis(25), stream.read(&mut drain)).await;
+}
+
 async fn handle_socks5(
     mut client: TcpStream,
     peer: SocketAddr,
@@ -213,7 +225,7 @@ async fn handle_socks5(
 
         if cfg.auth_required() {
             if !methods.contains(&0x02) {
-                let _ = client.write_all(&[0x05, 0xFF]).await;
+                reply_and_close(&mut client, &[0x05, 0xFF]).await;
                 bail!("Proxy yêu cầu xác thực username/password");
             }
             client.write_all(&[0x05, 0x02]).await?;
@@ -221,7 +233,7 @@ async fn handle_socks5(
             let mut auth_head = [0u8; 2];
             client.read_exact(&mut auth_head).await?;
             if auth_head[0] != 0x01 {
-                let _ = client.write_all(&[0x01, 0x01]).await;
+                reply_and_close(&mut client, &[0x01, 0x01]).await;
                 bail!("Phiên bản xác thực SOCKS5 không hợp lệ");
             }
             let ulen = auth_head[1] as usize;
@@ -234,23 +246,21 @@ async fn handle_socks5(
             let user = String::from_utf8_lossy(&ubuf);
             let pass = String::from_utf8_lossy(&pbuf);
             if !cfg.verify_credentials(&user, &pass) {
-                let _ = client.write_all(&[0x01, 0x01]).await;
+                reply_and_close(&mut client, &[0x01, 0x01]).await;
                 bail!("Sai tài khoản hoặc mật khẩu proxy từ {peer}");
             }
             client.write_all(&[0x01, 0x00]).await?;
         } else if methods.contains(&0x00) {
             client.write_all(&[0x05, 0x00]).await?;
         } else {
-            let _ = client.write_all(&[0x05, 0xFF]).await;
+            reply_and_close(&mut client, &[0x05, 0xFF]).await;
             bail!("Không có phương thức SOCKS5 tương thích");
         }
 
         let mut req_head = [0u8; 4];
         client.read_exact(&mut req_head).await?;
         if req_head[0] != 0x05 || req_head[1] != 0x01 {
-            let _ = client
-                .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                .await;
+            reply_and_close(&mut client, &[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
             bail!("Chỉ hỗ trợ lệnh SOCKS5 CONNECT");
         }
 
@@ -272,9 +282,7 @@ async fn handle_socks5(
                 std::net::Ipv6Addr::from(ip).to_string()
             }
             _ => {
-                let _ = client
-                    .write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                    .await;
+                reply_and_close(&mut client, &[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
                 bail!("Kiểu địa chỉ SOCKS5 không hỗ trợ");
             }
         };
@@ -286,9 +294,7 @@ async fn handle_socks5(
     let mut outbound = match connect_outbound(&host, port, &cfg).await {
         Ok(stream) => stream,
         Err(e) => {
-            let _ = client
-                .write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                .await;
+            reply_and_close(&mut client, &[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
             return Err(e);
         }
     };
@@ -369,18 +375,20 @@ async fn handle_http_connect(
         }
 
         if !method.eq_ignore_ascii_case("CONNECT") {
-            let _ = reader
-                .get_mut()
-                .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n")
-                .await;
+            reply_and_close(
+                reader.get_mut(),
+                b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n",
+            )
+            .await;
             bail!("Chỉ hỗ trợ HTTP CONNECT tunnel");
         }
 
         let Some((host, port)) = parse_connect_authority(target) else {
-            let _ = reader
-                .get_mut()
-                .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
-                .await;
+            reply_and_close(
+                reader.get_mut(),
+                b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n",
+            )
+            .await;
             bail!("Đích CONNECT không hợp lệ: {target}");
         };
 
@@ -388,26 +396,27 @@ async fn handle_http_connect(
     })
     .await??;
 
-    let mut client = reader.into_inner();
     if cfg.auth_required()
         && !auth_header
             .as_deref()
             .is_some_and(|h| verify_basic_proxy_auth(h, &cfg))
     {
-        let _ = client
-            .write_all(
-                b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"LiteChat Relay\"\r\nConnection: close\r\n\r\n",
-            )
-            .await;
+        reply_and_close(
+            reader.get_mut(),
+            b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"LiteChat Relay\"\r\nConnection: close\r\n\r\n",
+        )
+        .await;
         bail!("Sai hoặc thiếu xác thực HTTP CONNECT từ {peer}");
     }
 
     let mut outbound = match connect_outbound(&host, port, &cfg).await {
         Ok(stream) => stream,
         Err(e) => {
-            let _ = client
-                .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
-                .await;
+            reply_and_close(
+                reader.get_mut(),
+                b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n",
+            )
+            .await;
             return Err(e);
         }
     };
@@ -416,10 +425,12 @@ async fn handle_http_connect(
         eprintln!("[CONNECT] {peer} -> {host}:{port}");
     }
 
-    client
+    reader
+        .get_mut()
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut outbound).await;
+    // Keep BufReader around TcpStream so any pipelined bytes read during header parsing are preserved.
+    let _ = tokio::io::copy_bidirectional(&mut reader, &mut outbound).await;
     Ok(())
 }
 
@@ -531,19 +542,154 @@ mod tests {
 
     #[test]
     fn host_allowlist_and_private_ip_guards() {
-        let cfg = RelayServerConfig::default();
+        let mut cfg = RelayServerConfig::default();
         assert!(is_allowed_target("chat.zalo.me", 443, &cfg));
+        assert!(is_allowed_target("CHAT.ZALO.ME.", 443, &cfg));
         assert!(is_allowed_target("f10-zpc.zdn.vn", 443, &cfg));
         assert!(is_allowed_target("api-free.deepl.com", 443, &cfg));
         assert!(is_allowed_target("objects.githubusercontent.com", 443, &cfg));
         assert!(!is_allowed_target("chat.zalo.me", 80, &cfg));
+        assert!(!is_allowed_target("evilzalo.me", 443, &cfg));
         assert!(!is_allowed_target("facebook.com", 443, &cfg));
+
+        cfg.extra_allowed_hosts = vec!["custom.example.org".into()];
+        assert!(is_allowed_target("api.custom.example.org", 443, &cfg));
+        cfg.allow_all = true;
+        assert!(is_allowed_target("facebook.com", 8080, &cfg));
 
         assert!(is_forbidden_ip("127.0.0.1".parse().unwrap()));
         assert!(is_forbidden_ip("10.7.12.233".parse().unwrap()));
+        assert!(is_forbidden_ip("100.64.0.1".parse().unwrap()));
         assert!(is_forbidden_ip("192.168.1.1".parse().unwrap()));
         assert!(is_forbidden_ip("169.254.169.254".parse().unwrap()));
+        assert!(is_forbidden_ip("::1".parse().unwrap()));
+        assert!(is_forbidden_ip("fd00::1".parse().unwrap()));
+        assert!(is_forbidden_ip("fe80::1".parse().unwrap()));
+        assert!(is_forbidden_ip("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(is_forbidden_ip("::ffff:10.7.12.233".parse().unwrap()));
+        assert!(is_forbidden_ip("::ffff:169.254.169.254".parse().unwrap()));
         assert!(!is_forbidden_ip("1.1.1.1".parse().unwrap()));
+        assert!(!is_forbidden_ip("2606:4700:4700::1111".parse().unwrap()));
+
+        assert_eq!(
+            parse_connect_authority("chat.zalo.me:443"),
+            Some(("chat.zalo.me".into(), 443))
+        );
+        assert_eq!(
+            parse_connect_authority("[::1]:443"),
+            Some(("::1".into(), 443))
+        );
+        assert_eq!(parse_connect_authority("bad-no-port"), None);
+    }
+
+    #[tokio::test]
+    async fn http_connect_auth_policy_and_pipelined_payload() {
+        let cfg = RelayServerConfig {
+            username: "lite".into(),
+            password: "secret".into(),
+            allow_all: false,
+            allow_private_targets: true,
+            ..Default::default()
+        };
+        let (_, relay_addr) = spawn_echo_and_relay(cfg).await;
+
+        // Missing auth -> 407
+        let mut s407 = TcpStream::connect(relay_addr).await.unwrap();
+        s407.write_all(b"CONNECT chat.zalo.me:443 HTTP/1.1\r\nHost: chat.zalo.me:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 256];
+        let n = s407.read(&mut buf).await.unwrap();
+        assert!(std::str::from_utf8(&buf[..n]).unwrap().contains("407"));
+
+        // Non-CONNECT verb -> 405
+        let mut s405 = TcpStream::connect(relay_addr).await.unwrap();
+        s405.write_all(b"GET https://chat.zalo.me/ HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let n = s405.read(&mut buf).await.unwrap();
+        assert!(std::str::from_utf8(&buf[..n]).unwrap().contains("405"));
+
+        // Disallowed target with valid auth -> 403
+        let auth = B64.encode("lite:secret");
+        let mut s403 = TcpStream::connect(relay_addr).await.unwrap();
+        let req403 = format!(
+            "CONNECT evil.example:443 HTTP/1.1\r\nProxy-Authorization: Basic {auth}\r\n\r\n"
+        );
+        s403.write_all(req403.as_bytes()).await.unwrap();
+        let n = s403.read(&mut buf).await.unwrap();
+        assert!(std::str::from_utf8(&buf[..n]).unwrap().contains("403"));
+
+        // Pipelined CONNECT + payload must preserve early payload bytes in BufReader
+        let pipe_cfg = RelayServerConfig {
+            username: "lite".into(),
+            password: "secret".into(),
+            allow_all: true,
+            allow_private_targets: true,
+            ..Default::default()
+        };
+        let (echo_addr, pipe_relay) = spawn_echo_and_relay(pipe_cfg).await;
+        let mut spipe = TcpStream::connect(pipe_relay).await.unwrap();
+        let combined = format!(
+            "CONNECT 127.0.0.1:{} HTTP/1.1\r\nProxy-Authorization: Basic {auth}\r\n\r\nPIPELINED",
+            echo_addr.port()
+        );
+        spipe.write_all(combined.as_bytes()).await.unwrap();
+        let expected_head = b"HTTP/1.1 200 Connection Established\r\n\r\nPIPELINED";
+        let mut got = vec![0u8; expected_head.len()];
+        spipe.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, expected_head);
+    }
+
+    #[tokio::test]
+    async fn socks5_rejects_bad_auth_non_connect_and_mapped_loopback() {
+        let cfg = RelayServerConfig {
+            username: "lite".into(),
+            password: "secret".into(),
+            allow_all: true,
+            allow_private_targets: false,
+            ..Default::default()
+        };
+        let (echo_addr, relay_addr) = spawn_echo_and_relay(cfg).await;
+
+        // Wrong password -> auth failure [0x01, 0x01]
+        let mut bad_auth = TcpStream::connect(relay_addr).await.unwrap();
+        bad_auth.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let mut rep = [0u8; 2];
+        bad_auth.read_exact(&mut rep).await.unwrap();
+        assert_eq!(rep, [0x05, 0x02]);
+        bad_auth.write_all(b"\x01\x04lite\x05wrong").await.unwrap();
+        bad_auth.read_exact(&mut rep).await.unwrap();
+        assert_eq!(rep, [0x01, 0x01]);
+
+        // IPv4-mapped IPv6 loopback (::ffff:127.0.0.1) blocked when allow_private_targets = false
+        let mut mapped = TcpStream::connect(relay_addr).await.unwrap();
+        mapped.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        mapped.read_exact(&mut rep).await.unwrap();
+        mapped.write_all(b"\x01\x04lite\x06secret").await.unwrap();
+        mapped.read_exact(&mut rep).await.unwrap();
+        assert_eq!(rep, [0x01, 0x00]);
+        let mapped_v6: std::net::Ipv6Addr = "::ffff:127.0.0.1".parse().unwrap();
+        let mut req = vec![0x05, 0x01, 0x00, 0x04];
+        req.extend_from_slice(&mapped_v6.octets());
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        mapped.write_all(&req).await.unwrap();
+        let mut conn_rep = [0u8; 10];
+        mapped.read_exact(&mut conn_rep).await.unwrap();
+        assert_ne!(conn_rep[1], 0x00);
+
+        // Non-CONNECT command (0x02 BIND) rejected with 0x07
+        let mut bad_cmd = TcpStream::connect(relay_addr).await.unwrap();
+        bad_cmd.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        bad_cmd.read_exact(&mut rep).await.unwrap();
+        bad_cmd.write_all(b"\x01\x04lite\x06secret").await.unwrap();
+        bad_cmd.read_exact(&mut rep).await.unwrap();
+        bad_cmd
+            .write_all(&[0x05, 0x02, 0x00, 0x01, 1, 1, 1, 1, 0x01, 0xBB])
+            .await
+            .unwrap();
+        bad_cmd.read_exact(&mut conn_rep).await.unwrap();
+        assert_eq!(conn_rep[1], 0x07);
     }
 
     async fn spawn_echo_and_relay(cfg: RelayServerConfig) -> (SocketAddr, SocketAddr) {

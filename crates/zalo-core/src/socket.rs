@@ -544,5 +544,52 @@ mod tests {
         let unwrapped = unwrap_data_str(v);
         assert_eq!(unwrapped.pointer("/data/queueId").unwrap(), "q1");
         assert_eq!(unwrapped.pointer("/data/ids/0").unwrap(), 101);
+
+        let arr = json!({ "data": "[{\"msgId\":\"m1\"}]" });
+        assert_eq!(unwrap_data_str(arr).pointer("/data/0/msgId").unwrap(), "m1");
+
+        let plain = json!({ "data": "not-json" });
+        assert_eq!(unwrap_data_str(plain).get("data").unwrap(), "not-json");
+    }
+
+    #[test]
+    fn decode_frame_rejects_short_or_corrupt_json_buffers() {
+        assert!(decode_frame(&[1, 2, 3]).is_none());
+        assert!(decode_frame(&[1, 1, 0, 0, b'{', b'b']).is_none());
+        let (_, _, _, empty_val) = decode_frame(&[1, 2, 0, 1]).unwrap();
+        assert_eq!(empty_val, Value::Null);
+    }
+
+    #[test]
+    fn decrypt_payload_handles_plain_compressed_and_missing_key_errors() {
+        assert_eq!(decrypt_payload(None, 0, "hello").unwrap(), b"hello");
+
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut enc, b"{\"ok\":true}").unwrap();
+        let compressed = enc.finish().unwrap();
+        let b64 = B64.encode(compressed);
+        assert_eq!(decrypt_payload(None, 1, &b64).unwrap(), b"{\"ok\":true}");
+
+        assert!(decrypt_payload(None, 2, "abc").is_err());
+        assert!(decrypt_payload(None, 3, "abc").is_err());
+        assert!(decrypt_payload(None, 99, "abc").is_err());
+    }
+
+    #[test]
+    fn queues_from_auth_deduplicates_ctrl_and_chat_queues() {
+        let auth = json!({
+            "data": {
+                "ctrl_qCmds": [
+                    { "cmd": 603, "subCmd": 0 },
+                    { "cmd": 603, "subCmd": 0 }
+                ],
+                "qCmds": [
+                    { "cmd": 510, "subCmd": 1 },
+                    { "cmd": 511, "subCmd": 0 },
+                    { "cmd": 603, "subCmd": 0 }
+                ]
+            }
+        });
+        assert_eq!(queues_from_auth(&auth), vec![(603, 0), (510, 1), (511, 0)]);
     }
 }

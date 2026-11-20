@@ -855,4 +855,66 @@ mod tests {
             other => panic!("unexpected action: {other:?}"),
         }
     }
+
+    #[test]
+    fn parses_ws_undo_and_read_unread_control_actions() {
+        let ev = WsEvent {
+            cmd: CMD_CTRL_PUSH_CTRL,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "controls": [
+                    {
+                        "act_type": "undo_msg",
+                        "data": { "uidFrom": "999", "idTo": "456", "globalMsgId": "gm-99" }
+                    },
+                    {
+                        "act_type": "seen",
+                        "data": { "uidFrom": "999", "idTo": "456" }
+                    },
+                    {
+                        "act_type": "mark_unread",
+                        "data": { "uidFrom": "456", "idTo": "888" }
+                    }
+                ]
+            }),
+        };
+        let actions = parse_ws_event(&ev, "456", "");
+        assert_eq!(actions.len(), 3);
+        assert!(matches!(
+            &actions[0],
+            WsParsedAction::Recalled { thread_id, msg_id } if thread_id == "999" && msg_id == "gm-99"
+        ));
+        assert!(matches!(
+            &actions[1],
+            WsParsedAction::Read { thread_id, is_unread } if thread_id == "999" && !*is_unread
+        ));
+        assert!(matches!(
+            &actions[2],
+            WsParsedAction::Read { thread_id, is_unread } if thread_id == "888" && *is_unread
+        ));
+    }
+
+    #[test]
+    fn parses_cloud_self_messages_and_quote_snippets() {
+        let val = json!({
+            "msgId": "cm1",
+            "uidFrom": "456",
+            "idTo": "send2me_77",
+            "content": "Ghi chu ca nhan",
+            "ts": "1700000012",
+            "quote": {
+                "globalMsgId": "cm0",
+                "fromD": "Tôi",
+                "msg": "Tin goc"
+            }
+        });
+        let msg = parse_chat_message(&val, None, "456", "send2me_77", false).unwrap();
+        assert_eq!(msg.thread_id, "send2me_77");
+        assert!(msg.is_outgoing);
+        assert_eq!(msg.ts, 1_700_000_012_000);
+        let q = msg.quote.unwrap();
+        assert_eq!(q.msg_id, "cm0");
+        assert_eq!(q.snippet, "Tin goc");
+    }
 }

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { CornerUpLeft, FileText, Image as ImageIcon, Loader2, Paperclip, Send, Smile, X, Zap } from "lucide-react";
 import { bridge, isTauri, MAX_ATTACHMENT_BYTES } from "../bridge";
 import type { MessageDto, PendingAttachment, StickerItem, ThreadMemberDto } from "../types";
+import { extFromMime, extractAttachmentFromClipboard } from "../utils/clipboardParse";
 import { RelayImage } from "./RelayImage";
 import { ThreadAvatar } from "./ThreadAvatar";
 
@@ -42,54 +43,6 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function extFromMime(mime: string): string {
-  switch (mime.toLowerCase()) {
-    case "image/jpeg":
-    case "image/jpg":
-      return "jpg";
-    case "image/webp":
-      return "webp";
-    case "image/gif":
-      return "gif";
-    case "image/bmp":
-      return "bmp";
-    default:
-      return "png";
-  }
-}
-
-function extractAttachmentFromClipboard(cd: DataTransfer | null): File | null {
-  if (!cd) return null;
-  const fromItems: File[] = [];
-  if (cd.items) {
-    for (const item of Array.from(cd.items)) {
-      if (item.kind === "file") {
-        const f = item.getAsFile();
-        if (f) fromItems.push(f);
-      }
-    }
-  }
-  const candidates = fromItems.length > 0 ? fromItems : Array.from(cd.files ?? []);
-  if (candidates.length === 0) return null;
-
-  const plainText = cd.getData("text/plain");
-  const uriList = cd.getData("text/uri-list");
-  // Word/Excel/browsers often place both text AND an auto-rendered snapshot image on the clipboard;
-  // prefer pasting text unless the clipboard actually holds non-image files or no text.
-  if (
-    plainText.trim().length > 0 &&
-    !uriList &&
-    candidates.every(
-      (f) =>
-        f.type.startsWith("image/") &&
-        (!f.name || /^image\.(png|jpe?g|bmp|webp|gif)$/i.test(f.name)),
-    )
-  ) {
-    return null;
-  }
-  return candidates[0];
 }
 
 export function Composer({

@@ -1,4 +1,4 @@
-import type { ImgHTMLAttributes } from "react";
+import { useEffect, useRef, type ImgHTMLAttributes } from "react";
 import { useResolvedMediaUrl } from "../utils/mediaCache";
 
 interface Props extends Omit<ImgHTMLAttributes<HTMLImageElement>, "src"> {
@@ -14,7 +14,15 @@ export function RelayImage({
   onError,
   ...rest
 }: Props) {
-  const { src: resolvedSrc, requestFallback } = useResolvedMediaUrl(src, forceRelay);
+  const { src: resolvedSrc, failed, requestFallback } = useResolvedMediaUrl(src, forceRelay);
+  const onFallbackFailRef = useRef(onFallbackFail);
+  onFallbackFailRef.current = onFallbackFail;
+
+  useEffect(() => {
+    if (failed) {
+      onFallbackFailRef.current?.();
+    }
+  }, [failed, src]);
 
   if (!resolvedSrc) {
     return null;

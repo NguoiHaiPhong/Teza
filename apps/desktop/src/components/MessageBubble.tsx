@@ -196,6 +196,10 @@ export function MessageBubble({
   const [pickerOpen, setPickerOpen] = useState(false);
   const [mediaError, setMediaError] = useState(false);
   const [showOriginal, setShowOriginal] = useState(false);
+
+  useEffect(() => {
+    setMediaError(false);
+  }, [msg.attachment_url, msg.msg_type]);
   const isReplaced = Boolean(replaceWithTranslation && translation?.text && !showOriginal);
   const isBuzz = isBuzzMessage(msg);
   const isSticker = !msg.is_recalled && isStickerMessage(msg) && !mediaError;

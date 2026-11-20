@@ -51,6 +51,7 @@ export function useResolvedMediaUrl(
 ): {
   src: string;
   loading: boolean;
+  failed: boolean;
   requestFallback: () => void;
 } {
   const clean = rawUrl?.trim() || "";
@@ -65,6 +66,7 @@ export function useResolvedMediaUrl(
   const [loading, setLoading] = useState<boolean>(
     () => shouldFetchViaRust && !resolvedCache.has(clean),
   );
+  const [failed, setFailed] = useState(false);
 
   useEffect(() => {
     listeners.add(setRelayActive);
@@ -75,23 +77,27 @@ export function useResolvedMediaUrl(
 
   useEffect(() => {
     setFallbackTried(false);
+    setFailed(false);
   }, [clean]);
 
   useEffect(() => {
     if (!shouldFetchViaRust) {
       setResolved(clean);
       setLoading(false);
+      setFailed(false);
       return;
     }
     const hit = resolvedCache.get(clean);
     if (hit) {
       setResolved(hit);
       setLoading(false);
+      setFailed(false);
       return;
     }
     let cancelled = false;
     setResolved("");
     setLoading(true);
+    setFailed(false);
     void fetchCachedMediaDataUrl(clean)
       .then((dataUrl) => {
         if (!cancelled) {
@@ -103,6 +109,7 @@ export function useResolvedMediaUrl(
         if (!cancelled) {
           setResolved("");
           setLoading(false);
+          setFailed(true);
         }
       });
     return () => {
@@ -113,6 +120,7 @@ export function useResolvedMediaUrl(
   return {
     src: resolved,
     loading,
+    failed,
     requestFallback: () => {
       if (isRemoteHttps && !fallbackTried) {
         setFallbackTried(true);

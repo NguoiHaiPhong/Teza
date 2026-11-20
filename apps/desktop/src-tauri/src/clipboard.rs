@@ -25,6 +25,16 @@ pub fn copy_rgba_image_native(width: u32, height: u32, rgba: &[u8]) -> Result<()
     }
 }
 
+pub fn encode_utf16_nul_le(text: &str) -> Vec<u8> {
+    let mut utf16: Vec<u16> = text.encode_utf16().collect();
+    utf16.push(0);
+    let mut raw = Vec::with_capacity(utf16.len() * 2);
+    for unit in utf16 {
+        raw.extend_from_slice(&unit.to_le_bytes());
+    }
+    raw
+}
+
 pub fn rgba_to_dib_bytes(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
     if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
         return Err("Kích thước ảnh không hợp lệ để sao chép".into());
@@ -144,12 +154,7 @@ mod win32 {
     }
 
     pub fn copy_utf16_text(text: &str) -> Result<(), String> {
-        let mut utf16: Vec<u16> = text.encode_utf16().collect();
-        utf16.push(0);
-        let mut raw = Vec::with_capacity(utf16.len() * 2);
-        for unit in utf16 {
-            raw.extend_from_slice(&unit.to_le_bytes());
-        }
+        let raw = super::encode_utf16_nul_le(text);
         set_clipboard_bytes(CF_UNICODETEXT, &raw)
     }
 
@@ -161,6 +166,32 @@ mod win32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encode_utf16_nul_le_handles_vietnamese_empty_and_surrogates() {
+        let empty = encode_utf16_nul_le("");
+        assert_eq!(empty, [0u8, 0u8]);
+
+        let text = "Xin chào 🚀";
+        let encoded = encode_utf16_nul_le(text);
+        assert_eq!(encoded.len() % 2, 0);
+        assert_eq!(&encoded[encoded.len() - 2..], &[0, 0]);
+        let units: Vec<u16> = encoded[..encoded.len() - 2]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
+        assert_eq!(String::from_utf16(&units).unwrap(), text);
+    }
+
+    #[test]
+    fn rgba_to_dib_bytes_rejects_invalid_dimensions_and_mismatched_buffers() {
+        assert!(rgba_to_dib_bytes(0, 1, &[]).is_err());
+        assert!(rgba_to_dib_bytes(1, 0, &[]).is_err());
+        assert!(rgba_to_dib_bytes(16_385, 1, &[]).is_err());
+        assert!(rgba_to_dib_bytes(2, 2, &[0u8; 12]).is_err());
+    }
 
     #[test]
     fn rgba_to_dib_builds_bottom_up_bgra_header() {

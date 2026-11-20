@@ -584,11 +584,11 @@ impl MessageStore {
                 text_norm = '',
                 msg_type = excluded.msg_type,
                 is_recalled = excluded.is_recalled,
-                is_pinned = excluded.is_pinned,
+                is_pinned = MAX(messages.is_pinned, excluded.is_pinned),
                 quote_json = COALESCE(excluded.quote_json, messages.quote_json),
                 reactions_json = CASE WHEN ?15 = 1 THEN messages.reactions_json ELSE excluded.reactions_json END,
-                attachment_url = COALESCE(excluded.attachment_url, messages.attachment_url),
-                attachment_name = COALESCE(excluded.attachment_name, messages.attachment_name)
+                attachment_url = CASE WHEN excluded.is_recalled = 1 THEN NULL ELSE COALESCE(excluded.attachment_url, messages.attachment_url) END,
+                attachment_name = CASE WHEN excluded.is_recalled = 1 THEN NULL ELSE COALESCE(excluded.attachment_name, messages.attachment_name) END
             "#,
             params![
                 m.msg_id,
@@ -1503,6 +1503,86 @@ mod tests {
 
         let unpinned = store.set_message_pinned("t1", "pm1", false).unwrap().unwrap();
         assert!(!unpinned.is_pinned);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_thread_preview_returning_created_reports_true_only_on_first_insert() {
+        let dir = std::env::temp_dir().join(format!("litechat-store-created-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("created.db");
+        let store = MessageStore::open(&db_path).unwrap();
+
+        let created_first = store
+            .update_thread_preview_returning_created("t-new", "Xin chao", 1_700_000_001_000, true, false)
+            .unwrap();
+        assert!(created_first);
+
+        let created_second = store
+            .update_thread_preview_returning_created("t-new", "Tin tiep theo", 1_700_000_002_000, true, false)
+            .unwrap();
+        assert!(!created_second);
+
+        let listed = store.list_threads(FolderFilter::All).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].unread_count, 2);
+        assert_eq!(listed[0].last_preview, "Tin tiep theo");
+
+        let created_clear = store
+            .update_thread_preview_returning_created("t-new", "Bạn: Đã xem", 1_700_000_003_000, false, true)
+            .unwrap();
+        assert!(!created_clear);
+        let after_clear = store.list_threads(FolderFilter::All).unwrap();
+        assert_eq!(after_clear[0].unread_count, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recall_clears_attachment_and_resync_preserves_local_pin() {
+        let dir = std::env::temp_dir().join(format!("litechat-store-recall-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("recall_pin.db");
+        let mut store = MessageStore::open(&db_path).unwrap();
+
+        let original = MessageDto {
+            msg_id: "rm1".into(),
+            thread_id: "t1".into(),
+            sender_id: "u1".into(),
+            sender_name: "An".into(),
+            text: "Anh dinh kem".into(),
+            msg_type: "chat.photo".into(),
+            ts: 1_700_000_010_000,
+            is_outgoing: false,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
+            reactions: Vec::new(),
+            attachment_url: Some("https://f10-zpc.zdn.vn/pic.jpg".into()),
+            attachment_name: Some("pic.jpg".into()),
+        };
+        store.upsert_message(&original).unwrap();
+        store.set_message_pinned("t1", "rm1", true).unwrap();
+
+        // Simulate remote history sync arriving without local is_pinned flag
+        store.upsert_message(&original).unwrap();
+        let after_resync = store.get_message("t1", "rm1").unwrap().unwrap();
+        assert!(after_resync.is_pinned);
+
+        // Explicit unpin still works
+        store.set_message_pinned("t1", "rm1", false).unwrap();
+        assert!(!store.get_message("t1", "rm1").unwrap().unwrap().is_pinned);
+
+        // Recall must strip old attachment_url & attachment_name in SQLite
+        let recalled = store.mark_recalled("t1", "rm1").unwrap().unwrap();
+        assert!(recalled.is_recalled);
+        assert!(recalled.attachment_url.is_none());
+        assert!(recalled.attachment_name.is_none());
+        let reloaded = store.get_message("t1", "rm1").unwrap().unwrap();
+        assert!(reloaded.is_recalled);
+        assert!(reloaded.attachment_url.is_none());
+        assert!(reloaded.attachment_name.is_none());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
