@@ -41,7 +41,8 @@ pub const CMD_CTRL_PUSH_CTRL: u16 = 601;
 pub const CMD_CTRL_ACTION: u16 = 602;
 pub const CMD_CTRL_PULL_CTRL: u16 = 603;
 
-const PING_SECS: u64 = 45;
+const PING_SECS: u64 = 25;
+const WS_WRITE_TIMEOUT_SECS: u64 = 10;
 const BROWSER_UA: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
@@ -362,7 +363,12 @@ async fn run_once(
                 if authed {
                     let body = json!({ "eventId": now_ms() });
                     let f = encode_frame(CMD_PING, SUB_KEEP_CONNECTION, 1, Some(&body));
-                    ws.send(Message::Binary(f)).await?;
+                    tokio::time::timeout(
+                        Duration::from_secs(WS_WRITE_TIMEOUT_SECS),
+                        ws.send(Message::Binary(f)),
+                    )
+                    .await
+                    .map_err(|_| anyhow!("ws ping write timeout"))??;
                 }
             }
             incoming = ws.next() => {

@@ -163,8 +163,14 @@ async fn restart_ws_worker(
 
     let handle = tokio::spawn(async move {
         let mut rx = socket::spawn(sess_clone.clone_shallow());
-        let mut ws_name_cache: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
+        let initial_titles = store_arc
+            .lock()
+            .await
+            .resolve_known_titles()
+            .unwrap_or_default();
+        let ws_name_cache = Arc::new(Mutex::new(initial_titles));
+        let in_flight_uids = Arc::new(Mutex::new(std::collections::HashSet::<String>::new()));
+
         while let Some(sig) = rx.recv().await {
             match sig {
                 WsSignal::Status(status) => {
@@ -193,89 +199,69 @@ async fn restart_ws_worker(
                     if actions.is_empty() {
                         continue;
                     }
-                    let missing_uids: Vec<String> = {
-                        let known = store_arc
-                            .lock()
-                            .await
-                            .resolve_known_titles()
-                            .unwrap_or_default();
-                        for (k, v) in known {
-                            ws_name_cache.entry(k).or_insert(v);
-                        }
-                        let mut out = Vec::new();
-                        for act in &actions {
+
+                    let mut missing_uids: Vec<String> = Vec::new();
+                    {
+                        let cache = ws_name_cache.lock().await;
+                        let mut inflight = in_flight_uids.lock().await;
+                        for act in &mut actions {
                             if let WsParsedAction::Message(msg) = act {
                                 if !msg.is_outgoing
                                     && !msg.sender_id.is_empty()
                                     && (msg.sender_name == msg.sender_id
                                         || is_raw_numeric_id(&msg.sender_name))
-                                    && !ws_name_cache.contains_key(&msg.sender_id)
-                                    && !out.iter().any(|x| x == &msg.sender_id)
                                 {
-                                    out.push(msg.sender_id.clone());
-                                }
-                            }
-                        }
-                        out
-                    };
-                    if !missing_uids.is_empty() {
-                        if let Ok(profiles) = threads::get_mini_profiles(&sess_clone, &missing_uids).await
-                        {
-                            for (uid, p) in profiles {
-                                if let Some(name) = pick_str(
-                                    &p,
-                                    &["displayName", "zaloName", "name", "display_name"],
-                                ) {
-                                    ws_name_cache.insert(uid, name);
+                                    if let Some(name) = cache.get(&msg.sender_id) {
+                                        msg.sender_name = name.clone();
+                                    } else if inflight.insert(msg.sender_id.clone())
+                                        && !missing_uids.iter().any(|x| x == &msg.sender_id)
+                                    {
+                                        missing_uids.push(msg.sender_id.clone());
+                                    }
                                 }
                             }
                         }
                     }
 
                     let active_id = active_thread_arc.lock().await.clone();
-                    let mut store = store_arc.lock().await;
+                    let mut pending_resolve_msgs: Vec<MessageDto> = Vec::new();
                     let mut threads_touched = false;
-                    for act in &mut actions {
-                        if let WsParsedAction::Message(msg) = act {
-                            if !msg.is_outgoing
-                                && (msg.sender_name == msg.sender_id
-                                    || is_raw_numeric_id(&msg.sender_name))
-                            {
-                                if let Some(name) = ws_name_cache.get(&msg.sender_id) {
-                                    msg.sender_name = name.clone();
+                    {
+                        let mut store = store_arc.lock().await;
+                        for act in actions {
+                            match act {
+                                WsParsedAction::Message(msg) => {
+                                    let is_group = store
+                                        .get_thread_kind(&msg.thread_id)
+                                        .ok()
+                                        .flatten()
+                                        == Some(ThreadKind::Group);
+                                    let _ = store.upsert_message(&msg);
+                                    let preview = format_thread_preview(
+                                        &msg.text,
+                                        msg.is_outgoing,
+                                        &msg.sender_name,
+                                        is_group,
+                                    );
+                                    let inc_unread = !msg.is_outgoing
+                                        && active_id.as_deref() != Some(msg.thread_id.as_str());
+                                    let clear_unread = msg.is_outgoing
+                                        || active_id.as_deref() == Some(msg.thread_id.as_str());
+                                    let _ = store.update_thread_preview_with_unread(
+                                        &msg.thread_id,
+                                        &preview,
+                                        msg.ts,
+                                        inc_unread,
+                                        clear_unread,
+                                    );
+                                    threads_touched = true;
+                                    let _ = app.emit("core://message-new", &*msg);
+                                    if !missing_uids.is_empty()
+                                        && missing_uids.iter().any(|u| u == &msg.sender_id)
+                                    {
+                                        pending_resolve_msgs.push(*msg);
+                                    }
                                 }
-                            }
-                        }
-                    }
-                    for act in actions {
-                        match act {
-                            WsParsedAction::Message(msg) => {
-                                let is_group = store
-                                    .get_thread_kind(&msg.thread_id)
-                                    .ok()
-                                    .flatten()
-                                    == Some(ThreadKind::Group);
-                                let _ = store.upsert_message(&msg);
-                                let preview = format_thread_preview(
-                                    &msg.text,
-                                    msg.is_outgoing,
-                                    &msg.sender_name,
-                                    is_group,
-                                );
-                                let inc_unread = !msg.is_outgoing
-                                    && active_id.as_deref() != Some(msg.thread_id.as_str());
-                                let clear_unread = msg.is_outgoing
-                                    || active_id.as_deref() == Some(msg.thread_id.as_str());
-                                let _ = store.update_thread_preview_with_unread(
-                                    &msg.thread_id,
-                                    &preview,
-                                    msg.ts,
-                                    inc_unread,
-                                    clear_unread,
-                                );
-                                threads_touched = true;
-                                let _ = app.emit("core://message-new", &*msg);
-                            }
                             WsParsedAction::Read {
                                 thread_id,
                                 is_unread,
@@ -306,9 +292,52 @@ async fn restart_ws_worker(
                                 }
                             }
                         }
+                        }
                     }
                     if threads_touched {
                         let _ = app.emit("core://threads-updated", ());
+                    }
+                    if !missing_uids.is_empty() {
+                        let app_bg = app.clone();
+                        let sess_bg = sess_clone.clone_shallow();
+                        let store_bg = store_arc.clone();
+                        let cache_bg = ws_name_cache.clone();
+                        let inflight_bg = in_flight_uids.clone();
+                        tokio::spawn(async move {
+                            let mut resolved = std::collections::HashMap::<String, String>::new();
+                            if let Ok(profiles) =
+                                threads::get_mini_profiles(&sess_bg, &missing_uids).await
+                            {
+                                for (uid, p) in profiles {
+                                    if let Some(name) = pick_str(
+                                        &p,
+                                        &["displayName", "zaloName", "name", "display_name"],
+                                    ) {
+                                        resolved.insert(uid, name);
+                                    }
+                                }
+                            }
+                            if !resolved.is_empty() {
+                                {
+                                    let mut cache = cache_bg.lock().await;
+                                    for (k, v) in &resolved {
+                                        cache.insert(k.clone(), v.clone());
+                                    }
+                                }
+                                let mut store = store_bg.lock().await;
+                                for mut msg in pending_resolve_msgs {
+                                    if let Some(name) = resolved.get(&msg.sender_id) {
+                                        msg.sender_name = name.clone();
+                                        let _ = store.upsert_message(&msg);
+                                        let _ = app_bg.emit("core://message-updated", &msg);
+                                    }
+                                }
+                            }
+                            let mut inflight = inflight_bg.lock().await;
+                            for uid in &missing_uids {
+                                inflight.remove(uid);
+                            }
+                        });
                     }
                 }
             }
