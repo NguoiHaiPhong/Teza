@@ -1,4 +1,5 @@
 import { Network, QrCode, RefreshCw } from "lucide-react";
+import { useI18n } from "../i18n";
 import type { RelayConfigSummary } from "../types";
 
 interface Props {
@@ -20,6 +21,7 @@ export function QrLoginModal({
   onRefresh,
   onEnterDemo,
 }: Props) {
+  const { t } = useI18n();
   return (
     <div className="flex h-full w-full items-center justify-center p-6" style={{ background: "var(--bg-stage)" }}>
       <div
@@ -32,16 +34,16 @@ export function QrLoginModal({
         >
           <QrCode className="h-6 w-6" />
         </div>
-        <h1 className="text-xl font-semibold">Đăng nhập Teza</h1>
+        <h1 className="text-xl font-semibold">{t("qrTitle")}</h1>
         <p className="mt-1 text-sm" style={{ color: "var(--text-secondary)" }}>
-          Mở ứng dụng trên điện thoại và quét mã QR bên dưới
+          {t("qrSubtitle")}
         </p>
 
         <div className="mx-auto my-6 flex h-56 w-56 items-center justify-center rounded-xl bg-white p-3">
           {qrSvg ? (
             <div className="h-full w-full [&>svg]:h-full [&>svg]:w-full" dangerouslySetInnerHTML={{ __html: qrSvg }} />
           ) : (
-            <div className="text-xs text-slate-500">Đang tải mã QR từ máy chủ...</div>
+            <div className="text-xs text-slate-500">{t("qrLoading")}</div>
           )}
         </div>
 
@@ -68,7 +70,7 @@ export function QrLoginModal({
             className="tf-btn inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold"
           >
             <RefreshCw className="h-4 w-4" />
-            Tạo lại QR
+            {t("qrRegenerate")}
           </button>
           {onOpenRelaySettings && (
             <button
@@ -82,7 +84,7 @@ export function QrLoginModal({
               }}
             >
               <Network className="h-4 w-4" />
-              Mạng Relay
+              {t("qrRelayBtn")}
             </button>
           )}
           <button
@@ -90,7 +92,7 @@ export function QrLoginModal({
             className="rounded-lg px-3.5 py-2 text-sm font-medium transition hover:opacity-80"
             style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
           >
-            Xem trước giao diện
+            {t("qrPreviewBtn")}
           </button>
         </div>
       </div>

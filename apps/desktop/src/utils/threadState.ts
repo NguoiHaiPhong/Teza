@@ -1,32 +1,39 @@
 import type { ChatFolderDto, MessageDto, ThreadDto } from "../types.ts";
+import type { UiLanguage } from "../i18n/types.ts";
+import { uiLanguageToLocale } from "../i18n/types.ts";
 
 export function dayKey(ts: number): string {
   const d = new Date(ts > 1e12 ? ts : ts * 1000);
   return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
 }
 
-export function formatDayLabel(ts: number): string {
+export function formatDayLabel(ts: number, lang: UiLanguage = "vi"): string {
   const d = new Date(ts > 1e12 ? ts : ts * 1000);
   const today = new Date();
   const yest = new Date(Date.now() - 86_400_000);
-  if (dayKey(d.getTime()) === dayKey(today.getTime())) return "Hôm nay";
-  if (dayKey(d.getTime()) === dayKey(yest.getTime())) return "Hôm qua";
-  return d.toLocaleDateString("vi-VN");
+  if (dayKey(d.getTime()) === dayKey(today.getTime())) {
+    return lang === "en" ? "Today" : lang === "ko" ? "오늘" : "Hôm nay";
+  }
+  if (dayKey(d.getTime()) === dayKey(yest.getTime())) {
+    return lang === "en" ? "Yesterday" : lang === "ko" ? "어제" : "Hôm qua";
+  }
+  return d.toLocaleDateString(uiLanguageToLocale(lang));
 }
 
-export function formatThreadTime(ts: number): string {
+export function formatThreadTime(ts: number, lang: UiLanguage = "vi"): string {
   if (!ts) return "";
   const ms = ts > 1e12 ? ts : ts * 1000;
   const d = new Date(ms);
   const now = new Date();
+  const locale = uiLanguageToLocale(lang);
   if (dayKey(ms) === dayKey(now.getTime())) {
-    return d.toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" });
+    return d.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" });
   }
   const yest = new Date(Date.now() - 86_400_000);
   if (dayKey(ms) === dayKey(yest.getTime())) {
-    return "Hôm qua";
+    return lang === "en" ? "Yesterday" : lang === "ko" ? "어제" : "Hôm qua";
   }
-  return d.toLocaleDateString("vi-VN", { day: "2-digit", month: "2-digit" });
+  return d.toLocaleDateString(locale, { day: "2-digit", month: "2-digit" });
 }
 
 export function upsertMsg(list: MessageDto[], incoming: MessageDto): MessageDto[] {
@@ -176,22 +183,30 @@ export function filterThreadsByFolder(
   selection: string,
   customFolders: ChatFolderDto[],
 ): ThreadDto[] {
-  if (selection === "all") return threads;
-  if (selection === "unread") return threads.filter((t) => t.unread_count > 0);
-  if (selection === "direct" || selection === "group" || selection === "cloud") {
-    return threads.filter((t) => t.kind === selection);
+  if (selection === "archived") {
+    return threads.filter((t) => Boolean(t.is_archived));
   }
-  if (!selection.startsWith("custom:")) return threads;
+  const active = threads.filter((t) => !t.is_archived);
+  if (selection === "all") return active;
+  if (selection === "unread") return active.filter((t) => t.unread_count > 0);
+  if (selection === "direct" || selection === "group" || selection === "cloud") {
+    return active.filter((t) => t.kind === selection);
+  }
+  if (!selection.startsWith("custom:")) return active;
 
   const folderId = selection.slice("custom:".length);
   const folder = customFolders.find((f) => f.id === folderId);
-  if (!folder) return threads;
+  if (!folder) return active;
 
   const hasExplicitSet = folder.thread_ids.length > 0;
   const hasKindRule = folder.include_kinds.length > 0;
   const idSet = hasExplicitSet ? new Set(folder.thread_ids) : null;
+  const excludedSet = folder.excluded_thread_ids?.length
+    ? new Set(folder.excluded_thread_ids)
+    : null;
 
-  return threads.filter((t) => {
+  return active.filter((t) => {
+    if (excludedSet?.has(t.id)) return false;
     if (folder.exclude_muted && t.is_muted) return false;
     if (folder.only_unread && t.unread_count <= 0) return false;
     if (hasExplicitSet || hasKindRule) {
@@ -201,6 +216,22 @@ export function filterThreadsByFolder(
     }
     return folder.only_unread || folder.exclude_muted;
   });
+}
+
+export function moveArrayItem<T>(items: T[], fromIdx: number, toIdx: number): T[] {
+  if (
+    fromIdx < 0 ||
+    toIdx < 0 ||
+    fromIdx >= items.length ||
+    toIdx >= items.length ||
+    fromIdx === toIdx
+  ) {
+    return items;
+  }
+  const next = [...items];
+  const [moved] = next.splice(fromIdx, 1);
+  next.splice(toIdx, 0, moved);
+  return next;
 }
 
 export function countFolderUnread(
@@ -244,6 +275,12 @@ export function bumpThreadList(list: ThreadDto[], msg: MessageDto, incUnread: bo
     ...target,
     last_preview: msg.ts >= target.last_ts ? preview : target.last_preview,
     last_ts: Math.max(target.last_ts, msg.ts),
+    last_read_in_ts: !incUnread
+      ? Math.max(target.last_read_in_ts ?? 0, msg.ts)
+      : (target.last_read_in_ts ?? 0),
+    peer_read_ts: !msg.is_outgoing
+      ? Math.max(target.peer_read_ts ?? 0, msg.ts)
+      : (target.peer_read_ts ?? 0),
     unread_count: msg.is_outgoing
       ? 0
       : incUnread
@@ -251,4 +288,24 @@ export function bumpThreadList(list: ThreadDto[], msg: MessageDto, incUnread: bo
         : target.unread_count,
   };
   return next.sort(compareThreads);
+}
+
+export function findFirstUnreadMsgId(
+  messages: MessageDto[],
+  lastReadInTs: number,
+  fallbackUnreadCount: number,
+): string | null {
+  if (fallbackUnreadCount <= 0 || messages.length === 0) return null;
+  if (lastReadInTs > 0) {
+    const firstNew = messages.find((m) => !m.is_outgoing && m.ts > lastReadInTs);
+    if (firstNew) return firstNew.msg_id;
+  }
+  let rem = fallbackUnreadCount;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (!messages[i].is_outgoing) {
+      rem -= 1;
+      if (rem <= 0) return messages[i].msg_id;
+    }
+  }
+  return messages.find((m) => !m.is_outgoing)?.msg_id ?? null;
 }

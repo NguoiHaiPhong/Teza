@@ -234,6 +234,10 @@ impl MessageStore {
         )?;
         self.ensure_column("messages", "quote_json", "TEXT")?;
         self.ensure_column("messages", "reactions_json", "TEXT NOT NULL DEFAULT '[]'")?;
+        self.ensure_column("threads", "last_read_in_ts", "INTEGER NOT NULL DEFAULT 0")?;
+        self.ensure_column("threads", "peer_read_ts", "INTEGER NOT NULL DEFAULT 0")?;
+        self.ensure_column("threads", "muted_until_ts", "INTEGER NOT NULL DEFAULT 0")?;
+        self.ensure_column("threads", "is_archived", "INTEGER NOT NULL DEFAULT 0")?;
 
         let existing_check: Option<String> = self
             .conn
@@ -303,6 +307,31 @@ impl MessageStore {
                      0
                    ) = 1;
                  INSERT OR REPLACE INTO store_meta (k, v) VALUES ('fixed_outgoing_unread_v1', '1');",
+            )?;
+        }
+        let backfilled_watermarks: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT v FROM store_meta WHERE k = 'backfill_read_watermarks_v1' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if backfilled_watermarks.is_none() {
+            self.conn.execute_batch(
+                "UPDATE threads
+                 SET peer_read_ts = MAX(
+                     peer_read_ts,
+                     COALESCE((SELECT MAX(m.ts) FROM messages m WHERE m.thread_id = threads.id AND m.is_outgoing = 0), 0)
+                 )
+                 WHERE peer_read_ts = 0;
+                 UPDATE threads
+                 SET last_read_in_ts = MAX(
+                     last_read_in_ts,
+                     COALESCE((SELECT MAX(m.ts) FROM messages m WHERE m.thread_id = threads.id AND m.is_outgoing = 0), last_ts)
+                 )
+                 WHERE unread_count = 0 AND last_read_in_ts = 0;
+                 INSERT OR REPLACE INTO store_meta (k, v) VALUES ('backfill_read_watermarks_v1', '1');",
             )?;
         }
         if had_disk_fts || migrated_rows {
@@ -485,8 +514,8 @@ impl MessageStore {
         let last_ts = normalize_ts_ms(t.last_ts);
         self.conn.execute(
             r#"
-            INSERT INTO threads (id, title, title_norm, avatar, kind, last_preview, last_ts, unread_count, is_pinned, is_muted)
-            VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            INSERT INTO threads (id, title, title_norm, avatar, kind, last_preview, last_ts, unread_count, is_pinned, is_muted, last_read_in_ts, peer_read_ts, muted_until_ts, is_archived)
+            VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?15, ?16, ?17, ?18)
             ON CONFLICT(id) DO UPDATE SET
                 title = CASE WHEN ?12 = 1 THEN threads.title ELSE excluded.title END,
                 title_norm = '',
@@ -502,7 +531,11 @@ impl MessageStore {
                     WHEN ?14 = 1 THEN excluded.is_pinned
                     ELSE MAX(excluded.is_pinned, threads.is_pinned)
                 END,
-                is_muted = MAX(excluded.is_muted, threads.is_muted)
+                is_muted = MAX(excluded.is_muted, threads.is_muted),
+                last_read_in_ts = MAX(threads.last_read_in_ts, excluded.last_read_in_ts),
+                peer_read_ts = MAX(threads.peer_read_ts, excluded.peer_read_ts),
+                muted_until_ts = MAX(threads.muted_until_ts, excluded.muted_until_ts),
+                is_archived = MAX(threads.is_archived, excluded.is_archived)
             "#,
             params![
                 t.id,
@@ -519,6 +552,10 @@ impl MessageStore {
                 title_fallback,
                 clear_unread,
                 overwrite_pinned as i64,
+                normalize_ts_ms(t.last_read_in_ts),
+                normalize_ts_ms(t.peer_read_ts),
+                normalize_ts_ms(t.muted_until_ts),
+                t.is_archived as i64,
             ],
         )?;
         Ok(())
@@ -533,7 +570,7 @@ impl MessageStore {
             FolderFilter::Cloud => "WHERE kind = 'cloud'",
         };
         let sql = format!(
-            "SELECT id, title, avatar, kind, last_preview, last_ts, unread_count, is_pinned, is_muted
+            "SELECT id, title, avatar, kind, last_preview, last_ts, unread_count, is_pinned, is_muted, last_read_in_ts, peer_read_ts, muted_until_ts, is_archived
              FROM threads {where_clause} ORDER BY is_pinned DESC, last_ts DESC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -548,13 +585,31 @@ impl MessageStore {
                 row.get::<_, i64>(6)?,
                 row.get::<_, i64>(7)?,
                 row.get::<_, i64>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, i64>(10)?,
+                row.get::<_, i64>(11)?,
+                row.get::<_, i64>(12)?,
             ))
         })?;
 
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let mut out = Vec::new();
         for r in rows {
-            let (id, enc_title, enc_avatar, kind_str, enc_preview, last_ts, unread, pinned, muted) =
-                r?;
+            let (
+                id,
+                enc_title,
+                enc_avatar,
+                kind_str,
+                enc_preview,
+                last_ts,
+                unread,
+                pinned,
+                muted,
+                last_read_in_ts,
+                peer_read_ts,
+                raw_muted_until_ts,
+                archived,
+            ) = r?;
             let aad = thread_aad(&id);
             let title = self.cipher.decrypt_str(&aad, &enc_title)?;
             let avatar = self.cipher.decrypt_str(&aad, &enc_avatar)?;
@@ -564,6 +619,10 @@ impl MessageStore {
                 "cloud" => ThreadKind::Cloud,
                 _ => ThreadKind::Direct,
             };
+            let mute_expired =
+                muted != 0 && raw_muted_until_ts > 0 && raw_muted_until_ts <= now_ms;
+            let is_muted = muted != 0 && !mute_expired;
+            let muted_until_ts = if is_muted { raw_muted_until_ts } else { 0 };
             out.push(ThreadDto {
                 id,
                 title,
@@ -573,7 +632,11 @@ impl MessageStore {
                 last_ts,
                 unread_count: unread.max(0) as u32,
                 is_pinned: pinned != 0,
-                is_muted: muted != 0,
+                is_muted,
+                last_read_in_ts,
+                peer_read_ts,
+                muted_until_ts,
+                is_archived: archived != 0,
             });
         }
         Ok(out)
@@ -612,7 +675,10 @@ impl MessageStore {
                 is_pinned = MAX(messages.is_pinned, excluded.is_pinned),
                 quote_json = COALESCE(excluded.quote_json, messages.quote_json),
                 reactions_json = CASE WHEN ?15 = 1 THEN messages.reactions_json ELSE excluded.reactions_json END,
-                attachment_url = CASE WHEN excluded.is_recalled = 1 THEN NULL ELSE COALESCE(excluded.attachment_url, messages.attachment_url) END,
+                attachment_url = CASE
+                    WHEN excluded.is_recalled = 1 OR excluded.msg_type IN ('chat.reminder', 'chat.poll') THEN NULL
+                    ELSE COALESCE(excluded.attachment_url, messages.attachment_url)
+                END,
                 attachment_name = CASE WHEN excluded.is_recalled = 1 THEN NULL ELSE COALESCE(excluded.attachment_name, messages.attachment_name) END
             "#,
             params![
@@ -633,6 +699,12 @@ impl MessageStore {
                 reactions_empty,
             ],
         )?;
+        if !m.is_outgoing {
+            tx.execute(
+                "UPDATE threads SET peer_read_ts = MAX(peer_read_ts, ?2) WHERE id = ?1",
+                params![m.thread_id, ts],
+            )?;
+        }
         tx.commit()?;
 
         let fts_tx = self.fts_conn.transaction()?;
@@ -896,6 +968,10 @@ impl MessageStore {
             "UPDATE threads
              SET last_preview = ?2,
                  last_ts = MAX(last_ts, ?3),
+                 last_read_in_ts = CASE
+                     WHEN ?5 = 1 THEN MAX(last_read_in_ts, ?3)
+                     ELSE last_read_in_ts
+                 END,
                  unread_count = CASE
                      WHEN ?5 = 1 THEN 0
                      ELSE unread_count + ?4
@@ -920,6 +996,10 @@ impl MessageStore {
                 unread_count: if inc_unread && !clear_unread { 1 } else { 0 },
                 is_pinned: false,
                 is_muted: false,
+                last_read_in_ts: if clear_unread { ts } else { 0 },
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
             })?;
             return Ok(true);
         }
@@ -928,18 +1008,72 @@ impl MessageStore {
 
     pub fn mark_thread_read(&self, thread_id: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE threads SET unread_count = 0 WHERE id = ?1",
+            "UPDATE threads
+             SET unread_count = 0,
+                 last_read_in_ts = MAX(
+                     last_read_in_ts,
+                     COALESCE((SELECT MAX(ts) FROM messages WHERE thread_id = ?1 AND is_outgoing = 0), last_ts)
+                 )
+             WHERE id = ?1",
             params![thread_id],
         )?;
         Ok(())
     }
 
     pub fn set_thread_unread(&self, thread_id: &str, unread: u32) -> Result<()> {
+        if unread == 0 {
+            return self.mark_thread_read(thread_id);
+        }
         self.conn.execute(
-            "UPDATE threads SET unread_count = ?2 WHERE id = ?1",
+            "UPDATE threads
+             SET unread_count = ?2,
+                 last_read_in_ts = CASE
+                     WHEN (SELECT MAX(ts) FROM messages WHERE thread_id = ?1 AND is_outgoing = 0) IS NOT NULL
+                          AND last_read_in_ts >= (SELECT MAX(ts) FROM messages WHERE thread_id = ?1 AND is_outgoing = 0)
+                     THEN (SELECT MAX(ts) FROM messages WHERE thread_id = ?1 AND is_outgoing = 0) - 1
+                     ELSE last_read_in_ts
+                 END
+             WHERE id = ?1",
             params![thread_id, unread],
         )?;
         Ok(())
+    }
+
+    pub fn update_peer_read_ts(&self, thread_id: &str, seen_ts: i64) -> Result<i64> {
+        let ts = normalize_ts_ms(seen_ts);
+        self.conn.execute(
+            "UPDATE threads SET peer_read_ts = MAX(peer_read_ts, ?2) WHERE id = ?1",
+            params![thread_id, ts],
+        )?;
+        let saved: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT peer_read_ts FROM threads WHERE id = ?1 LIMIT 1",
+                params![thread_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(saved.unwrap_or(ts))
+    }
+
+    pub fn get_latest_incoming_message(&self, thread_id: &str) -> Result<Option<(String, String, i64)>> {
+        let row: Option<(String, String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT msg_id, sender_id, ts FROM messages
+                 WHERE thread_id = ?1 AND is_outgoing = 0
+                 ORDER BY ts DESC LIMIT 1",
+                params![thread_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((msg_id, enc_sender_id, ts)) = row else {
+            return Ok(None);
+        };
+        let sender_id = self
+            .cipher
+            .decrypt_str(&msg_aad(thread_id, &msg_id), &enc_sender_id)?;
+        Ok(Some((msg_id, sender_id, ts)))
     }
 
     pub fn set_thread_pinned(&self, thread_id: &str, pinned: bool) -> Result<()> {
@@ -950,10 +1084,28 @@ impl MessageStore {
         Ok(())
     }
 
-    pub fn set_thread_muted(&self, thread_id: &str, muted: bool) -> Result<()> {
+    pub fn set_thread_muted_until(
+        &self,
+        thread_id: &str,
+        muted: bool,
+        muted_until_ts: i64,
+    ) -> Result<()> {
+        let until = if muted { muted_until_ts.max(0) } else { 0 };
         self.conn.execute(
-            "UPDATE threads SET is_muted = ?2 WHERE id = ?1",
-            params![thread_id, muted as i64],
+            "UPDATE threads SET is_muted = ?2, muted_until_ts = ?3 WHERE id = ?1",
+            params![thread_id, muted as i64, until],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_thread_muted(&self, thread_id: &str, muted: bool) -> Result<()> {
+        self.set_thread_muted_until(thread_id, muted, 0)
+    }
+
+    pub fn set_thread_archived(&self, thread_id: &str, archived: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE threads SET is_archived = ?2 WHERE id = ?1",
+            params![thread_id, archived as i64],
         )?;
         Ok(())
     }
@@ -1015,7 +1167,14 @@ impl MessageStore {
             if media.len() >= limit && files.len() >= limit {
                 break;
             }
-            if m.msg_type.contains("sticker") || m.msg_type == "5" || m.msg_type == "35" || m.msg_type == "36" {
+            let mt_lower = m.msg_type.to_lowercase();
+            if mt_lower.contains("sticker")
+                || mt_lower.contains("reminder")
+                || mt_lower.contains("poll")
+                || m.msg_type == "5"
+                || m.msg_type == "35"
+                || m.msg_type == "36"
+            {
                 continue;
             }
             let url_lower = m
@@ -1023,6 +1182,9 @@ impl MessageStore {
                 .as_deref()
                 .unwrap_or_default()
                 .to_lowercase();
+            if url_lower.contains("/reminder_") || url_lower.contains("/reminder-") {
+                continue;
+            }
             let is_img_or_video = m.msg_type.contains("photo")
                 || m.msg_type == "2"
                 || m.msg_type.contains("video")
@@ -1125,6 +1287,107 @@ impl MessageStore {
             params![folder_id],
         )?;
         Ok(affected > 0)
+    }
+
+    pub fn reorder_chat_folders(&self, ordered_ids: &[String]) -> Result<()> {
+        let mut existing = self.list_chat_folders()?;
+        if existing.is_empty() {
+            return Ok(());
+        }
+        let mut ordered: Vec<ChatFolderDto> = Vec::with_capacity(existing.len());
+        for id in ordered_ids {
+            if let Some(pos) = existing.iter().position(|f| &f.id == id) {
+                ordered.push(existing.remove(pos));
+            }
+        }
+        ordered.extend(existing);
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let res = (|| -> Result<()> {
+            for (idx, mut folder) in ordered.into_iter().enumerate() {
+                folder.position = (idx + 1) as i64;
+                self.save_chat_folder(&folder)?;
+            }
+            Ok(())
+        })();
+        match res {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
+    }
+
+    pub fn thread_interaction_stats(&self, thread_id: &str) -> Result<(u64, u64, i64)> {
+        let row: (i64, i64, i64) = self.conn.query_row(
+            "SELECT
+                COUNT(*),
+                COALESCE(SUM(CASE WHEN attachment_url IS NOT NULL AND attachment_url != '' AND LOWER(msg_type) NOT IN ('chat.sticker', 'sticker', '5', '35', '36') THEN 1 ELSE 0 END), 0),
+                COALESCE(MAX(ts), 0)
+             FROM messages
+             WHERE thread_id = ?1 AND is_recalled = 0",
+            params![thread_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        Ok((row.0.max(0) as u64, row.1.max(0) as u64, row.2))
+    }
+
+    pub fn list_recent_stickers(&self, limit: usize) -> Result<Vec<(u64, u64, String)>> {
+        let scan_limit = limit.saturating_mul(5).max(150) as i64;
+        let rows = self.query_messages(
+            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name
+             FROM messages
+             WHERE is_recalled = 0
+               AND attachment_url IS NOT NULL
+               AND attachment_url != ''
+               AND LOWER(msg_type) IN ('chat.sticker', 'sticker', '5', '35', '36')
+             ORDER BY ts DESC, msg_id DESC
+             LIMIT ?1",
+            params![scan_limit],
+        )?;
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for m in rows {
+            if out.len() >= limit {
+                break;
+            }
+            let Some(url) = m.attachment_url.clone().filter(|u| !u.is_empty()) else {
+                continue;
+            };
+            let mut cate_id = 0_u64;
+            let mut sticker_id = 0_u64;
+            if let Some(name) = m.attachment_name.as_deref() {
+                if let Some(rest) = name.strip_prefix("sticker_") {
+                    let parts: Vec<&str> = rest.split(['_', '.']).collect();
+                    if parts.len() >= 2 {
+                        cate_id = parts[0].parse().unwrap_or(0);
+                        sticker_id = parts[1].parse().unwrap_or(0);
+                    }
+                }
+            }
+            if sticker_id == 0 {
+                if let Some(eid_part) = url.split("eid=").nth(1) {
+                    sticker_id = eid_part
+                        .split('&')
+                        .next()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                } else if let Some(last) = url.split('/').next_back() {
+                    sticker_id = last
+                        .split('.')
+                        .next()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                }
+            }
+            if sticker_id > 0 && seen.insert(sticker_id) {
+                out.push((sticker_id, cate_id, url));
+            }
+        }
+        Ok(out)
     }
 
     pub fn list_pinned_messages(&self, thread_id: &str, limit: usize) -> Result<Vec<MessageDto>> {
@@ -1311,6 +1574,10 @@ mod tests {
                     unread_count: 1,
                     is_pinned: false,
                     is_muted: false,
+                    last_read_in_ts: 0,
+                    peer_read_ts: 0,
+                    muted_until_ts: 0,
+                    is_archived: false,
                 })
                 .unwrap();
             store
@@ -1573,6 +1840,10 @@ mod tests {
                 unread_count: 0,
                 is_pinned: true,
                 is_muted: false,
+                last_read_in_ts: 0,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
             })
             .unwrap();
         store
@@ -1586,6 +1857,10 @@ mod tests {
                 unread_count: 0,
                 is_pinned: false,
                 is_muted: false,
+                last_read_in_ts: 0,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
             })
             .unwrap();
         store
@@ -1760,6 +2035,10 @@ mod tests {
             unread_count: 0,
             is_pinned: true,
             is_muted: false,
+            last_read_in_ts: 0,
+            peer_read_ts: 0,
+            muted_until_ts: 0,
+            is_archived: false,
         };
         store.upsert_thread(&t).unwrap();
         assert!(store.list_threads(FolderFilter::All).unwrap()[0].is_pinned);
@@ -1950,6 +2229,7 @@ mod tests {
             icon: "briefcase".into(),
             color: "#CFA13A".into(),
             thread_ids: vec!["t1".into(), "t2".into()],
+            excluded_thread_ids: Vec::new(),
             include_kinds: vec![ThreadKind::Group],
             only_unread: false,
             exclude_muted: true,
@@ -1962,6 +2242,7 @@ mod tests {
             icon: "star".into(),
             color: String::new(),
             thread_ids: vec!["t9".into()],
+            excluded_thread_ids: Vec::new(),
             include_kinds: Vec::new(),
             only_unread: true,
             exclude_muted: false,
@@ -2023,6 +2304,340 @@ mod tests {
         let links = store.list_thread_links("t1", 20).unwrap();
         let ids: Vec<&str> = links.iter().map(|m| m.msg_id.as_str()).collect();
         assert_eq!(ids, vec!["m4", "m2"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn thread_interaction_stats_and_recent_stickers_work() {
+        let dir = std::env::temp_dir().join(format!("teza-stats-stk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = MessageStore::open(&dir.join("stats.db")).unwrap();
+
+        for (id, thread_id, msg_type, url, name, ts) in [
+            ("m1", "u-1", "chat.text", None, None, 1_700_000_001_000),
+            (
+                "m2",
+                "u-1",
+                "chat.photo",
+                Some("https://f.zdn.vn/pic.jpg"),
+                Some("pic.jpg"),
+                1_700_000_002_000,
+            ),
+            (
+                "s1",
+                "u-1",
+                "chat.sticker",
+                Some("https://api.zaloapp.com/api/emoticon/sticker/webpc?eid=2005&size=130"),
+                Some("sticker_12_2005.png"),
+                1_700_000_003_000,
+            ),
+            (
+                "s2",
+                "grp-2",
+                "chat.sticker",
+                Some("https://stc-chat.zdn.vn/images/stickers/default/thumb/7.png"),
+                None,
+                1_700_000_004_000,
+            ),
+        ] {
+            store
+                .upsert_message(&MessageDto {
+                    msg_id: id.into(),
+                    thread_id: thread_id.into(),
+                    sender_id: "u-1".into(),
+                    sender_name: "An".into(),
+                    text: id.into(),
+                    msg_type: msg_type.into(),
+                    ts,
+                    is_outgoing: false,
+                    is_recalled: false,
+                    is_pinned: false,
+                    quote: None,
+                    reactions: Vec::new(),
+                    attachment_url: url.map(str::to_string),
+                    attachment_name: name.map(str::to_string),
+                })
+                .unwrap();
+        }
+
+        let (total, media, last_ts) = store.thread_interaction_stats("u-1").unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(media, 1); // excludes sticker from media count
+        assert_eq!(last_ts, 1_700_000_003_000);
+
+        let stickers = store.list_recent_stickers(10).unwrap();
+        assert_eq!(stickers.len(), 2);
+        assert_eq!(stickers[0].0, 7);
+        assert_eq!(stickers[1].0, 2005);
+        assert_eq!(stickers[1].1, 12);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_watermarks_and_peer_seen_persist_correctly() {
+        let dir = std::env::temp_dir().join(format!("teza-watermarks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = MessageStore::open(&dir.join("watermarks.db")).unwrap();
+
+        store
+            .upsert_thread(&ThreadDto {
+                id: "dm-1".into(),
+                title: "Minh".into(),
+                avatar: String::new(),
+                kind: ThreadKind::Direct,
+                last_preview: "Ping".into(),
+                last_ts: 1_700_000_030_000,
+                unread_count: 1,
+                is_pinned: false,
+                is_muted: false,
+                last_read_in_ts: 1_700_000_010_000,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
+            })
+            .unwrap();
+
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "m1".into(),
+                thread_id: "dm-1".into(),
+                sender_id: "dm-1".into(),
+                sender_name: "Minh".into(),
+                text: "Msg 1".into(),
+                msg_type: "chat.text".into(),
+                ts: 1_700_000_010_000,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "m2".into(),
+                thread_id: "dm-1".into(),
+                sender_id: "me".into(),
+                sender_name: "Bạn".into(),
+                text: "Msg 2".into(),
+                msg_type: "chat.text".into(),
+                ts: 1_700_000_020_000,
+                is_outgoing: true,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "m3".into(),
+                thread_id: "dm-1".into(),
+                sender_id: "dm-1".into(),
+                sender_name: "Minh".into(),
+                text: "Msg 3".into(),
+                msg_type: "chat.text".into(),
+                ts: 1_700_000_030_000,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+
+        // Peer reply advances peer_read_ts to 1_700_000_030_000
+        let listed = store.list_threads(FolderFilter::All).unwrap();
+        assert_eq!(listed[0].peer_read_ts, 1_700_000_030_000);
+        assert_eq!(listed[0].last_read_in_ts, 1_700_000_010_000);
+
+        let latest_in = store.get_latest_incoming_message("dm-1").unwrap().unwrap();
+        assert_eq!(latest_in.0, "m3");
+        assert_eq!(latest_in.1, "dm-1");
+        assert_eq!(latest_in.2, 1_700_000_030_000);
+
+        // Mark read advances last_read_in_ts to latest incoming message ts
+        store.mark_thread_read("dm-1").unwrap();
+        let after_read = store.list_threads(FolderFilter::All).unwrap();
+        assert_eq!(after_read[0].unread_count, 0);
+        assert_eq!(after_read[0].last_read_in_ts, 1_700_000_030_000);
+
+        // Mark unread rewinds last_read_in_ts below latest incoming ts
+        store.set_thread_unread("dm-1", 1).unwrap();
+        let after_unread = store.list_threads(FolderFilter::All).unwrap();
+        assert_eq!(after_unread[0].unread_count, 1);
+        assert_eq!(after_unread[0].last_read_in_ts, 1_700_000_029_999);
+
+        // update_peer_read_ts advances peer_read_ts monotonically
+        let p = store.update_peer_read_ts("dm-1", 1_700_000_050).unwrap();
+        assert_eq!(p, 1_700_000_050_000);
+        let kept = store.update_peer_read_ts("dm-1", 1_700_000_010_000).unwrap();
+        assert_eq!(kept, 1_700_000_050_000);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn timed_mute_persists_and_expires_in_list_threads() {
+        let dir = std::env::temp_dir().join(format!("teza-timed-mute-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = MessageStore::open(&dir.join("mute.db")).unwrap();
+
+        let now = chrono::Utc::now().timestamp_millis();
+        store
+            .upsert_thread(&ThreadDto {
+                id: "m-future".into(),
+                title: "Muted Future".into(),
+                avatar: String::new(),
+                kind: ThreadKind::Direct,
+                last_preview: "hi".into(),
+                last_ts: now,
+                unread_count: 0,
+                is_pinned: false,
+                is_muted: false,
+                last_read_in_ts: 0,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
+            })
+            .unwrap();
+        store
+            .upsert_thread(&ThreadDto {
+                id: "m-expired".into(),
+                title: "Muted Expired".into(),
+                avatar: String::new(),
+                kind: ThreadKind::Direct,
+                last_preview: "hi".into(),
+                last_ts: now - 1000,
+                unread_count: 0,
+                is_pinned: false,
+                is_muted: false,
+                last_read_in_ts: 0,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
+            })
+            .unwrap();
+
+        store
+            .set_thread_muted_until("m-future", true, now + 3_600_000)
+            .unwrap();
+        store
+            .set_thread_muted_until("m-expired", true, now - 60_000)
+            .unwrap();
+
+        let list = store.list_threads(FolderFilter::All).unwrap();
+        let future = list.iter().find(|t| t.id == "m-future").unwrap();
+        assert!(future.is_muted);
+        assert!(future.muted_until_ts > now);
+
+        let expired = list.iter().find(|t| t.id == "m-expired").unwrap();
+        assert!(!expired.is_muted);
+        assert_eq!(expired.muted_until_ts, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_and_folder_reorder_and_excluded_ids_persist() {
+        let dir = std::env::temp_dir().join(format!("teza-g3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = MessageStore::open(&dir.join("g3.db")).unwrap();
+
+        let now = chrono::Utc::now().timestamp_millis();
+        store
+            .upsert_thread(&ThreadDto {
+                id: "arch-1".into(),
+                title: "Archived Thread".into(),
+                avatar: String::new(),
+                kind: ThreadKind::Direct,
+                last_preview: "old".into(),
+                last_ts: now,
+                unread_count: 0,
+                is_pinned: false,
+                is_muted: false,
+                last_read_in_ts: 0,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
+            })
+            .unwrap();
+        store.set_thread_archived("arch-1", true).unwrap();
+        let list = store.list_threads(FolderFilter::All).unwrap();
+        assert!(list.iter().find(|t| t.id == "arch-1").unwrap().is_archived);
+
+        // Local upsert preserves archived flag
+        store
+            .upsert_thread(&ThreadDto {
+                id: "arch-1".into(),
+                title: "Archived Thread".into(),
+                avatar: String::new(),
+                kind: ThreadKind::Direct,
+                last_preview: "new preview".into(),
+                last_ts: now + 1000,
+                unread_count: 1,
+                is_pinned: false,
+                is_muted: false,
+                last_read_in_ts: 0,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
+            })
+            .unwrap();
+        let list = store.list_threads(FolderFilter::All).unwrap();
+        assert!(list.iter().find(|t| t.id == "arch-1").unwrap().is_archived);
+
+        store.set_thread_archived("arch-1", false).unwrap();
+        let list = store.list_threads(FolderFilter::All).unwrap();
+        assert!(!list.iter().find(|t| t.id == "arch-1").unwrap().is_archived);
+
+        let f1 = ChatFolderDto {
+            id: "f-a".into(),
+            name: "Folder A".into(),
+            icon: "folder".into(),
+            color: String::new(),
+            thread_ids: vec!["t1".into()],
+            excluded_thread_ids: vec!["t2".into()],
+            include_kinds: vec![ThreadKind::Direct],
+            only_unread: false,
+            exclude_muted: false,
+            position: 1,
+            remote_label_id: None,
+        };
+        let f2 = ChatFolderDto {
+            id: "f-b".into(),
+            name: "Folder B".into(),
+            icon: "star".into(),
+            color: String::new(),
+            thread_ids: vec![],
+            excluded_thread_ids: vec!["t3".into()],
+            include_kinds: vec![ThreadKind::Group],
+            only_unread: false,
+            exclude_muted: false,
+            position: 2,
+            remote_label_id: None,
+        };
+        store.save_chat_folder(&f1).unwrap();
+        store.save_chat_folder(&f2).unwrap();
+        store
+            .reorder_chat_folders(&["f-b".to_string(), "f-a".to_string()])
+            .unwrap();
+        let folders = store.list_chat_folders().unwrap();
+        assert_eq!(folders.len(), 2);
+        assert_eq!(folders[0].id, "f-b");
+        assert_eq!(folders[0].position, 1);
+        assert_eq!(folders[0].excluded_thread_ids, vec!["t3".to_string()]);
+        assert_eq!(folders[1].id, "f-a");
+        assert_eq!(folders[1].position, 2);
+        assert_eq!(folders[1].excluded_thread_ids, vec!["t2".to_string()]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

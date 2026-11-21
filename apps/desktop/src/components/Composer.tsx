@@ -1,25 +1,53 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { CornerUpLeft, FileText, Image as ImageIcon, Loader2, Paperclip, Send, Smile, X, Zap } from "lucide-react";
+import { BarChart3, CalendarClock, CornerUpLeft, FileText, Image as ImageIcon, Loader2, Paperclip, Search, Send, Smile, X, Zap } from "lucide-react";
 import { bridge, isTauri, MAX_ATTACHMENT_BYTES } from "../bridge";
+import { useI18n, type TranslationKey } from "../i18n";
 import type { MessageDto, PendingAttachment, StickerItem, ThreadMemberDto } from "../types";
 import { extFromMime, extractAttachmentFromClipboard } from "../utils/clipboardParse";
+import { EMOJI_CATEGORIES, searchEmojis } from "../utils/emojiCatalog";
 import { RelayImage } from "./RelayImage";
 import { ThreadAvatar } from "./ThreadAvatar";
 
-const EMOJI_GROUPS: { label: string; items: string[] }[] = [
-  {
-    label: "Thường dùng",
-    items: ["😀", "😂", "🥰", "😍", "😊", "😭", "😮", "🤔", "🙏", "👍", "❤️", "🔥", "🎉", "👏", "✨", "💯"],
-  },
-  {
-    label: "Cảm xúc",
-    items: ["😅", "🤣", "😉", "😎", "🥳", "😢", "😡", "🤯", "😴", "🤗", "🤭", "😇", "🥺", "😤", "😬", "🫠"],
-  },
-  {
-    label: "Công việc",
-    items: ["✅", "📌", "📎", "📝", "📅", "⏰", "💡", "🚀", "👀", "👌", "🤝", "💪", "📊", "📁", "⚠️", "❌"],
-  },
-];
+const RECENT_EMOJIS_KEY = "teza.recentEmojis";
+const MAX_RECENT_EMOJIS = 24;
+const STICKER_QUICK_TAGS = ["Haha", "Hi", "Love", "OK", "Thanks", "Cute"];
+const STICKER_CATEGORY_TABS = ["Tất cả", "Gần đây", "Gợi ý", "Mặc định"] as const;
+const STICKER_CAT_LABEL_KEYS: Record<(typeof STICKER_CATEGORY_TABS)[number], TranslationKey> = {
+  "Tất cả": "folderAll",
+  "Gần đây": "recentUsedLabel",
+  "Gợi ý": "stickerCatSuggested",
+  "Mặc định": "stickerCatDefault",
+};
+const EMOJI_CAT_LABEL_KEYS: Record<string, TranslationKey> = {
+  smileys: "emojiCatSmileys",
+  gestures: "emojiCatGestures",
+  hearts: "emojiCatHearts",
+  nature: "emojiCatNature",
+  food: "emojiCatFood",
+  work: "emojiCatWork",
+  activities: "emojiCatActivities",
+};
+
+function readRecentEmojis(): string[] {
+  try {
+    const raw = window.localStorage.getItem(RECENT_EMOJIS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string").slice(0, MAX_RECENT_EMOJIS) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveRecentEmoji(emoji: string): string[] {
+  const next = [emoji, ...readRecentEmojis().filter((item) => item !== emoji)].slice(0, MAX_RECENT_EMOJIS);
+  try {
+    window.localStorage.setItem(RECENT_EMOJIS_KEY, JSON.stringify(next));
+  } catch {
+    // Ignore storage quota errors in restricted webviews.
+  }
+  return next;
+}
 
 interface Props {
   threadKey?: string;
@@ -34,8 +62,11 @@ interface Props {
   onSendText: (text: string) => Promise<boolean | void>;
   onSendAttachment?: (att: PendingAttachment, caption: string) => Promise<boolean | void | unknown>;
   onBuzz?: () => Promise<void>;
+  onOpenReminder?: () => void;
+  onOpenPoll?: () => void;
   buzzCooldownSec?: number;
   placeholder?: string;
+  sendOnEnter?: boolean;
   globalPasteFallback?: boolean;
   onError: (err: unknown) => void;
 }
@@ -59,8 +90,11 @@ export function Composer({
   onSendText,
   onSendAttachment,
   onBuzz,
+  onOpenReminder,
+  onOpenPoll,
   buzzCooldownSec = 0,
   placeholder,
+  sendOnEnter = true,
   globalPasteFallback = false,
   onError,
 }: Props) {
@@ -130,18 +164,38 @@ export function Composer({
       onDraftChangeRef.current?.(val, scheduledKey);
     }, 350);
   };
+  const { t } = useI18n();
   const [sending, setSending] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [pickerMode, setPickerMode] = useState<"emoji" | "sticker">("emoji");
-  const [emojiTab, setEmojiTab] = useState(0);
+  const [recentEmojis, setRecentEmojis] = useState<string[]>(() => readRecentEmojis());
+  const [emojiTab, setEmojiTab] = useState<string>(() =>
+    readRecentEmojis().length > 0 ? "recent" : (EMOJI_CATEGORIES[0]?.id ?? "smileys"),
+  );
+  const [emojiQuery, setEmojiQuery] = useState("");
   const [stickers, setStickers] = useState<StickerItem[] | null>(null);
   const [stickersLoading, setStickersLoading] = useState(false);
+  const [stickerQuery, setStickerQuery] = useState("");
+  const [stickerCategory, setStickerCategory] = useState<(typeof STICKER_CATEGORY_TABS)[number]>("Tất cả");
+  const [searchedStickers, setSearchedStickers] = useState<StickerItem[] | null>(null);
+  const [stickersSearching, setStickersSearching] = useState(false);
   const [cursorPos, setCursorPos] = useState(0);
   const [mentionIndex, setMentionIndex] = useState(0);
   const [mentionDismissedAt, setMentionDismissedAt] = useState<number | null>(null);
   const isComposingRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+
+  useEffect(() => {
+    if (!emojiOpen) return;
+    const onWindowKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setEmojiOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onWindowKeyDown);
+    return () => window.removeEventListener("keydown", onWindowKeyDown);
+  }, [emojiOpen]);
 
   useEffect(() => {
     if (!emojiOpen || pickerMode !== "sticker" || stickers !== null || !onSendSticker) return;
@@ -165,6 +219,75 @@ export function Composer({
       cancelled = true;
     };
   }, [emojiOpen, pickerMode, stickers, onSendSticker, onError]);
+
+  useEffect(() => {
+    if (!emojiOpen || pickerMode !== "sticker" || !onSendSticker) return;
+    const trimmed = stickerQuery.trim();
+    if (!trimmed) {
+      setSearchedStickers(null);
+      setStickersSearching(false);
+      return;
+    }
+    let cancelled = false;
+    setStickersSearching(true);
+    const timer = window.setTimeout(() => {
+      void bridge
+        .searchStickers(trimmed)
+        .then((list) => {
+          if (!cancelled) setSearchedStickers(list);
+        })
+        .catch(() => {
+          if (!cancelled) setSearchedStickers([]);
+        })
+        .finally(() => {
+          if (!cancelled) setStickersSearching(false);
+        });
+    }, 250);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [emojiOpen, pickerMode, stickerQuery, onSendSticker]);
+
+  const activeEmojiCategory = useMemo(
+    () => EMOJI_CATEGORIES.find((cat) => cat.id === emojiTab) ?? EMOJI_CATEGORIES[0],
+    [emojiTab],
+  );
+
+  const visibleEmojis = useMemo(() => {
+    const trimmed = emojiQuery.trim();
+    if (trimmed) return searchEmojis(trimmed);
+    if (emojiTab === "recent") return recentEmojis;
+    return activeEmojiCategory ? activeEmojiCategory.items.map((item) => item.emoji) : [];
+  }, [emojiQuery, emojiTab, recentEmojis, activeEmojiCategory]);
+
+  const visibleStickers = useMemo(() => {
+    if (stickerQuery.trim()) return searchedStickers ?? [];
+    if (!stickers) return [];
+    if (stickerCategory === "Tất cả") return stickers;
+    return stickers.filter((s) => (s.category ?? "Mặc định") === stickerCategory);
+  }, [stickerQuery, searchedStickers, stickers, stickerCategory]);
+
+  const insertEmojiAtCaret = (emoji: string) => {
+    const input = textareaRef.current;
+    const rawStart =
+      input && typeof input.selectionStart === "number" ? input.selectionStart : Math.min(cursorPos, draft.length);
+    const rawEnd = input && typeof input.selectionEnd === "number" ? input.selectionEnd : rawStart;
+    const safeStart = Math.max(0, Math.min(rawStart, draft.length));
+    const safeEnd = Math.max(safeStart, Math.min(rawEnd, draft.length));
+    const nextText = `${draft.slice(0, safeStart)}${emoji}${draft.slice(safeEnd)}`;
+    const nextCursor = safeStart + emoji.length;
+    setDraft(nextText);
+    setCursorPos(nextCursor);
+    setRecentEmojis(saveRecentEmoji(emoji));
+    requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (el) {
+        el.focus();
+        el.setSelectionRange(nextCursor, nextCursor);
+      }
+    });
+  };
 
   const mentionMatch = useMemo(() => {
     if (mentionMembers.length === 0) return null;
@@ -390,7 +513,7 @@ export function Composer({
             <CornerUpLeft className="h-4 w-4 shrink-0" style={{ color: "var(--accent)" }} />
             <div className="min-w-0 border-l-2 pl-2" style={{ borderColor: "var(--accent)" }}>
               <div className="font-semibold" style={{ color: "var(--accent)" }}>
-                Trả lời {replyTo.sender_name}
+                {t("replyingTo")} {replyTo.sender_name}
               </div>
               <div className="truncate" style={{ color: "var(--text-secondary)" }}>
                 {replyTo.text}
@@ -440,7 +563,7 @@ export function Composer({
                 </span>
               </div>
               <div style={{ color: "var(--text-secondary)" }}>
-                Nhập chú thích bên dưới rồi nhấn Enter để gửi
+                {t("enterToNewlineHint")}
               </div>
             </div>
           </div>
@@ -463,7 +586,7 @@ export function Composer({
               className="px-2 py-1 text-[11px] font-semibold uppercase tracking-wider"
               style={{ color: "var(--text-secondary)" }}
             >
-              Nhắc tên thành viên
+              {t("mentionMembersHeader")}
             </div>
             {mentionMatches.map((m, idx) => (
               <button
@@ -497,7 +620,7 @@ export function Composer({
 
         {emojiOpen && (
           <div
-            className="absolute bottom-full left-4 z-30 mb-2 w-76 rounded-2xl p-3 shadow-2xl"
+            className="absolute bottom-full left-4 z-30 mb-2 w-[360px] max-w-[calc(100vw-2rem)] rounded-2xl p-3 shadow-2xl"
             style={{ background: "var(--bg-sidebar)", border: "1px solid var(--border-subtle)" }}
           >
             <div
@@ -526,7 +649,7 @@ export function Composer({
                       color: pickerMode === "sticker" ? "var(--accent)" : "var(--text-secondary)",
                     }}
                   >
-                    Nhãn dán
+                    {t("stickerTabLabel")}
                   </button>
                 )}
               </div>
@@ -535,6 +658,7 @@ export function Composer({
                 onClick={() => setEmojiOpen(false)}
                 className="hover-menu rounded p-1"
                 style={{ color: "var(--text-secondary)" }}
+                aria-label={t("closeEmojiPanelLabel")}
               >
                 <X className="h-3.5 w-3.5" />
               </button>
@@ -542,86 +666,228 @@ export function Composer({
 
             {pickerMode === "emoji" ? (
               <>
-                <div className="mb-2 flex gap-1">
-                  {EMOJI_GROUPS.map((g, idx) => (
+                <div
+                  className="mb-2 flex items-center gap-1.5 rounded-xl px-2.5 py-1.5"
+                  style={{ background: "var(--bg-input)", border: "1px solid var(--border-subtle)" }}
+                >
+                  <Search className="h-3.5 w-3.5 shrink-0" style={{ color: "var(--text-muted)" }} />
+                  <input
+                    type="text"
+                    value={emojiQuery}
+                    onChange={(e) => setEmojiQuery(e.target.value)}
+                    placeholder={t("searchEmojiPlaceholder")}
+                    className="min-w-0 flex-1 bg-transparent text-xs outline-none"
+                    style={{ color: "var(--text-primary)" }}
+                  />
+                  {emojiQuery && (
                     <button
-                      key={g.label}
                       type="button"
-                      onClick={() => setEmojiTab(idx)}
-                      className="rounded-lg px-2 py-1 text-[11px] font-medium transition"
-                      style={{
-                        background: emojiTab === idx ? "var(--bg-hover)" : "transparent",
-                        color: emojiTab === idx ? "var(--accent)" : "var(--text-secondary)",
-                      }}
+                      onClick={() => setEmojiQuery("")}
+                      className="rounded p-0.5 transition hover:opacity-80"
+                      style={{ color: "var(--text-secondary)" }}
+                      aria-label={t("clearEmojiSearchLabel")}
                     >
-                      {g.label}
+                      <X className="h-3 w-3" />
                     </button>
-                  ))}
+                  )}
                 </div>
-                <div className="grid grid-cols-8 gap-1">
-                  {EMOJI_GROUPS[emojiTab].items.map((emoji) => (
-                    <button
-                      key={emoji}
-                      type="button"
-                      onClick={() => {
-                        const end = Math.min(cursorPos, draft.length);
-                        const nextText = `${draft.slice(0, end)}${emoji}${draft.slice(end)}`;
-                        const nextCursor = end + emoji.length;
-                        setDraft(nextText);
-                        setCursorPos(nextCursor);
-                        requestAnimationFrame(() => {
-                          const el = textareaRef.current;
-                          if (el) {
-                            el.focus();
-                            el.setSelectionRange(nextCursor, nextCursor);
-                          }
-                        });
-                      }}
-                      className="hover-menu flex h-8 w-8 items-center justify-center rounded-lg text-base transition hover:scale-110"
-                    >
-                      {emoji}
-                    </button>
-                  ))}
-                </div>
-              </>
-            ) : stickersLoading ? (
-              <div
-                className="flex h-44 items-center justify-center gap-2 text-xs"
-                style={{ color: "var(--text-secondary)" }}
-              >
-                <Loader2 className="h-4 w-4 animate-spin" />
-                <span>Đang tải nhãn dán...</span>
-              </div>
-            ) : !stickers || stickers.length === 0 ? (
-              <div
-                className="flex h-44 items-center justify-center text-xs"
-                style={{ color: "var(--text-secondary)" }}
-              >
-                Chưa có nhãn dán khả dụng
-              </div>
-            ) : (
-              <div className="grid max-h-56 grid-cols-4 gap-2 overflow-y-auto pr-1">
-                {stickers.map((s) => (
+
+                <div className="mb-1.5 flex items-center gap-1 overflow-x-auto pb-1">
                   <button
-                    key={`${s.cate_id}-${s.id}`}
                     type="button"
+                    title={t("recentUsedLabel")}
                     onClick={() => {
-                      setEmojiOpen(false);
-                      void onSendSticker?.(s);
+                      setEmojiQuery("");
+                      setEmojiTab("recent");
                     }}
-                    className="hover-surface flex items-center justify-center rounded-xl p-1.5 transition hover:scale-105"
+                    className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-sm transition"
+                    style={{
+                      background: !emojiQuery.trim() && emojiTab === "recent" ? "var(--accent-soft)" : "transparent",
+                      color: !emojiQuery.trim() && emojiTab === "recent" ? "var(--accent)" : "var(--text-secondary)",
+                    }}
                   >
-                    <RelayImage
-                      src={s.url}
-                      alt={`Sticker ${s.id}`}
-                      loading="lazy"
-                      decoding="async"
-                      referrerPolicy="no-referrer"
-                      className="h-14 w-14 object-contain"
-                    />
+                    🕒
                   </button>
-                ))}
-              </div>
+                  {EMOJI_CATEGORIES.map((cat) => {
+                    const active = !emojiQuery.trim() && emojiTab === cat.id;
+                    const catLabel = EMOJI_CAT_LABEL_KEYS[cat.id] ? t(EMOJI_CAT_LABEL_KEYS[cat.id]) : cat.label;
+                    return (
+                      <button
+                        key={cat.id}
+                        type="button"
+                        title={catLabel}
+                        onClick={() => {
+                          setEmojiQuery("");
+                          setEmojiTab(cat.id);
+                        }}
+                        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-sm transition"
+                        style={{
+                          background: active ? "var(--accent-soft)" : "transparent",
+                          color: active ? "var(--accent)" : "var(--text-secondary)",
+                        }}
+                      >
+                        {cat.icon}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <div className="mb-1.5 flex items-center justify-between text-[11px] font-medium" style={{ color: "var(--text-muted)" }}>
+                  <span>
+                    {emojiQuery.trim()
+                      ? t("searchResultsCount", { count: visibleEmojis.length })
+                      : emojiTab === "recent"
+                        ? t("recentUsedLabel")
+                        : activeEmojiCategory
+                          ? (EMOJI_CAT_LABEL_KEYS[activeEmojiCategory.id]
+                              ? t(EMOJI_CAT_LABEL_KEYS[activeEmojiCategory.id])
+                              : activeEmojiCategory.label)
+                          : ""}
+                  </span>
+                </div>
+
+                {visibleEmojis.length === 0 ? (
+                  <div
+                    className="flex h-44 items-center justify-center text-center text-xs"
+                    style={{ color: "var(--text-secondary)" }}
+                  >
+                    {emojiQuery.trim()
+                      ? t("noEmojiFound")
+                      : t("noRecentEmoji")}
+                  </div>
+                ) : (
+                  <div className="grid max-h-56 grid-cols-8 gap-1 overflow-y-auto pr-1">
+                    {visibleEmojis.map((emoji) => (
+                      <button
+                        key={emoji}
+                        type="button"
+                        onClick={() => insertEmojiAtCaret(emoji)}
+                        className="hover-menu flex h-8 w-8 items-center justify-center rounded-lg text-base transition hover:scale-110"
+                      >
+                        {emoji}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </>
+            ) : (
+              <>
+                <div
+                  className="mb-2 flex items-center gap-1.5 rounded-xl px-2.5 py-1.5"
+                  style={{ background: "var(--bg-input)", border: "1px solid var(--border-subtle)" }}
+                >
+                  <Search className="h-3.5 w-3.5 shrink-0" style={{ color: "var(--text-muted)" }} />
+                  <input
+                    type="text"
+                    value={stickerQuery}
+                    onChange={(e) => setStickerQuery(e.target.value)}
+                    placeholder={t("searchStickerPlaceholder")}
+                    className="min-w-0 flex-1 bg-transparent text-xs outline-none"
+                    style={{ color: "var(--text-primary)" }}
+                  />
+                  {stickerQuery && (
+                    <button
+                      type="button"
+                      onClick={() => setStickerQuery("")}
+                      className="rounded p-0.5 transition hover:opacity-80"
+                      style={{ color: "var(--text-secondary)" }}
+                      aria-label={t("clearStickerSearchLabel")}
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  )}
+                </div>
+
+                <div className="mb-2 flex flex-wrap gap-1">
+                  {STICKER_QUICK_TAGS.map((tag) => {
+                    const active = stickerQuery.trim().toLowerCase() === tag.toLowerCase();
+                    return (
+                      <button
+                        key={tag}
+                        type="button"
+                        onClick={() => setStickerQuery(active ? "" : tag)}
+                        className="rounded-full px-2 py-0.5 text-[11px] font-medium transition"
+                        style={{
+                          background: active ? "var(--accent-soft)" : "var(--bg-hover)",
+                          color: active ? "var(--accent)" : "var(--text-secondary)",
+                        }}
+                      >
+                        {tag}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {!stickerQuery.trim() && (
+                  <div className="mb-2 flex gap-1 overflow-x-auto pb-0.5">
+                    {STICKER_CATEGORY_TABS.map((cat) => {
+                      const active = stickerCategory === cat;
+                      return (
+                        <button
+                          key={cat}
+                          type="button"
+                          onClick={() => setStickerCategory(cat)}
+                          className="shrink-0 rounded-lg px-2 py-1 text-[11px] font-medium transition"
+                          style={{
+                            background: active ? "var(--accent-soft)" : "transparent",
+                            color: active ? "var(--accent)" : "var(--text-secondary)",
+                          }}
+                        >
+                          {t(STICKER_CAT_LABEL_KEYS[cat])}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {(stickerQuery.trim() ? stickersSearching : stickersLoading) ? (
+                  <div
+                    className="flex h-48 items-center justify-center gap-2 text-xs"
+                    style={{ color: "var(--text-secondary)" }}
+                  >
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    <span>{stickerQuery.trim() ? t("searchingStickers") : t("loadingStickers")}</span>
+                  </div>
+                ) : visibleStickers.length === 0 ? (
+                  <div
+                    className="flex h-48 items-center justify-center text-center text-xs"
+                    style={{ color: "var(--text-secondary)" }}
+                  >
+                    {stickerQuery.trim() ? t("noStickerFound") : t("noStickersAvailable")}
+                  </div>
+                ) : (
+                  <div className="grid max-h-60 grid-cols-4 gap-2 overflow-y-auto pr-1">
+                    {visibleStickers.map((s, idx) => (
+                      <button
+                        key={`${s.cate_id}-${s.id}-${idx}`}
+                        type="button"
+                        onClick={() => {
+                          setStickers((prev) =>
+                            prev
+                              ? [
+                                  { ...s, category: "Gần đây" },
+                                  ...prev.filter((item) => !(item.id === s.id && item.cate_id === s.cate_id)),
+                                ]
+                              : prev,
+                          );
+                          setEmojiOpen(false);
+                          void onSendSticker?.(s);
+                        }}
+                        className="hover-surface flex items-center justify-center rounded-xl p-1.5 transition hover:scale-105"
+                      >
+                        <RelayImage
+                          src={s.url}
+                          alt={`Sticker ${s.id}`}
+                          loading="lazy"
+                          decoding="async"
+                          referrerPolicy="no-referrer"
+                          className="h-14 w-14 object-contain"
+                        />
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </>
             )}
           </div>
         )}
@@ -663,7 +929,7 @@ export function Composer({
           <button
             type="button"
             onClick={() => void handleAttachClick()}
-            title="Đính kèm tệp hoặc hình ảnh (tối đa 100 MB)"
+            title={t("composerAttachTitle")}
             className="hover-surface rounded-lg p-2 transition"
             style={{ color: "var(--text-secondary)" }}
           >
@@ -674,7 +940,7 @@ export function Composer({
         <button
           type="button"
           onClick={() => setEmojiOpen((v) => !v)}
-          title="Chèn biểu cảm & nhãn dán"
+          title={t("composerEmojiTitle")}
           className="hover-surface rounded-lg p-2 transition"
           style={{ color: emojiOpen ? "var(--accent)" : "var(--text-secondary)" }}
         >
@@ -691,8 +957,8 @@ export function Composer({
             }}
             title={
               buzzCooldownSec > 0
-                ? `Chờ ${buzzCooldownSec}s để gửi BUZZ tiếp`
-                : "Gửi BUZZ! gây chú ý (giới hạn 5s/lần)"
+                ? t("composerBuzzCooldown", { secs: buzzCooldownSec })
+                : t("composerBuzzTitle")
             }
             className="hover-surface relative rounded-lg p-2 transition disabled:cursor-not-allowed disabled:opacity-45"
             style={{ color: buzzCooldownSec > 0 ? "var(--text-secondary)" : "#f59e0b" }}
@@ -703,6 +969,36 @@ export function Composer({
                 {buzzCooldownSec}
               </span>
             )}
+          </button>
+        )}
+
+        {onOpenReminder && (
+          <button
+            type="button"
+            onClick={() => {
+              setEmojiOpen(false);
+              onOpenReminder();
+            }}
+            title={t("composerReminderTitle")}
+            className="hover-surface rounded-lg p-2 transition"
+            style={{ color: "var(--text-secondary)" }}
+          >
+            <CalendarClock className="h-5 w-5" />
+          </button>
+        )}
+
+        {onOpenPoll && (
+          <button
+            type="button"
+            onClick={() => {
+              setEmojiOpen(false);
+              onOpenPoll();
+            }}
+            title={t("composerPollTitle")}
+            className="hover-surface rounded-lg p-2 transition"
+            style={{ color: "var(--text-secondary)" }}
+          >
+            <BarChart3 className="h-5 w-5" />
           </button>
         )}
 
@@ -769,12 +1065,10 @@ export function Composer({
                 return;
               }
             }
-            if (
-              e.key === "Enter" &&
-              !e.shiftKey &&
-              !isComposingRef.current &&
-              !e.nativeEvent.isComposing
-            ) {
+            const shouldSubmit = sendOnEnter
+              ? e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey
+              : e.key === "Enter" && (e.ctrlKey || e.metaKey);
+            if (shouldSubmit && !isComposingRef.current && !e.nativeEvent.isComposing) {
               e.preventDefault();
               setEmojiOpen(false);
               void handleSubmit();
@@ -782,8 +1076,8 @@ export function Composer({
           }}
           placeholder={
             pendingAttachment
-              ? "Thêm chú thích cho tệp đính kèm..."
-              : placeholder || "Nhập tin nhắn..."
+              ? t("composerCaptionPlaceholder")
+              : placeholder || t("composerPlaceholder")
           }
           className="min-h-[40px] max-h-[140px] flex-1 resize-none overflow-y-auto rounded-xl px-3.5 py-2 text-[15px] leading-6 outline-none"
           style={{ background: "var(--bg-surface)", color: "var(--text-primary)" }}
@@ -796,7 +1090,7 @@ export function Composer({
             void handleSubmit();
           }}
           disabled={sending || (!draft.trim() && !pendingAttachment)}
-          title="Gửi tin nhắn"
+          title={t("composerSendTitle")}
           className="tf-btn rounded-xl p-2.5 disabled:cursor-not-allowed disabled:opacity-40"
         >
           <Send className="h-4 w-4" />

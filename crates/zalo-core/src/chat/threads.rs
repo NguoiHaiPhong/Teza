@@ -8,10 +8,11 @@ use serde_json::{json, Map, Value};
 use crate::chat::parser::{
     clean_group_id, extract_content_text, extract_thread_id, format_thread_preview,
     is_raw_numeric_id, normalize_avatar_url, normalize_media_url, normalize_ts_ms,
-    parse_chat_message, parse_friend_thread, pick_str,
+    parse_chat_message, parse_friend_thread, parse_poll_value, pick_str,
 };
 use crate::chat::{
-    ChatFolderDto, MessageDto, ThreadDto, ThreadKind, ThreadMemberDto, UserProfileDto,
+    AddGroupMembersResultDto, ChatFolderDto, MessageDto, MutualGroupDto, PollDto, PollOptionDto,
+    ThreadDto, ThreadKind, ThreadMemberDto, UserProfileDto,
 };
 use crate::session::{is_session_expired_code, Session, SessionError};
 
@@ -104,6 +105,10 @@ pub async fn get_friends(session: &Session) -> Result<Vec<ThreadDto>> {
             unread_count: 0,
             is_pinned: false,
             is_muted: false,
+            last_read_in_ts: 0,
+            peer_read_ts: 0,
+            muted_until_ts: 0,
+            is_archived: false,
         });
     }
 
@@ -175,6 +180,10 @@ pub async fn get_groups(session: &Session) -> Result<Vec<ThreadDto>> {
             unread_count: 0,
             is_pinned: false,
             is_muted: false,
+            last_read_in_ts: 0,
+            peer_read_ts: 0,
+            muted_until_ts: 0,
+            is_archived: false,
         });
     }
 
@@ -965,6 +974,10 @@ pub fn parse_phone_profile_response(
         phone_number,
         is_friend,
         is_self,
+        mutual_groups: Vec::new(),
+        local_message_count: 0,
+        local_media_count: 0,
+        last_interaction_ts: 0,
     })
 }
 
@@ -1292,6 +1305,10 @@ pub fn apply_last_msgs_to_threads_with_names(
             unread_count: info.unread,
             is_pinned: false,
             is_muted: false,
+            last_read_in_ts: 0,
+            peer_read_ts: 0,
+            muted_until_ts: 0,
+            is_archived: false,
         });
     }
 
@@ -1684,7 +1701,74 @@ pub async fn fetch_user_profile(
         phone_number,
         is_friend,
         is_self,
+        mutual_groups: Vec::new(),
+        local_message_count: 0,
+        local_media_count: 0,
+        last_interaction_ts: 0,
     })
+}
+
+pub fn group_info_has_member(info: &Value, target_uid: &str) -> bool {
+    let uid = target_uid.trim().split('_').next().unwrap_or("");
+    if uid.is_empty() {
+        return false;
+    }
+    if pick_str(info, &["creatorId"]).as_deref() == Some(uid) {
+        return true;
+    }
+    for key in ["adminIds", "memVerList", "memberIds"] {
+        if let Some(arr) = info.get(key).and_then(Value::as_array) {
+            for item in arr {
+                let raw = item
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(|| item.as_u64().map(|n| n.to_string()))
+                    .unwrap_or_default();
+                if raw.trim().split('_').next() == Some(uid) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+pub async fn fetch_mutual_groups(
+    session: &Session,
+    target_uid: &str,
+    group_threads: &[ThreadDto],
+) -> Vec<MutualGroupDto> {
+    if !session.is_authenticated() || target_uid.trim().is_empty() || group_threads.is_empty() {
+        return Vec::new();
+    }
+    let slice: Vec<&ThreadDto> = group_threads.iter().take(60).collect();
+    let clean_ids: Vec<String> = slice
+        .iter()
+        .map(|t| clean_group_id(&t.id).to_string())
+        .collect();
+    let Ok((info_map, _)) = fetch_group_profiles(session, &clean_ids).await else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for t in slice {
+        let clean = clean_group_id(&t.id);
+        let Some(info) = info_map.get(clean).or_else(|| info_map.get(&t.id)) else {
+            continue;
+        };
+        if group_info_has_member(info, target_uid) {
+            let total_members = info
+                .get("totalMember")
+                .and_then(Value::as_u64)
+                .map(|n| n as u32);
+            out.push(MutualGroupDto {
+                id: t.id.clone(),
+                title: t.title.clone(),
+                avatar: t.avatar.clone(),
+                total_members,
+            });
+        }
+    }
+    out
 }
 
 pub async fn find_user_by_phone(session: &Session, raw_phone: &str) -> Result<UserProfileDto> {
@@ -1936,6 +2020,7 @@ pub fn parse_remote_labels_response(resp: &Value) -> Vec<ChatFolderDto> {
             icon: "tag".to_string(),
             color,
             thread_ids,
+            excluded_thread_ids: Vec::new(),
             include_kinds: Vec::new(),
             only_unread: false,
             exclude_muted: false,
@@ -2033,6 +2118,7 @@ pub async fn sync_mute_thread(
     thread_id: &str,
     kind: ThreadKind,
     muted: bool,
+    duration_secs: Option<i64>,
 ) -> Result<()> {
     if !session.is_authenticated() || session.domains.profile.is_empty() {
         return Ok(());
@@ -2044,9 +2130,14 @@ pub async fn sync_mute_thread(
         thread_id.to_string()
     };
     let now_sec = chrono::Utc::now().timestamp();
+    let duration = if muted {
+        duration_secs.filter(|d| *d > 0).unwrap_or(-1)
+    } else {
+        -1
+    };
     let body = obj(&[
         ("toid", json!(toid)),
-        ("duration", json!(-1)),
+        ("duration", json!(duration)),
         ("action", json!(if muted { 1 } else { 3 })),
         ("startTime", json!(now_sec)),
         ("muteType", json!(if is_group { 2 } else { 1 })),
@@ -2061,6 +2152,435 @@ pub async fn sync_mute_thread(
     let raw = session.post_form(&url, format!("params={params}")).await?;
     let dec = session.maybe_decrypt(raw, session.session_key_bytes());
     ensure_not_expired(&dec)
+}
+
+pub async fn send_seen_event(
+    session: &Session,
+    thread_id: &str,
+    kind: ThreadKind,
+    msg_id: &str,
+    sender_id: &str,
+) -> Result<()> {
+    if !session.is_authenticated() || kind == ThreadKind::Cloud || msg_id.trim().is_empty() {
+        return Ok(());
+    }
+    let is_group = kind == ThreadKind::Group;
+    let id_val = if is_group {
+        clean_group_id(thread_id).to_string()
+    } else {
+        thread_id.to_string()
+    };
+    let sender = if sender_id.trim().is_empty() {
+        id_val.as_str()
+    } else {
+        sender_id.trim()
+    };
+    let item = json!({
+        "cmi": msg_id.trim(),
+        "gmi": msg_id.trim(),
+        "uidFrom": sender,
+        "idTo": id_val,
+        "msgType": "chat.text",
+    });
+    let (base_host, path, msg_infos) = if is_group {
+        let group_host = if session.domains.group.is_empty() {
+            crate::endpoints::service("group").unwrap_or("https://tt-group-wpa.chat.zalo.me")
+        } else {
+            session.domains.group.trim_end_matches('/')
+        };
+        (
+            group_host,
+            "api/group/seenv2",
+            json!({ "data": [item], "grid": id_val }),
+        )
+    } else {
+        let chat_host = if session.domains.chat.is_empty()
+            || session.domains.chat.contains("-msg-chat.")
+            || session.domains.chat.contains("tt-chat2-wpa")
+        {
+            crate::endpoints::service("chat").unwrap_or("https://tt-chat3-wpa.chat.zalo.me")
+        } else {
+            session.domains.chat.trim_end_matches('/')
+        };
+        (chat_host, "api/message/seenv2", json!({ "data": [item] }))
+    };
+    let body = obj(&[
+        ("msgInfos", json!(msg_infos.to_string())),
+        ("imei", json!(session.imei)),
+    ]);
+    let params = session.encoded_params(&body)?;
+    let url = format!("{base_host}/{path}?{}", session.common_params());
+    let raw = session.post_form(&url, format!("params={params}")).await?;
+    let dec = session.maybe_decrypt(raw, session.session_key_bytes());
+    ensure_not_expired(&dec)
+}
+
+fn push_unique_host(hosts: &mut Vec<String>, host: &str) {
+    let trimmed = host.trim().trim_end_matches('/');
+    if !trimmed.is_empty() && !hosts.iter().any(|h| h == trimmed) {
+        hosts.push(trimmed.to_string());
+    }
+}
+
+async fn post_form_across_hosts(
+    session: &Session,
+    hosts: &[String],
+    path: &str,
+    body: &Value,
+) -> Result<Value> {
+    let params = session.encoded_params(body)?;
+    let clean_path = path.trim_start_matches('/');
+    let mut last_err = anyhow::anyhow!("Không có máy chủ khả dụng cho {clean_path}");
+    for host in hosts {
+        let url = format!(
+            "{}/{}?{}",
+            host.trim_end_matches('/'),
+            clean_path,
+            session.common_params()
+        );
+        match session.post_form(&url, format!("params={params}")).await {
+            Ok(raw) => {
+                let dec = unwrap_data_str(session.maybe_decrypt(raw, session.session_key_bytes()));
+                ensure_not_expired(&dec)?;
+                let code = dec.get("error_code").and_then(value_as_i64).unwrap_or(0);
+                if code == 0 {
+                    return Ok(dec);
+                }
+                let msg = pick_str(&dec, &["error_message", "message"])
+                    .unwrap_or_else(|| format!("Mã lỗi {code}"));
+                last_err = anyhow::anyhow!("{msg}");
+            }
+            Err(e) if is_expired_err(&e) => return Err(e),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
+fn collect_id_list(v: Option<&Value>) -> Vec<String> {
+    let Some(val) = v else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    match val {
+        Value::Array(arr) => {
+            for item in arr {
+                let id = item
+                    .as_str()
+                    .map(str::trim)
+                    .map(str::to_string)
+                    .or_else(|| item.as_i64().map(|n| n.to_string()))
+                    .or_else(|| pick_str(item, &["uid", "userId", "id"]));
+                if let Some(s) = id.filter(|x| !x.is_empty()) {
+                    if !out.contains(&s) {
+                        out.push(s);
+                    }
+                }
+            }
+        }
+        Value::Object(map) => {
+            for (k, _) in map {
+                let s = k.trim().to_string();
+                if !s.is_empty() && !out.contains(&s) {
+                    out.push(s);
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+pub fn parse_add_group_members_response(
+    resp: &Value,
+    requested_ids: &[String],
+) -> AddGroupMembersResultDto {
+    let data = resp.get("data").unwrap_or(resp);
+    let mut failed = collect_id_list(data.get("errorMembers"));
+    for extra in collect_id_list(data.get("error_data")) {
+        if !failed.contains(&extra) {
+            failed.push(extra);
+        }
+    }
+    let pending = collect_id_list(
+        data.get("pendingMembers")
+            .or_else(|| data.get("pending_members")),
+    );
+    let added: Vec<String> = requested_ids
+        .iter()
+        .filter(|id| !failed.contains(id) && !pending.contains(id))
+        .cloned()
+        .collect();
+    let message = pick_str(resp, &["error_message", "message"]).unwrap_or_default();
+    AddGroupMembersResultDto {
+        added,
+        pending,
+        failed,
+        message,
+    }
+}
+
+pub async fn add_group_members(
+    session: &Session,
+    group_id: &str,
+    member_ids: &[String],
+) -> Result<AddGroupMembersResultDto> {
+    if !session.is_authenticated() {
+        anyhow::bail!("Chưa đăng nhập");
+    }
+    let clean_gid = clean_group_id(group_id);
+    if clean_gid.is_empty() {
+        anyhow::bail!("Mã nhóm không hợp lệ");
+    }
+    let clean_members: Vec<String> = member_ids
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if clean_members.is_empty() {
+        anyhow::bail!("Vui lòng chọn ít nhất 1 thành viên");
+    }
+    let member_types = vec![-1_i64; clean_members.len()];
+    let body = obj(&[
+        ("grid", json!(clean_gid)),
+        ("members", json!(clean_members)),
+        ("membersTypes", json!(member_types)),
+        ("imei", json!(session.imei)),
+        ("clientLang", json!("vi")),
+    ]);
+    let mut hosts = session.domains.candidates("group");
+    if let Some(svc) = crate::endpoints::service("group") {
+        push_unique_host(&mut hosts, svc);
+    }
+    let resp = post_form_across_hosts(session, &hosts, "api/group/add", &body).await?;
+    Ok(parse_add_group_members_response(&resp, &clean_members))
+}
+
+pub async fn create_reminder(
+    session: &Session,
+    thread_id: &str,
+    kind: ThreadKind,
+    title: &str,
+    start_time_ms: i64,
+    repeat: i32,
+) -> Result<MessageDto> {
+    if !session.is_authenticated() {
+        anyhow::bail!("Chưa đăng nhập");
+    }
+    let clean_title = title.trim();
+    if clean_title.is_empty() {
+        anyhow::bail!("Nội dung nhắc hẹn không được để trống");
+    }
+    let normalized_start = normalize_ts_ms(start_time_ms);
+    let inner_params = json!({ "title": clean_title }).to_string();
+    let resp = if kind == ThreadKind::Group {
+        let clean_gid = clean_group_id(thread_id);
+        let body = obj(&[
+            ("grid", json!(clean_gid)),
+            ("type", json!(0)),
+            ("color", json!(-16_777_216_i64)),
+            ("emoji", json!("⏰")),
+            ("startTime", json!(normalized_start)),
+            ("duration", json!(-1)),
+            ("params", json!(inner_params)),
+            ("repeat", json!(repeat)),
+            ("src", json!(1)),
+            ("imei", json!(session.imei)),
+        ]);
+        let mut hosts = session.domains.candidates("groupboard");
+        push_unique_host(&mut hosts, crate::endpoints::GROUP_BOARD);
+        push_unique_host(&mut hosts, crate::endpoints::BOARD);
+        post_form_across_hosts(session, &hosts, "api/board/topic/createv2", &body).await?
+    } else {
+        let to_uid = thread_id.trim();
+        let object_data = json!({
+            "toUid": to_uid,
+            "type": 0,
+            "color": -16_777_216_i64,
+            "emoji": "⏰",
+            "startTime": normalized_start,
+            "duration": -1,
+            "params": { "title": clean_title },
+            "needPin": false,
+            "reminderType": 0,
+            "repeat": repeat,
+        })
+        .to_string();
+        let body = obj(&[("objectData", json!(object_data)), ("imei", json!(session.imei))]);
+        let mut hosts = session.domains.candidates("reminder");
+        push_unique_host(&mut hosts, crate::endpoints::REMINDER);
+        push_unique_host(&mut hosts, crate::endpoints::FRIEND_BOARD);
+        post_form_across_hosts(session, &hosts, "api/reminder/create", &body).await?
+    };
+
+    let data = resp.get("data").unwrap_or(&resp);
+    let reminder_id =
+        pick_str(data, &["id", "reminderId", "topicId"]).unwrap_or_default();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let msg_id = if !reminder_id.is_empty() {
+        format!("rem-{reminder_id}")
+    } else {
+        format!("rem-{now_ms}")
+    };
+    let meta = json!({
+        "title": clean_title,
+        "startTime": normalized_start,
+        "repeat": repeat,
+        "reminderId": reminder_id,
+    })
+    .to_string();
+    Ok(MessageDto {
+        msg_id,
+        thread_id: thread_id.to_string(),
+        sender_id: session.profile.uid.clone(),
+        sender_name: "Bạn".to_string(),
+        text: format!("Nhắc hẹn: {clean_title}"),
+        msg_type: "chat.reminder".to_string(),
+        ts: now_ms,
+        is_outgoing: true,
+        is_recalled: false,
+        is_pinned: false,
+        quote: None,
+        reactions: Vec::new(),
+        attachment_url: None,
+        attachment_name: Some(format!("teza-reminder:{meta}")),
+    })
+}
+
+pub fn parse_poll_dto(resp: &Value, fallback_poll_id: i64) -> Option<PollDto> {
+    let data = resp.get("data").unwrap_or(resp);
+    parse_poll_value(data, fallback_poll_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn create_poll(
+    session: &Session,
+    group_id: &str,
+    question: &str,
+    options: &[String],
+    expired_time_ms: i64,
+    allow_multi: bool,
+    allow_add_option: bool,
+    is_anonymous: bool,
+) -> Result<MessageDto> {
+    if !session.is_authenticated() {
+        anyhow::bail!("Chưa đăng nhập");
+    }
+    let clean_gid = clean_group_id(group_id);
+    let clean_q = question.trim();
+    if clean_q.is_empty() {
+        anyhow::bail!("Câu hỏi bình chọn không được để trống");
+    }
+    let clean_opts: Vec<String> = options
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if clean_opts.len() < 2 {
+        anyhow::bail!("Cần ít nhất 2 lựa chọn để tạo bình chọn");
+    }
+
+    let body = obj(&[
+        ("group_id", json!(clean_gid)),
+        ("question", json!(clean_q)),
+        ("options", json!(clean_opts)),
+        ("expired_time", json!(expired_time_ms.max(0))),
+        ("pinAct", json!(false)),
+        ("allow_multi_choices", json!(allow_multi)),
+        ("allow_add_new_option", json!(allow_add_option)),
+        ("is_hide_vote_preview", json!(false)),
+        ("is_anonymous", json!(is_anonymous)),
+        ("poll_type", json!(0)),
+        ("src", json!(1)),
+        ("imei", json!(session.imei)),
+    ]);
+    let mut hosts = session.domains.candidates("groupboard");
+    push_unique_host(&mut hosts, crate::endpoints::GROUP_BOARD);
+    push_unique_host(&mut hosts, crate::endpoints::BOARD);
+    for h in session.domains.candidates("group") {
+        push_unique_host(&mut hosts, &h);
+    }
+
+    let resp = post_form_across_hosts(session, &hosts, "api/poll/create", &body).await?;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let fallback_id = now_ms;
+    let poll = parse_poll_dto(&resp, fallback_id).unwrap_or_else(|| PollDto {
+        poll_id: fallback_id,
+        question: clean_q.to_string(),
+        options: clean_opts
+            .iter()
+            .enumerate()
+            .map(|(i, c)| PollOptionDto {
+                id: (i + 1) as i64,
+                content: c.clone(),
+                votes: 0,
+                voted: false,
+            })
+            .collect(),
+        allow_multi,
+        allow_add_option,
+        is_anonymous,
+        expired_time: expired_time_ms.max(0),
+        closed: false,
+    });
+    let poll_json = serde_json::to_string(&poll)?;
+    Ok(MessageDto {
+        msg_id: format!("poll-{}", poll.poll_id),
+        thread_id: group_id.to_string(),
+        sender_id: session.profile.uid.clone(),
+        sender_name: "Bạn".to_string(),
+        text: format!("Bình chọn: {}", poll.question),
+        msg_type: "chat.poll".to_string(),
+        ts: now_ms,
+        is_outgoing: true,
+        is_recalled: false,
+        is_pinned: false,
+        quote: None,
+        reactions: Vec::new(),
+        attachment_url: None,
+        attachment_name: Some(format!("teza-poll:{poll_json}")),
+    })
+}
+
+pub async fn get_poll_detail(session: &Session, poll_id: i64) -> Result<PollDto> {
+    if !session.is_authenticated() {
+        anyhow::bail!("Chưa đăng nhập");
+    }
+    let body = obj(&[("poll_id", json!(poll_id)), ("imei", json!(session.imei))]);
+    let mut hosts = session.domains.candidates("groupboard");
+    push_unique_host(&mut hosts, crate::endpoints::GROUP_BOARD);
+    push_unique_host(&mut hosts, crate::endpoints::BOARD);
+    for h in session.domains.candidates("group") {
+        push_unique_host(&mut hosts, &h);
+    }
+    let resp = post_form_across_hosts(session, &hosts, "api/poll/detail", &body).await?;
+    parse_poll_dto(&resp, poll_id).ok_or_else(|| anyhow::anyhow!("Không đọc được dữ liệu bình chọn"))
+}
+
+pub async fn vote_poll(
+    session: &Session,
+    poll_id: i64,
+    option_ids: &[i64],
+) -> Result<PollDto> {
+    if !session.is_authenticated() {
+        anyhow::bail!("Chưa đăng nhập");
+    }
+    let body = obj(&[
+        ("poll_id", json!(poll_id)),
+        ("option_id", json!(option_ids)),
+        ("imei", json!(session.imei)),
+    ]);
+    let mut hosts = session.domains.candidates("groupboard");
+    push_unique_host(&mut hosts, crate::endpoints::GROUP_BOARD);
+    push_unique_host(&mut hosts, crate::endpoints::BOARD);
+    for h in session.domains.candidates("group") {
+        push_unique_host(&mut hosts, &h);
+    }
+    let resp = post_form_across_hosts(session, &hosts, "api/poll/vote", &body).await?;
+    if let Some(dto) = parse_poll_dto(&resp, poll_id).filter(|p| !p.options.is_empty()) {
+        return Ok(dto);
+    }
+    get_poll_detail(session, poll_id).await
 }
 
 #[cfg(test)]
@@ -2081,6 +2601,10 @@ mod tests {
                 unread_count: 0,
                 is_pinned: true,
                 is_muted: false,
+                last_read_in_ts: 0,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
             },
             ThreadDto {
                 id: "friend-a".into(),
@@ -2092,6 +2616,10 @@ mod tests {
                 unread_count: 0,
                 is_pinned: false,
                 is_muted: false,
+                last_read_in_ts: 0,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
             },
             ThreadDto {
                 id: "888111".into(),
@@ -2103,6 +2631,10 @@ mod tests {
                 unread_count: 0,
                 is_pinned: false,
                 is_muted: false,
+                last_read_in_ts: 0,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
             },
         ];
 
@@ -2166,6 +2698,10 @@ mod tests {
                 unread_count: 2,
                 is_pinned: false,
                 is_muted: false,
+                last_read_in_ts: 0,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
             },
             ThreadDto {
                 id: "999888777".into(),
@@ -2177,6 +2713,10 @@ mod tests {
                 unread_count: 0,
                 is_pinned: false,
                 is_muted: false,
+                last_read_in_ts: 0,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
             },
         ];
 
@@ -2320,5 +2860,65 @@ mod tests {
         assert_eq!(folders[0].remote_label_id.as_deref(), Some("1"));
         assert_eq!(folders[1].id, "label-work");
         assert_eq!(folders[1].thread_ids, vec!["555"]);
+    }
+
+    #[test]
+    fn group_info_has_member_checks_creator_admins_and_mem_ver_list() {
+        let info = json!({
+            "creatorId": "1001",
+            "adminIds": ["2002"],
+            "memVerList": ["3003_1", "4004_0"]
+        });
+        assert!(group_info_has_member(&info, "1001"));
+        assert!(group_info_has_member(&info, "2002"));
+        assert!(group_info_has_member(&info, "3003"));
+        assert!(group_info_has_member(&info, "4004_9"));
+        assert!(!group_info_has_member(&info, "9999"));
+        assert!(!group_info_has_member(&info, ""));
+    }
+
+    #[test]
+    fn parse_add_group_members_handles_error_and_pending() {
+        let resp = json!({
+            "error_code": 0,
+            "data": {
+                "errorMembers": ["u2"],
+                "pendingMembers": [{ "uid": "u3" }]
+            }
+        });
+        let req = vec!["u1".to_string(), "u2".to_string(), "u3".to_string()];
+        let out = parse_add_group_members_response(&resp, &req);
+        assert_eq!(out.added, vec!["u1"]);
+        assert_eq!(out.failed, vec!["u2"]);
+        assert_eq!(out.pending, vec!["u3"]);
+    }
+
+    #[test]
+    fn parse_poll_dto_extracts_options_and_flags() {
+        let resp = json!({
+            "error_code": 0,
+            "data": {
+                "poll_id": 5511_i64,
+                "question": "Cuối tuần đi đâu?",
+                "allow_multi_choices": true,
+                "allow_add_new_option": false,
+                "is_anonymous": true,
+                "expired_time": 1700010000_i64,
+                "closed": false,
+                "options": [
+                    { "option_id": 10, "content": "Đà Lạt", "total_vote": 4, "voted": false },
+                    { "option_id": 11, "content": "Vũng Tàu", "total_vote": 2, "voted": true }
+                ]
+            }
+        });
+        let dto = parse_poll_dto(&resp, 0).unwrap();
+        assert_eq!(dto.poll_id, 5511);
+        assert_eq!(dto.question, "Cuối tuần đi đâu?");
+        assert!(dto.allow_multi);
+        assert!(!dto.allow_add_option);
+        assert!(dto.is_anonymous);
+        assert_eq!(dto.expired_time, 1_700_010_000_000);
+        assert_eq!(dto.options[0].votes, 4);
+        assert!(dto.options[1].voted);
     }
 }

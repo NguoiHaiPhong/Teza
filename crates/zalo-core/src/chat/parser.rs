@@ -2,11 +2,14 @@
 
 use serde_json::Value;
 
-use crate::chat::{MessageDto, QuoteRef, ReactionSummary, ThreadDto, ThreadKind};
+use crate::chat::{
+    MessageDto, PollDto, PollOptionDto, QuoteRef, ReactionSummary, ThreadDto, ThreadKind,
+};
 use crate::socket::{
-    WsEvent, CMD_CTRL_ACTION, CMD_CTRL_PULL_CTRL, CMD_CTRL_PUSH_CTRL, CMD_GET_MSG,
-    CMD_PULL_MSG_1_1, CMD_PULL_MSG_513, CMD_PULL_MSG_514, CMD_PULL_MSG_515, CMD_PULL_MSG_517,
-    CMD_PULL_MSG_518, CMD_PULL_MSG_GROUP, CMD_PUSH_MISS_MSG, CMD_PUSH_MSG_1_1, CMD_PUSH_MSG_GROUP,
+    WsEvent, CMD_CTRL_ACTION, CMD_CTRL_PULL_CTRL, CMD_CTRL_PUSH_CTRL, CMD_DELIVERED_1_1,
+    CMD_DELIVERED_GROUP, CMD_GET_MSG, CMD_PULL_MSG_1_1, CMD_PULL_MSG_513, CMD_PULL_MSG_514,
+    CMD_PULL_MSG_515, CMD_PULL_MSG_517, CMD_PULL_MSG_518, CMD_PULL_MSG_GROUP, CMD_PUSH_MISS_MSG,
+    CMD_PUSH_MSG_1_1, CMD_PUSH_MSG_GROUP, CMD_SEEN_1_1, CMD_SEEN_GROUP,
 };
 
 #[derive(Debug, Clone)]
@@ -14,6 +17,11 @@ pub enum WsParsedAction {
     Message(Box<MessageDto>),
     Recalled { thread_id: String, msg_id: String },
     Read { thread_id: String, is_unread: bool },
+    PeerSeen {
+        thread_id: String,
+        seen_ts: i64,
+        is_delivered_only: bool,
+    },
     Reaction {
         thread_id: String,
         msg_id: String,
@@ -154,6 +162,279 @@ pub fn parse_friend_thread(v: &Value) -> Option<ThreadDto> {
         unread_count: 0,
         is_pinned: false,
         is_muted: false,
+        last_read_in_ts: 0,
+        peer_read_ts: 0,
+        muted_until_ts: 0,
+        is_archived: false,
+    })
+}
+
+fn unwrap_json_object(v: &Value) -> Option<Value> {
+    match v {
+        Value::Object(_) => Some(v.clone()),
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.starts_with('{') && trimmed.ends_with('}') {
+                serde_json::from_str::<Value>(trimmed).ok()
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn value_as_bool_flag(v: &Value) -> bool {
+    v.as_bool()
+        .unwrap_or_else(|| v.as_i64().map(|n| n != 0).unwrap_or(false))
+}
+
+fn is_reminder_thumb_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains("/reminder_") || lower.contains("/reminder-")
+}
+
+fn extract_reminder_meta(
+    raw: Option<&Value>,
+    msg_type: &str,
+) -> Option<(String, i64, i32, String, String)> {
+    let lower_type = msg_type.to_ascii_lowercase();
+    let explicit = lower_type.contains("reminder");
+    let obj = raw.and_then(unwrap_json_object);
+    let inner_params = obj
+        .as_ref()
+        .and_then(|o| o.get("params"))
+        .and_then(unwrap_json_object);
+
+    if !explicit {
+        let action_is_reminder = [obj.as_ref(), inner_params.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|v| pick_str(v, &["action", "msgAction", "type"]))
+            .any(|s| s.to_ascii_lowercase().contains("reminder"));
+        let thumb_is_reminder = [obj.as_ref(), inner_params.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|v| pick_str(v, &["thumb", "href", "oriUrl"]))
+            .any(|u| is_reminder_thumb_url(&u));
+        let clock_card = obj.as_ref().is_some_and(|o| {
+            pick_str(o, &["title"]).is_some_and(|t| t.trim_start().starts_with('⏰'))
+                && (o.get("description").is_some() || o.get("thumb").is_some())
+        });
+        let looks_like_reminder = action_is_reminder
+            || thumb_is_reminder
+            || clock_card
+            || obj.as_ref().is_some_and(|o| {
+                o.get("reminderId").is_some()
+                    || o.get("repeatMode").is_some()
+                    || ((o.get("startTime").is_some() || o.get("remindTime").is_some())
+                        && (o.get("title").is_some() || inner_params.is_some()))
+            })
+            || inner_params.as_ref().is_some_and(|p| {
+                p.get("reminderId").is_some()
+                    || ((p.get("startTime").is_some() || p.get("remindTime").is_some())
+                        && p.get("title").is_some())
+            });
+        if !looks_like_reminder {
+            return None;
+        }
+    }
+
+    let find_str = |keys: &[&str]| -> Option<String> {
+        inner_params
+            .as_ref()
+            .and_then(|p| pick_str(p, keys))
+            .or_else(|| obj.as_ref().and_then(|o| pick_str(o, keys)))
+    };
+    let find_i64 = |keys: &[&str]| -> Option<i64> {
+        for key in keys {
+            for src in [inner_params.as_ref(), obj.as_ref()].into_iter().flatten() {
+                if let Some(val) = src.get(*key) {
+                    if let Some(n) = val.as_i64().or_else(|| val.as_str()?.trim().parse().ok()) {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+        None
+    };
+
+    let raw_title = find_str(&["title", "topic", "content", "msg", "description"])
+        .filter(|s| !(s.trim_start().starts_with('{') && s.trim_end().ends_with('}')))
+        .unwrap_or_else(|| "Nhắc hẹn".to_string());
+    let cleaned_title = raw_title
+        .trim()
+        .trim_start_matches('⏰')
+        .trim()
+        .to_string();
+    let title = if cleaned_title.is_empty() {
+        "Nhắc hẹn".to_string()
+    } else {
+        cleaned_title
+    };
+    let schedule_text = find_str(&["description", "desc", "subTitle"])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != &title && s != &raw_title)
+        .unwrap_or_default();
+    let start_time = find_i64(&["startTime", "remindTime", "time", "triggerTime"])
+        .map(normalize_ts_ms)
+        .unwrap_or(0);
+    let repeat = find_i64(&["repeat", "repeatMode"]).unwrap_or(0) as i32;
+    let reminder_id = find_str(&["reminderId", "topicId", "id"]).unwrap_or_default();
+    Some((title, start_time, repeat, reminder_id, schedule_text))
+}
+
+pub fn parse_poll_value(v: &Value, fallback_poll_id: i64) -> Option<PollDto> {
+    let inner_params = v.get("params").and_then(unwrap_json_object);
+    let src = inner_params.as_ref().unwrap_or(v);
+    let read_i64 = |keys: &[&str]| -> Option<i64> {
+        for key in keys {
+            for node in [Some(src), Some(v)].into_iter().flatten() {
+                if let Some(val) = node.get(*key) {
+                    if let Some(n) = val.as_i64().or_else(|| val.as_str()?.trim().parse().ok()) {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+        None
+    };
+    let read_bool = |keys: &[&str]| -> bool {
+        for key in keys {
+            for node in [Some(src), Some(v)].into_iter().flatten() {
+                if let Some(val) = node.get(*key) {
+                    return value_as_bool_flag(val);
+                }
+            }
+        }
+        false
+    };
+
+    let poll_id = read_i64(&["poll_id", "pollId", "id"]).unwrap_or(fallback_poll_id);
+    let question = pick_str(src, &["question", "title", "content"])
+        .or_else(|| pick_str(v, &["question", "title", "content"]))
+        .unwrap_or_else(|| "Bình chọn".to_string());
+
+    let raw_options = src
+        .get("options")
+        .or_else(|| v.get("options"))
+        .and_then(|o| match o {
+            Value::Array(arr) => Some(arr.clone()),
+            Value::String(s) => serde_json::from_str::<Vec<Value>>(s.trim()).ok(),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    let mut options = Vec::new();
+    for (idx, item) in raw_options.into_iter().enumerate() {
+        match item {
+            Value::String(label) => {
+                let clean = label.trim();
+                if !clean.is_empty() {
+                    options.push(PollOptionDto {
+                        id: (idx + 1) as i64,
+                        content: clean.to_string(),
+                        votes: 0,
+                        voted: false,
+                    });
+                }
+            }
+            Value::Object(ref o) => {
+                let id = o
+                    .get("option_id")
+                    .or_else(|| o.get("optionId"))
+                    .or_else(|| o.get("id"))
+                    .and_then(|x| x.as_i64().or_else(|| x.as_str()?.parse().ok()))
+                    .unwrap_or((idx + 1) as i64);
+                let content = pick_str(&item, &["content", "title", "label", "name"])
+                    .unwrap_or_else(|| format!("Lựa chọn {}", idx + 1));
+                let votes = o
+                    .get("total_vote")
+                    .or_else(|| o.get("totalVote"))
+                    .or_else(|| o.get("votes"))
+                    .or_else(|| o.get("voteCount"))
+                    .and_then(|x| {
+                        x.as_u64()
+                            .or_else(|| x.as_str()?.parse().ok())
+                            .or_else(|| x.as_array().map(|a| a.len() as u64))
+                    })
+                    .or_else(|| {
+                        o.get("voters")
+                            .and_then(Value::as_array)
+                            .map(|a| a.len() as u64)
+                    })
+                    .unwrap_or(0) as u32;
+                let voted = o
+                    .get("voted")
+                    .or_else(|| o.get("is_voted"))
+                    .map(value_as_bool_flag)
+                    .unwrap_or(false);
+                options.push(PollOptionDto {
+                    id,
+                    content,
+                    votes,
+                    voted,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    if poll_id == 0 && options.is_empty() && question == "Bình chọn" {
+        return None;
+    }
+
+    let expired_time = read_i64(&["expired_time", "expiredTime", "expiried_time"])
+        .map(normalize_ts_ms)
+        .unwrap_or(0);
+    let closed = read_bool(&["closed", "is_closed", "isClosed"]);
+
+    Some(PollDto {
+        poll_id,
+        question,
+        options,
+        allow_multi: read_bool(&["allow_multi_choices", "allowMultiChoices", "allow_multi"]),
+        allow_add_option: read_bool(&[
+            "allow_add_new_option",
+            "allowAddNewOption",
+            "allow_add_option",
+        ]),
+        is_anonymous: read_bool(&["is_anonymous", "isAnonymous"]),
+        expired_time,
+        closed,
+    })
+}
+
+fn extract_poll_meta(raw: Option<&Value>, msg_type: &str, fallback_msg_id: &str) -> Option<PollDto> {
+    let lower_type = msg_type.to_ascii_lowercase();
+    let explicit = matches!(lower_type.as_str(), "chat.poll" | "group.poll" | "poll");
+    let obj = raw.and_then(unwrap_json_object);
+    if !explicit {
+        let looks_like_poll = obj.as_ref().is_some_and(|o| {
+            o.get("poll_id").is_some()
+                || o.get("pollId").is_some()
+                || (o.get("question").is_some() && o.get("options").is_some())
+        });
+        if !looks_like_poll {
+            return None;
+        }
+    }
+    let fallback_id = fallback_msg_id.trim().parse::<i64>().unwrap_or(0);
+    obj.as_ref().and_then(|o| parse_poll_value(o, fallback_id)).or_else(|| {
+        if explicit {
+            Some(PollDto {
+                poll_id: fallback_id,
+                question: "Bình chọn".to_string(),
+                options: Vec::new(),
+                allow_multi: false,
+                allow_add_option: false,
+                is_anonymous: false,
+                expired_time: 0,
+                closed: false,
+            })
+        } else {
+            None
+        }
     })
 }
 
@@ -463,13 +744,46 @@ pub fn parse_chat_message(
         sticker_meta = extract_sticker_info(it);
     }
 
-    let (mut attachment_url, mut attachment_name) = raw_content
-        .map(|rv| extract_attachment(rv, &msg_type))
-        .unwrap_or((None, None));
+    let raw_msg_id = pick_str(it, &["msgId", "globalMsgId", "cliMsgId", "id"]);
+    let reminder_meta = extract_reminder_meta(raw_content, &msg_type);
+    let poll_meta = if reminder_meta.is_none() {
+        extract_poll_meta(raw_content, &msg_type, raw_msg_id.as_deref().unwrap_or(""))
+    } else {
+        None
+    };
+
+    let (mut attachment_url, mut attachment_name) = if reminder_meta.is_some() || poll_meta.is_some() {
+        (None, None)
+    } else {
+        raw_content
+            .map(|rv| extract_attachment(rv, &msg_type))
+            .unwrap_or((None, None))
+    };
 
     let is_undo = matches!(msg_type.as_str(), "chat.undo" | "undo" | "31");
     if is_undo {
         sticker_meta = None;
+    } else if let Some((ref title, start_time, repeat, ref rid, ref schedule_text)) = reminder_meta {
+        msg_type = "chat.reminder".to_string();
+        sticker_meta = None;
+        attachment_url = None;
+        let mut meta_obj = serde_json::json!({
+            "title": title,
+            "startTime": start_time,
+            "repeat": repeat,
+            "reminderId": rid,
+        });
+        if !schedule_text.is_empty() {
+            meta_obj["scheduleText"] = Value::String(schedule_text.clone());
+        }
+        attachment_name = Some(format!("teza-reminder:{meta_obj}"));
+    } else if let Some(ref poll) = poll_meta {
+        msg_type = "chat.poll".to_string();
+        sticker_meta = None;
+        attachment_url = None;
+        if let Ok(json_str) = serde_json::to_string(poll) {
+            attachment_name = Some(format!("teza-poll:{json_str}"));
+        }
     } else if let Some((sid, cid, _)) = sticker_meta {
         msg_type = "chat.sticker".to_string();
         if attachment_url.is_none() {
@@ -483,6 +797,18 @@ pub fn parse_chat_message(
     let is_file_type = matches!(msg_type.as_str(), "chat.file" | "file" | "19" | "share.file");
     let mut text = if is_undo {
         "[Tin nhắn đã thu hồi]".to_string()
+    } else if let Some((ref title, _, _, _, _)) = reminder_meta {
+        if title == "Nhắc hẹn" {
+            "[Nhắc hẹn]".to_string()
+        } else {
+            format!("Nhắc hẹn: {title}")
+        }
+    } else if let Some(ref poll) = poll_meta {
+        if poll.question == "Bình chọn" {
+            "[Bình chọn]".to_string()
+        } else {
+            format!("Bình chọn: {}", poll.question)
+        }
     } else if sticker_meta.is_some() {
         "[Nhãn dán]".to_string()
     } else if is_file_type {
@@ -624,8 +950,133 @@ pub fn parse_ws_event(ev: &WsEvent, my_uid: &str, send2me_id: &str) -> Vec<WsPar
         collect_messages_from_node(data, is_group_cmd, my_uid, send2me_id, &mut actions);
     } else if matches!(ev.cmd, CMD_CTRL_PUSH_CTRL | CMD_CTRL_ACTION | CMD_CTRL_PULL_CTRL) {
         collect_controls_from_node(data, my_uid, send2me_id, &mut actions);
+    } else if matches!(
+        ev.cmd,
+        CMD_DELIVERED_1_1 | CMD_SEEN_1_1 | CMD_DELIVERED_GROUP | CMD_SEEN_GROUP
+    ) {
+        let is_group_cmd = matches!(ev.cmd, CMD_DELIVERED_GROUP | CMD_SEEN_GROUP);
+        let default_seen = matches!(ev.cmd, CMD_SEEN_1_1 | CMD_SEEN_GROUP) || ev.sub_cmd == 1;
+        collect_receipts_from_node(
+            data,
+            is_group_cmd,
+            default_seen,
+            my_uid,
+            send2me_id,
+            &mut actions,
+        );
     }
     actions
+}
+
+fn parse_receipt_item(
+    item: &Value,
+    is_group_cmd: bool,
+    is_seen: bool,
+    my_uid: &str,
+    send2me_id: &str,
+) -> Option<WsParsedAction> {
+    if let Some(uids) = item.get("seenUids").and_then(Value::as_array) {
+        if !uids.is_empty() {
+            let has_peer = uids.iter().any(|v| {
+                let s = match v {
+                    Value::String(s) => s.trim().to_string(),
+                    Value::Number(n) => n.to_string(),
+                    _ => String::new(),
+                };
+                !s.is_empty() && s != "0" && (my_uid.is_empty() || s != my_uid)
+            });
+            if !has_peer {
+                return None;
+            }
+        }
+    } else {
+        let uid_from = pick_str(item, &["uidFrom", "fromUid", "fromId"]).unwrap_or_default();
+        let id_to = pick_str(item, &["idTo", "toId"]).unwrap_or_default();
+        if !my_uid.is_empty() && uid_from == my_uid && id_to == my_uid {
+            return None;
+        }
+    }
+
+    let is_group = is_group_cmd
+        || item.get("grid").is_some()
+        || item.get("groupId").is_some()
+        || is_group_flag(item);
+    let thread_id = if is_group {
+        let raw_gid = pick_str(item, &["grid", "groupId", "idTo", "threadId"])?;
+        format!("group_{}", clean_group_id(&raw_gid))
+    } else {
+        ["idTo", "uidFrom", "fromUid", "userId"]
+            .iter()
+            .filter_map(|k| pick_str(item, &[k]))
+            .find(|s| !s.is_empty() && s != "0" && (my_uid.is_empty() || s != my_uid))
+            .or_else(|| extract_thread_id(item, false, my_uid, send2me_id).map(|(t, _)| t))?
+    };
+
+    let parsed_ts = ["seenTs", "actionTs", "ts", "msgTs", "sendTime"]
+        .iter()
+        .find_map(|k| {
+            item.get(*k)
+                .and_then(|v| v.as_i64().or_else(|| v.as_str()?.trim().parse().ok()))
+        })
+        .or_else(|| {
+            item.get("cliMsgId")
+                .and_then(|v| v.as_i64().or_else(|| v.as_str()?.trim().parse().ok()))
+                .filter(|n| *n >= 1_000_000_000)
+        })
+        .map(normalize_ts_ms)
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+
+    Some(WsParsedAction::PeerSeen {
+        thread_id,
+        seen_ts: parsed_ts,
+        is_delivered_only: !is_seen,
+    })
+}
+
+fn collect_receipts_from_node(
+    node: &Value,
+    is_group_cmd: bool,
+    default_seen: bool,
+    my_uid: &str,
+    send2me_id: &str,
+    out: &mut Vec<WsParsedAction>,
+) {
+    let buckets = [
+        ("seenMsgs", true),
+        ("seen_msgs", true),
+        ("deliverMsgs", false),
+        ("deliver_msgs", false),
+    ];
+    let mut matched_bucket = false;
+    for (key, is_seen) in buckets {
+        if let Some(arr) = node.get(key).and_then(Value::as_array) {
+            matched_bucket = true;
+            for item in arr {
+                if let Some(act) = parse_receipt_item(item, is_group_cmd, is_seen, my_uid, send2me_id)
+                {
+                    out.push(act);
+                }
+            }
+        }
+    }
+    if matched_bucket {
+        return;
+    }
+
+    if let Some(arr) = node.as_array() {
+        for item in arr {
+            if let Some(act) =
+                parse_receipt_item(item, is_group_cmd, default_seen, my_uid, send2me_id)
+            {
+                out.push(act);
+            }
+        }
+    } else if node.is_object() {
+        let is_seen = default_seen || node.get("seenUids").is_some();
+        if let Some(act) = parse_receipt_item(node, is_group_cmd, is_seen, my_uid, send2me_id) {
+            out.push(act);
+        }
+    }
 }
 
 fn collect_messages_from_node(
@@ -731,11 +1182,39 @@ fn collect_controls_from_node(
                     });
                 }
             }
+        } else if matches!(act_type.as_str(), "seen_msg" | "read_receipt") {
+            let peer_uid = pick_str(data_node, &["uidFrom", "fromUid", "fromId"]).unwrap_or_default();
+            let is_peer = !peer_uid.is_empty()
+                && peer_uid != "0"
+                && (my_uid.is_empty() || peer_uid != my_uid);
+            if is_peer {
+                if let Some(act) =
+                    parse_receipt_item(data_node, is_group_flag(data_node), true, my_uid, send2me_id)
+                {
+                    out.push(act);
+                }
+            }
         } else if matches!(
             act_type.as_str(),
             "seen" | "read" | "read_msg" | "mark_read" | "remove_unread_mark" | "unread" | "add_unread_mark" | "mark_unread"
         ) {
-            if let Some((tid, _)) = extract_thread_id(data_node, false, my_uid, send2me_id) {
+            let has_explicit_receipt = act_type == "seen"
+                && (data_node.get("seenUids").is_some()
+                    || data_node.get("seenTs").is_some()
+                    || data_node.get("msgId").is_some()
+                    || data_node.get("globalMsgId").is_some()
+                    || data_node.get("realMsgId").is_some());
+            let peer_uid = pick_str(data_node, &["uidFrom", "fromUid", "fromId"]).unwrap_or_default();
+            let is_peer = !peer_uid.is_empty()
+                && peer_uid != "0"
+                && (my_uid.is_empty() || peer_uid != my_uid);
+            if has_explicit_receipt && is_peer {
+                if let Some(act) =
+                    parse_receipt_item(data_node, is_group_flag(data_node), true, my_uid, send2me_id)
+                {
+                    out.push(act);
+                }
+            } else if let Some((tid, _)) = extract_thread_id(data_node, false, my_uid, send2me_id) {
                 let is_unread = matches!(act_type.as_str(), "unread" | "add_unread_mark" | "mark_unread");
                 out.push(WsParsedAction::Read {
                     thread_id: tid,
@@ -1006,5 +1485,153 @@ mod tests {
             parsed2.attachment_url.as_deref(),
             Some("https://f.zdn.vn/hd_from_params.jpg")
         );
+    }
+
+    #[test]
+    fn parses_ws_seen_and_delivered_receipts() {
+        let ev_seen_11 = WsEvent {
+            cmd: CMD_SEEN_1_1,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "seenMsgs": [
+                        { "idTo": "999", "uidFrom": "999", "seenTs": 1_700_000_050_i64 },
+                        { "uidFrom": "456", "idTo": "456", "seenTs": 1_700_000_060_i64 }
+                    ]
+                }
+            }),
+        };
+        let a1 = parse_ws_event(&ev_seen_11, "456", "");
+        assert_eq!(a1.len(), 1);
+        assert!(matches!(
+            &a1[0],
+            WsParsedAction::PeerSeen { thread_id, seen_ts, is_delivered_only }
+                if thread_id == "999" && *seen_ts == 1_700_000_050_000 && !*is_delivered_only
+        ));
+
+        let ev_seen_grp = WsEvent {
+            cmd: CMD_SEEN_GROUP,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "seenMsgs": [
+                        { "grid": "888111", "seenUids": ["456", "777"], "ts": 1_700_000_090_000_i64 },
+                        { "grid": "888222", "seenUids": ["456"], "ts": 1_700_000_091_000_i64 }
+                    ]
+                }
+            }),
+        };
+        let a2 = parse_ws_event(&ev_seen_grp, "456", "");
+        assert_eq!(a2.len(), 1);
+        assert!(matches!(
+            &a2[0],
+            WsParsedAction::PeerSeen { thread_id, seen_ts, is_delivered_only }
+                if thread_id == "group_888111" && *seen_ts == 1_700_000_090_000 && !*is_delivered_only
+        ));
+
+        let ev_deliv = WsEvent {
+            cmd: CMD_DELIVERED_1_1,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "deliverMsgs": [
+                        { "idTo": "555", "ts": 1_700_000_120_000_i64 }
+                    ]
+                }
+            }),
+        };
+        let a3 = parse_ws_event(&ev_deliv, "456", "");
+        assert_eq!(a3.len(), 1);
+        assert!(matches!(
+            &a3[0],
+            WsParsedAction::PeerSeen { thread_id, is_delivered_only, .. }
+                if thread_id == "555" && *is_delivered_only
+        ));
+    }
+
+    #[test]
+    fn parses_reminder_message_without_thumb_image_and_extracts_metadata() {
+        let rem = json!({
+            "msgId": "7001",
+            "uidFrom": "100",
+            "idTo": "200",
+            "msgType": "chat.reminder",
+            "ts": 1_700_000_000_000_i64,
+            "content": {
+                "title": "Họp giao ban tuần",
+                "thumb": "https://stc-chat.zdn.vn/images/reminder_calendar_bg.png",
+                "href": "https://chat.zalo.me",
+                "params": "{\"reminderId\":\"r-42\",\"title\":\"Họp giao ban tuần\",\"startTime\":1700003600,\"repeat\":2}"
+            }
+        });
+        let parsed = parse_chat_message(&rem, None, "999", "", false).unwrap();
+        assert_eq!(parsed.msg_type, "chat.reminder");
+        assert!(parsed.attachment_url.is_none());
+        assert_eq!(parsed.text, "Nhắc hẹn: Họp giao ban tuần");
+        let meta = parsed.attachment_name.as_deref().unwrap();
+        assert!(meta.starts_with("teza-reminder:"));
+        assert!(meta.contains("1700003600000"));
+        assert!(meta.contains("r-42"));
+    }
+
+    #[test]
+    fn parses_ecard_reminder_notification_with_clock_title_and_thumb_url() {
+        let rem = json!({
+            "msgId": "8514082898696",
+            "uidFrom": "100",
+            "idTo": "200",
+            "msgType": "chat.ecard",
+            "ts": 1_763_712_000_000_i64,
+            "content": {
+                "title": "⏰ uống nước để lấy năng lượng...",
+                "description": "Thứ Bảy, 21 tháng 11 lúc 15:00",
+                "thumb": "https://res-zalo.zadn.vn/upload/media/2018/8/3/reminder_2_1533262255293_116971.png",
+                "href": "https://chat.zalo.me"
+            }
+        });
+        let parsed = parse_chat_message(&rem, None, "999", "", false).unwrap();
+        assert_eq!(parsed.msg_type, "chat.reminder");
+        assert!(parsed.attachment_url.is_none());
+        assert_eq!(parsed.text, "Nhắc hẹn: uống nước để lấy năng lượng...");
+        let meta = parsed.attachment_name.as_deref().unwrap();
+        assert!(meta.starts_with("teza-reminder:"));
+        assert!(meta.contains("uống nước để lấy năng lượng..."));
+        assert!(meta.contains("Thứ Bảy, 21 tháng 11 lúc 15:00"));
+    }
+
+    #[test]
+    fn parses_poll_message_metadata() {
+        let poll = json!({
+            "msgId": "7002",
+            "uidFrom": "100",
+            "grid": "888111",
+            "msgType": "group.poll",
+            "ts": 1_700_000_000_000_i64,
+            "content": {
+                "poll_id": 98765_i64,
+                "question": "Trưa nay ăn gì?",
+                "allow_multi_choices": true,
+                "is_anonymous": false,
+                "options": [
+                    { "option_id": 1, "content": "Phở bò", "total_vote": 3, "voted": true },
+                    { "option_id": 2, "content": "Bún chả", "total_vote": 1, "voted": false }
+                ]
+            }
+        });
+        let parsed = parse_chat_message(&poll, None, "999", "", true).unwrap();
+        assert_eq!(parsed.msg_type, "chat.poll");
+        assert!(parsed.attachment_url.is_none());
+        assert_eq!(parsed.text, "Bình chọn: Trưa nay ăn gì?");
+        let raw_meta = parsed.attachment_name.as_deref().unwrap();
+        let json_str = raw_meta.strip_prefix("teza-poll:").unwrap();
+        let dto: PollDto = serde_json::from_str(json_str).unwrap();
+        assert_eq!(dto.poll_id, 98765);
+        assert!(dto.allow_multi);
+        assert_eq!(dto.options.len(), 2);
+        assert_eq!(dto.options[0].votes, 3);
+        assert!(dto.options[0].voted);
     }
 }

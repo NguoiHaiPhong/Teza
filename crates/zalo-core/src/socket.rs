@@ -26,6 +26,8 @@ pub const CMD_PING: u16 = 2;
 pub const SUB_KEEP_CONNECTION: u8 = 1;
 
 pub const CMD_PUSH_MSG_1_1: u16 = 501;
+pub const CMD_DELIVERED_1_1: u16 = 502;
+pub const CMD_SEEN_1_1: u16 = 503;
 pub const CMD_PULL_MSG_1_1: u16 = 510;
 pub const CMD_PULL_MSG_GROUP: u16 = 511;
 pub const CMD_PULL_MSG_513: u16 = 513;
@@ -34,6 +36,8 @@ pub const CMD_PULL_MSG_515: u16 = 515;
 pub const CMD_PULL_MSG_517: u16 = 517;
 pub const CMD_PULL_MSG_518: u16 = 518;
 pub const CMD_PUSH_MSG_GROUP: u16 = 521;
+pub const CMD_DELIVERED_GROUP: u16 = 522;
+pub const CMD_SEEN_GROUP: u16 = 523;
 pub const CMD_HAS_MSG: u16 = 533;
 pub const CMD_PUSH_MISS_MSG: u16 = 534;
 pub const CMD_GET_MSG: u16 = 570;
@@ -83,6 +87,13 @@ impl WsEvent {
 
     pub fn is_control_ish(&self) -> bool {
         matches!(self.cmd, CMD_CTRL_PUSH_CTRL | CMD_CTRL_ACTION | CMD_CTRL_PULL_CTRL)
+    }
+
+    pub fn is_receipt_ish(&self) -> bool {
+        matches!(
+            self.cmd,
+            CMD_DELIVERED_1_1 | CMD_SEEN_1_1 | CMD_DELIVERED_GROUP | CMD_SEEN_GROUP
+        )
     }
 }
 

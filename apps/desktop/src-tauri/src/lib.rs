@@ -4,14 +4,17 @@ mod clipboard;
 mod file_dialog;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::ipc::InvokeBody;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri::{
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, State,
+    WebviewBuilder, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+};
 use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -23,8 +26,8 @@ use zalo_core::chat::parser::{
 };
 use zalo_core::chat::threads;
 use zalo_core::chat::{
-    ChatFolderDto, FolderFilter, MessageDto, ThreadDetailsDto, ThreadDto, ThreadKind,
-    UserProfileDto,
+    AddGroupMembersResultDto, ChatFolderDto, FolderFilter, MessageDto, PollDto, ThreadDetailsDto,
+    ThreadDto, ThreadKind, UserProfileDto,
 };
 use zalo_core::data_dir::StoragePaths;
 use zalo_core::qr::{self, QrTicket};
@@ -49,6 +52,47 @@ pub struct AppState {
     pub pending_update: Arc<Mutex<Option<tauri_plugin_updater::Update>>>,
     pub close_to_tray: Arc<AtomicBool>,
     pub allow_exit: Arc<AtomicBool>,
+    pub pending_notify: Arc<Mutex<Option<NotifyToastPayload>>>,
+    pub notify_hide_gen: Arc<AtomicU64>,
+    pub active_webapp_label: Arc<Mutex<Option<String>>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotifyToastPayload {
+    pub thread_id: String,
+    pub title: String,
+    pub body: String,
+    pub avatar: String,
+    pub theme: String,
+    pub position: String,
+    pub duration_ms: u64,
+}
+
+const TOAST_LOGICAL_W: f64 = 356.0;
+const TOAST_LOGICAL_H: f64 = 96.0;
+const TOAST_MARGIN: f64 = 16.0;
+
+fn compute_notify_position(
+    work_x: i32,
+    work_y: i32,
+    work_w: u32,
+    work_h: u32,
+    scale: f64,
+    position: &str,
+) -> (i32, i32) {
+    let pw = (TOAST_LOGICAL_W * scale).round() as i32;
+    let ph = (TOAST_LOGICAL_H * scale).round() as i32;
+    let pm = (TOAST_MARGIN * scale).round() as i32;
+    let left_x = work_x + pm;
+    let right_x = (work_x + work_w as i32 - pw - pm).max(left_x);
+    let top_y = work_y + pm;
+    let bottom_y = (work_y + work_h as i32 - ph - pm).max(top_y);
+    match position {
+        "top-left" => (left_x, top_y),
+        "top-right" => (right_x, top_y),
+        "bottom-left" => (left_x, bottom_y),
+        _ => (right_x, bottom_y),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -205,7 +249,7 @@ async fn restart_ws_worker(
                     break;
                 }
                 WsSignal::Event(ev) => {
-                    if !ev.is_chat_ish() && !ev.is_control_ish() {
+                    if !ev.is_chat_ish() && !ev.is_control_ish() && !ev.is_receipt_ish() {
                         continue;
                     }
                     let mut actions = parse_ws_event(&ev, &my_uid, &send2me_id);
@@ -285,6 +329,23 @@ async fn restart_ws_worker(
                             } => {
                                 let _ = store.set_thread_unread(&thread_id, if is_unread { 1 } else { 0 });
                                 threads_touched = true;
+                            }
+                            WsParsedAction::PeerSeen {
+                                thread_id,
+                                seen_ts,
+                                is_delivered_only,
+                            } => {
+                                if !is_delivered_only {
+                                    if let Ok(peer_ts) = store.update_peer_read_ts(&thread_id, seen_ts) {
+                                        let _ = app.emit(
+                                            "core://thread-receipt",
+                                            serde_json::json!({
+                                                "thread_id": thread_id,
+                                                "peer_read_ts": peer_ts,
+                                            }),
+                                        );
+                                    }
+                                }
                             }
                             WsParsedAction::Recalled { thread_id, msg_id } => {
                                 if let Ok(Some(updated)) = store.mark_recalled(&thread_id, &msg_id) {
@@ -614,25 +675,40 @@ fn spawn_best_effort_thread_sync<F>(
 }
 
 #[tauri::command]
+async fn thread_set_active(
+    state: State<'_, AppState>,
+    thread_id: Option<String>,
+) -> Result<(), String> {
+    *state.active_thread_id.lock().await = thread_id;
+    Ok(())
+}
+
+#[tauri::command]
 async fn thread_mark_read(
     app: AppHandle,
     state: State<'_, AppState>,
     thread_id: String,
 ) -> Result<(), String> {
     *state.active_thread_id.lock().await = Some(thread_id.clone());
-    let kind = {
+    let (kind, latest_incoming) = {
         let store = state.store.lock().await;
         store.mark_thread_read(&thread_id).map_err(|e| e.to_string())?;
-        store
+        let kind = store
             .get_thread_kind(&thread_id)
             .ok()
             .flatten()
-            .unwrap_or(ThreadKind::Direct)
+            .unwrap_or(ThreadKind::Direct);
+        let latest = store.get_latest_incoming_message(&thread_id).ok().flatten();
+        (kind, latest)
     };
     if thread_id != "cloud-me" {
         let tid = thread_id.clone();
         spawn_best_effort_thread_sync(app, &state, move |sess| async move {
-            threads::sync_unread_mark(&sess, &tid, kind, false).await
+            let res = threads::sync_unread_mark(&sess, &tid, kind, false).await;
+            if let Some((mid, sender_id, _)) = latest_incoming {
+                let _ = threads::send_seen_event(&sess, &tid, kind, &mid, &sender_id).await;
+            }
+            res
         });
     }
     Ok(())
@@ -703,11 +779,20 @@ async fn thread_toggle_mute(
     state: State<'_, AppState>,
     thread_id: String,
     muted: bool,
-) -> Result<(), String> {
+    duration_secs: Option<i64>,
+) -> Result<i64, String> {
+    let muted_until_ts = if muted {
+        duration_secs
+            .filter(|d| *d > 0)
+            .map(|d| chrono_now_ms().saturating_add(d.saturating_mul(1000)))
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let kind = {
         let store = state.store.lock().await;
         store
-            .set_thread_muted(&thread_id, muted)
+            .set_thread_muted_until(&thread_id, muted, muted_until_ts)
             .map_err(|e| e.to_string())?;
         store
             .get_thread_kind(&thread_id)
@@ -718,9 +803,119 @@ async fn thread_toggle_mute(
     if thread_id != "cloud-me" {
         let tid = thread_id.clone();
         spawn_best_effort_thread_sync(app, &state, move |sess| async move {
-            threads::sync_mute_thread(&sess, &tid, kind, muted).await
+            threads::sync_mute_thread(&sess, &tid, kind, muted, duration_secs).await
         });
     }
+    Ok(muted_until_ts)
+}
+
+#[tauri::command]
+async fn thread_toggle_archive(
+    state: State<'_, AppState>,
+    thread_id: String,
+    archived: bool,
+) -> Result<(), String> {
+    let store = state.store.lock().await;
+    store
+        .set_thread_archived(&thread_id, archived)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn notify_show_popup(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    payload: NotifyToastPayload,
+) -> Result<(), String> {
+    *state.pending_notify.lock().await = Some(payload.clone());
+
+    let (px, py) = app
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .map(|mon| {
+            let work = mon.work_area();
+            compute_notify_position(
+                work.position.x,
+                work.position.y,
+                work.size.width,
+                work.size.height,
+                mon.scale_factor(),
+                &payload.position,
+            )
+        })
+        .unwrap_or((16, 16));
+
+    let win = if let Some(existing) = app.get_webview_window("teza-notify") {
+        existing
+    } else {
+        WebviewWindowBuilder::new(
+            &app,
+            "teza-notify",
+            WebviewUrl::App("index.html?view=notify".into()),
+        )
+        .title("Teza Notification")
+        .inner_size(TOAST_LOGICAL_W, TOAST_LOGICAL_H)
+        .resizable(false)
+        .decorations(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .focused(false)
+        .visible(false)
+        .build()
+        .map_err(|e| e.to_string())?
+    };
+
+    let _ = win.set_position(PhysicalPosition::new(px, py));
+    let _ = win.show();
+    let _ = app.emit_to("teza-notify", "core://notify-payload", &payload);
+
+    let gen = state.notify_hide_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let gen_arc = state.notify_hide_gen.clone();
+    let app_hide = app.clone();
+    let ms = payload.duration_ms.clamp(2500, 15000);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        if gen_arc.load(Ordering::SeqCst) == gen {
+            if let Some(w) = app_hide.get_webview_window("teza-notify") {
+                let _ = w.hide();
+            }
+        }
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn notify_get_current(state: State<'_, AppState>) -> Result<Option<NotifyToastPayload>, String> {
+    Ok(state.pending_notify.lock().await.clone())
+}
+
+#[tauri::command]
+async fn notify_dismiss(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    state.notify_hide_gen.fetch_add(1, Ordering::SeqCst);
+    if let Some(w) = app.get_webview_window("teza-notify") {
+        let _ = w.hide();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn notify_click(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> Result<(), String> {
+    state.notify_hide_gen.fetch_add(1, Ordering::SeqCst);
+    if let Some(w) = app.get_webview_window("teza-notify") {
+        let _ = w.hide();
+    }
+    if let Some(main_win) = app.get_webview_window("main") {
+        let _ = main_win.show();
+        let _ = main_win.unminimize();
+        let _ = main_win.set_focus();
+    }
+    let _ = app.emit_to("main", "core://open-thread", thread_id);
     Ok(())
 }
 
@@ -817,6 +1012,18 @@ async fn folder_delete(
 }
 
 #[tauri::command]
+async fn folders_reorder(
+    state: State<'_, AppState>,
+    ordered_ids: Vec<String>,
+) -> Result<Vec<ChatFolderDto>, String> {
+    let store = state.store.lock().await;
+    store
+        .reorder_chat_folders(&ordered_ids)
+        .map_err(|e| e.to_string())?;
+    store.list_chat_folders().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn folders_sync_remote_labels(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -859,6 +1066,7 @@ async fn folders_sync_remote_labels(
             rf.id = old.id.clone();
             rf.icon = old.icon.clone();
             rf.include_kinds = old.include_kinds.clone();
+            rf.excluded_thread_ids = old.excluded_thread_ids.clone();
             rf.only_unread = old.only_unread;
             rf.exclude_muted = old.exclude_muted;
             rf.position = old.position;
@@ -873,17 +1081,36 @@ async fn user_get_profile(
     state: State<'_, AppState>,
     user_id: String,
 ) -> Result<UserProfileDto, String> {
-    let known_profiles = {
+    let clean_uid = user_id
+        .trim()
+        .split('_')
+        .next()
+        .unwrap_or(user_id.trim())
+        .to_string();
+    let (known_profiles, group_threads, (msg_count, media_count, last_ts)) = {
         let store = state.store.lock().await;
-        store.resolve_known_profiles().unwrap_or_default()
+        let known = store.resolve_known_profiles().unwrap_or_default();
+        let groups = store.list_threads(FolderFilter::Group).unwrap_or_default();
+        let stats = store
+            .thread_interaction_stats(&clean_uid)
+            .unwrap_or((0, 0, 0));
+        (known, groups, stats)
     };
     let sess_snapshot = {
         let sess = state.session.lock().await;
         sess.clone_shallow()
     };
-    threads::fetch_user_profile(&sess_snapshot, &user_id, &known_profiles)
+    let mut profile = threads::fetch_user_profile(&sess_snapshot, &user_id, &known_profiles)
         .await
-        .map_err(|e| format!("Không tra được thông tin tài khoản: {e}"))
+        .map_err(|e| format!("Không tra được thông tin tài khoản: {e}"))?;
+    if !profile.is_self && sess_snapshot.is_authenticated() && !group_threads.is_empty() {
+        profile.mutual_groups =
+            threads::fetch_mutual_groups(&sess_snapshot, &profile.uid, &group_threads).await;
+    }
+    profile.local_message_count = msg_count;
+    profile.local_media_count = media_count;
+    profile.last_interaction_ts = last_ts;
+    Ok(profile)
 }
 
 #[tauri::command]
@@ -898,6 +1125,337 @@ async fn user_find_by_phone(
     threads::find_user_by_phone(&sess_snapshot, &phone)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn group_add_members(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    member_ids: Vec<String>,
+) -> Result<AddGroupMembersResultDto, String> {
+    let sess_snapshot = {
+        let sess = state.session.lock().await;
+        sess.clone_shallow()
+    };
+    if !sess_snapshot.is_authenticated() {
+        return Ok(AddGroupMembersResultDto {
+            added: member_ids,
+            pending: Vec::new(),
+            failed: Vec::new(),
+            message: String::new(),
+        });
+    }
+    match threads::add_group_members(&sess_snapshot, &thread_id, &member_ids).await {
+        Ok(res) => Ok(res),
+        Err(e) => {
+            if let Some(code) = expired_code(&e) {
+                let reason =
+                    format!("Phiên đăng nhập đã hết hạn (mã {code}). Vui lòng quét lại mã QR.");
+                clear_expired_session(
+                    &app,
+                    &state.session,
+                    Some(&state.ws_task),
+                    &state.paths,
+                    reason.clone(),
+                    true,
+                )
+                .await;
+                return Err(reason);
+            }
+            Err(format!("Không thêm được thành viên vào nhóm: {e}"))
+        }
+    }
+}
+
+#[tauri::command]
+async fn reminder_create(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    title: String,
+    start_time_ms: i64,
+    repeat: i32,
+) -> Result<MessageDto, String> {
+    let clean_title = title.trim();
+    if clean_title.is_empty() {
+        return Err("Nội dung nhắc hẹn không được để trống".into());
+    }
+    let kind = {
+        let store = state.store.lock().await;
+        store
+            .get_thread_kind(&thread_id)
+            .ok()
+            .flatten()
+            .unwrap_or(ThreadKind::Direct)
+    };
+    let sess_snapshot = {
+        let sess = state.session.lock().await;
+        sess.clone_shallow()
+    };
+    let msg = if sess_snapshot.is_authenticated() {
+        match threads::create_reminder(
+            &sess_snapshot,
+            &thread_id,
+            kind,
+            clean_title,
+            start_time_ms,
+            repeat,
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                if let Some(code) = expired_code(&e) {
+                    let reason =
+                        format!("Phiên đăng nhập đã hết hạn (mã {code}). Vui lòng quét lại mã QR.");
+                    clear_expired_session(
+                        &app,
+                        &state.session,
+                        Some(&state.ws_task),
+                        &state.paths,
+                        reason.clone(),
+                        true,
+                    )
+                    .await;
+                    return Err(reason);
+                }
+                return Err(format!("Tạo nhắc hẹn thất bại: {e}"));
+            }
+        }
+    } else {
+        let now_ms = chrono_now_ms();
+        let meta = serde_json::json!({
+            "title": clean_title,
+            "startTime": start_time_ms,
+            "repeat": repeat,
+            "reminderId": format!("local-rem-{now_ms}"),
+        })
+        .to_string();
+        MessageDto {
+            msg_id: format!("local-rem-{now_ms}"),
+            thread_id: thread_id.clone(),
+            sender_id: "me".into(),
+            sender_name: "Bạn".into(),
+            text: format!("Nhắc hẹn: {clean_title}"),
+            msg_type: "chat.reminder".into(),
+            ts: now_ms,
+            is_outgoing: true,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
+            reactions: Vec::new(),
+            attachment_url: None,
+            attachment_name: Some(format!("teza-reminder:{meta}")),
+        }
+    };
+    persist_and_emit_sent_message(&app, &state, msg).await
+}
+
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+async fn poll_create(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    question: String,
+    options: Vec<String>,
+    expired_time_ms: i64,
+    allow_multi: bool,
+    allow_add_option: bool,
+    is_anonymous: bool,
+) -> Result<MessageDto, String> {
+    let clean_q = question.trim();
+    if clean_q.is_empty() {
+        return Err("Câu hỏi bình chọn không được để trống".into());
+    }
+    let clean_opts: Vec<String> = options
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if clean_opts.len() < 2 {
+        return Err("Cần ít nhất 2 lựa chọn để tạo bình chọn".into());
+    }
+    let sess_snapshot = {
+        let sess = state.session.lock().await;
+        sess.clone_shallow()
+    };
+    let msg = if sess_snapshot.is_authenticated() {
+        match threads::create_poll(
+            &sess_snapshot,
+            &thread_id,
+            clean_q,
+            &clean_opts,
+            expired_time_ms,
+            allow_multi,
+            allow_add_option,
+            is_anonymous,
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                if let Some(code) = expired_code(&e) {
+                    let reason =
+                        format!("Phiên đăng nhập đã hết hạn (mã {code}). Vui lòng quét lại mã QR.");
+                    clear_expired_session(
+                        &app,
+                        &state.session,
+                        Some(&state.ws_task),
+                        &state.paths,
+                        reason.clone(),
+                        true,
+                    )
+                    .await;
+                    return Err(reason);
+                }
+                return Err(format!("Tạo bình chọn thất bại: {e}"));
+            }
+        }
+    } else {
+        let now_ms = chrono_now_ms();
+        let dto = PollDto {
+            poll_id: now_ms,
+            question: clean_q.to_string(),
+            options: clean_opts
+                .iter()
+                .enumerate()
+                .map(|(i, content)| zalo_core::chat::PollOptionDto {
+                    id: (i + 1) as i64,
+                    content: content.clone(),
+                    votes: 0,
+                    voted: false,
+                })
+                .collect(),
+            allow_multi,
+            allow_add_option,
+            is_anonymous,
+            expired_time: expired_time_ms.max(0),
+            closed: false,
+        };
+        let poll_json = serde_json::to_string(&dto).map_err(|e| e.to_string())?;
+        MessageDto {
+            msg_id: format!("local-poll-{now_ms}"),
+            thread_id: thread_id.clone(),
+            sender_id: "me".into(),
+            sender_name: "Bạn".into(),
+            text: format!("Bình chọn: {clean_q}"),
+            msg_type: "chat.poll".into(),
+            ts: now_ms,
+            is_outgoing: true,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
+            reactions: Vec::new(),
+            attachment_url: None,
+            attachment_name: Some(format!("teza-poll:{poll_json}")),
+        }
+    };
+    persist_and_emit_sent_message(&app, &state, msg).await
+}
+
+async fn update_local_poll_message(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    thread_id: Option<&str>,
+    msg_id: Option<&str>,
+    poll: &PollDto,
+) {
+    let (Some(tid), Some(mid)) = (thread_id, msg_id) else {
+        return;
+    };
+    let Ok(poll_json) = serde_json::to_string(poll) else {
+        return;
+    };
+    let mut store = state.store.lock().await;
+    if let Ok(Some(mut msg)) = store.get_message(tid, mid) {
+        msg.msg_type = "chat.poll".to_string();
+        msg.attachment_url = None;
+        msg.attachment_name = Some(format!("teza-poll:{poll_json}"));
+        if store.upsert_message(&msg).is_ok() {
+            let _ = app.emit("core://message-updated", &msg);
+        }
+    }
+}
+
+#[tauri::command]
+async fn poll_get_detail(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    poll_id: i64,
+    thread_id: Option<String>,
+    msg_id: Option<String>,
+) -> Result<PollDto, String> {
+    let sess_snapshot = {
+        let sess = state.session.lock().await;
+        sess.clone_shallow()
+    };
+    if !sess_snapshot.is_authenticated() {
+        return Err("Chế độ xem trước không đồng bộ dữ liệu máy chủ".into());
+    }
+    let poll = match threads::get_poll_detail(&sess_snapshot, poll_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            if let Some(code) = expired_code(&e) {
+                let reason =
+                    format!("Phiên đăng nhập đã hết hạn (mã {code}). Vui lòng quét lại mã QR.");
+                clear_expired_session(
+                    &app,
+                    &state.session,
+                    Some(&state.ws_task),
+                    &state.paths,
+                    reason.clone(),
+                    true,
+                )
+                .await;
+                return Err(reason);
+            }
+            return Err(format!("Không tải được bình chọn: {e}"));
+        }
+    };
+    update_local_poll_message(&app, &state, thread_id.as_deref(), msg_id.as_deref(), &poll).await;
+    Ok(poll)
+}
+
+#[tauri::command]
+async fn poll_vote(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    poll_id: i64,
+    option_ids: Vec<i64>,
+    thread_id: Option<String>,
+    msg_id: Option<String>,
+) -> Result<PollDto, String> {
+    let sess_snapshot = {
+        let sess = state.session.lock().await;
+        sess.clone_shallow()
+    };
+    if !sess_snapshot.is_authenticated() {
+        return Err("Chế độ xem trước không đồng bộ bình chọn máy chủ".into());
+    }
+    let poll = match threads::vote_poll(&sess_snapshot, poll_id, &option_ids).await {
+        Ok(p) => p,
+        Err(e) => {
+            if let Some(code) = expired_code(&e) {
+                let reason =
+                    format!("Phiên đăng nhập đã hết hạn (mã {code}). Vui lòng quét lại mã QR.");
+                clear_expired_session(
+                    &app,
+                    &state.session,
+                    Some(&state.ws_task),
+                    &state.paths,
+                    reason.clone(),
+                    true,
+                )
+                .await;
+                return Err(reason);
+            }
+            return Err(format!("Bình chọn thất bại: {e}"));
+        }
+    };
+    update_local_poll_message(&app, &state, thread_id.as_deref(), msg_id.as_deref(), &poll).await;
+    Ok(poll)
 }
 
 struct RemoteThreadSyncCtx {
@@ -1595,11 +2153,40 @@ async fn message_toggle_pin(
 
 #[tauri::command]
 async fn stickers_list(state: State<'_, AppState>) -> Result<Vec<messaging::StickerItem>, String> {
+    let recent: Vec<messaging::StickerItem> = {
+        let store = state.store.lock().await;
+        store
+            .list_recent_stickers(40)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(id, cate_id, url)| messaging::StickerItem {
+                id,
+                cate_id,
+                sticker_type: 1,
+                url,
+                category: "Gần đây".into(),
+            })
+            .collect()
+    };
     let sess_snapshot = {
         let sess = state.session.lock().await;
         sess.clone_shallow()
     };
-    messaging::list_stickers(&sess_snapshot)
+    messaging::list_stickers(&sess_snapshot, recent)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn stickers_search(
+    state: State<'_, AppState>,
+    keyword: String,
+) -> Result<Vec<messaging::StickerItem>, String> {
+    let sess_snapshot = {
+        let sess = state.session.lock().await;
+        sess.clone_shallow()
+    };
+    messaging::search_stickers(&sess_snapshot, &keyword)
         .await
         .map_err(|e| e.to_string())
 }
@@ -2232,6 +2819,210 @@ async fn clipboard_copy_rgba_image(request: tauri::ipc::Request<'_>) -> Result<(
         .map_err(|e| format!("Lỗi tác vụ clipboard ảnh: {e}"))?
 }
 
+const WEBAPP_LABEL_PREFIX: &str = "teza-webapp-";
+
+fn webapp_label(id: &str) -> String {
+    let clean: String = id
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = clean.trim_matches('-');
+    if trimmed.is_empty() {
+        format!("{WEBAPP_LABEL_PREFIX}default")
+    } else {
+        format!("{WEBAPP_LABEL_PREFIX}{trimmed}")
+    }
+}
+
+fn validate_web_url(raw: &str) -> Result<tauri::Url, String> {
+    let trimmed = raw.trim();
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    };
+    let parsed =
+        tauri::Url::parse(&with_scheme).map_err(|e| format!("URL không hợp lệ: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => return Err(format!("Chỉ hỗ trợ giao thức http/https (nhận: {other})")),
+    }
+    if parsed.host_str().map(str::is_empty).unwrap_or(true) {
+        return Err("URL phải có tên miền hợp lệ".into());
+    }
+    Ok(parsed)
+}
+
+fn hide_all_webapp_children(app: &AppHandle) {
+    for (label, wv) in app.webviews() {
+        if label.starts_with(WEBAPP_LABEL_PREFIX) {
+            let _ = wv.hide();
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+async fn webapp_open(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    url: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    let parsed = validate_web_url(&url)?;
+    let label = webapp_label(&id);
+    let safe_w = width.max(120.0);
+    let safe_h = height.max(120.0);
+
+    for (existing_label, wv) in app.webviews() {
+        if existing_label.starts_with(WEBAPP_LABEL_PREFIX) && existing_label != label {
+            let _ = wv.hide();
+        }
+    }
+
+    if let Some(wv) = app.get_webview(&label) {
+        wv.set_position(LogicalPosition::new(x, y))
+            .map_err(|e| e.to_string())?;
+        wv.set_size(LogicalSize::new(safe_w, safe_h))
+            .map_err(|e| e.to_string())?;
+        wv.show().map_err(|e| e.to_string())?;
+        *state.active_webapp_label.lock().await = Some(label);
+        return Ok(());
+    }
+
+    let main_win = app
+        .get_webview_window("main")
+        .ok_or_else(|| "Không tìm thấy cửa sổ chính".to_string())?;
+    let parent_window = main_win.as_ref().window();
+    let builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed));
+    parent_window
+        .add_child(
+            builder,
+            LogicalPosition::new(x, y),
+            LogicalSize::new(safe_w, safe_h),
+        )
+        .map_err(|e| format!("Không thể nhúng Web App: {e}"))?;
+
+    *state.active_webapp_label.lock().await = Some(label);
+    Ok(())
+}
+
+#[tauri::command]
+async fn webapp_set_bounds(
+    app: AppHandle,
+    id: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
+    let label = webapp_label(&id);
+    if let Some(wv) = app.get_webview(&label) {
+        let safe_w = width.max(120.0);
+        let safe_h = height.max(120.0);
+        wv.set_position(LogicalPosition::new(x, y))
+            .map_err(|e| e.to_string())?;
+        wv.set_size(LogicalSize::new(safe_w, safe_h))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn webapp_hide_all(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    hide_all_webapp_children(&app);
+    *state.active_webapp_label.lock().await = None;
+    Ok(())
+}
+
+#[tauri::command]
+async fn webapp_close(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let label = webapp_label(&id);
+    if let Some(wv) = app.get_webview(&label) {
+        wv.close().map_err(|e| e.to_string())?;
+    }
+    let mut active = state.active_webapp_label.lock().await;
+    if active.as_deref() == Some(label.as_str()) {
+        *active = None;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn webapp_navigate(
+    app: AppHandle,
+    id: String,
+    action: String,
+    url: Option<String>,
+) -> Result<(), String> {
+    let label = webapp_label(&id);
+    let Some(wv) = app.get_webview(&label) else {
+        return Ok(());
+    };
+    match action.as_str() {
+        "back" => {
+            let _ = wv.eval("window.history.back()");
+        }
+        "forward" => {
+            let _ = wv.eval("window.history.forward()");
+        }
+        "reload" => {
+            wv.reload().map_err(|e| e.to_string())?;
+        }
+        "home" => {
+            if let Some(target_url) = url {
+                let parsed = validate_web_url(&target_url)?;
+                wv.navigate(parsed).map_err(|e| e.to_string())?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn open_external_url(url: String) -> Result<(), String> {
+    let parsed = validate_web_url(&url)?;
+    let target = parsed.as_str().to_string();
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", &target])
+            .spawn()
+            .map_err(|e| format!("Không mở được trình duyệt: {e}"))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&target)
+            .spawn()
+            .map_err(|e| format!("Không mở được trình duyệt: {e}"))?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&target)
+            .spawn()
+            .map_err(|e| format!("Không mở được trình duyệt: {e}"))?;
+    }
+    Ok(())
+}
+
 fn chrono_now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2275,6 +3066,9 @@ pub fn run() {
         pending_update: Arc::new(Mutex::new(None)),
         close_to_tray: close_to_tray.clone(),
         allow_exit: allow_exit.clone(),
+        pending_notify: Arc::new(Mutex::new(None)),
+        notify_hide_gen: Arc::new(AtomicU64::new(0)),
+        active_webapp_label: Arc::new(Mutex::new(None)),
     };
 
     let builder = tauri::Builder::default();
@@ -2298,17 +3092,25 @@ pub fn run() {
             auth_logout,
             threads_sync,
             threads_list,
+            thread_set_active,
             thread_mark_read,
             thread_mark_unread,
             thread_toggle_pin,
             thread_toggle_mute,
+            thread_toggle_archive,
             thread_get_details,
             folders_list,
             folder_save,
             folder_delete,
+            folders_reorder,
             folders_sync_remote_labels,
             user_get_profile,
             user_find_by_phone,
+            group_add_members,
+            reminder_create,
+            poll_create,
+            poll_get_detail,
+            poll_vote,
             messages_load,
             messages_load_around,
             messages_list_pinned,
@@ -2320,6 +3122,7 @@ pub fn run() {
             message_delete_local,
             message_toggle_pin,
             stickers_list,
+            stickers_search,
             message_send_sticker,
             pick_attachment_file,
             save_remote_file,
@@ -2334,11 +3137,21 @@ pub fn run() {
             relay_get_config,
             relay_save_config,
             relay_test_connection,
+            notify_show_popup,
+            notify_get_current,
+            notify_dismiss,
+            notify_click,
             app_check_update,
             app_install_update,
             app_set_close_to_tray,
             clipboard_copy_text,
             clipboard_copy_rgba_image,
+            webapp_open,
+            webapp_set_bounds,
+            webapp_hide_all,
+            webapp_close,
+            webapp_navigate,
+            open_external_url,
         ])
         .setup(move |app| {
             let _ = app.get_webview_window("main");
@@ -2383,16 +3196,68 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                let st = window.state::<AppState>();
-                if st.close_to_tray.load(Ordering::SeqCst)
-                    && !st.allow_exit.load(Ordering::SeqCst)
-                {
-                    api.prevent_close();
-                    let _ = window.hide();
+            if window.label() == "main" {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    let st = window.state::<AppState>();
+                    if st.close_to_tray.load(Ordering::SeqCst)
+                        && !st.allow_exit.load(Ordering::SeqCst)
+                    {
+                        api.prevent_close();
+                        hide_all_webapp_children(window.app_handle());
+                        let _ = window.hide();
+                    }
                 }
             }
         })
         .run(tauri::generate_context!())
         .expect("error while running Teza");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_notify_position;
+
+    #[test]
+    fn compute_notify_position_places_all_four_corners_with_dpi_scaling() {
+        // 1920x1040 work area starting at (0, 0), scale 1.0 -> pw=356, ph=96, margin=16
+        assert_eq!(
+            compute_notify_position(0, 0, 1920, 1040, 1.0, "top-left"),
+            (16, 16)
+        );
+        assert_eq!(
+            compute_notify_position(0, 0, 1920, 1040, 1.0, "top-right"),
+            (1548, 16)
+        );
+        assert_eq!(
+            compute_notify_position(0, 0, 1920, 1040, 1.0, "bottom-left"),
+            (16, 928)
+        );
+        assert_eq!(
+            compute_notify_position(0, 0, 1920, 1040, 1.0, "bottom-right"),
+            (1548, 928)
+        );
+
+        // Scale 1.5 with non-zero work area origin (taskbar top/left): pw=534, ph=144, margin=24
+        assert_eq!(
+            compute_notify_position(100, 40, 1920, 1080, 1.5, "top-left"),
+            (124, 64)
+        );
+        assert_eq!(
+            compute_notify_position(100, 40, 1920, 1080, 1.5, "bottom-right"),
+            (1462, 952)
+        );
+    }
+
+    #[test]
+    fn validate_web_url_rejects_non_http_schemes() {
+        assert!(super::validate_web_url("https://calendar.google.com").is_ok());
+        assert!(super::validate_web_url("notion.so").is_ok());
+        assert_eq!(
+            super::validate_web_url("notion.so").unwrap().as_str(),
+            "https://notion.so/"
+        );
+        assert!(super::validate_web_url("javascript:alert(1)").is_err());
+        assert!(super::validate_web_url("file:///C:/Windows/win.ini").is_err());
+        assert!(super::validate_web_url("data:text/html,hi").is_err());
+    }
 }

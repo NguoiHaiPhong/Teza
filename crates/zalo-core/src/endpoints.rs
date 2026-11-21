@@ -26,6 +26,7 @@ pub const WPA_CHAT: &str = "https://wpa.chat.zalo.me";
 pub const GROUP_BOARD: &str = "https://groupboard-wpa.chat.zalo.me";
 pub const FRIEND_BOARD: &str = "https://friendboard-wpa.chat.zalo.me";
 pub const BOARD: &str = "https://board-wpa.chat.zalo.me";
+pub const REMINDER: &str = "https://reminder-wpa.chat.zalo.me";
 
 /// Look up an authoritative service base URL by key.
 pub fn service(key: &str) -> Option<&'static str> {

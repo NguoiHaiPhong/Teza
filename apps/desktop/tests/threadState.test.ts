@@ -8,8 +8,10 @@ import {
   countFolderUnread,
   extractFirstUrl,
   filterThreadsByFolder,
+  findFirstUnreadMsgId,
   getDisplayBodyText,
   looksLikePhoneQuery,
+  moveArrayItem,
   splitTextLinks,
   upsertMsg,
 } from "../src/utils/threadState.ts";
@@ -246,6 +248,7 @@ test("filterThreadsByFolder, countFolderUnread, and extractFirstUrl support cust
       icon: "briefcase",
       color: "",
       thread_ids: ["u1"],
+      excluded_thread_ids: [],
       include_kinds: ["group"],
       only_unread: false,
       exclude_muted: true,
@@ -258,6 +261,7 @@ test("filterThreadsByFolder, countFolderUnread, and extractFirstUrl support cust
       icon: "star",
       color: "",
       thread_ids: [],
+      excluded_thread_ids: [],
       include_kinds: [],
       only_unread: true,
       exclude_muted: false,
@@ -287,4 +291,89 @@ test("filterThreadsByFolder, countFolderUnread, and extractFirstUrl support cust
     "https://teza.app/docs(v2)",
   );
   assert.equal(extractFirstUrl("Khong co lien ket"), null);
+});
+
+test("findFirstUnreadMsgId uses last_read_in_ts watermark with count fallback and bumpThreadList updates receipt watermarks", () => {
+  const msgs = [
+    makeMsg({ msg_id: "m1", ts: 1000, is_outgoing: false }),
+    makeMsg({ msg_id: "m2", ts: 2000, is_outgoing: true }),
+    makeMsg({ msg_id: "m3", ts: 3000, is_outgoing: false }),
+    makeMsg({ msg_id: "m4", ts: 4000, is_outgoing: false }),
+  ];
+
+  // Zero unread returns null
+  assert.equal(findFirstUnreadMsgId(msgs, 1000, 0), null);
+  // Watermark picks first incoming message after lastReadInTs
+  assert.equal(findFirstUnreadMsgId(msgs, 2500, 1), "m3");
+  // Fallback when watermark is 0 counts backwards by fallbackUnreadCount incoming messages
+  assert.equal(findFirstUnreadMsgId(msgs, 0, 2), "m3");
+  assert.equal(findFirstUnreadMsgId(msgs, 0, 1), "m4");
+
+  const threads = [
+    makeThread({ id: "t1", last_ts: 1000, unread_count: 0, last_read_in_ts: 1000, peer_read_ts: 1000 }),
+  ];
+  const afterUnreadIn = bumpThreadList(
+    threads,
+    makeMsg({ thread_id: "t1", ts: 3000, is_outgoing: false, text: "Ping" }),
+    true,
+  );
+  assert.equal(afterUnreadIn[0].peer_read_ts, 3000);
+  assert.equal(afterUnreadIn[0].last_read_in_ts, 1000);
+  assert.equal(afterUnreadIn[0].unread_count, 1);
+
+  const afterReadIn = bumpThreadList(
+    afterUnreadIn,
+    makeMsg({ thread_id: "t1", ts: 4000, is_outgoing: false, text: "Seen now" }),
+    false,
+  );
+  assert.equal(afterReadIn[0].peer_read_ts, 4000);
+  assert.equal(afterReadIn[0].last_read_in_ts, 4000);
+});
+
+test("filterThreadsByFolder handles excluded_thread_ids, archived view, and moveArrayItem", () => {
+  const threads = [
+    makeThread({ id: "u1", kind: "direct", unread_count: 2 }),
+    makeThread({ id: "g1", kind: "group", unread_count: 1 }),
+    makeThread({ id: "g2", kind: "group", unread_count: 4 }),
+    makeThread({ id: "arch1", kind: "direct", unread_count: 3, is_archived: true }),
+  ];
+  const folders = [
+    {
+      id: "work",
+      name: "Work",
+      icon: "briefcase",
+      color: "",
+      thread_ids: ["u1"],
+      excluded_thread_ids: ["g2"],
+      include_kinds: ["group" as const],
+      only_unread: false,
+      exclude_muted: false,
+      position: 1,
+      remote_label_id: null,
+    },
+  ];
+
+  // Active lists exclude archived threads
+  assert.deepEqual(
+    filterThreadsByFolder(threads, "all", folders).map((t) => t.id),
+    ["u1", "g1", "g2"],
+  );
+  assert.deepEqual(
+    filterThreadsByFolder(threads, "unread", folders).map((t) => t.id),
+    ["u1", "g1", "g2"],
+  );
+  assert.deepEqual(
+    filterThreadsByFolder(threads, "custom:work", folders).map((t) => t.id),
+    ["u1", "g1"],
+  );
+  assert.deepEqual(
+    filterThreadsByFolder(threads, "archived", folders).map((t) => t.id),
+    ["arch1"],
+  );
+  assert.equal(countFolderUnread(threads, "all", folders), 7);
+
+  // Moving array items swaps order cleanly without mutating original array
+  const src = ["a", "b", "c"];
+  assert.deepEqual(moveArrayItem(src, 2, 0), ["c", "a", "b"]);
+  assert.deepEqual(src, ["a", "b", "c"]);
 });

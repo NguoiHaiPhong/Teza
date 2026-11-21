@@ -1,6 +1,10 @@
 import { memo, useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import {
+  BarChart3,
+  CalendarClock,
   Check,
+  CheckCheck,
   CheckSquare,
   Copy,
   CornerUpLeft,
@@ -12,14 +16,22 @@ import {
   Loader2,
   MessagesSquare,
   Pin,
+  RefreshCw,
+  Repeat,
   RotateCcw,
   Smile,
   Trash2,
   Zap,
 } from "lucide-react";
 import type { MessageDto, ThreadKind } from "../types";
+import { useI18n } from "../i18n";
 import { isBuzzMessage } from "../utils/buzz";
 import { copyImageReliable, copyTextReliable } from "../utils/clipboard";
+import {
+  formatReminderCountdown,
+  parsePollPayload,
+  parseReminderPayload,
+} from "../utils/richMessage";
 import { getDisplayBodyText, splitTextLinks } from "../utils/threadState";
 import { RelayAudio, RelayImage, RelayVideo } from "./RelayImage";
 import { ThreadAvatar } from "./ThreadAvatar";
@@ -38,7 +50,9 @@ interface Props {
   msg: MessageDto;
   threadKind: ThreadKind;
   groupedWithPrev: boolean;
+  groupedWithNext?: boolean;
   highlighted: boolean;
+  isSeen?: boolean;
   senderAvatar?: string;
   translation?: MessageTranslationState;
   replaceWithTranslation?: boolean;
@@ -65,6 +79,8 @@ interface Props {
   onDiscardFailed?: (msgId: string) => void;
   onSaveFile?: (url: string, name: string) => void;
   onCopyError?: (err: unknown) => void;
+  onVotePoll?: (msg: MessageDto, optionIds: number[]) => Promise<void> | void;
+  onRefreshPoll?: (msg: MessageDto) => Promise<void> | void;
 }
 
 function formatClock(ts: number): string {
@@ -169,7 +185,9 @@ export const MessageBubble = memo(function MessageBubble({
   msg,
   threadKind,
   groupedWithPrev,
+  groupedWithNext = false,
   highlighted,
+  isSeen = false,
   senderAvatar,
   translation,
   replaceWithTranslation = false,
@@ -196,23 +214,32 @@ export const MessageBubble = memo(function MessageBubble({
   onDiscardFailed,
   onSaveFile,
   onCopyError,
+  onVotePoll,
+  onRefreshPoll,
 }: Props) {
+  const { lang, locale, t } = useI18n();
   const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
-  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerPos, setPickerPos] = useState<{ left: number; top: number } | null>(null);
   const [mediaError, setMediaError] = useState(false);
   const [showOriginal, setShowOriginal] = useState(false);
+  const [pollBusy, setPollBusy] = useState(false);
 
   useEffect(() => {
     setMediaError(false);
   }, [msg.attachment_url, msg.msg_type]);
   const isReplaced = Boolean(replaceWithTranslation && translation?.text && !showOriginal);
-  const isBuzz = isBuzzMessage(msg);
-  const isSticker = !msg.is_recalled && isStickerMessage(msg) && !mediaError;
-  const isVoice = !msg.is_recalled && isVoiceAttachment(msg) && !mediaError;
-  const isVideo = !msg.is_recalled && isVideoAttachment(msg) && !mediaError;
-  const isImage = !msg.is_recalled && !isVoice && !isVideo && isImageAttachment(msg) && !mediaError;
+  const reminderData = !msg.is_recalled ? parseReminderPayload(msg) : null;
+  const pollData = !msg.is_recalled && !reminderData ? parsePollPayload(msg) : null;
+  const isRichCard = Boolean(reminderData || pollData);
+  const isBuzz = !isRichCard && isBuzzMessage(msg);
+  const isSticker = !msg.is_recalled && !isRichCard && isStickerMessage(msg) && !mediaError;
+  const isVoice = !msg.is_recalled && !isRichCard && isVoiceAttachment(msg) && !mediaError;
+  const isVideo = !msg.is_recalled && !isRichCard && isVideoAttachment(msg) && !mediaError;
+  const isImage =
+    !msg.is_recalled && !isRichCard && !isVoice && !isVideo && isImageAttachment(msg) && !mediaError;
   const isFileAttachment =
     !msg.is_recalled &&
+    !isRichCard &&
     !isSticker &&
     !isVoice &&
     !isVideo &&
@@ -238,10 +265,10 @@ export const MessageBubble = memo(function MessageBubble({
       : null;
 
   useEffect(() => {
-    if (!menuPos && !pickerOpen) return;
+    if (!menuPos && !pickerPos) return;
     const close = () => {
       setMenuPos(null);
-      setPickerOpen(false);
+      setPickerPos(null);
     };
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") close();
@@ -256,7 +283,7 @@ export const MessageBubble = memo(function MessageBubble({
       window.removeEventListener("scroll", close, true);
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [menuPos, pickerOpen]);
+  }, [menuPos, pickerPos]);
 
   const handleCopy = () => {
     const textToCopy = isReplaced && translation?.text ? translation.text : msg.text;
@@ -271,14 +298,91 @@ export const MessageBubble = memo(function MessageBubble({
     void copyImageReliable(url).catch((err) => onCopyError?.(err));
   };
 
+  const bubbleCornerClass = msg.is_outgoing
+    ? groupedWithPrev && groupedWithNext
+      ? "rounded-2xl rounded-r-[6px]"
+      : groupedWithPrev && !groupedWithNext
+        ? "rounded-2xl rounded-tr-[6px] rounded-br-[4px]"
+        : !groupedWithPrev && groupedWithNext
+          ? "rounded-2xl rounded-br-[6px]"
+          : "rounded-2xl rounded-br-[4px]"
+    : groupedWithPrev && groupedWithNext
+      ? "rounded-2xl rounded-l-[6px]"
+      : groupedWithPrev && !groupedWithNext
+        ? "rounded-2xl rounded-tl-[6px] rounded-bl-[4px]"
+        : !groupedWithPrev && groupedWithNext
+          ? "rounded-2xl rounded-bl-[6px]"
+          : "rounded-2xl rounded-bl-[4px]";
+
+  const hasTranslationPanel = Boolean(
+    translation && !isReplaced && (!replaceWithTranslation || showOriginal || translation.error),
+  );
+  const useInlineMeta = Boolean(
+    displayText &&
+      !isBuzz &&
+      !isRichCard &&
+      !isPlainSticker &&
+      !hasTranslationPanel &&
+      msg.reactions.length === 0 &&
+      !isReplaced &&
+      !(replaceWithTranslation && translation?.loading) &&
+      msg.send_status !== "failed" &&
+      !(replyCount > 0 && onOpenThread),
+  );
+  const inlineMetaWidthPx =
+    48 +
+    (msg.is_outgoing && !msg.is_recalled ? (isSeen ? 18 : 16) : 0) +
+    (msg.is_pinned ? 16 : 0);
+
+  const timestampEl = (
+    <span
+      className={`inline-flex select-none items-center gap-1 text-[11px] leading-none tabular-nums ${
+        isPlainSticker ? "rounded-full px-2 py-0.5" : ""
+      }`}
+      style={{
+        color: isPlainSticker ? "var(--pill-text)" : "var(--text-secondary)",
+        background: isPlainSticker ? "var(--pill-bg)" : undefined,
+      }}
+    >
+      {msg.is_pinned && (
+        <span title={t("pinnedBadgeTitle")} className="inline-flex items-center">
+          <Pin
+            className="h-3 w-3 rotate-45"
+            style={{ color: msg.is_outgoing ? "var(--link-out)" : "var(--accent)" }}
+          />
+        </span>
+      )}
+      <span>{formatClock(msg.ts)}</span>
+      {msg.is_outgoing && !msg.is_recalled && msg.send_status === "sending" && (
+        <span title={t("sendingStatus")}>
+          <Loader2 className="h-3 w-3 animate-spin" />
+        </span>
+      )}
+      {msg.is_outgoing && !msg.is_recalled && !msg.send_status && (
+        isSeen ? (
+          <span title={t("youSeenStatus")}>
+            <CheckCheck className="h-3.5 w-3.5" style={{ color: "var(--accent)" }} />
+          </span>
+        ) : (
+          <span title={t("youSentStatus")}>
+            <Check className="h-3 w-3 opacity-80" />
+          </span>
+        )
+      )}
+    </span>
+  );
+
   return (
     <div
       id={`msg-${msg.msg_id}`}
       onClick={selectMode && !msg.send_status ? () => onToggleSelect?.(msg.msg_id) : undefined}
       className={`group relative flex ${msg.is_outgoing ? "justify-end" : "justify-start"} ${
-        groupedWithPrev ? "mt-0.5" : "mt-2.5"
-      } ${selectMode ? "cursor-pointer rounded-xl px-1.5 py-0.5 transition" : ""}`}
-      style={selectMode && selected ? { background: "var(--accent-soft)" } : undefined}
+        selectMode ? "cursor-pointer rounded-xl px-1.5 py-0.5 transition" : ""
+      }`}
+      style={{
+        marginTop: groupedWithPrev ? "var(--msg-gap-grouped)" : "var(--msg-gap-group)",
+        ...(selectMode && selected ? { background: "var(--accent-soft)" } : undefined),
+      }}
     >
       {selectMode && (
         <div className="order-0 mr-2.5 flex items-center self-center">
@@ -297,13 +401,13 @@ export const MessageBubble = memo(function MessageBubble({
       )}
 
       {!msg.is_outgoing && threadKind === "group" && (
-        <div className="order-1 mr-2 mt-0.5 flex w-7 shrink-0 items-start justify-center self-start">
-          {!groupedWithPrev && (
+        <div className="order-1 mb-0.5 mr-2 flex w-7 shrink-0 items-end justify-center self-end">
+          {!groupedWithNext && (
             <button
               type="button"
               disabled={!onOpenProfile || !msg.sender_id}
               onClick={() => msg.sender_id && onOpenProfile?.(msg.sender_id)}
-              title="Xem thông tin tài khoản"
+              title={t("viewProfileTitle")}
               className="rounded-full transition hover:opacity-85"
             >
               <ThreadAvatar
@@ -327,7 +431,7 @@ export const MessageBubble = memo(function MessageBubble({
         >
           <button
             onClick={() => onReply(msg)}
-            title="Trả lời"
+            title={t("replyTitle")}
             className="hover-surface rounded-full p-1.5 transition"
             style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
           >
@@ -336,7 +440,7 @@ export const MessageBubble = memo(function MessageBubble({
           {onOpenThread && (
             <button
               onClick={() => onOpenThread(msg)}
-              title={replyCount > 0 ? `Xem luồng trả lời (${replyCount})` : "Mở luồng trả lời"}
+              title={replyCount > 0 ? t("viewThreadReplies", { count: replyCount }) : t("openThreadReplies")}
               className="hover-surface rounded-full p-1.5 transition"
               style={{
                 background: "var(--bg-surface)",
@@ -351,7 +455,7 @@ export const MessageBubble = memo(function MessageBubble({
               onClick={() =>
                 translation?.text ? onHideTranslation?.(msg.msg_id) : onTranslate(msg)
               }
-              title={translation?.text ? "Ẩn bản dịch" : "Dịch tin nhắn"}
+              title={translation?.text ? t("hideTranslation") : t("translateMessage")}
               className="hover-surface rounded-full p-1.5 transition"
               style={{
                 background: "var(--bg-surface)",
@@ -364,7 +468,7 @@ export const MessageBubble = memo(function MessageBubble({
           {onForward && (
             <button
               onClick={() => onForward(msg)}
-              title="Chuyển tiếp"
+              title={t("forwardMessage")}
               className="hover-surface rounded-full p-1.5 transition"
               style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
             >
@@ -373,55 +477,84 @@ export const MessageBubble = memo(function MessageBubble({
           )}
           <div className="relative">
             <button
-              onClick={() => setPickerOpen((v) => !v)}
-              title="Thả cảm xúc"
+              onClick={(e) => {
+                e.stopPropagation();
+                if (pickerPos) {
+                  setPickerPos(null);
+                  return;
+                }
+                const rect = e.currentTarget.getBoundingClientRect();
+                const pickerW = 240;
+                const left = Math.max(
+                  12,
+                  Math.min(
+                    rect.left + rect.width / 2 - pickerW / 2,
+                    window.innerWidth - pickerW - 12,
+                  ),
+                );
+                const top =
+                  rect.top >= 58
+                    ? rect.top - 48
+                    : Math.min(window.innerHeight - 52, rect.bottom + 8);
+                setMenuPos(null);
+                setPickerPos({ left, top });
+              }}
+              title={t("reactTitle")}
               className="rounded-full p-1.5 hover:opacity-80"
               style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
             >
               <Smile className="h-3.5 w-3.5" />
             </button>
-            {pickerOpen && (
-              <div
-                className={`absolute bottom-full z-20 mb-1 flex items-center gap-1 rounded-full px-2 py-1 shadow-xl ${
-                  msg.is_outgoing ? "right-0" : "left-0"
-                }`}
-                style={{ background: "var(--bg-sidebar)", border: "1px solid var(--border-subtle)" }}
-              >
-                {QUICK_EMOJIS.map((emoji) => {
-                  const active = msg.reactions.some((r) => r.emoji === emoji && r.me);
-                  return (
-                    <button
-                      key={emoji}
-                      onClick={() => {
-                        onReact(msg, emoji);
-                        setPickerOpen(false);
-                      }}
-                      title={active ? "Bấm để bỏ cảm xúc" : `Thả ${emoji}`}
-                      className="rounded-full p-1 text-sm transition hover:scale-125"
-                      style={
-                        active
-                          ? {
-                              background: "rgba(56, 189, 248, 0.24)",
-                              outline: "1px solid var(--accent)",
-                            }
-                          : undefined
-                      }
-                    >
-                      {emoji}
-                    </button>
-                  );
-                })}
-              </div>
-            )}
           </div>
         </div>
       )}
+
+      {pickerPos &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="fixed z-[80] flex items-center gap-1 rounded-full px-2 py-1 shadow-xl"
+            style={{
+              left: `${pickerPos.left}px`,
+              top: `${pickerPos.top}px`,
+              background: "var(--bg-sidebar)",
+              border: "1px solid var(--border-subtle)",
+            }}
+          >
+            {QUICK_EMOJIS.map((emoji) => {
+              const active = msg.reactions.some((r) => r.emoji === emoji && r.me);
+              return (
+                <button
+                  key={emoji}
+                  onClick={() => {
+                    onReact(msg, emoji);
+                    setPickerPos(null);
+                  }}
+                  title={active ? t("reactToggleRemoveTitle") : t("reactWithTitle", { emoji })}
+                  className="rounded-full p-1 text-sm transition hover:scale-125"
+                  style={
+                    active
+                      ? {
+                          background: "rgba(56, 189, 248, 0.24)",
+                          outline: "1px solid var(--accent)",
+                        }
+                      : undefined
+                  }
+                >
+                  {emoji}
+                </button>
+              );
+            })}
+          </div>,
+          document.body,
+        )}
 
       <div
         onContextMenu={(e) => {
           e.preventDefault();
           e.stopPropagation();
-          setPickerOpen(false);
+          setPickerPos(null);
           setMenuPos({
             x: Math.min(e.clientX, window.innerWidth - 210),
             y: Math.min(e.clientY, window.innerHeight - 390),
@@ -434,10 +567,10 @@ export const MessageBubble = memo(function MessageBubble({
           if (el?.closest("a, button, input, textarea, audio, video")) return;
           onReply(msg);
         }}
-        className={`selectable-text wrap-anywhere relative order-2 min-w-0 max-w-[72%] rounded-2xl transition ${
+        className={`selectable-text wrap-anywhere relative order-2 min-w-0 max-w-[72%] transition ${
           isPlainSticker
-            ? "px-1 py-0.5"
-            : `px-3.5 shadow-sm ${msg.is_outgoing ? "rounded-br-md" : "rounded-bl-md"}`
+            ? "rounded-2xl px-1 py-0.5"
+            : `px-3 shadow-sm ${bubbleCornerClass}`
         } ${highlighted ? "ring-2 ring-sky-400" : ""} ${
           msg.send_status === "sending" ? "opacity-80" : ""
         }`}
@@ -463,9 +596,9 @@ export const MessageBubble = memo(function MessageBubble({
             type="button"
             disabled={!onOpenProfile || !msg.sender_id}
             onClick={() => msg.sender_id && onOpenProfile?.(msg.sender_id)}
-            className="mb-1 block text-left text-[13px] font-semibold hover:underline"
+            className="mb-0.5 block text-left text-[12.5px] font-semibold leading-tight hover:underline"
             style={{ color: "var(--accent)" }}
-            title="Xem thông tin tài khoản"
+            title={t("viewProfileTitle")}
           >
             {msg.sender_name}
           </button>
@@ -475,7 +608,7 @@ export const MessageBubble = memo(function MessageBubble({
           <button
             type="button"
             onClick={() => msg.quote?.msg_id && onJumpToMsg(msg.quote.msg_id)}
-            className="mb-1.5 block w-full rounded-lg border-l-2 px-2.5 py-1.5 text-left text-[13px] transition hover:opacity-85"
+            className="mb-1 block w-full rounded-lg border-l-2 px-2.5 py-1 text-left text-[12.5px] transition hover:opacity-85"
             style={{
               borderColor: msg.is_outgoing ? "var(--link-out)" : "var(--accent)",
               background: "var(--quote-bg)",
@@ -485,7 +618,7 @@ export const MessageBubble = memo(function MessageBubble({
               className="font-semibold"
               style={{ color: msg.is_outgoing ? "var(--link-out)" : "var(--accent)" }}
             >
-              {msg.quote.sender_name || "Tin nhắn gốc"}
+              {msg.quote.sender_name || t("originalMessageFallback")}
             </div>
             <div className="truncate" style={{ color: "var(--text-secondary)" }}>
               {msg.quote.snippet}
@@ -510,7 +643,7 @@ export const MessageBubble = memo(function MessageBubble({
             preload="none"
             src={msg.attachment_url}
             onFallbackFail={() => setMediaError(true)}
-            className="mb-1.5 max-w-full"
+            className="mb-1 max-w-full"
           />
         )}
 
@@ -520,7 +653,7 @@ export const MessageBubble = memo(function MessageBubble({
             preload="metadata"
             src={msg.attachment_url}
             onFallbackFail={() => setMediaError(true)}
-            className="mb-1.5 max-h-72 w-full rounded-xl bg-black/40"
+            className="mb-1 max-h-72 w-full rounded-xl bg-black/40"
           />
         )}
 
@@ -528,7 +661,7 @@ export const MessageBubble = memo(function MessageBubble({
           <button
             type="button"
             onClick={() => onOpenImage(msg.attachment_url!, msg.attachment_name || "Hình ảnh")}
-            className="mb-1.5 block overflow-hidden rounded-xl"
+            className="mb-1 block overflow-hidden rounded-xl"
           >
             <RelayImage
               src={msg.attachment_url}
@@ -546,8 +679,8 @@ export const MessageBubble = memo(function MessageBubble({
             <button
               type="button"
               onClick={() => onSaveFile(safeDownloadUrl, msg.attachment_name || "download")}
-              title="Nhấn để tải tệp về máy"
-              className="mb-1.5 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left transition hover:brightness-95"
+              title={t("clickToDownloadFile")}
+              className="mb-1 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left transition hover:brightness-95"
               style={{ background: "var(--card-bg)" }}
             >
               <FileText
@@ -556,10 +689,10 @@ export const MessageBubble = memo(function MessageBubble({
               />
               <div className="min-w-0 flex-1">
                 <div className="truncate text-[13.5px] font-medium">
-                  {msg.attachment_name || "Tập tin đính kèm"}
+                  {msg.attachment_name || t("attachedFileTitle")}
                 </div>
                 <div className="text-xs" style={{ color: "var(--text-secondary)" }}>
-                  Tệp đính kèm · Nhấn để lưu
+                  {t("attachedFileHint")}
                 </div>
               </div>
               <span
@@ -571,7 +704,7 @@ export const MessageBubble = memo(function MessageBubble({
             </button>
           ) : (
             <div
-              className="mb-1.5 flex items-center gap-2.5 rounded-xl px-3 py-2"
+              className="mb-1 flex items-center gap-2.5 rounded-xl px-3 py-2"
               style={{ background: "var(--card-bg)" }}
             >
               <FileText
@@ -580,10 +713,10 @@ export const MessageBubble = memo(function MessageBubble({
               />
               <div className="min-w-0 flex-1">
                 <div className="truncate text-[13.5px] font-medium">
-                  {msg.attachment_name || "Tập tin đính kèm"}
+                  {msg.attachment_name || t("attachedFileTitle")}
                 </div>
                 <div className="text-xs" style={{ color: "var(--text-secondary)" }}>
-                  Tệp đính kèm
+                  {t("attachedFileSub")}
                 </div>
               </div>
               {safeDownloadUrl && (
@@ -592,7 +725,7 @@ export const MessageBubble = memo(function MessageBubble({
                   target="_blank"
                   rel="noreferrer"
                   download={msg.attachment_name || undefined}
-                  title="Tải xuống tệp"
+                  title={t("downloadFileTitle")}
                   className="hover-menu rounded-lg p-1.5 transition"
                   style={{ color: msg.is_outgoing ? "var(--link-out)" : "var(--accent)" }}
                 >
@@ -602,7 +735,195 @@ export const MessageBubble = memo(function MessageBubble({
             </div>
           ))}
 
-        {isBuzz ? (
+        {reminderData ? (
+          <div
+            className="my-0.5 flex min-w-[240px] max-w-[330px] items-stretch gap-3 rounded-xl p-2.5"
+            style={{
+              background: msg.is_outgoing ? "rgba(0,0,0,0.16)" : "var(--bg-surface)",
+              border: "1px solid var(--border-subtle)",
+            }}
+          >
+            <div
+              className="flex w-12 shrink-0 flex-col items-center justify-center rounded-xl py-1.5 text-center"
+              style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
+            >
+              {reminderData.startTime > 0 ? (
+                <>
+                  <span className="text-[10px] font-bold uppercase tracking-wider">
+                    T{new Date(reminderData.startTime).getMonth() + 1}
+                  </span>
+                  <span className="text-lg font-extrabold leading-tight tabular-nums">
+                    {String(new Date(reminderData.startTime).getDate()).padStart(2, "0")}
+                  </span>
+                </>
+              ) : (
+                <CalendarClock className="h-5 w-5" />
+              )}
+            </div>
+            <div className="min-w-0 flex-1">
+              <div
+                className="flex items-center gap-1 text-[11px] font-semibold uppercase tracking-wider"
+                style={{ color: msg.is_outgoing ? "var(--link-out)" : "var(--accent)" }}
+              >
+                <CalendarClock className="h-3.5 w-3.5 shrink-0" />
+                <span>{t("reminderTitleLabel")}</span>
+              </div>
+              <div className="mt-0.5 text-[14px] font-semibold leading-snug">
+                {reminderData.title}
+              </div>
+              <div
+                className="mt-1 flex flex-wrap items-center gap-1.5 text-[11.5px]"
+                style={{ color: "var(--text-secondary)" }}
+              >
+                {(reminderData.scheduleText || reminderData.startTime > 0) && (
+                  <span>
+                    {reminderData.scheduleText ||
+                      new Date(reminderData.startTime).toLocaleString(locale, {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                        day: "2-digit",
+                        month: "2-digit",
+                        year: "numeric",
+                      })}
+                  </span>
+                )}
+                {reminderData.repeat > 0 && (
+                  <span
+                    className="inline-flex items-center gap-0.5 rounded-md px-1.5 py-0.5 text-[10.5px] font-medium"
+                    style={{ background: "var(--bg-sidebar)" }}
+                  >
+                    <Repeat className="h-3 w-3" />
+                    {reminderData.repeat === 1
+                      ? t("repeatDaily")
+                      : reminderData.repeat === 2
+                        ? t("repeatWeekly")
+                        : t("repeatMonthly")}
+                  </span>
+                )}
+              </div>
+              {reminderData.startTime > 0 && (
+                <div
+                  className="mt-1 inline-block rounded-full px-2 py-0.5 text-[10.5px] font-semibold"
+                  style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
+                >
+                  {formatReminderCountdown(reminderData.startTime, Date.now(), lang)}
+                </div>
+              )}
+            </div>
+          </div>
+        ) : pollData ? (
+          <div
+            className="my-0.5 min-w-[250px] max-w-[340px] rounded-xl p-2.5"
+            style={{
+              background: msg.is_outgoing ? "rgba(0,0,0,0.16)" : "var(--bg-surface)",
+              border: "1px solid var(--border-subtle)",
+            }}
+          >
+            <div className="flex items-start justify-between gap-2">
+              <div
+                className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider"
+                style={{ color: msg.is_outgoing ? "var(--link-out)" : "var(--accent)" }}
+              >
+                <BarChart3 className="h-3.5 w-3.5 shrink-0" />
+                <span>{t("pollTitleLabel")}</span>
+              </div>
+              {onRefreshPoll && pollData.poll_id > 0 && (
+                <button
+                  type="button"
+                  disabled={pollBusy}
+                  onClick={() => {
+                    if (pollBusy) return;
+                    setPollBusy(true);
+                    void Promise.resolve(onRefreshPoll(msg)).finally(() => setPollBusy(false));
+                  }}
+                  title={t("pollRefreshTitle")}
+                  className="hover-menu rounded p-1 opacity-75 hover:opacity-100 disabled:opacity-40"
+                >
+                  <RefreshCw className={`h-3 w-3 ${pollBusy ? "animate-spin" : ""}`} />
+                </button>
+              )}
+            </div>
+            <div className="mt-1 text-[14px] font-semibold leading-snug">{pollData.question}</div>
+            <div
+              className="mt-1 flex flex-wrap gap-1 text-[10.5px]"
+              style={{ color: "var(--text-secondary)" }}
+            >
+              <span>{pollData.allow_multi ? t("pollMultiChoice") : t("pollSingleChoice")}</span>
+              {pollData.is_anonymous && <span>{t("pollAnonymous")}</span>}
+              {pollData.closed && <span className="text-rose-400">{t("pollClosed")}</span>}
+            </div>
+            <div className="mt-2 space-y-1.5">
+              {pollData.options.length === 0 ? (
+                <div className="text-xs italic opacity-70">
+                  {t("pollNoOptionsHint")}
+                </div>
+              ) : (
+                (() => {
+                  const totalVotes = pollData.options.reduce((s, o) => s + (o.votes || 0), 0);
+                  return pollData.options.map((opt) => {
+                    const pct = totalVotes > 0 ? Math.round((opt.votes / totalVotes) * 100) : 0;
+                    const canVote = Boolean(onVotePoll && pollData.poll_id > 0 && !pollData.closed);
+                    return (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        disabled={!canVote || pollBusy}
+                        onClick={() => {
+                          if (!canVote || !onVotePoll || pollBusy) return;
+                          const nextIds = pollData.allow_multi
+                            ? opt.voted
+                              ? pollData.options.filter((o) => o.voted && o.id !== opt.id).map((o) => o.id)
+                              : [...pollData.options.filter((o) => o.voted).map((o) => o.id), opt.id]
+                            : opt.voted
+                              ? []
+                              : [opt.id];
+                          setPollBusy(true);
+                          void Promise.resolve(onVotePoll(msg, nextIds)).finally(() =>
+                            setPollBusy(false),
+                          );
+                        }}
+                        className="relative block w-full overflow-hidden rounded-lg px-2.5 py-1.5 text-left text-xs transition hover:brightness-95 disabled:cursor-default"
+                        style={{
+                          background: "var(--bg-sidebar)",
+                          border: opt.voted
+                            ? "1px solid var(--accent)"
+                            : "1px solid var(--border-subtle)",
+                        }}
+                      >
+                        <div
+                          aria-hidden="true"
+                          className="pointer-events-none absolute inset-y-0 left-0 opacity-20 transition-all"
+                          style={{
+                            width: `${pct}%`,
+                            background: "var(--accent)",
+                          }}
+                        />
+                        <div className="relative flex items-center justify-between gap-2">
+                          <span className="flex min-w-0 items-center gap-1.5 font-medium">
+                            {opt.voted && (
+                              <Check
+                                className="h-3.5 w-3.5 shrink-0"
+                                style={{ color: "var(--accent)" }}
+                              />
+                            )}
+                            <span className="truncate">{opt.content}</span>
+                          </span>
+                          <span
+                            className="shrink-0 text-[11px] font-semibold tabular-nums"
+                            style={{ color: "var(--text-secondary)" }}
+                          >
+                            {opt.votes}
+                            {totalVotes > 0 ? ` (${pct}%)` : ""}
+                          </span>
+                        </div>
+                      </button>
+                    );
+                  });
+                })()
+              )}
+            </div>
+          </div>
+        ) : isBuzz ? (
           <div className="my-0.5 inline-flex items-center gap-2 rounded-xl bg-amber-500/20 px-3 py-1.5 font-extrabold tracking-wider text-amber-400 ring-1 ring-amber-400/40">
             <Zap className="h-4 w-4 animate-pulse fill-amber-400 text-amber-300" />
             <span className="text-[16px]">BUZZ!</span>
@@ -610,11 +931,18 @@ export const MessageBubble = memo(function MessageBubble({
         ) : (
           displayText && (
             <div
-              className={`msg-body-text whitespace-pre-wrap wrap-anywhere leading-[1.55] ${
+              className={`msg-body-text whitespace-pre-wrap wrap-anywhere leading-[1.38] ${
                 msg.is_recalled ? "italic opacity-65" : ""
               } ${replaceWithTranslation && translation?.loading ? "opacity-75" : ""}`}
             >
               {renderLinkedText(displayText, msg.is_outgoing, highlightQuery)}
+              {useInlineMeta && (
+                <span
+                  aria-hidden="true"
+                  className="pointer-events-none inline-block h-[11px] select-none align-baseline"
+                  style={{ width: `${inlineMetaWidthPx}px` }}
+                />
+              )}
             </div>
           )
         )}
@@ -632,10 +960,10 @@ export const MessageBubble = memo(function MessageBubble({
               <span className="flex items-center gap-1 font-medium">
                 <Languages className="h-3.5 w-3.5" />
                 {translation.loading
-                  ? "Đang dịch..."
+                  ? t("translatingDots")
                   : translation.error
-                    ? "Lỗi dịch"
-                    : `Dịch${translation.src ? ` · ${translation.src}` : ""}${
+                    ? t("translateError")
+                    : `${t("translateHeader")}${translation.src ? ` · ${translation.src}` : ""}${
                         translation.targetLang ? ` → ${translation.targetLang}` : ""
                       }`}
               </span>
@@ -645,7 +973,7 @@ export const MessageBubble = memo(function MessageBubble({
                   onClick={() => setShowOriginal(false)}
                   className="hover:underline"
                 >
-                  Xem bản dịch
+                  {t("viewTranslation")}
                 </button>
               ) : (
                 onHideTranslation &&
@@ -655,7 +983,7 @@ export const MessageBubble = memo(function MessageBubble({
                     onClick={() => onHideTranslation(msg.msg_id)}
                     className="hover:underline"
                   >
-                    Ẩn
+                    {t("hideTranslation")}
                   </button>
                 )
               )}
@@ -663,7 +991,7 @@ export const MessageBubble = memo(function MessageBubble({
             {translation.loading ? (
               <div className="flex items-center gap-1.5 text-[13.5px] opacity-80">
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                <span>Đang xử lý bản dịch...</span>
+                <span>{t("translatingBody")}</span>
               </div>
             ) : translation.error ? (
               <div
@@ -680,80 +1008,61 @@ export const MessageBubble = memo(function MessageBubble({
           </div>
         )}
 
-        <div className="mt-1 flex items-center justify-end gap-2">
-          {msg.reactions.length > 0 && (
-            <div className="mr-auto flex flex-wrap gap-1">
-              {msg.reactions.map((r) => (
-                <button
-                  key={r.emoji}
-                  onClick={() => onReact(msg, r.emoji)}
-                  className="rounded-full px-2 py-0.5 text-[13px] transition hover:opacity-85"
-                  style={{
-                    background: r.me ? "var(--accent-soft)" : "var(--chip-bg)",
-                    border: r.me ? "1px solid var(--accent)" : "1px solid var(--chip-border)",
-                  }}
-                >
-                  {r.emoji} {r.count}
-                </button>
-              ))}
-            </div>
-          )}
-          {replaceWithTranslation && translation?.loading && (
-            <span
-              className="flex items-center gap-1 text-[11px] opacity-80"
-              style={{ color: "var(--text-secondary)" }}
-            >
-              <Loader2 className="h-3 w-3 animate-spin" />
-              Đang dịch...
-            </span>
-          )}
-          {isReplaced && (
-            <button
-              type="button"
-              onClick={() => setShowOriginal(true)}
-              title="Nhấn để xem văn bản gốc"
-              className="flex items-center gap-1 text-[11px] opacity-75 hover:opacity-100 hover:underline"
-              style={{ color: "var(--text-secondary)" }}
-            >
-              <Languages className="h-3 w-3" />
-              <span>Đã dịch · Gốc</span>
-            </button>
-          )}
+        {useInlineMeta ? (
           <span
-            className={`flex items-center gap-1 text-xs ${
-              isPlainSticker ? "rounded-full px-2 py-0.5" : ""
-            }`}
-            style={{
-              color: isPlainSticker ? "var(--pill-text)" : "var(--text-secondary)",
-              background: isPlainSticker ? "var(--pill-bg)" : undefined,
-            }}
+            className="absolute right-2.5 select-none"
+            style={{ bottom: "var(--bubble-py)" }}
           >
-            {msg.is_pinned && (
-              <span title="Tin nhắn đã ghim" className="inline-flex items-center">
-                <Pin
-                  className="h-3 w-3 rotate-45"
-                  style={{ color: msg.is_outgoing ? "var(--link-out)" : "var(--accent)" }}
-                />
-              </span>
-            )}
-            <span>{formatClock(msg.ts)}</span>
-            {msg.is_outgoing && !msg.is_recalled && msg.send_status === "sending" && (
-              <span title="Đang gửi...">
-                <Loader2 className="h-3 w-3 animate-spin" />
-              </span>
-            )}
-            {msg.is_outgoing && !msg.is_recalled && !msg.send_status && (
-              <span title="Đã gửi">
-                <Check className="h-3 w-3 opacity-80" />
-              </span>
-            )}
+            {timestampEl}
           </span>
-        </div>
+        ) : (
+          <div className="mt-0.5 flex items-center justify-end gap-2">
+            {msg.reactions.length > 0 && (
+              <div className="mr-auto flex flex-wrap gap-1">
+                {msg.reactions.map((r) => (
+                  <button
+                    key={r.emoji}
+                    onClick={() => onReact(msg, r.emoji)}
+                    className="rounded-full px-2 py-0.5 text-[13px] transition hover:opacity-85"
+                    style={{
+                      background: r.me ? "var(--accent-soft)" : "var(--chip-bg)",
+                      border: r.me ? "1px solid var(--accent)" : "1px solid var(--chip-border)",
+                    }}
+                  >
+                    {r.emoji} {r.count}
+                  </button>
+                ))}
+              </div>
+            )}
+            {replaceWithTranslation && translation?.loading && (
+              <span
+                className="flex items-center gap-1 text-[11px] opacity-80"
+                style={{ color: "var(--text-secondary)" }}
+              >
+                <Loader2 className="h-3 w-3 animate-spin" />
+                {t("translatingDots")}
+              </span>
+            )}
+            {isReplaced && (
+              <button
+                type="button"
+                onClick={() => setShowOriginal(true)}
+                title={t("viewOrigTextTitle")}
+                className="flex items-center gap-1 text-[11px] opacity-75 hover:opacity-100 hover:underline"
+                style={{ color: "var(--text-secondary)" }}
+              >
+                <Languages className="h-3 w-3" />
+                <span>{t("translatedOrigLabel")}</span>
+              </button>
+            )}
+            {timestampEl}
+          </div>
+        )}
 
         {msg.send_status === "failed" && (
           <div className="mt-1.5 flex items-center justify-end gap-2 text-xs">
             <span style={{ color: "var(--danger-text)" }}>
-              {msg.send_error || "Gửi thất bại"}
+              {msg.send_error || t("sendErrorFallback")}
             </span>
             {onRetrySend && (
               <button
@@ -762,7 +1071,7 @@ export const MessageBubble = memo(function MessageBubble({
                 className="font-semibold underline hover:opacity-80"
                 style={{ color: "var(--accent)" }}
               >
-                Thử lại
+                {t("retryShort")}
               </button>
             )}
             {onDiscardFailed && (
@@ -771,7 +1080,7 @@ export const MessageBubble = memo(function MessageBubble({
                 onClick={() => onDiscardFailed(msg.msg_id)}
                 className="opacity-75 underline hover:opacity-100"
               >
-                Xóa
+                {t("delete")}
               </button>
             )}
           </div>
@@ -781,7 +1090,7 @@ export const MessageBubble = memo(function MessageBubble({
           <button
             type="button"
             onClick={() => onOpenThread(msg)}
-            className="mt-2 -mx-1 flex w-[calc(100%+0.5rem)] items-center justify-between gap-3 rounded-xl border-t px-2 py-1.5 text-left text-[13px] font-medium transition hover:bg-white/5"
+            className="mt-1.5 -mx-1 flex w-[calc(100%+0.5rem)] items-center justify-between gap-3 rounded-xl border-t px-2 py-1.5 text-left text-[13px] font-medium transition hover:bg-white/5"
             style={{
               borderColor: msg.is_outgoing ? "rgba(255,255,255,0.16)" : "var(--border-subtle)",
               color: msg.is_outgoing ? "var(--link-out)" : "var(--accent)",
@@ -789,24 +1098,26 @@ export const MessageBubble = memo(function MessageBubble({
           >
             <span className="flex items-center gap-1.5">
               <MessagesSquare className="h-3.5 w-3.5 shrink-0" />
-              <span>{replyCount} phản hồi</span>
+              <span>{t("replyCountLabel", { count: replyCount })}</span>
             </span>
-            <span className="text-xs opacity-85">Xem luồng ›</span>
+            <span className="text-xs opacity-85">{t("viewThreadLink")}</span>
           </button>
         )}
 
         {/* Fixed viewport-clamped Context menu */}
-        {menuPos && (
-          <div
-            onClick={(e) => e.stopPropagation()}
-            className="fixed z-50 w-52 rounded-xl py-1 shadow-2xl"
-            style={{
-              left: `${menuPos.x}px`,
-              top: `${menuPos.y}px`,
-              background: "var(--bg-sidebar)",
-              border: "1px solid var(--border-subtle)",
-            }}
-          >
+        {menuPos &&
+          typeof document !== "undefined" &&
+          createPortal(
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="fixed z-[80] w-52 rounded-xl py-1 shadow-2xl"
+              style={{
+                left: `${menuPos.x}px`,
+                top: `${menuPos.y}px`,
+                background: "var(--bg-sidebar)",
+                border: "1px solid var(--border-subtle)",
+              }}
+            >
             {!msg.is_recalled && !msg.send_status && (
               <button
                 onClick={() => {
@@ -815,7 +1126,7 @@ export const MessageBubble = memo(function MessageBubble({
                 }}
                 className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
               >
-                <CornerUpLeft className="h-3.5 w-3.5" /> Trả lời
+                <CornerUpLeft className="h-3.5 w-3.5" /> {t("replyTitle")}
               </button>
             )}
             {!msg.is_recalled && !msg.send_status && onOpenThread && (
@@ -827,7 +1138,7 @@ export const MessageBubble = memo(function MessageBubble({
                 className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
               >
                 <MessagesSquare className="h-3.5 w-3.5" />{" "}
-                {replyCount > 0 ? `Xem luồng (${replyCount})` : "Mở luồng trả lời"}
+                {replyCount > 0 ? t("viewThreadReplies", { count: replyCount }) : t("openThreadReplies")}
               </button>
             )}
             {!msg.is_recalled &&
@@ -851,11 +1162,11 @@ export const MessageBubble = memo(function MessageBubble({
                   <Languages className="h-3.5 w-3.5" />{" "}
                   {replaceWithTranslation && translation?.text
                     ? showOriginal
-                      ? "Chỉ hiện bản dịch"
-                      : "Xem văn bản gốc"
+                      ? t("showTranslationOnly")
+                      : t("viewOriginalTextMenu")
                     : translation?.text
-                      ? "Ẩn bản dịch"
-                      : "Dịch tin nhắn"}
+                      ? t("hideTranslation")
+                      : t("translateMessage")}
                 </button>
               )}
             {!msg.is_recalled && !msg.send_status && onTogglePin && (
@@ -867,7 +1178,7 @@ export const MessageBubble = memo(function MessageBubble({
                 className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
               >
                 <Pin className="h-3.5 w-3.5" />{" "}
-                {msg.is_pinned ? "Bỏ ghim tin nhắn" : "Ghim tin nhắn"}
+                {msg.is_pinned ? t("unpinMessage") : t("pinMessage")}
               </button>
             )}
             {!msg.is_recalled && !msg.send_status && onForward && (
@@ -878,7 +1189,7 @@ export const MessageBubble = memo(function MessageBubble({
                 }}
                 className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
               >
-                <Forward className="h-3.5 w-3.5" /> Chuyển tiếp
+                <Forward className="h-3.5 w-3.5" /> {t("forwardMessage")}
               </button>
             )}
             {!msg.send_status && onStartSelect && (
@@ -889,7 +1200,7 @@ export const MessageBubble = memo(function MessageBubble({
                 }}
                 className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
               >
-                <CheckSquare className="h-3.5 w-3.5" /> Chọn nhiều tin
+                <CheckSquare className="h-3.5 w-3.5" /> {t("selectMultiple")}
               </button>
             )}
             {isImage && msg.attachment_url && (
@@ -897,14 +1208,14 @@ export const MessageBubble = memo(function MessageBubble({
                 onClick={handleCopyImage}
                 className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
               >
-                <ImageIcon className="h-3.5 w-3.5" /> Sao chép hình ảnh
+                <ImageIcon className="h-3.5 w-3.5" /> {t("copyImage")}
               </button>
             )}
             <button
               onClick={handleCopy}
               className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
             >
-              <Copy className="h-3.5 w-3.5" /> Sao chép
+              <Copy className="h-3.5 w-3.5" /> {t("copyText")}
             </button>
             {msg.is_outgoing && !msg.is_recalled && !msg.send_status && (
               <button
@@ -914,7 +1225,7 @@ export const MessageBubble = memo(function MessageBubble({
                 }}
                 className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px] text-amber-500"
               >
-                <RotateCcw className="h-3.5 w-3.5" /> Thu hồi
+                <RotateCcw className="h-3.5 w-3.5" /> {t("recallMessage")}
               </button>
             )}
             <button
@@ -928,10 +1239,11 @@ export const MessageBubble = memo(function MessageBubble({
               }}
               className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px] text-rose-500"
             >
-              <Trash2 className="h-3.5 w-3.5" /> Xóa trên máy
+              <Trash2 className="h-3.5 w-3.5" /> {t("deleteOnDevice")}
             </button>
-          </div>
-        )}
+          </div>,
+            document.body,
+          )}
       </div>
     </div>
   );

@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, Info, LocateFixed, MessagesSquare } from "lucide-react";
+import { useI18n } from "../i18n";
 import type { MessageDto, PendingAttachment, StickerItem, ThreadKind, ThreadMemberDto } from "../types";
+import { formatDayLabel } from "../utils/threadState";
 import { Composer } from "./Composer";
 import { MessageBubble, type MessageTranslationState } from "./MessageBubble";
 import { RelayImage } from "./RelayImage";
@@ -10,22 +12,12 @@ function dayKey(ts: number): string {
   return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
 }
 
-function formatDayLabel(ts: number): string {
-  const d = new Date(ts > 1e12 ? ts : ts * 1000);
-  const now = new Date();
-  const todayKey = dayKey(now.getTime());
-  const yest = new Date(now.getTime() - 86_400_000);
-  const k = dayKey(ts);
-  if (k === todayKey) return "Hôm nay";
-  if (k === dayKey(yest.getTime())) return "Hôm qua";
-  return d.toLocaleDateString("vi-VN", { day: "2-digit", month: "2-digit", year: "numeric" });
-}
-
 interface Props {
   threadTitle: string;
   rootMessage: MessageDto;
   replies: MessageDto[];
   threadKind: ThreadKind;
+  peerReadTs?: number;
   pendingAttachment: PendingAttachment | null;
   onPendingAttachmentChange: (att: PendingAttachment | null) => void;
   translationsByMsg: Record<string, MessageTranslationState>;
@@ -61,6 +53,7 @@ export function ReplyThreadPanel({
   rootMessage,
   replies,
   threadKind,
+  peerReadTs,
   pendingAttachment,
   onPendingAttachmentChange,
   translationsByMsg,
@@ -90,6 +83,7 @@ export function ReplyThreadPanel({
   onTogglePin,
   onError,
 }: Props) {
+  const { lang, t } = useI18n();
   const [replyTarget, setReplyTarget] = useState<MessageDto>(rootMessage);
   const [threadHighlightId, setThreadHighlightId] = useState<string | null>(null);
   const listContainerRef = useRef<HTMLDivElement | null>(null);
@@ -178,18 +172,18 @@ export function ReplyThreadPanel({
             style={{ color: "var(--accent)" }}
           >
             <ArrowLeft className="h-4 w-4" />
-            <span>Quay lại</span>
+            <span>{t("back")}</span>
           </button>
           <div className="h-5 w-px" style={{ background: "var(--border-subtle)" }} />
           <div className="min-w-0">
             <div className="flex items-center gap-1.5">
               <MessagesSquare className="h-4 w-4 shrink-0" style={{ color: "var(--accent)" }} />
               <h2 className="truncate text-[15.5px] font-semibold">
-                {replies.length} phản hồi · {threadTitle}
+                {t("replyThreadTitle", { count: replies.length, title: threadTitle })}
               </h2>
             </div>
             <p className="text-xs" style={{ color: "var(--text-secondary)" }}>
-              {participantCount} người tham gia trong luồng
+              {t("replyParticipantsCount", { count: participantCount })}
             </p>
           </div>
         </div>
@@ -197,17 +191,17 @@ export function ReplyThreadPanel({
           <button
             type="button"
             onClick={() => onJumpToMsgInMainChat(rootMessage.msg_id)}
-            title="Xem tin gốc trong đoạn chat chính"
+            title={t("jumpToRootTitle")}
             className="hover-menu flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium transition"
             style={{ color: "var(--text-secondary)" }}
           >
             <LocateFixed className="h-4 w-4" />
-            <span>Tin gốc</span>
+            <span>{t("rootMsgBtn")}</span>
           </button>
           <button
             type="button"
             onClick={onToggleDrawer}
-            title="Thông tin hội thoại"
+            title={t("threadInfoTitle")}
             className="rounded-lg p-2 hover:opacity-80"
             style={{ color: drawerOpen ? "var(--accent)" : "var(--text-secondary)" }}
           >
@@ -234,14 +228,14 @@ export function ReplyThreadPanel({
               onClick={() =>
                 onOpenImage(
                   rootMessage.attachment_url!,
-                  rootMessage.attachment_name || "Hình ảnh gốc",
+                  rootMessage.attachment_name || t("photoAlt"),
                 )
               }
               className="h-12 w-12 shrink-0 overflow-hidden rounded-lg"
             >
               <RelayImage
                 src={rootMessage.attachment_url}
-                alt={rootMessage.attachment_name || "Ảnh"}
+                alt={rootMessage.attachment_name || t("photoAlt")}
                 referrerPolicy="no-referrer"
                 className="h-full w-full object-cover"
               />
@@ -258,7 +252,7 @@ export function ReplyThreadPanel({
               >
                 {rootMessage.sender_name}
               </button>
-              <span style={{ color: "var(--text-secondary)" }}>Tin nhắn gốc</span>
+              <span style={{ color: "var(--text-secondary)" }}>{t("rootMsgLabel")}</span>
             </div>
             <div className="selectable-text line-clamp-3 whitespace-pre-wrap wrap-anywhere text-[14.5px] leading-relaxed">
               {rootText}
@@ -268,33 +262,41 @@ export function ReplyThreadPanel({
       </div>
 
       {/* Thread Replies Stream */}
-      <div ref={listContainerRef} className="relative flex-1 overflow-y-auto px-6 py-4">
+      <div ref={listContainerRef} className="relative flex-1 overflow-y-auto px-5 py-2.5">
         {replies.length === 0 ? (
           <div
             className="flex h-full flex-col items-center justify-center px-6 text-center text-[14px]"
             style={{ color: "var(--text-secondary)" }}
           >
-            Chưa có phản hồi nào cho tin nhắn này. Nhập câu trả lời bên dưới để bắt đầu luồng thảo luận!
+            {t("noRepliesYetHint")}
           </div>
         ) : (
           replies.map((m, idx) => {
             const prev = idx > 0 ? replies[idx - 1] : null;
+            const next = idx < replies.length - 1 ? replies[idx + 1] : null;
             const showDate = !prev || dayKey(prev.ts) !== dayKey(m.ts);
             const grouped =
               !!prev &&
               !showDate &&
               prev.sender_id === m.sender_id &&
               prev.is_outgoing === m.is_outgoing &&
-              m.ts - prev.ts < 120_000;
+              m.ts - prev.ts < 300_000;
+            const nextShowDate = !next || dayKey(m.ts) !== dayKey(next.ts);
+            const groupedWithNext =
+              !!next &&
+              !nextShowDate &&
+              next.sender_id === m.sender_id &&
+              next.is_outgoing === m.is_outgoing &&
+              next.ts - m.ts < 300_000;
             return (
               <div key={m.msg_id}>
                 {showDate && (
-                  <div className="my-4 flex justify-center">
+                  <div className="my-2.5 flex justify-center">
                     <span
                       className="rounded-full px-3 py-0.5 text-xs font-medium shadow-xs"
                       style={{ background: "var(--pill-bg)", color: "var(--pill-text)" }}
                     >
-                      {formatDayLabel(m.ts)}
+                      {formatDayLabel(m.ts, lang)}
                     </span>
                   </div>
                 )}
@@ -302,7 +304,14 @@ export function ReplyThreadPanel({
                   msg={m}
                   threadKind={threadKind}
                   groupedWithPrev={grouped}
+                  groupedWithNext={groupedWithNext}
                   highlighted={threadHighlightId === m.msg_id}
+                  isSeen={
+                    m.is_outgoing &&
+                    !m.is_recalled &&
+                    !m.send_status &&
+                    (threadKind === "cloud" || (peerReadTs ?? 0) >= m.ts)
+                  }
                   senderAvatar={getSenderAvatar?.(m.sender_id)}
                   translation={translationsByMsg[m.msg_id]}
                   replaceWithTranslation={replaceWithTranslation}
@@ -347,7 +356,7 @@ export function ReplyThreadPanel({
         }}
         onBuzz={onBuzz}
         buzzCooldownSec={buzzCooldownSec}
-        placeholder={`Trả lời trong luồng (${replyTarget.sender_name})... (Enter gửi, Esc quay lại)`}
+        placeholder={t("replyInThreadPlaceholder", { name: replyTarget.sender_name })}
         onError={onError}
       />
     </div>

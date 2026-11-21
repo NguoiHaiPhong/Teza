@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default capability for litechat main window",
-  "windows": ["main"],
+  "windows": ["main", "teza-notify"],
   "permissions": [
     "core:default",
     "core:window:allow-request-user-attention",

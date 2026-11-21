@@ -4,6 +4,8 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
+  Archive,
+  ArchiveRestore,
   ArrowLeft,
   Bell,
   BellOff,
@@ -20,11 +22,12 @@ import {
   Image as ImageIcon,
   Info,
   Languages,
+  LayoutGrid,
   Link2,
-  LogOut,
+  Lock,
+  Menu,
   MessageSquare,
   MessagesSquare,
-  Moon,
   PanelLeftClose,
   PanelLeftOpen,
   Pin,
@@ -33,13 +36,11 @@ import {
   RefreshCw,
   Search,
   Settings,
-  Sun,
   Trash2,
   UploadCloud,
   User,
   UserPlus,
   Users,
-  Wifi,
   X,
   Zap,
 } from "lucide-react";
@@ -53,6 +54,14 @@ import {
 import { setRelayMediaRouting } from "./utils/mediaCache";
 import { playMessageSound, showDesktopNotification } from "./utils/notify";
 import {
+  computeTotalUnreadBadge,
+  formatNotificationContent,
+  isThreadCurrentlyMuted,
+  loadNotifyPrefs,
+  saveNotifyPrefs,
+  shouldNotifyMessage,
+} from "./utils/notifyPrefs";
+import {
   bumpThreadList,
   compareThreads,
   computeLayoutMode,
@@ -60,17 +69,23 @@ import {
   dayKey,
   extractFirstUrl,
   filterThreadsByFolder,
+  findFirstUnreadMsgId,
   formatDayLabel,
   formatThreadTime,
   looksLikePhoneQuery,
   upsertMsg,
 } from "./utils/threadState";
+import { AddGroupMembersModal } from "./components/AddGroupMembersModal";
 import { Composer } from "./components/Composer";
+import { CreatePollModal } from "./components/CreatePollModal";
+import { CreateReminderModal } from "./components/CreateReminderModal";
 import { FindUserModal } from "./components/FindUserModal";
 import { FolderEditorModal, renderFolderIcon } from "./components/FolderEditorModal";
 import { ForwardModal } from "./components/ForwardModal";
 import { MediaLightbox, type LightboxItem } from "./components/MediaLightbox";
 import { MessageBubble, type MessageTranslationState } from "./components/MessageBubble";
+import { NavDrawer } from "./components/NavDrawer";
+import { PasscodeLockScreen } from "./components/PasscodeLockScreen";
 import { QrLoginModal } from "./components/QrLoginModal";
 import { QuickSearchModal } from "./components/QuickSearchModal";
 import { RelayImage } from "./components/RelayImage";
@@ -79,6 +94,7 @@ import {
   SettingsModal,
   type DensityMode,
   type FontSizeScale,
+  type SettingsTab,
 } from "./components/SettingsModal";
 import { ThreadAvatar } from "./components/ThreadAvatar";
 import {
@@ -88,14 +104,35 @@ import {
 import { TriforceEffects } from "./components/TriforceEffects";
 import { UpdateModal } from "./components/UpdateModal";
 import { UserProfileModal } from "./components/UserProfileModal";
+import { WebAppHub } from "./components/WebAppHub";
+import { WebAppWorkspace } from "./components/WebAppWorkspace";
+import { useI18n, type TranslationKey } from "./i18n";
+import {
+  DEFAULT_PASSCODE_CONFIG,
+  loadPasscodeConfig,
+  savePasscodeConfig,
+  verifyPasscode,
+} from "./utils/passcode";
+import { parsePollPayload } from "./utils/richMessage";
+import {
+  loadWebAppsConfig,
+  saveWebAppsConfig,
+  type WebAppItem,
+  type WebAppsConfig,
+} from "./utils/webApps";
 import type {
   AccountProfile,
   AppUpdateInfo,
+  BuiltInRailFolderId,
   ChatFolderDto,
   ConnectionStatus,
   FolderFilter,
   MessageDto,
+  NotificationPrefs,
+  NotifyToastPayload,
+  PasscodeConfig,
   PendingAttachment,
+  RailDisplayMode,
   RelayConfigSummary,
   StickerItem,
   ThemeMode,
@@ -105,15 +142,16 @@ import type {
   UserProfileDto,
 } from "./types";
 
-const FOLDERS: { id: FolderFilter; label: string; icon: typeof MessageSquare }[] = [
-  { id: "all", label: "Tất cả", icon: MessagesSquare },
-  { id: "unread", label: "Chưa đọc", icon: MessageSquare },
-  { id: "direct", label: "Cá nhân", icon: User },
-  { id: "group", label: "Nhóm", icon: Users },
-  { id: "cloud", label: "Cloud", icon: Bookmark },
+const FOLDERS: { id: FolderFilter; labelKey: TranslationKey; icon: typeof MessageSquare }[] = [
+  { id: "all", labelKey: "folderAll", icon: MessagesSquare },
+  { id: "unread", labelKey: "folderUnread", icon: MessageSquare },
+  { id: "direct", labelKey: "folderDirect", icon: User },
+  { id: "group", labelKey: "folderGroup", icon: Users },
+  { id: "cloud", labelKey: "folderCloud", icon: Bookmark },
 ];
 
 export default function App() {
+  const { lang, translateCode, t } = useI18n();
   const [theme, setTheme] = useState<ThemeMode>(() => {
     const saved = localStorage.getItem("litechat.theme");
     return saved === "night-blue" || saved === "dark" || saved === "light" || saved === "triforce"
@@ -174,6 +212,9 @@ export default function App() {
   const [profileInitial, setProfileInitial] = useState<UserProfileDto | null>(null);
   const [findUserOpen, setFindUserOpen] = useState(false);
   const [findUserInitialPhone, setFindUserInitialPhone] = useState("");
+  const [addMembersOpen, setAddMembersOpen] = useState(false);
+  const [createReminderOpen, setCreateReminderOpen] = useState(false);
+  const [createPollOpen, setCreatePollOpen] = useState(false);
   const [forwardMessages, setForwardMessages] = useState<MessageDto[]>([]);
   const [selectMode, setSelectMode] = useState(false);
   const [selectedMsgIds, setSelectedMsgIds] = useState<Set<string>>(() => new Set());
@@ -208,12 +249,38 @@ export default function App() {
     localStorage.getItem("litechat.density") === "compact" ? "compact" : "comfortable",
   );
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [desktopNotifyEnabled, setDesktopNotifyEnabled] = useState<boolean>(
-    () => localStorage.getItem("litechat.notify") !== "0",
+  const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTab>("notifications");
+  const [navDrawerOpen, setNavDrawerOpen] = useState(false);
+  const [notifyPrefs, setNotifyPrefs] = useState<NotificationPrefs>(() => loadNotifyPrefs());
+  const [sendOnEnter, setSendOnEnter] = useState<boolean>(
+    () => localStorage.getItem("teza.sendOnEnter") !== "0",
   );
-  const [soundEnabled, setSoundEnabled] = useState<boolean>(
-    () => localStorage.getItem("litechat.sound") !== "0",
-  );
+  const [webNotifyToast, setWebNotifyToast] = useState<NotifyToastPayload | null>(null);
+  const [drawerMuteOpen, setDrawerMuteOpen] = useState(false);
+  const [hiddenBuiltInFolders, setHiddenBuiltInFolders] = useState<BuiltInRailFolderId[]>(() => {
+    try {
+      const raw = localStorage.getItem("litechat.hiddenBuiltInFolders");
+      if (!raw) return [];
+      const parsed = JSON.parse(raw) as unknown;
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter(
+        (x): x is BuiltInRailFolderId =>
+          x === "unread" || x === "direct" || x === "group" || x === "cloud",
+      );
+    } catch {
+      return [];
+    }
+  });
+  const [passcodeCfg, setPasscodeCfg] = useState<PasscodeConfig>(() => loadPasscodeConfig());
+  const [isLocked, setIsLocked] = useState<boolean>(() => loadPasscodeConfig().enabled);
+  const [threadMenuFoldersExpanded, setThreadMenuFoldersExpanded] = useState(false);
+  const [railDisplayMode, setRailDisplayMode] = useState<RailDisplayMode>(() => {
+    const raw = localStorage.getItem("teza.railDisplayMode");
+    return raw === "icon-only" || raw === "text-only" ? raw : "icon-text";
+  });
+  const [webAppsCfg, setWebAppsCfg] = useState<WebAppsConfig>(() => loadWebAppsConfig());
+  const [activeWebAppId, setActiveWebAppId] = useState<string | null>(null);
+  const [webAppHubOpen, setWebAppHubOpen] = useState<boolean>(false);
   const [closeToTray, setCloseToTray] = useState<boolean>(
     () => localStorage.getItem("litechat.closeToTray") !== "0",
   );
@@ -221,6 +288,7 @@ export default function App() {
   const [inChatSearchQuery, setInChatSearchQuery] = useState("");
   const [inChatMatchIdx, setInChatMatchIdx] = useState(0);
   const [unreadDividerCount, setUnreadDividerCount] = useState(0);
+  const [unreadWatermarkTs, setUnreadWatermarkTs] = useState(0);
   const [draftsByThread, setDraftsByThread] = useState<Record<string, string>>(() => {
     try {
       const raw = localStorage.getItem("litechat.drafts");
@@ -229,9 +297,6 @@ export default function App() {
       return {};
     }
   });
-  const [buzzEnabled, setBuzzEnabled] = useState<boolean>(
-    () => localStorage.getItem("litechat.buzz") !== "0",
-  );
   const [buzzShaking, setBuzzShaking] = useState(false);
   const [buzzToast, setBuzzToast] = useState<{
     threadId: string;
@@ -257,9 +322,10 @@ export default function App() {
   const folderRef = useRef<string>(folder);
   const threadsRef = useRef<ThreadDto[]>(threads);
   const visibleThreadsRef = useRef<ThreadDto[]>([]);
-  const buzzEnabledRef = useRef<boolean>(buzzEnabled);
-  const desktopNotifyRef = useRef<boolean>(desktopNotifyEnabled);
-  const soundEnabledRef = useRef<boolean>(soundEnabled);
+  const notifyPrefsRef = useRef<NotificationPrefs>(notifyPrefs);
+  const themeRef = useRef<ThemeMode>(theme);
+  const myProfileRef = useRef<AccountProfile | null>(myProfile);
+  const webToastTimerRef = useRef<number | null>(null);
   const activeThreadRootIdRef = useRef<string | null>(activeThreadRootId);
   const inChatSearchInputRef = useRef<HTMLInputElement | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
@@ -271,16 +337,55 @@ export default function App() {
   const prevConnStatusRef = useRef<ConnectionStatus>(connStatus);
   const lastOlderCursorRef = useRef<string | null>(null);
   const pinnedMsgIdsRef = useRef<Set<string>>(new Set());
+  const pendingMarkReadRef = useRef<string | null>(null);
+  const isLockedRef = useRef<boolean>(isLocked);
+  const passcodeEnabledRef = useRef<boolean>(passcodeCfg.enabled);
+  const customFoldersRef = useRef<ChatFolderDto[]>(customFolders);
+  const hiddenBuiltInFoldersRef = useRef<BuiltInRailFolderId[]>(hiddenBuiltInFolders);
+  const lastActivityAtRef = useRef<number>(Date.now());
+  const progressiveEscStateRef = useRef({
+    hasOverlay: false,
+    hasMenu: false,
+    inChatSearch: false,
+    hasThreadPanel: false,
+    hasReply: false,
+  });
 
   selectedIdRef.current = selectedId;
   folderRef.current = folder;
   threadsRef.current = threads;
-  buzzEnabledRef.current = buzzEnabled;
-  desktopNotifyRef.current = desktopNotifyEnabled;
-  soundEnabledRef.current = soundEnabled;
+  notifyPrefsRef.current = notifyPrefs;
+  themeRef.current = theme;
+  myProfileRef.current = myProfile;
   activeThreadRootIdRef.current = activeThreadRootId;
   translationsRef.current = translationsByMsg;
   pinnedMsgIdsRef.current = new Set(pinnedMessages.map((p) => p.msg_id));
+  isLockedRef.current = isLocked;
+  passcodeEnabledRef.current = passcodeCfg.enabled;
+  customFoldersRef.current = customFolders;
+  hiddenBuiltInFoldersRef.current = hiddenBuiltInFolders;
+  progressiveEscStateRef.current = {
+    hasOverlay: Boolean(
+      settingsOpen ||
+        navDrawerOpen ||
+        folderModalOpen ||
+        quickSearchOpen ||
+        findUserOpen ||
+        addMembersOpen ||
+        createReminderOpen ||
+        createPollOpen ||
+        profileUid ||
+        lightboxState ||
+        forwardMessages.length > 0 ||
+        updateModalOpen ||
+        translateModalOpen ||
+        selectMode,
+    ),
+    hasMenu: Boolean(threadMenu || folderMenu || drawerMuteOpen),
+    inChatSearch: inChatSearchOpen,
+    hasThreadPanel: Boolean(activeThreadRootId),
+    hasReply: Boolean(replyTo),
+  };
 
   const layout = useMemo(
     () => computeLayoutMode(windowWidth, manualSidebarCompact),
@@ -332,16 +437,12 @@ export default function App() {
   }, [fxEnabled]);
 
   useEffect(() => {
-    localStorage.setItem("litechat.buzz", buzzEnabled ? "1" : "0");
-  }, [buzzEnabled]);
+    saveNotifyPrefs(notifyPrefs);
+  }, [notifyPrefs]);
 
   useEffect(() => {
-    localStorage.setItem("litechat.notify", desktopNotifyEnabled ? "1" : "0");
-  }, [desktopNotifyEnabled]);
-
-  useEffect(() => {
-    localStorage.setItem("litechat.sound", soundEnabled ? "1" : "0");
-  }, [soundEnabled]);
+    localStorage.setItem("teza.sendOnEnter", sendOnEnter ? "1" : "0");
+  }, [sendOnEnter]);
 
   useEffect(() => {
     localStorage.setItem("litechat.closeToTray", closeToTray ? "1" : "0");
@@ -349,7 +450,7 @@ export default function App() {
   }, [closeToTray]);
 
   useEffect(() => {
-    const totalUnread = threads.reduce((acc, t) => acc + (t.is_muted ? 0 : t.unread_count), 0);
+    const totalUnread = computeTotalUnreadBadge(threads, notifyPrefs);
     const title = totalUnread > 0 ? `(${totalUnread}) Teza` : "Teza";
     document.title = title;
     if (isTauri()) {
@@ -357,7 +458,7 @@ export default function App() {
         .setTitle(title)
         .catch(() => undefined);
     }
-  }, [threads]);
+  }, [threads, notifyPrefs]);
 
   const setDraftForThread = useCallback((tid: string, val: string) => {
     setDraftsByThread((prev) => {
@@ -438,6 +539,14 @@ export default function App() {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      if (isLockedRef.current) return;
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "l") {
+        if (passcodeEnabledRef.current) {
+          e.preventDefault();
+          setIsLocked(true);
+        }
+        return;
+      }
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
         setQuickSearchOpen((v) => !v);
@@ -446,6 +555,26 @@ export default function App() {
           e.preventDefault();
           setInChatSearchOpen(true);
           setTimeout(() => inChatSearchInputRef.current?.focus(), 20);
+        }
+      } else if (
+        (e.ctrlKey || e.metaKey) &&
+        !e.shiftKey &&
+        !e.altKey &&
+        e.key >= "1" &&
+        e.key <= "9"
+      ) {
+        const railIds: string[] = [
+          ...FOLDERS.filter(
+            (item) => item.id === "all" || !hiddenBuiltInFoldersRef.current.includes(item.id),
+          ).map((item) => item.id),
+          ...customFoldersRef.current.map((cf) => `custom:${cf.id}`),
+        ];
+        const targetFolder = railIds[Number(e.key) - 1];
+        if (targetFolder) {
+          e.preventDefault();
+          setActiveWebAppId(null);
+          void bridge.webappHideAll();
+          setFolder(targetFolder);
         }
       } else if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
         const list = visibleThreadsRef.current;
@@ -456,11 +585,59 @@ export default function App() {
         const nextIdx =
           curIdx < 0 ? 0 : (curIdx + delta + list.length) % list.length;
         setSelectedId(list[nextIdx].id);
+      } else if (e.key === "Escape") {
+        const esc = progressiveEscStateRef.current;
+        if (esc.hasMenu) {
+          setThreadMenu(null);
+          setFolderMenu(null);
+          setDrawerMuteOpen(false);
+        } else if (!esc.hasOverlay) {
+          if (esc.inChatSearch) {
+            setInChatSearchOpen(false);
+            setInChatSearchQuery("");
+          } else if (esc.hasThreadPanel) {
+            setActiveThreadRootId(null);
+          } else if (esc.hasReply) {
+            setReplyTo(null);
+          }
+        }
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
+
+  useEffect(() => {
+    if (!authed || !passcodeCfg.enabled || passcodeCfg.autoLockMinutes <= 0 || isLocked) {
+      return;
+    }
+    lastActivityAtRef.current = Date.now();
+    const markActivity = () => {
+      lastActivityAtRef.current = Date.now();
+    };
+    const events: (keyof WindowEventMap)[] = [
+      "mousemove",
+      "mousedown",
+      "keydown",
+      "wheel",
+      "touchstart",
+    ];
+    for (const evName of events) {
+      window.addEventListener(evName, markActivity, { passive: true });
+    }
+    const thresholdMs = passcodeCfg.autoLockMinutes * 60_000;
+    const timer = window.setInterval(() => {
+      if (Date.now() - lastActivityAtRef.current >= thresholdMs) {
+        setIsLocked(true);
+      }
+    }, 15_000);
+    return () => {
+      for (const evName of events) {
+        window.removeEventListener(evName, markActivity);
+      }
+      window.clearInterval(timer);
+    };
+  }, [authed, passcodeCfg.enabled, passcodeCfg.autoLockMinutes, isLocked]);
 
   useEffect(() => {
     if (!selectMode || forwardMessages.length > 0) return;
@@ -516,8 +693,12 @@ export default function App() {
     setPendingAttachment(null);
     setThreadDetails(null);
     setThreadMenu(null);
+    setThreadMenuFoldersExpanded(false);
     setShowScrollDown(false);
     setUnreadBelow(0);
+    setIsLocked(false);
+    setActiveWebAppId(null);
+    void bridge.webappHideAll();
   }, []);
 
   useEffect(() => {
@@ -621,11 +802,10 @@ export default function App() {
     (msg: MessageDto) => {
       const targetLang =
         (selectedIdRef.current && threadAutoTranslate[selectedIdRef.current]) ||
-        translateCfg?.target_lang ||
-        "VI";
+        translateCode;
       void translateBatchMessages([msg], targetLang, true);
     },
-    [threadAutoTranslate, translateCfg, translateBatchMessages],
+    [threadAutoTranslate, translateCode, translateBatchMessages],
   );
 
   const handleToggleThreadTranslate = useCallback(() => {
@@ -645,10 +825,9 @@ export default function App() {
         return next;
       });
     } else {
-      const lang = translateCfg?.target_lang || "VI";
-      setThreadAutoTranslate((prev) => ({ ...prev, [selectedId]: lang }));
+      setThreadAutoTranslate((prev) => ({ ...prev, [selectedId]: translateCode }));
     }
-  }, [selectedId, threadAutoTranslate, translateCfg, messages]);
+  }, [selectedId, threadAutoTranslate, translateCode, messages]);
 
   const syncRemoteThreads = useCallback(async () => {
     setSyncing(true);
@@ -690,6 +869,51 @@ export default function App() {
         setAuthChecking(false);
       });
   }, [refreshQr, syncRemoteThreads]);
+
+  const completeMarkReadForThread = useCallback((tid: string) => {
+    if (pendingMarkReadRef.current === tid) {
+      pendingMarkReadRef.current = null;
+    }
+    void bridge.markRead(tid);
+    setThreads((prev) =>
+      prev.map((t) =>
+        t.id === tid
+          ? {
+              ...t,
+              unread_count: 0,
+              last_read_in_ts: Math.max(t.last_read_in_ts ?? 0, t.last_ts),
+            }
+          : t,
+      ),
+    );
+  }, []);
+
+  const openThreadById = useCallback((tid: string) => {
+    setActiveWebAppId(null);
+    void bridge.webappHideAll();
+    setSelectedId(tid);
+    setActiveThreadRootId(null);
+    setMobilePane("chat");
+  }, []);
+
+  const triggerNotifyPopup = useCallback((payload: NotifyToastPayload) => {
+    if (isTauri()) {
+      if (notifyPrefsRef.current.useCustomPopup) {
+        void bridge.showNotifyPopup(payload).catch(() => undefined);
+      } else {
+        void showDesktopNotification(payload.title, payload.body);
+      }
+      return;
+    }
+    setWebNotifyToast(payload);
+    if (webToastTimerRef.current !== null) {
+      window.clearTimeout(webToastTimerRef.current);
+    }
+    webToastTimerRef.current = window.setTimeout(() => {
+      webToastTimerRef.current = null;
+      setWebNotifyToast(null);
+    }, Math.max(2500, Math.min(15000, payload.duration_ms)));
+  }, []);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -752,61 +976,90 @@ export default function App() {
         listen<MessageDto>("core://message-new", (ev) => {
           const msg = ev.payload;
           const hasThread = threadsRef.current.some((t) => t.id === msg.thread_id);
-          setThreads((prev) =>
-            bumpThreadList(prev, msg, msg.thread_id !== selectedIdRef.current && !msg.is_outgoing),
-          );
+          const isActiveThread = msg.thread_id === selectedIdRef.current;
+          const el = isActiveThread ? scrollContainerRef.current : null;
+          const nearBottom =
+            isActiveThread && (!el || el.scrollHeight - el.scrollTop - el.clientHeight < 140);
+          const readingLive =
+            !msg.is_outgoing &&
+            nearBottom &&
+            document.hasFocus() &&
+            pendingMarkReadRef.current !== msg.thread_id;
+          const incUnread = !msg.is_outgoing && !readingLive;
+          setThreads((prev) => bumpThreadList(prev, msg, incUnread));
           if (!hasThread) {
             void bridge
               .listThreads("all")
               .then(setThreads)
               .catch(() => undefined);
           }
-          if (msg.thread_id === selectedIdRef.current) {
+          if (isActiveThread) {
             setMessages((prev) => upsertMsg(prev, msg));
             if (msg.attachment_url) {
               setDetailsRefreshTick((n) => n + 1);
             }
-            const el = scrollContainerRef.current;
-            const nearBottom = !el || el.scrollHeight - el.scrollTop - el.clientHeight < 180;
-            if (nearBottom || msg.is_outgoing) {
+            if (!msg.is_outgoing && readingLive) {
+              completeMarkReadForThread(msg.thread_id);
+            }
+            if ((nearBottom && pendingMarkReadRef.current !== msg.thread_id) || msg.is_outgoing) {
               setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
-            } else {
+            } else if (!msg.is_outgoing) {
               setUnreadBelow((n) => n + 1);
+              setShowScrollDown(true);
             }
           }
           const matchedThread = threadsRef.current.find((t) => t.id === msg.thread_id);
           const isRecent = Math.abs(Date.now() - msg.ts) < 90_000;
-          if (!msg.is_outgoing && isBuzzMessage(msg) && buzzEnabledRef.current) {
-            if (!matchedThread?.is_muted && isRecent) {
+          const prefs = notifyPrefsRef.current;
+          const threadMuted = isThreadCurrentlyMuted(matchedThread);
+          if (!msg.is_outgoing && isBuzzMessage(msg) && prefs.buzz) {
+            if (!threadMuted && isRecent) {
               playBuzzSound();
-              setBuzzShaking(true);
-              setTimeout(() => setBuzzShaking(false), 1200);
-              setBuzzToast({
-                threadId: msg.thread_id,
-                threadTitle: matchedThread?.title || msg.sender_name || msg.thread_id,
-                senderName: msg.sender_name || matchedThread?.title || "Liên hệ",
-              });
-              setTimeout(() => setBuzzToast(null), 5000);
+              if (!isLockedRef.current) {
+                setBuzzShaking(true);
+                setTimeout(() => setBuzzShaking(false), 1200);
+                setBuzzToast({
+                  threadId: msg.thread_id,
+                  threadTitle: matchedThread?.title || msg.sender_name || msg.thread_id,
+                  senderName: msg.sender_name || matchedThread?.title || "Liên hệ",
+                });
+                setTimeout(() => setBuzzToast(null), 5000);
+              }
               if (isTauri()) {
                 void getCurrentWindow()
                   .requestUserAttention(2)
                   .catch(() => undefined);
               }
             }
-          } else if (!msg.is_outgoing && !matchedThread?.is_muted && isRecent) {
-            const away = !document.hasFocus() || msg.thread_id !== selectedIdRef.current;
-            if (away) {
-              if (soundEnabledRef.current) {
-                playMessageSound();
-              }
-              if (desktopNotifyRef.current && !document.hasFocus()) {
-                const threadTitle = matchedThread?.title || msg.sender_name || "Tin nhắn mới";
-                const body = msg.text.trim() || msg.attachment_name || "[Tệp đính kèm]";
-                void showDesktopNotification(
-                  threadTitle,
-                  matchedThread?.kind === "group" ? `${msg.sender_name}: ${body}` : body,
-                );
-              }
+          } else if (isRecent) {
+            const { showPopup, playSound } = shouldNotifyMessage({
+              msg,
+              thread: matchedThread,
+              isActiveThread: msg.thread_id === selectedIdRef.current,
+              windowFocused: document.hasFocus(),
+              prefs,
+              myUid: myProfileRef.current?.uid ?? "",
+              myName: myProfileRef.current?.display_name ?? "",
+            });
+            if (playSound) {
+              playMessageSound();
+            }
+            if (showPopup) {
+              const locked = isLockedRef.current;
+              const { title, body } = formatNotificationContent({
+                msg,
+                thread: matchedThread,
+                previewMode: locked ? "hidden" : prefs.previewMode,
+              });
+              triggerNotifyPopup({
+                thread_id: msg.thread_id,
+                title,
+                body,
+                avatar: locked ? "" : matchedThread?.avatar || "",
+                theme: themeRef.current,
+                position: prefs.position,
+                duration_ms: prefs.durationSec * 1000,
+              });
             }
           }
         }),
@@ -829,6 +1082,16 @@ export default function App() {
         }),
         listen("core://threads-updated", () => {
           void bridge.listThreads("all").then(setThreads);
+        }),
+        listen<{ thread_id: string; peer_read_ts: number }>("core://thread-receipt", (ev) => {
+          const { thread_id, peer_read_ts } = ev.payload;
+          setThreads((prev) =>
+            prev.map((t) =>
+              t.id === thread_id
+                ? { ...t, peer_read_ts: Math.max(t.peer_read_ts ?? 0, peer_read_ts) }
+                : t,
+            ),
+          );
         }),
         listen<{ thread_id: string; messages: MessageDto[]; has_more?: boolean }>(
           "core://thread-messages-synced",
@@ -861,6 +1124,11 @@ export default function App() {
         listen<RelayConfigSummary>("core://relay-updated", (ev) => {
           applyRelaySummary(ev.payload);
         }),
+        listen<string>("core://open-thread", (ev) => {
+          if (ev.payload) {
+            openThreadById(ev.payload);
+          }
+        }),
       ]);
 
       if (cancelled) {
@@ -875,7 +1143,15 @@ export default function App() {
       cancelled = true;
       unlisteners.forEach((fn) => fn());
     };
-  }, [syncRemoteThreads, refreshQr, applyRelaySummary, refreshPinnedMessages]);
+  }, [
+    syncRemoteThreads,
+    refreshQr,
+    applyRelaySummary,
+    refreshPinnedMessages,
+    completeMarkReadForThread,
+    openThreadById,
+    triggerNotifyPopup,
+  ]);
 
   useEffect(() => {
     if (!authed) return;
@@ -926,6 +1202,7 @@ export default function App() {
   }, [authed, drawerOpen, selectedId, activeThreadKind, detailsRefreshTick]);
 
   useEffect(() => {
+    setThreadMenuFoldersExpanded(false);
     if (!threadMenu) return;
     const close = () => setThreadMenu(null);
     window.addEventListener("click", close);
@@ -1027,8 +1304,18 @@ export default function App() {
   useEffect(() => {
     if (!authed || !selectedId) return;
     let cancelled = false;
-    const initUnread = threadsRef.current.find((t) => t.id === selectedId)?.unread_count ?? 0;
+    const current = threadsRef.current.find((t) => t.id === selectedId);
+    const initUnread = current?.unread_count ?? 0;
+    const initWatermark = current?.last_read_in_ts ?? 0;
     setUnreadDividerCount(initUnread);
+    setUnreadWatermarkTs(initWatermark);
+    if (initUnread === 0) {
+      pendingMarkReadRef.current = null;
+      completeMarkReadForThread(selectedId);
+    } else {
+      pendingMarkReadRef.current = selectedId;
+      void bridge.setActiveThread(null);
+    }
     setInChatSearchOpen(false);
     setInChatSearchQuery("");
     setInChatMatchIdx(0);
@@ -1048,8 +1335,6 @@ export default function App() {
     setShowScrollDown(false);
     setUnreadBelow(0);
     void refreshPinnedMessages(selectedId);
-    void bridge.markRead(selectedId);
-    setThreads((prev) => prev.map((t) => (t.id === selectedId ? { ...t, unread_count: 0 } : t)));
     void bridge
       .loadMessages(selectedId, undefined, true)
       .then(async (page) => {
@@ -1070,7 +1355,33 @@ export default function App() {
         } else {
           setMessages(page.messages);
           setHasMoreHistory(page.has_more);
-          setTimeout(() => bottomRef.current?.scrollIntoView(), 40);
+          const targetUnreadId = findFirstUnreadMsgId(page.messages, initWatermark, initUnread);
+          if (targetUnreadId) {
+            setTimeout(() => {
+              if (cancelled) return;
+              document
+                .getElementById("unread-divider")
+                ?.scrollIntoView({ block: "start" });
+              requestAnimationFrame(() => {
+                if (cancelled) return;
+                const el = scrollContainerRef.current;
+                if (!el || el.scrollHeight - el.scrollTop - el.clientHeight < 90) {
+                  completeMarkReadForThread(selectedId);
+                } else {
+                  setShowScrollDown(true);
+                  setUnreadBelow(initUnread);
+                }
+              });
+            }, 50);
+          } else {
+            setTimeout(() => {
+              if (cancelled) return;
+              bottomRef.current?.scrollIntoView();
+              if (pendingMarkReadRef.current === selectedId) {
+                completeMarkReadForThread(selectedId);
+              }
+            }, 40);
+          }
         }
       })
       .finally(() => {
@@ -1079,9 +1390,38 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [authed, selectedId, jumpToMsg, refreshPinnedMessages]);
+  }, [authed, selectedId, jumpToMsg, refreshPinnedMessages, completeMarkReadForThread]);
 
   const activeThreadLang = selectedId ? threadAutoTranslate[selectedId] : undefined;
+  const prevTranslateCodeRef = useRef(translateCode);
+  useEffect(() => {
+    const prevCode = prevTranslateCodeRef.current;
+    if (prevCode === translateCode) return;
+    prevTranslateCodeRef.current = translateCode;
+    setThreadAutoTranslate((prev) => {
+      let changed = false;
+      const next: Record<string, string> = {};
+      for (const [tid, target] of Object.entries(prev)) {
+        if (target === prevCode) {
+          next[tid] = translateCode;
+          changed = true;
+        } else {
+          next[tid] = target;
+        }
+      }
+      return changed ? next : prev;
+    });
+    setTranslationsByMsg((prev) => {
+      if (Object.keys(prev).length === 0) return prev;
+      const next: typeof prev = {};
+      for (const [mid, item] of Object.entries(prev)) {
+        if (item.targetLang !== prevCode) {
+          next[mid] = item;
+        }
+      }
+      return next;
+    });
+  }, [translateCode]);
   useEffect(() => {
     if (!authed || !selectedId || !activeThreadLang || messages.length === 0) return;
     void translateBatchMessages(messages, activeThreadLang);
@@ -1203,17 +1543,146 @@ export default function App() {
     el?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [inChatActiveMatchId]);
 
-  const firstUnreadMsgId = useMemo(() => {
-    if (unreadDividerCount <= 0 || messages.length === 0) return null;
-    let rem = unreadDividerCount;
-    for (let i = messages.length - 1; i >= 0; i -= 1) {
-      if (!messages[i].is_outgoing) {
-        rem -= 1;
-        if (rem <= 0) return messages[i].msg_id;
+  const firstUnreadMsgId = useMemo(
+    () => findFirstUnreadMsgId(messages, unreadWatermarkTs, unreadDividerCount),
+    [messages, unreadWatermarkTs, unreadDividerCount],
+  );
+
+  const archivedThreads = useMemo(
+    () => threads.filter((t) => Boolean(t.is_archived)).sort(compareThreads),
+    [threads],
+  );
+
+  const archivedUnread = useMemo(
+    () => archivedThreads.reduce((acc, t) => acc + (t.is_muted ? 0 : t.unread_count), 0),
+    [archivedThreads],
+  );
+
+  const visibleBuiltInFolders = useMemo(
+    () => FOLDERS.filter((item) => item.id === "all" || !hiddenBuiltInFolders.includes(item.id)),
+    [hiddenBuiltInFolders],
+  );
+
+  const handleToggleBuiltInFolder = useCallback(
+    (id: BuiltInRailFolderId) => {
+      setHiddenBuiltInFolders((prev) => {
+        const exists = prev.includes(id);
+        const next = exists ? prev.filter((x) => x !== id) : [...prev, id];
+        try {
+          localStorage.setItem("litechat.hiddenBuiltInFolders", JSON.stringify(next));
+        } catch {
+          // ignore storage quota errors
+        }
+        return next;
+      });
+      if (folderRef.current === id) {
+        setFolder("all");
       }
+    },
+    [],
+  );
+
+  const handleUpdatePasscode = useCallback((next: PasscodeConfig) => {
+    savePasscodeConfig(next);
+    setPasscodeCfg(next);
+    if (!next.enabled) {
+      setIsLocked(false);
     }
-    return messages.find((m) => !m.is_outgoing)?.msg_id ?? null;
-  }, [unreadDividerCount, messages]);
+  }, []);
+
+  const embeddedWebApps = useMemo(
+    () => webAppsCfg.items.filter((x) => x.openMode === "embedded"),
+    [webAppsCfg.items],
+  );
+
+  const activeWebApp = useMemo(
+    () =>
+      webAppsCfg.enabled && activeWebAppId
+        ? webAppsCfg.items.find((x) => x.id === activeWebAppId) ?? null
+        : null,
+    [webAppsCfg, activeWebAppId],
+  );
+
+  const webappSuspended = Boolean(
+    isLocked ||
+      navDrawerOpen ||
+      settingsOpen ||
+      folderModalOpen ||
+      quickSearchOpen ||
+      findUserOpen ||
+      translateModalOpen ||
+      updateModalOpen ||
+      profileUid ||
+      threadMenu ||
+      folderMenu ||
+      lightboxState ||
+      forwardMessages.length > 0 ||
+      addMembersOpen ||
+      createReminderOpen ||
+      createPollOpen,
+  );
+
+  useEffect(() => {
+    if (!activeWebApp) {
+      void bridge.webappHideAll();
+    }
+  }, [activeWebApp]);
+
+  const handleWebAppsCfgChange = useCallback(
+    (next: WebAppsConfig) => {
+      const prevMap = new Map(webAppsCfg.items.map((x) => [x.id, x]));
+      const nextMap = new Map(next.items.map((x) => [x.id, x]));
+      for (const [id, prevItem] of prevMap) {
+        const nextItem = nextMap.get(id);
+        if (!nextItem || nextItem.url !== prevItem.url || nextItem.openMode !== prevItem.openMode) {
+          void bridge.webappClose(id);
+        }
+      }
+      if (!next.enabled) {
+        setActiveWebAppId(null);
+        setWebAppHubOpen(false);
+        void bridge.webappHideAll();
+      } else if (activeWebAppId && !nextMap.has(activeWebAppId)) {
+        setActiveWebAppId(null);
+        void bridge.webappHideAll();
+      }
+      saveWebAppsConfig(next);
+      setWebAppsCfg(next);
+    },
+    [webAppsCfg, activeWebAppId],
+  );
+
+  const handleActivateWebApp = useCallback(
+    (item: WebAppItem) => {
+      if (item.openMode === "external") {
+        void bridge.openExternalUrl(item.url).catch(showError);
+        return;
+      }
+      setWebAppHubOpen(false);
+      setActiveWebAppId(item.id);
+      if (layout.mode === "single") setMobilePane("chat");
+    },
+    [layout.mode, showError],
+  );
+
+  const handleToggleArchive = async (target: ThreadDto, archived: boolean) => {
+    try {
+      await bridge.toggleArchive(target.id, archived);
+      setThreads((prev) =>
+        prev.map((t) => (t.id === target.id ? { ...t, is_archived: archived } : t)),
+      );
+      if (!archived && folderRef.current === "archived") {
+        const remaining = threadsRef.current.filter(
+          (t) => t.id !== target.id && Boolean(t.is_archived),
+        ).length;
+        if (remaining === 0) {
+          setFolder("all");
+        }
+      }
+    } catch (err) {
+      showError(err);
+    }
+  };
 
   const handleTogglePin = async (target: ThreadDto) => {
     const nextPinned = !target.is_pinned;
@@ -1227,24 +1696,48 @@ export default function App() {
     }
   };
 
-  const handleToggleMute = async (target: ThreadDto) => {
-    const nextMuted = !target.is_muted;
+  const handleToggleMute = async (target: ThreadDto, durationSecs?: number) => {
+    const nextMuted = durationSecs !== undefined ? true : !isThreadCurrentlyMuted(target);
     try {
-      await bridge.toggleMute(target.id, nextMuted);
+      const untilTs = await bridge.toggleMute(target.id, nextMuted, durationSecs);
       setThreads((prev) =>
-        prev.map((t) => (t.id === target.id ? { ...t, is_muted: nextMuted } : t)),
+        prev.map((t) =>
+          t.id === target.id
+            ? { ...t, is_muted: nextMuted, muted_until_ts: nextMuted ? untilTs : 0 }
+            : t,
+        ),
       );
+      setDrawerMuteOpen(false);
     } catch (err) {
       showError(err);
     }
+  };
+
+  const formatMuteUntil = (ts?: number): string => {
+    if (!ts || ts <= Date.now()) return "";
+    return new Date(ts).toLocaleTimeString("vi-VN", {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
   };
 
   const handleMarkRead = useCallback(
     async (target: ThreadDto) => {
       try {
         await bridge.markRead(target.id);
+        if (pendingMarkReadRef.current === target.id) {
+          pendingMarkReadRef.current = null;
+        }
         setThreads((prev) =>
-          prev.map((t) => (t.id === target.id ? { ...t, unread_count: 0 } : t)),
+          prev.map((t) =>
+            t.id === target.id
+              ? {
+                  ...t,
+                  unread_count: 0,
+                  last_read_in_ts: Math.max(t.last_read_in_ts ?? 0, t.last_ts),
+                }
+              : t,
+          ),
         );
       } catch (err) {
         showError(err);
@@ -1256,10 +1749,22 @@ export default function App() {
   const handleMarkUnread = async (target: ThreadDto) => {
     try {
       await bridge.markUnread(target.id);
+      if (selectedIdRef.current === target.id) {
+        pendingMarkReadRef.current = target.id;
+      }
       setThreads((prev) =>
         prev
           .map((t) =>
-            t.id === target.id ? { ...t, unread_count: Math.max(1, t.unread_count) } : t,
+            t.id === target.id
+              ? {
+                  ...t,
+                  unread_count: Math.max(1, t.unread_count),
+                  last_read_in_ts:
+                    t.last_read_in_ts && t.last_ts
+                      ? Math.min(t.last_read_in_ts, t.last_ts - 1)
+                      : t.last_read_in_ts,
+                }
+              : t,
           )
           .sort(compareThreads),
       );
@@ -1395,6 +1900,8 @@ export default function App() {
     const q = replyTo;
     setReplyTo(null);
     setUnreadDividerCount(0);
+    setUnreadWatermarkTs(0);
+    completeMarkReadForThread(selectedId);
     return await sendTextInternal(selectedId, text, q);
   };
 
@@ -1568,6 +2075,8 @@ export default function App() {
       const tid = selectedIdRef.current;
       if (!tid) return;
       setUnreadDividerCount(0);
+      setUnreadWatermarkTs(0);
+      completeMarkReadForThread(tid);
       try {
         const sent = await bridge.sendSticker(tid, sticker);
         setMessages((prev) => upsertMsg(prev, sent));
@@ -1577,7 +2086,7 @@ export default function App() {
         showError(err);
       }
     },
-    [showError],
+    [showError, completeMarkReadForThread],
   );
 
   const handleToggleSelectMsg = useCallback((msgId: string) => {
@@ -1610,6 +2119,51 @@ export default function App() {
       showError(err);
     }
   }, [selectedMsgIds, showError]);
+
+  const handleVotePoll = useCallback(
+    async (msg: MessageDto, optionIds: number[]) => {
+      const poll = parsePollPayload(msg);
+      if (!poll || poll.poll_id <= 0) return;
+      try {
+        const updated = await bridge.votePoll(
+          poll.poll_id,
+          optionIds,
+          msg.thread_id,
+          msg.msg_id,
+        );
+        const nextMsg: MessageDto = {
+          ...msg,
+          msg_type: "chat.poll",
+          attachment_url: null,
+          attachment_name: `teza-poll:${JSON.stringify(updated)}`,
+        };
+        setMessages((prev) => upsertMsg(prev, nextMsg));
+      } catch (err) {
+        showError(err);
+      }
+    },
+    [showError],
+  );
+
+  const handleRefreshPoll = useCallback(
+    async (msg: MessageDto) => {
+      const poll = parsePollPayload(msg);
+      if (!poll || poll.poll_id <= 0) return;
+      try {
+        const updated = await bridge.getPollDetail(poll.poll_id, msg.thread_id, msg.msg_id);
+        const nextMsg: MessageDto = {
+          ...msg,
+          msg_type: "chat.poll",
+          attachment_url: null,
+          attachment_name: `teza-poll:${JSON.stringify(updated)}`,
+        };
+        setMessages((prev) => upsertMsg(prev, nextMsg));
+      } catch (err) {
+        showError(err);
+      }
+    },
+    [showError],
+  );
 
   const activeMentionMembers = useMemo(
     () =>
@@ -1695,6 +2249,9 @@ export default function App() {
     caption: string,
   ): Promise<MessageDto | false> => {
     if (!selectedId) return false;
+    setUnreadDividerCount(0);
+    setUnreadWatermarkTs(0);
+    completeMarkReadForThread(selectedId);
     try {
       const msg =
         att.kind === "path"
@@ -1804,6 +2361,10 @@ export default function App() {
             setFolder("all");
           }
         }}
+        onReorderFolders={async (orderedIds) => {
+          const updated = await bridge.reorderChatFolders(orderedIds);
+          setCustomFolders(updated);
+        }}
         onSyncRemoteLabels={async () => {
           const updated = await bridge.syncRemoteLabelFolders();
           setCustomFolders(updated);
@@ -1813,6 +2374,19 @@ export default function App() {
 
       <SettingsModal
         open={settingsOpen}
+        initialTab={settingsInitialTab}
+        myProfile={myProfile}
+        connStatus={connStatus}
+        onOpenMyProfile={() => {
+          if (myProfile?.uid) setProfileUid(myProfile.uid);
+        }}
+        onLogout={() => {
+          void bridge.logout().then(() => {
+            setAuthed(false);
+            resetSessionUi();
+            void refreshQr();
+          });
+        }}
         theme={theme}
         onThemeChange={setTheme}
         fontSize={fontSize}
@@ -1821,14 +2395,69 @@ export default function App() {
         onDensityChange={setDensity}
         fxEnabled={fxEnabled}
         onFxChange={setFxEnabled}
-        buzzEnabled={buzzEnabled}
-        onBuzzChange={setBuzzEnabled}
-        desktopNotifyEnabled={desktopNotifyEnabled}
-        onDesktopNotifyChange={setDesktopNotifyEnabled}
-        soundEnabled={soundEnabled}
-        onSoundChange={setSoundEnabled}
+        sendOnEnter={sendOnEnter}
+        onSendOnEnterChange={setSendOnEnter}
+        notifyPrefs={notifyPrefs}
+        onNotifyPrefsChange={setNotifyPrefs}
+        onTestSound={() => playMessageSound(true)}
+        onTestNotification={() => {
+          const sampleThread =
+            threads.find((t) => t.id === selectedId) ??
+            threads.find((t) => t.kind !== "cloud") ??
+            threads[0];
+          const sampleMsg: MessageDto = {
+            msg_id: `preview-${Date.now()}`,
+            thread_id: sampleThread?.id || "cloud-me",
+            sender_id: sampleThread?.id || "u-demo",
+            sender_name: sampleThread?.title || "Teza",
+            text: "Đây là thông báo thử — bấm vào đây để mở hội thoại này.",
+            msg_type: "chat.text",
+            ts: Date.now(),
+            is_outgoing: false,
+            is_recalled: false,
+            is_pinned: false,
+            quote: null,
+            reactions: [],
+            attachment_url: null,
+            attachment_name: null,
+          };
+          const { title, body } = formatNotificationContent({
+            msg: sampleMsg,
+            thread: sampleThread,
+            previewMode: notifyPrefs.previewMode,
+          });
+          triggerNotifyPopup({
+            thread_id: sampleMsg.thread_id,
+            title,
+            body,
+            avatar: sampleThread?.avatar || "",
+            theme,
+            position: notifyPrefs.position,
+            duration_ms: notifyPrefs.durationSec * 1000,
+          });
+        }}
         closeToTray={closeToTray}
         onCloseToTrayChange={setCloseToTray}
+        customFoldersCount={customFolders.length}
+        hiddenBuiltInFolders={hiddenBuiltInFolders}
+        onToggleBuiltInFolder={handleToggleBuiltInFolder}
+        railDisplayMode={railDisplayMode}
+        onRailDisplayModeChange={(mode) => {
+          setRailDisplayMode(mode);
+          localStorage.setItem("teza.railDisplayMode", mode);
+        }}
+        onOpenFoldersModal={() => {
+          setEditingFolder(null);
+          setFolderModalOpen(true);
+        }}
+        webAppsCfg={webAppsCfg}
+        onWebAppsCfgChange={handleWebAppsCfgChange}
+        onOpenWebApp={handleActivateWebApp}
+        passcodeCfg={passcodeCfg}
+        onUpdatePasscode={handleUpdatePasscode}
+        onLockNow={() => {
+          if (passcodeCfg.enabled) setIsLocked(true);
+        }}
         translateCfg={translateCfg}
         onOpenTranslateModal={() => setTranslateModalOpen(true)}
         relayCfg={relayCfg}
@@ -1869,7 +2498,7 @@ export default function App() {
           if (selectedId && threadAutoTranslate[selectedId]) {
             setThreadAutoTranslate((prev) => ({
               ...prev,
-              [selectedId]: cfg.target_lang || "VI",
+              [selectedId]: cfg.target_lang || translateCode,
             }));
           }
         }}
@@ -1918,37 +2547,135 @@ export default function App() {
   return (
     <div className={`relative flex h-full w-full overflow-hidden ${buzzShaking ? "buzz-shaking" : ""}`}>
       <TriforceEffects enabled={fxEnabled} dustEnabled={fxEnabled && theme === "triforce"} />
+      <NavDrawer
+        open={navDrawerOpen}
+        onClose={() => setNavDrawerOpen(false)}
+        myProfile={myProfile}
+        connStatus={connStatus}
+        theme={theme}
+        appVersion={appVersion}
+        availableUpdate={availableUpdate}
+        archivedCount={archivedThreads.length}
+        hasPasscode={passcodeCfg.enabled}
+        onOpenMyProfile={() => {
+          if (myProfile?.uid) setProfileUid(myProfile.uid);
+        }}
+        onOpenSavedMessages={() => {
+          const cloudId = threads.find((t) => t.kind === "cloud")?.id || "cloud-me";
+          openThreadById(cloudId);
+        }}
+        onOpenArchived={() => {
+          setActiveWebAppId(null);
+          void bridge.webappHideAll();
+          setFolder("archived");
+        }}
+        onOpenFindUser={() => {
+          setFindUserInitialPhone("");
+          setFindUserOpen(true);
+        }}
+        onOpenFolders={() => {
+          setEditingFolder(null);
+          setFolderModalOpen(true);
+        }}
+        onLockApp={() => {
+          if (passcodeCfg.enabled) setIsLocked(true);
+        }}
+        onOpenSettings={(tab) => {
+          setSettingsInitialTab(tab || "notifications");
+          setSettingsOpen(true);
+        }}
+        onCycleTheme={cycleTheme}
+        onOpenUpdateModal={() => setUpdateModalOpen(true)}
+        onLogout={() => {
+          void bridge.logout().then(() => {
+            setAuthed(false);
+            resetSessionUi();
+            void refreshQr();
+          });
+        }}
+      />
       {/* Column 1: Folder Rail */}
       <aside
-        className={`relative z-10 shrink-0 flex-col items-center justify-between overflow-y-auto py-3 ${
+        className={`tf-rail relative z-10 shrink-0 flex-col overflow-hidden ${
           layout.mode === "single"
             ? mobilePane === "chat"
               ? "hidden"
-              : "flex w-[64px]"
-            : "flex w-[78px]"
+              : railDisplayMode === "icon-only"
+                ? "flex w-[52px]"
+                : railDisplayMode === "text-only"
+                  ? "flex w-[96px]"
+                  : "flex w-[64px]"
+            : railDisplayMode === "icon-only"
+              ? "flex w-[56px]"
+              : railDisplayMode === "text-only"
+                ? "flex w-[104px]"
+                : "flex w-[78px]"
         }`}
-        style={{ background: "var(--bg-rail)", borderRight: "1px solid var(--border-subtle)" }}
+        style={{ borderRight: "1px solid var(--border-subtle)" }}
       >
-        <div className="flex w-full flex-col items-center gap-1 px-1.5">
-          {FOLDERS.map((item) => {
+        <div className="flex w-full shrink-0 flex-col items-center px-1.5 pb-1 pt-2.5">
+          <button
+            type="button"
+            onClick={() => setNavDrawerOpen(true)}
+            title={t("menuMainSettings")}
+            className="tf-rail-btn relative flex w-full items-center justify-center rounded-xl py-2"
+            style={{ color: "var(--rail-text)" }}
+          >
+            <Menu className="h-5 w-5" />
+            {availableUpdate && (
+              <span className="absolute right-3 top-1.5 h-2 w-2 rounded-full bg-emerald-400" />
+            )}
+          </button>
+          <div className="mt-1.5 h-px w-8" style={{ background: "var(--border-subtle)" }} />
+        </div>
+
+        <div className="flex min-h-0 w-full flex-1 flex-col items-center gap-1 overflow-y-auto px-1.5 py-1.5">
+          {visibleBuiltInFolders.map((item) => {
             const Icon = item.icon;
-            const active = folder === item.id;
+            const active = !activeWebApp && !webAppHubOpen && folder === item.id;
             const badge = item.id === "all" ? 0 : countFolderUnread(threads, item.id, customFolders);
+            const itemLabel = t(item.labelKey);
+            const isTextOnly = railDisplayMode === "text-only";
             return (
               <button
                 key={item.id}
-                onClick={() => setFolder(item.id)}
-                className="hover-rail relative flex w-full flex-col items-center gap-1 rounded-xl py-2 text-xs font-medium transition"
+                onClick={() => {
+                  setActiveWebAppId(null);
+                  setWebAppHubOpen(false);
+                  setFolder(item.id);
+                }}
+                title={itemLabel}
+                className={`tf-rail-btn ${active ? "tf-rail-btn-active" : ""} relative flex w-full shrink-0 rounded-xl ${
+                  railDisplayMode === "icon-only"
+                    ? "flex-col items-center justify-center py-2.5"
+                    : isTextOnly
+                      ? "flex-row items-center justify-between gap-1 py-2 pl-3 pr-2 text-left text-[12px] font-medium"
+                      : "flex-col items-center justify-center gap-1 py-2 text-xs font-medium"
+                }`}
                 style={{
-                  background: active ? "var(--rail-active-bg)" : "transparent",
+                  background: active ? "var(--rail-active-bg)" : undefined,
                   color: active ? "var(--rail-text-active)" : "var(--rail-text)",
                 }}
               >
-                <Icon className="h-5 w-5" />
-                <span className="max-w-full truncate px-0.5">{item.label}</span>
+                {!isTextOnly && <Icon className="h-5 w-5 shrink-0" />}
+                {railDisplayMode !== "icon-only" && (
+                  <span
+                    className={
+                      isTextOnly
+                        ? "min-w-0 flex-1 truncate text-left leading-tight"
+                        : "max-w-full truncate px-0.5"
+                    }
+                  >
+                    {itemLabel}
+                  </span>
+                )}
                 {badge > 0 && (
                   <span
-                    className="absolute right-1.5 top-1 min-w-[16px] rounded-full px-1 py-0.5 text-center text-[10px] font-bold leading-none"
+                    className={
+                      isTextOnly
+                        ? "shrink-0 min-w-[18px] rounded-full px-1.5 py-0.5 text-center text-[10px] font-bold leading-none"
+                        : "absolute right-1 top-1 min-w-[16px] rounded-full px-1 py-0.5 text-center text-[10px] font-bold leading-none"
+                    }
                     style={{ background: "var(--accent)", color: "var(--text-on-accent)" }}
                   >
                     {badge > 99 ? "99+" : badge}
@@ -1959,34 +2686,59 @@ export default function App() {
           })}
 
           {customFolders.length > 0 && (
-            <div className="my-1 h-px w-8" style={{ background: "var(--border-subtle)" }} />
+            <div className="my-1 h-px w-8 shrink-0" style={{ background: "var(--border-subtle)" }} />
           )}
 
           {customFolders.map((cf) => {
             const sel = `custom:${cf.id}`;
-            const active = folder === sel;
+            const active = !activeWebApp && !webAppHubOpen && folder === sel;
             const badge = countFolderUnread(threads, sel, customFolders);
+            const isTextOnly = railDisplayMode === "text-only";
             return (
               <button
                 key={cf.id}
                 type="button"
                 title={`${cf.name} (Chuột phải để tùy chỉnh)`}
-                onClick={() => setFolder(sel)}
+                onClick={() => {
+                  setActiveWebAppId(null);
+                  setWebAppHubOpen(false);
+                  setFolder(sel);
+                }}
                 onContextMenu={(e) => {
                   e.preventDefault();
                   setFolderMenu({ folder: cf, x: e.clientX, y: e.clientY });
                 }}
-                className="hover-rail relative flex w-full flex-col items-center gap-1 rounded-xl py-2 text-xs font-medium transition"
+                className={`tf-rail-btn ${active ? "tf-rail-btn-active" : ""} relative flex w-full shrink-0 rounded-xl ${
+                  railDisplayMode === "icon-only"
+                    ? "flex-col items-center justify-center py-2.5"
+                    : isTextOnly
+                      ? "flex-row items-center justify-between gap-1 py-2 pl-3 pr-2 text-left text-[12px] font-medium"
+                      : "flex-col items-center justify-center gap-1 py-2 text-xs font-medium"
+                }`}
                 style={{
-                  background: active ? "var(--rail-active-bg)" : "transparent",
+                  background: active ? "var(--rail-active-bg)" : undefined,
                   color: active ? "var(--rail-text-active)" : "var(--rail-text)",
                 }}
               >
-                {renderFolderIcon(cf.icon, "h-5 w-5")}
-                <span className="max-w-full truncate px-0.5">{cf.name}</span>
+                {!isTextOnly && renderFolderIcon(cf.icon, "h-5 w-5 shrink-0")}
+                {railDisplayMode !== "icon-only" && (
+                  <span
+                    className={
+                      isTextOnly
+                        ? "min-w-0 flex-1 truncate text-left leading-tight"
+                        : "max-w-full truncate px-0.5"
+                    }
+                  >
+                    {cf.name}
+                  </span>
+                )}
                 {badge > 0 && (
                   <span
-                    className="absolute right-1.5 top-1 min-w-[16px] rounded-full px-1 py-0.5 text-center text-[10px] font-bold leading-none"
+                    className={
+                      isTextOnly
+                        ? "shrink-0 min-w-[18px] rounded-full px-1.5 py-0.5 text-center text-[10px] font-bold leading-none"
+                        : "absolute right-1 top-1 min-w-[16px] rounded-full px-1 py-0.5 text-center text-[10px] font-bold leading-none"
+                    }
                     style={{ background: "var(--accent)", color: "var(--text-on-accent)" }}
                   >
                     {badge > 99 ? "99+" : badge}
@@ -2002,97 +2754,155 @@ export default function App() {
               setEditingFolder(null);
               setFolderModalOpen(true);
             }}
-            title="Quản lý & tạo thư mục hội thoại"
-            className="hover-rail mt-0.5 flex w-full flex-col items-center gap-1 rounded-xl py-2 text-[11px] font-medium transition"
+            title={t("manageFoldersTitle")}
+            className={`tf-rail-btn mt-0.5 flex w-full shrink-0 rounded-xl font-medium ${
+              railDisplayMode === "icon-only"
+                ? "flex-col items-center justify-center py-2.5"
+                : railDisplayMode === "text-only"
+                  ? "flex-row items-center justify-start py-2 pl-3 pr-2 text-left text-[11.5px]"
+                  : "flex-col items-center justify-center gap-1 py-2 text-[11px]"
+            }`}
             style={{ color: "var(--rail-text)" }}
           >
-            <FolderPlus className="h-4 w-4" />
-            <span className="truncate">Thư mục</span>
+            {railDisplayMode !== "text-only" && <FolderPlus className="h-4 w-4 shrink-0" />}
+            {railDisplayMode !== "icon-only" && (
+              <span className={railDisplayMode === "text-only" ? "truncate text-left" : "truncate"}>
+                {railDisplayMode === "text-only" ? `+ ${t("manageFolders")}` : t("manageFolders")}
+              </span>
+            )}
           </button>
+
+          {webAppsCfg.enabled && (
+            <>
+              <div className="my-1 h-px w-8 shrink-0" style={{ background: "var(--border-subtle)" }} />
+              {(() => {
+                const active = webAppHubOpen || Boolean(activeWebApp);
+                const totalApps = webAppsCfg.items.length;
+                const isTextOnly = railDisplayMode === "text-only";
+                return (
+                  <button
+                    type="button"
+                    title={t("webappHubTitle")}
+                    onClick={() => {
+                      if (activeWebApp) {
+                        void bridge.webappHideAll();
+                      }
+                      setActiveWebAppId(null);
+                      setWebAppHubOpen(true);
+                      if (layout.mode === "single") setMobilePane("chat");
+                    }}
+                    className={`tf-rail-btn ${active ? "tf-rail-btn-active" : ""} relative flex w-full shrink-0 rounded-xl ${
+                      railDisplayMode === "icon-only"
+                        ? "flex-col items-center justify-center py-2.5"
+                        : isTextOnly
+                          ? "flex-row items-center justify-between gap-1 py-2 pl-3 pr-2 text-left text-[12px] font-medium"
+                          : "flex-col items-center justify-center gap-1 py-2 text-xs font-medium"
+                    }`}
+                    style={{
+                      background: active ? "var(--rail-active-bg)" : undefined,
+                      color: active ? "var(--rail-text-active)" : "var(--rail-text)",
+                    }}
+                  >
+                    {!isTextOnly && <LayoutGrid className="h-5 w-5 shrink-0" />}
+                    {railDisplayMode !== "icon-only" && (
+                      <span
+                        className={
+                          isTextOnly
+                            ? "min-w-0 flex-1 truncate text-left leading-tight"
+                            : "max-w-full truncate px-0.5"
+                        }
+                      >
+                        {t("webappMenuLabel")}
+                      </span>
+                    )}
+                    {totalApps > 0 && (
+                      <span
+                        className={
+                          isTextOnly
+                            ? "shrink-0 min-w-[18px] rounded-full px-1.5 py-0.5 text-center text-[10px] font-bold leading-none"
+                            : "absolute right-1 top-1 min-w-[16px] rounded-full px-1 py-0.5 text-center text-[10px] font-bold leading-none"
+                        }
+                        style={{
+                          background: active ? "var(--accent)" : "var(--bg-surface)",
+                          color: active ? "var(--text-on-accent)" : "var(--text-secondary)",
+                        }}
+                      >
+                        {totalApps}
+                      </span>
+                    )}
+                  </button>
+                );
+              })()}
+            </>
+          )}
         </div>
 
-        <div className="flex flex-col items-center gap-2">
-          {myProfile?.uid && (
+        <div
+          className="flex w-full shrink-0 flex-col items-center gap-1.5 px-1.5 py-2.5"
+          style={{ borderTop: "1px solid var(--border-subtle)" }}
+        >
+          {passcodeCfg.enabled && (
             <button
               type="button"
-              onClick={() => setProfileUid(myProfile.uid)}
-              title={
-                myProfile.display_name
-                  ? `Tài khoản: ${myProfile.display_name}`
-                  : "Thông tin tài khoản của bạn"
-              }
-              className="rounded-full p-0.5 transition hover:opacity-85"
+              onClick={() => setIsLocked(true)}
+              title={t("lockAppShortcut")}
+              className="tf-rail-btn flex w-full items-center justify-center rounded-lg py-2"
+              style={{ color: "var(--rail-text)" }}
             >
-              <ThreadAvatar
-                avatar={myProfile.avatar}
-                title={myProfile.display_name || myProfile.uid}
-                kind="direct"
-                size="sm"
-              />
+              <Lock className="h-5 w-5" />
             </button>
           )}
-          <div
-            title={`WebSocket: ${connStatus}`}
-            className="flex items-center justify-center p-1.5"
-            style={{
-              color:
-                connStatus === "connected"
-                  ? "#10b981"
-                  : connStatus === "connecting"
-                    ? "#f59e0b"
-                    : "#ef4444",
-            }}
-          >
-            <Wifi className="h-4 w-4" />
-          </div>
           <button
-            onClick={() => setSettingsOpen(true)}
+            type="button"
+            onClick={() => {
+              setSettingsInitialTab("notifications");
+              setSettingsOpen(true);
+            }}
             title={
               availableUpdate
-                ? `Cài đặt Teza (có bản cập nhật v${availableUpdate.version})`
-                : "Cài đặt Teza"
+                ? t("settingsUpdateHint", { version: availableUpdate.version })
+                : t("settingsTeza")
             }
-            className="hover-rail relative rounded-lg p-2 transition"
+            className="tf-rail-btn relative flex w-full items-center justify-center rounded-lg py-2"
             style={{ color: availableUpdate ? "var(--accent)" : "var(--rail-text)" }}
           >
             <Settings className="h-5 w-5" />
             {availableUpdate && (
-              <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-emerald-400" />
+              <span className="absolute right-2.5 top-1.5 h-2 w-2 rounded-full bg-emerald-400" />
             )}
-          </button>
-          <button
-            onClick={cycleTheme}
-            title={`Đổi giao diện (hiện tại: ${
-              theme === "triforce"
-                ? "Obsidian Vàng Kim"
-                : theme === "night-blue"
-                  ? "Night Blue"
-                  : theme === "dark"
-                    ? "Dark"
-                    : "Light"
-            })`}
-            className="hover-rail rounded-lg p-2 transition"
-            style={{ color: "var(--rail-text)" }}
-          >
-            {theme === "light" ? <Moon className="h-5 w-5" /> : <Sun className="h-5 w-5" />}
-          </button>
-          <button
-            onClick={() => {
-              void bridge.logout().then(() => {
-                setAuthed(false);
-                resetSessionUi();
-                void refreshQr();
-              });
-            }}
-            title="Đăng xuất"
-            className="hover-rail rounded-lg p-2 transition"
-            style={{ color: "var(--rail-text)" }}
-          >
-            <LogOut className="h-5 w-5" />
           </button>
         </div>
       </aside>
 
+      {activeWebApp ? (
+        <WebAppWorkspace
+          app={activeWebApp}
+          suspended={webappSuspended}
+          allEmbeddedApps={embeddedWebApps}
+          onSelectApp={handleActivateWebApp}
+          onBackToHub={() => {
+            void bridge.webappHideAll();
+            setActiveWebAppId(null);
+            setWebAppHubOpen(true);
+          }}
+          onCloseToChat={() => {
+            setActiveWebAppId(null);
+            setWebAppHubOpen(false);
+          }}
+          onOpenExternal={(url) => void bridge.openExternalUrl(url).catch(showError)}
+          onError={showError}
+        />
+      ) : webAppsCfg.enabled && webAppHubOpen ? (
+        <WebAppHub
+          config={webAppsCfg}
+          lastActiveId={activeWebAppId}
+          onChangeConfig={handleWebAppsCfgChange}
+          onLaunch={handleActivateWebApp}
+          onOpenExternal={(url) => void bridge.openExternalUrl(url).catch(showError)}
+          onCloseToChat={() => setWebAppHubOpen(false)}
+        />
+      ) : (
+        <>
       {/* Column 2: Resizable / Auto-Collapsing Thread List */}
       <section
         className={`relative z-10 shrink-0 flex-col ${
@@ -2162,7 +2972,7 @@ export default function App() {
                 <input
                   value={filterText}
                   onChange={(e) => setFilterText(e.target.value)}
-                  placeholder="Tìm hội thoại hoặc SĐT..."
+                  placeholder={t("searchThreadPlaceholder")}
                   className="w-full min-w-0 bg-transparent text-[15px] outline-none"
                 />
               </div>
@@ -2172,7 +2982,7 @@ export default function App() {
                   setFindUserInitialPhone(looksLikePhoneQuery(filterText) ? filterText.trim() : "");
                   setFindUserOpen(true);
                 }}
-                title="Tìm bạn mới theo số điện thoại"
+                title={t("findFriendByPhoneTitle")}
                 className="hover-menu shrink-0 rounded-lg p-2 transition"
                 style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
               >
@@ -2181,7 +2991,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => void syncRemoteThreads()}
-                title="Đồng bộ lại danh bạ"
+                title={t("syncThreadsTitle")}
                 className="hover-menu shrink-0 rounded-lg p-2 transition"
                 style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
               >
@@ -2190,7 +3000,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setQuickSearchOpen(true)}
-                title="Tìm kiếm toàn cục (Ctrl+K)"
+                title={t("globalSearchTitle")}
                 className="hover-menu shrink-0 rounded-lg px-2 py-1.5 text-xs font-medium transition"
                 style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
               >
@@ -2203,7 +3013,7 @@ export default function App() {
                     setManualSidebarCompact(true);
                     localStorage.setItem("litechat.sidebarCompact", "1");
                   }}
-                  title="Thu gọn danh sách hội thoại"
+                  title={t("collapseListTitle")}
                   className="hover-menu shrink-0 rounded-lg p-2 transition"
                   style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
                 >
@@ -2223,7 +3033,7 @@ export default function App() {
               >
                 <UserPlus className="h-3.5 w-3.5 shrink-0" />
                 <span className="truncate">
-                  Tìm người dùng theo SĐT &ldquo;{filterText.trim()}&rdquo;
+                  {t("findFriendByPhonePrompt", { query: filterText.trim() })}
                 </span>
               </button>
             )}
@@ -2242,40 +3052,149 @@ export default function App() {
             }
           }}
         >
+          {folder === "archived" && (
+            <div
+              className="mb-2 flex items-center justify-between gap-2 rounded-xl px-3 py-2 text-xs"
+              style={{
+                background: "var(--bg-surface)",
+                border: "1px solid var(--border-subtle)",
+              }}
+            >
+              {layout.mode === "compact" ? (
+                <button
+                  type="button"
+                  onClick={() => setFolder("all")}
+                  title={t("backToAllThreads")}
+                  className="flex w-full items-center justify-center py-0.5"
+                  style={{ color: "var(--accent)" }}
+                >
+                  <ArrowLeft className="h-4 w-4" />
+                </button>
+              ) : (
+                <>
+                  <div className="flex min-w-0 items-center gap-2 font-medium">
+                    <Archive className="h-4 w-4 shrink-0" style={{ color: "var(--accent)" }} />
+                    <span className="truncate">
+                      {t("archiveBannerTitle", { count: archivedThreads.length })}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setFolder("all")}
+                    className="shrink-0 rounded-lg px-2 py-1 font-medium transition hover:opacity-85"
+                    style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
+                  >
+                    {t("back")}
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+
+          {folder === "all" && !filterText.trim() && archivedThreads.length > 0 && (
+            layout.mode === "compact" ? (
+              <button
+                type="button"
+                onClick={() => setFolder("archived")}
+                title={`${t("archiveRowTitle")} (${archivedThreads.length})`}
+                className="hover-surface relative mb-1.5 flex w-full items-center justify-center rounded-xl py-2.5 transition"
+                style={{ color: "var(--text-secondary)" }}
+              >
+                <Archive className="h-5 w-5" />
+                {archivedUnread > 0 && (
+                  <span
+                    className="absolute right-2 top-1 min-w-[16px] rounded-full px-1 py-0.5 text-center text-[10px] font-bold leading-none"
+                    style={{ background: "var(--accent)", color: "var(--text-on-accent)" }}
+                  >
+                    {archivedUnread > 99 ? "99+" : archivedUnread}
+                  </span>
+                )}
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setFolder("archived")}
+                className="hover-surface mb-1 flex w-full items-center gap-3 rounded-xl px-2.5 py-2.5 text-left transition"
+              >
+                <div
+                  className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full"
+                  style={{
+                    background: "var(--bg-surface)",
+                    color: "var(--accent)",
+                    border: "1px solid var(--border-subtle)",
+                  }}
+                >
+                  <Archive className="h-5 w-5" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="truncate text-[14.5px] font-semibold">
+                      {t("archiveRowTitle")}
+                    </span>
+                    <span className="shrink-0 text-[11px]" style={{ color: "var(--text-secondary)" }}>
+                      {archivedThreads.length}
+                    </span>
+                  </div>
+                  <div className="mt-0.5 flex items-center justify-between gap-2">
+                    <span
+                      className="truncate text-[12.5px]"
+                      style={{ color: "var(--text-secondary)" }}
+                    >
+                      {archivedThreads
+                        .slice(0, 3)
+                        .map((t) => t.title)
+                        .join(", ")}
+                    </span>
+                    {archivedUnread > 0 && (
+                      <span
+                        className="shrink-0 rounded-full px-1.5 py-0.5 text-[10.5px] font-bold leading-none"
+                        style={{ background: "var(--accent)", color: "var(--text-on-accent)" }}
+                      >
+                        {archivedUnread > 99 ? "99+" : archivedUnread}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </button>
+            )
+          )}
+
           {visibleThreads.length === 0 ? (
             <div className="px-4 py-12 text-center text-[13px]" style={{ color: "var(--text-secondary)" }}>
               {layout.mode === "compact"
-                ? "Trống"
+                ? t("emptyCompact")
                 : filterText.trim()
-                  ? "Không tìm thấy hội thoại phù hợp"
-                  : folder === "unread"
-                    ? "Không có tin nhắn chưa đọc"
-                    : "Chưa có cuộc hội thoại nào"}
+                  ? t("emptySearch")
+                  : folder === "archived"
+                    ? t("emptyArchived")
+                    : folder === "unread"
+                      ? t("emptyUnread")
+                      : t("emptyThreads")}
             </div>
           ) : (
-            visibleThreads.slice(0, threadRenderLimit).map((t) => {
-              const active = t.id === selectedId;
-              const unread = t.unread_count > 0;
-              const draftText = draftsByThread[t.id]?.trim() || "";
+            visibleThreads.slice(0, threadRenderLimit).map((thread) => {
+              const active = thread.id === selectedId;
+              const unread = thread.unread_count > 0;
+              const draftText = draftsByThread[thread.id]?.trim() || "";
               const fallbackPreview =
-                t.kind === "group"
-                  ? "Nhóm trò chuyện"
-                  : t.kind === "cloud"
-                    ? "Lưu trữ cá nhân & ghi chú nhanh"
-                    : "Nhấn để trò chuyện";
+                thread.kind === "group"
+                  ? t("fallbackGroupPreview")
+                  : thread.kind === "cloud"
+                    ? t("fallbackCloudPreview")
+                    : t("fallbackDirectPreview");
               if (layout.mode === "compact") {
                 return (
                   <button
-                    key={t.id}
+                    key={thread.id}
                     type="button"
-                    title={`${t.title}${t.last_preview ? ` — ${t.last_preview}` : ""}`}
+                    title={`${thread.title}${thread.last_preview ? ` — ${thread.last_preview}` : ""}`}
                     onClick={() => {
-                      setSelectedId(t.id);
+                      setSelectedId(thread.id);
                       if (layout.mode === "single") setMobilePane("chat");
                     }}
                     onContextMenu={(e) => {
                       e.preventDefault();
-                      setThreadMenu({ thread: t, x: e.clientX, y: e.clientY });
+                      setThreadMenu({ thread, x: e.clientX, y: e.clientY });
                     }}
                     className={`mb-1 flex w-full items-center justify-center rounded-xl py-2 transition ${
                       active ? "" : "hover-surface"
@@ -2286,19 +3205,19 @@ export default function App() {
                     }}
                   >
                     <div className="relative shrink-0">
-                      <ThreadAvatar avatar={t.avatar} title={t.title} kind={t.kind} size="md" />
+                      <ThreadAvatar avatar={thread.avatar} title={thread.title} kind={thread.kind} size="md" />
                       {unread && (
                         <span
                           className="absolute -right-1 -top-1 min-w-[18px] rounded-full px-1 py-0.5 text-center text-[10px] font-bold leading-none shadow"
                           style={{
-                            background: t.is_muted ? "var(--chip-bg)" : "var(--accent)",
-                            color: t.is_muted ? "var(--text-secondary)" : "var(--text-on-accent)",
+                            background: thread.is_muted ? "var(--chip-bg)" : "var(--accent)",
+                            color: thread.is_muted ? "var(--text-secondary)" : "var(--text-on-accent)",
                           }}
                         >
-                          {t.unread_count > 99 ? "99+" : t.unread_count}
+                          {thread.unread_count > 99 ? "99+" : thread.unread_count}
                         </span>
                       )}
-                      {t.is_pinned && (
+                      {thread.is_pinned && (
                         <span
                           className="absolute -bottom-0.5 -right-0.5 flex h-3.5 w-3.5 items-center justify-center rounded-full shadow"
                           style={{
@@ -2315,23 +3234,23 @@ export default function App() {
               }
               return (
                 <div
-                  key={t.id}
+                  key={thread.id}
                   role="button"
                   tabIndex={0}
                   onClick={() => {
-                    setSelectedId(t.id);
+                    setSelectedId(thread.id);
                     if (layout.mode === "single") setMobilePane("chat");
                   }}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" || e.key === " ") {
                       e.preventDefault();
-                      setSelectedId(t.id);
+                      setSelectedId(thread.id);
                       if (layout.mode === "single") setMobilePane("chat");
                     }
                   }}
                   onContextMenu={(e) => {
                     e.preventDefault();
-                    setThreadMenu({ thread: t, x: e.clientX, y: e.clientY });
+                    setThreadMenu({ thread, x: e.clientX, y: e.clientY });
                   }}
                   className={`tf-row thread-row-perf mb-0.5 flex w-full cursor-pointer items-center gap-3 rounded-xl px-2.5 text-left transition ${
                     active ? "" : "hover-surface"
@@ -2342,20 +3261,20 @@ export default function App() {
                     color: active ? "var(--text-on-active)" : "var(--text-primary)",
                   }}
                 >
-                  {t.kind === "direct" ? (
+                  {thread.kind === "direct" ? (
                     <button
                       type="button"
                       onClick={(e) => {
                         e.stopPropagation();
-                        setProfileUid(t.id);
+                        setProfileUid(thread.id);
                       }}
-                      title="Tra cứu thông tin tài khoản"
+                      title={t("lookupProfile")}
                       className="shrink-0 rounded-full transition hover:opacity-85"
                     >
-                      <ThreadAvatar avatar={t.avatar} title={t.title} kind={t.kind} size="md" />
+                      <ThreadAvatar avatar={thread.avatar} title={thread.title} kind={thread.kind} size="md" />
                     </button>
                   ) : (
-                    <ThreadAvatar avatar={t.avatar} title={t.title} kind={t.kind} size="md" />
+                    <ThreadAvatar avatar={thread.avatar} title={thread.title} kind={thread.kind} size="md" />
                   )}
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center justify-between gap-2">
@@ -2369,7 +3288,7 @@ export default function App() {
                               : "var(--list-title)",
                         }}
                       >
-                        {t.title}
+                        {thread.title}
                       </span>
                       <div
                         className="flex shrink-0 items-center gap-1 text-xs"
@@ -2377,9 +3296,23 @@ export default function App() {
                           color: active ? "var(--text-secondary-on-active)" : "var(--text-secondary)",
                         }}
                       >
-                        {t.is_muted && <BellOff className="h-3 w-3 opacity-75" />}
-                        {t.is_pinned && <Pin className="h-3 w-3 opacity-80" />}
-                        {t.last_ts > 0 && <span>{formatThreadTime(t.last_ts)}</span>}
+                        {thread.is_muted && <BellOff className="h-3 w-3 opacity-75" />}
+                        {thread.is_pinned && <Pin className="h-3 w-3 opacity-80" />}
+                        {thread.last_ts > 0 && thread.last_preview.startsWith("Bạn:") && !unread && (
+                          thread.kind === "cloud" || (thread.peer_read_ts ?? 0) >= thread.last_ts ? (
+                            <span title={t("youSeenStatus")} className="inline-flex items-center">
+                              <CheckCheck
+                                className="h-3.5 w-3.5"
+                                style={{ color: active ? "var(--text-on-active)" : "var(--accent)" }}
+                              />
+                            </span>
+                          ) : (
+                            <span title={t("youSentStatus")} className="inline-flex items-center">
+                              <Check className="h-3 w-3 opacity-80" />
+                            </span>
+                          )
+                        )}
+                        {thread.last_ts > 0 && <span>{formatThreadTime(thread.last_ts, lang)}</span>}
                       </div>
                     </div>
                     <div className="mt-0.5 flex items-center justify-between gap-2">
@@ -2396,12 +3329,12 @@ export default function App() {
                         {draftText && !active ? (
                           <>
                             <span style={{ color: "var(--danger-text)", fontWeight: 600 }}>
-                              [Nháp]{" "}
+                              {t("draftPrefix")}{" "}
                             </span>
                             {draftText}
                           </>
                         ) : (
-                          t.last_preview || fallbackPreview
+                          thread.last_preview || fallbackPreview
                         )}
                       </span>
                       {unread && (
@@ -2410,17 +3343,17 @@ export default function App() {
                           style={{
                             background: active
                               ? "rgba(255,255,255,0.2)"
-                              : t.is_muted
+                              : thread.is_muted
                                 ? "var(--chip-bg)"
                                 : "var(--accent)",
                             color: active
                               ? "var(--text-on-active)"
-                              : t.is_muted
+                              : thread.is_muted
                                 ? "var(--text-secondary)"
                                 : "var(--text-on-accent)",
                           }}
                         >
-                          {t.unread_count > 99 ? "99+" : t.unread_count}
+                          {thread.unread_count > 99 ? "99+" : thread.unread_count}
                         </span>
                       )}
                     </div>
@@ -2436,47 +3369,48 @@ export default function App() {
               className="hover-surface mt-1 w-full rounded-xl py-2 text-center text-xs font-medium transition"
               style={{ color: "var(--accent)" }}
             >
-              Tải thêm ({visibleThreads.length - threadRenderLimit} hội thoại)
+              {t("loadMoreThreads", { count: visibleThreads.length - threadRenderLimit })}
             </button>
           )}
         </div>
-
-        {layout.mode === "full" && (
-          <div
-            role="separator"
-            aria-orientation="vertical"
-            title="Kéo để thay đổi độ rộng (kéo hẹp < 160px để thu gọn)"
-            onPointerDown={(e) => {
-              e.preventDefault();
-              const startX = e.clientX;
-              const startW = sidebarWidth;
-              const onMove = (ev: PointerEvent) => {
-                const rawW = startW + (ev.clientX - startX);
-                if (rawW < 160) return;
-                const next = Math.min(440, Math.max(240, rawW));
-                setSidebarWidth(next);
-              };
-              const onUp = (ev: PointerEvent) => {
-                const rawW = startW + (ev.clientX - startX);
-                if (rawW < 160 && windowWidth >= 900) {
-                  setManualSidebarCompact(true);
-                  localStorage.setItem("litechat.sidebarCompact", "1");
-                } else {
-                  const finalW = Math.min(440, Math.max(240, rawW));
-                  setSidebarWidth(finalW);
-                  localStorage.setItem("litechat.sidebarCompact", "0");
-                  localStorage.setItem("litechat.sidebarWidth", String(finalW));
-                }
-                window.removeEventListener("pointermove", onMove);
-                window.removeEventListener("pointerup", onUp);
-              };
-              window.addEventListener("pointermove", onMove);
-              window.addEventListener("pointerup", onUp);
-            }}
-            className="absolute inset-y-0 -right-1 z-20 w-2 cursor-col-resize hover:bg-sky-500/30"
-          />
-        )}
       </section>
+
+      {layout.mode === "full" && (
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          title={t("resizeThreadsTitle")}
+          onPointerDown={(e) => {
+            e.preventDefault();
+            const startX = e.clientX;
+            const startW = sidebarWidth;
+            const onMove = (ev: PointerEvent) => {
+              const rawW = startW + (ev.clientX - startX);
+              if (rawW < 160) return;
+              const next = Math.min(440, Math.max(240, rawW));
+              setSidebarWidth(next);
+            };
+            const onUp = (ev: PointerEvent) => {
+              const rawW = startW + (ev.clientX - startX);
+              if (rawW < 160 && windowWidth >= 900) {
+                setManualSidebarCompact(true);
+                localStorage.setItem("litechat.sidebarCompact", "1");
+              } else {
+                const finalW = Math.min(440, Math.max(240, rawW));
+                setSidebarWidth(finalW);
+                localStorage.setItem("litechat.sidebarCompact", "0");
+                localStorage.setItem("litechat.sidebarWidth", String(finalW));
+              }
+              window.removeEventListener("pointermove", onMove);
+              window.removeEventListener("pointerup", onUp);
+            };
+            window.addEventListener("pointermove", onMove);
+            window.addEventListener("pointerup", onUp);
+          }}
+          className="relative z-20 w-1.5 shrink-0 cursor-col-resize transition-colors hover:bg-sky-500/35"
+          style={{ background: "var(--bg-sidebar)", borderRight: "1px solid var(--border-subtle)" }}
+        />
+      )}
 
       {/* Column 3: Chat Stage */}
       <main
@@ -2529,6 +3463,7 @@ export default function App() {
               rootMessage={activeThreadRootMsg}
               replies={replyGraph.repliesByRoot[activeThreadRootMsg.msg_id] ?? []}
               threadKind={activeThread.kind}
+              peerReadTs={activeThread.peer_read_ts}
               pendingAttachment={pendingAttachment}
               onPendingAttachmentChange={setPendingAttachment}
               translationsByMsg={translationsByMsg}
@@ -2614,10 +3549,10 @@ export default function App() {
                   <h2 className="truncate text-[16px] font-semibold">{activeThread.title}</h2>
                   <p className="text-[13px]" style={{ color: "var(--text-secondary)" }}>
                     {activeThread.kind === "group"
-                      ? "Nhóm trò chuyện"
+                      ? t("groupChatLabel")
                       : activeThread.kind === "cloud"
-                        ? "Lưu trữ cá nhân"
-                        : "Trò chuyện 1-1"}
+                        ? t("myCloudShort")
+                        : t("directChatLabel")}
                   </p>
                 </div>
               </div>
@@ -2626,8 +3561,8 @@ export default function App() {
                   onClick={handleToggleThreadTranslate}
                   title={
                     activeThreadLang
-                      ? "Tắt dịch toàn bộ hội thoại"
-                      : "Dịch toàn bộ hội thoại"
+                      ? t("autoTranslateOn", { lang: activeThreadLang })
+                      : t("autoTranslateOff", { lang: translateCode })
                   }
                   className="rounded-lg p-2 transition hover:opacity-80"
                   style={{
@@ -2645,7 +3580,7 @@ export default function App() {
                       return next;
                     });
                   }}
-                  title="Tìm trong hội thoại (Ctrl+F)"
+                  title={t("searchInChatTitle")}
                   className="rounded-lg p-2 hover:opacity-80"
                   style={{
                     color: inChatSearchOpen ? "var(--accent)" : "var(--text-secondary)",
@@ -2663,7 +3598,7 @@ export default function App() {
                       setDrawerOpen((v) => !v);
                     }
                   }}
-                  title="Thông tin hội thoại"
+                  title={t("threadInfoTitle")}
                   className="rounded-lg p-2 hover:opacity-80"
                   style={{
                     color: drawerOpen && !activeThreadRootId ? "var(--accent)" : "var(--text-secondary)",
@@ -2700,7 +3635,7 @@ export default function App() {
                         className="flex items-center gap-1.5 text-xs font-semibold"
                         style={{ color: "var(--accent)" }}
                       >
-                        <span>Tin nhắn đã ghim</span>
+                        <span>{t("pinnedBadgeTitle")}</span>
                         {pinnedMessages.length > 1 && (
                           <span>
                             ({(pinnedIdx % pinnedMessages.length) + 1}/{pinnedMessages.length})
@@ -2709,7 +3644,7 @@ export default function App() {
                       </div>
                       <div className="truncate" style={{ color: "var(--text-primary)" }}>
                         {currentPinned.sender_name ? `${currentPinned.sender_name}: ` : ""}
-                        {currentPinned.text || currentPinned.attachment_name || "[Đính kèm]"}
+                        {currentPinned.text || currentPinned.attachment_name || t("attachmentFallbackLabel")}
                       </div>
                     </div>
                   </button>
@@ -2718,7 +3653,7 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => setPinnedIdx((i) => (i + 1) % pinnedMessages.length)}
-                        title="Xem tin ghim tiếp theo"
+                        title={t("forward")}
                         className="hover-menu rounded-lg p-1.5"
                         style={{ color: "var(--text-secondary)" }}
                       >
@@ -2730,18 +3665,18 @@ export default function App() {
                       onClick={() => setPinnedListOpen((v) => !v)}
                       title={
                         pinnedListOpen
-                          ? "Thu gọn danh sách ghim"
-                          : `Xem tất cả ${pinnedMessages.length} tin ghim`
+                          ? t("close")
+                          : `${t("folderAll")} (${pinnedMessages.length})`
                       }
                       className="hover-menu rounded-lg px-2 py-1 text-xs font-medium"
                       style={{ color: "var(--accent)" }}
                     >
-                      {pinnedListOpen ? "Đóng" : `Tất cả (${pinnedMessages.length})`}
+                      {pinnedListOpen ? t("close") : `${t("folderAll")} (${pinnedMessages.length})`}
                     </button>
                     <button
                       type="button"
                       onClick={() => handleTogglePinMessage(currentPinned)}
-                      title="Bỏ ghim tin nhắn này"
+                      title={t("unpinThisMsg")}
                       className="hover-menu rounded-lg p-1.5"
                       style={{ color: "var(--text-secondary)" }}
                     >
@@ -2762,7 +3697,7 @@ export default function App() {
                       className="mb-1.5 px-1 text-xs font-semibold uppercase tracking-wider"
                       style={{ color: "var(--text-secondary)" }}
                     >
-                      Danh sách tin nhắn đã ghim ({pinnedMessages.length})
+                      {t("pinnedListHeader", { count: pinnedMessages.length })}
                     </div>
                     <div className="space-y-1">
                       {pinnedMessages.map((pm, idx) => (
@@ -2781,17 +3716,17 @@ export default function App() {
                             className="min-w-0 flex-1 text-left transition hover:opacity-85"
                           >
                             <div className="truncate text-xs font-semibold" style={{ color: "var(--accent)" }}>
-                              {pm.sender_name || "Tin nhắn"} ·{" "}
-                              {pm.ts > 0 ? formatThreadTime(pm.ts) : ""}
+                              {pm.sender_name || t("msgFallbackLabel")} ·{" "}
+                              {pm.ts > 0 ? formatThreadTime(pm.ts, lang) : ""}
                             </div>
                             <div className="truncate text-[13px]" style={{ color: "var(--text-primary)" }}>
-                              {pm.text || pm.attachment_name || "[Đính kèm]"}
+                              {pm.text || pm.attachment_name || t("attachmentFallbackLabel")}
                             </div>
                           </button>
                           <button
                             type="button"
                             onClick={() => handleTogglePinMessage(pm)}
-                            title="Bỏ ghim tin nhắn này"
+                            title={t("unpinThisMsg")}
                             className="hover-menu shrink-0 rounded-lg p-1.5"
                             style={{ color: "var(--text-secondary)" }}
                           >
@@ -2833,7 +3768,7 @@ export default function App() {
                       );
                     }
                   }}
-                  placeholder="Tìm tin nhắn trong hội thoại này (Enter tiếp, Shift+Enter trước, Esc đóng)..."
+                  placeholder={t("searchInChatPlaceholder")}
                   className="min-w-0 flex-1 bg-transparent text-[14px] outline-none"
                 />
                 {inChatSearchQuery.trim() && (
@@ -2889,7 +3824,7 @@ export default function App() {
                 <div className="flex items-center gap-2">
                   <Languages className="h-4 w-4 shrink-0" style={{ color: "var(--accent)" }} />
                   <span className="font-medium">
-                    Đang dịch hội thoại sang:
+                    {t("translatingThreadTo")}
                   </span>
                   <select
                     value={activeThreadLang}
@@ -2916,7 +3851,7 @@ export default function App() {
                   {threadTranslating && (
                     <span className="flex items-center gap-1 text-xs" style={{ color: "var(--text-secondary)" }}>
                       <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-                      Đang dịch...
+                      {t("translatingBatch")}
                     </span>
                   )}
                 </div>
@@ -2936,7 +3871,7 @@ export default function App() {
                     className="hover-menu rounded-lg px-2.5 py-1 text-xs font-semibold transition"
                     style={{ color: "var(--accent)" }}
                   >
-                    Không dịch nữa
+                    {t("stopTranslatingBtn")}
                   </button>
                 </div>
               </div>
@@ -2953,18 +3888,26 @@ export default function App() {
                 const farUp = distFromBottom > 220;
                 setShowScrollDown(farUp);
                 if (!farUp) setUnreadBelow(0);
+                if (distFromBottom < 90 && selectedId) {
+                  const activeUnread =
+                    pendingMarkReadRef.current === selectedId ||
+                    (threadsRef.current.find((t) => t.id === selectedId)?.unread_count ?? 0) > 0;
+                  if (activeUnread) {
+                    completeMarkReadForThread(selectedId);
+                  }
+                }
               }}
-              className="relative flex-1 overflow-y-auto px-6 py-4"
+              className="relative flex-1 overflow-y-auto px-5 py-2.5"
             >
               {loadingMessages && messages.length === 0 && (
                 <div className="flex h-full items-center justify-center gap-2 text-[14px]" style={{ color: "var(--text-secondary)" }}>
                   <RefreshCw className="h-4 w-4 animate-spin" style={{ color: "var(--accent)" }} />
-                  <span>Đang tải tin nhắn...</span>
+                  <span>{t("loadingMessages")}</span>
                 </div>
               )}
               {!loadingMessages && messages.length === 0 && (
                 <div className="flex h-full items-center justify-center text-[14px]" style={{ color: "var(--text-secondary)" }}>
-                  Chưa có tin nhắn nào. Hãy gửi lời chào đầu tiên!
+                  {t("noMessagesYet")}
                 </div>
               )}
               {hasMoreHistory && (
@@ -2976,40 +3919,54 @@ export default function App() {
                     className="rounded-full px-3.5 py-1 text-[13px] font-medium shadow-xs transition hover:opacity-85 disabled:opacity-60"
                     style={{ background: "var(--pill-bg)", color: "var(--pill-text)" }}
                   >
-                    {loadingOlder ? "Đang tải tin nhắn cũ hơn..." : "Tải thêm tin nhắn cũ"}
+                    {loadingOlder ? t("loadingOlderMessages") : t("loadOlderMessages")}
                   </button>
                 </div>
               )}
               {messages.map((m, idx) => {
                 const prev = idx > 0 ? messages[idx - 1] : null;
+                const next = idx < messages.length - 1 ? messages[idx + 1] : null;
                 const showDate = !prev || dayKey(prev.ts) !== dayKey(m.ts);
+                const showUnread = firstUnreadMsgId === m.msg_id && unreadDividerCount > 0;
                 const groupedWithPrev =
                   !!prev &&
                   !showDate &&
+                  !showUnread &&
                   prev.sender_id === m.sender_id &&
                   prev.is_outgoing === m.is_outgoing &&
-                  m.ts - prev.ts < 120_000;
+                  m.ts - prev.ts < 300_000;
+                const nextShowDate = !next || dayKey(m.ts) !== dayKey(next.ts);
+                const nextShowUnread = Boolean(
+                  next && firstUnreadMsgId === next.msg_id && unreadDividerCount > 0,
+                );
+                const groupedWithNext =
+                  !!next &&
+                  !nextShowDate &&
+                  !nextShowUnread &&
+                  next.sender_id === m.sender_id &&
+                  next.is_outgoing === m.is_outgoing &&
+                  next.ts - m.ts < 300_000;
 
                 return (
                   <div key={m.msg_id} className="msg-row-perf">
                     {showDate && (
-                      <div className="my-4 flex justify-center">
+                      <div className="my-2.5 flex justify-center">
                         <span
                           className="rounded-full px-3 py-0.5 text-xs font-medium shadow-xs"
                           style={{ background: "var(--pill-bg)", color: "var(--pill-text)" }}
                         >
-                          {formatDayLabel(m.ts)}
+                          {formatDayLabel(m.ts, lang)}
                         </span>
                       </div>
                     )}
-                    {firstUnreadMsgId === m.msg_id && unreadDividerCount > 0 && (
-                      <div className="my-3 flex items-center gap-3">
+                    {showUnread && (
+                      <div id="unread-divider" className="my-2 flex items-center gap-3">
                         <div className="h-px flex-1" style={{ background: "var(--accent)", opacity: 0.35 }} />
                         <span
                           className="rounded-full px-3 py-0.5 text-xs font-semibold"
                           style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
                         >
-                          {unreadDividerCount} tin nhắn chưa đọc
+                          {t("unreadDivider", { count: unreadDividerCount })}
                         </span>
                         <div className="h-px flex-1" style={{ background: "var(--accent)", opacity: 0.35 }} />
                       </div>
@@ -3018,7 +3975,14 @@ export default function App() {
                       msg={m}
                       threadKind={activeThread.kind}
                       groupedWithPrev={groupedWithPrev}
+                      groupedWithNext={groupedWithNext}
                       highlighted={highlightedId === m.msg_id || inChatActiveMatchId === m.msg_id}
+                      isSeen={
+                        m.is_outgoing &&
+                        !m.is_recalled &&
+                        !m.send_status &&
+                        (activeThread.kind === "cloud" || (activeThread.peer_read_ts ?? 0) >= m.ts)
+                      }
                       senderAvatar={avatarByUserId.get(m.sender_id)}
                       translation={translationsByMsg[m.msg_id]}
                       replaceWithTranslation={Boolean(activeThreadLang)}
@@ -3044,6 +4008,8 @@ export default function App() {
                       onDiscardFailed={handleDiscardFailedMessage}
                       onSaveFile={handleSaveRemoteFile}
                       onCopyError={showError}
+                      onVotePoll={handleVotePoll}
+                      onRefreshPoll={handleRefreshPoll}
                     />
                   </div>
                 );
@@ -3058,8 +4024,9 @@ export default function App() {
                   bottomRef.current?.scrollIntoView({ behavior: "smooth" });
                   setUnreadBelow(0);
                   setShowScrollDown(false);
+                  if (selectedId) completeMarkReadForThread(selectedId);
                 }}
-                title="Cuộn xuống tin nhắn mới nhất"
+                title={t("scrollToBottomTitle")}
                 className="absolute bottom-20 right-6 z-20 flex items-center gap-1.5 rounded-full px-3 py-2 text-xs font-medium shadow-lg transition hover:opacity-90"
                 style={{
                   background: "var(--bg-sidebar)",
@@ -3088,11 +4055,7 @@ export default function App() {
                 }}
               >
                 <div className="text-[14px] font-medium">
-                  Đã chọn{" "}
-                  <span className="font-bold" style={{ color: "var(--accent)" }}>
-                    {selectedMsgIds.size}
-                  </span>{" "}
-                  tin nhắn
+                  {t("selectedMessagesCount", { count: selectedMsgIds.size })}
                 </div>
                 <div className="flex items-center gap-2">
                   <button
@@ -3110,7 +4073,7 @@ export default function App() {
                     className="tf-btn flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-[13.5px] font-semibold disabled:cursor-not-allowed disabled:opacity-45"
                   >
                     <Forward className="h-4 w-4" />
-                    <span>Chuyển tiếp</span>
+                    <span>{t("forwardSelected")}</span>
                   </button>
                   <button
                     type="button"
@@ -3119,7 +4082,7 @@ export default function App() {
                     className="flex items-center gap-1.5 rounded-xl bg-rose-600/90 px-3.5 py-2 text-[13.5px] font-semibold text-white transition hover:bg-rose-600 disabled:cursor-not-allowed disabled:opacity-45"
                   >
                     <Trash2 className="h-4 w-4" />
-                    <span>Xóa trên máy</span>
+                    <span>{t("deleteLocalSelected")}</span>
                   </button>
                   <button
                     type="button"
@@ -3133,7 +4096,7 @@ export default function App() {
                       color: "var(--text-secondary)",
                     }}
                   >
-                    Hủy
+                    {t("cancel")}
                   </button>
                 </div>
               </footer>
@@ -3151,7 +4114,14 @@ export default function App() {
                 onSendText={handleSendText}
                 onSendAttachment={handleSendAttachment}
                 onBuzz={handleSendBuzz}
+                onOpenReminder={
+                  activeThread.kind !== "cloud" ? () => setCreateReminderOpen(true) : undefined
+                }
+                onOpenPoll={
+                  activeThread.kind === "group" ? () => setCreatePollOpen(true) : undefined
+                }
                 buzzCooldownSec={buzzCooldownSec}
+                sendOnEnter={sendOnEnter}
                 globalPasteFallback={!activeThreadRootId}
                 onError={showError}
               />
@@ -3163,7 +4133,7 @@ export default function App() {
             className="flex flex-1 items-center justify-center text-sm"
             style={{ color: "var(--text-secondary)" }}
           >
-            Chọn một cuộc trò chuyện để bắt đầu
+            {t("selectConversationPrompt")}
           </div>
         )}
       </main>
@@ -3193,14 +4163,14 @@ export default function App() {
               className="text-[13px] font-semibold uppercase tracking-wider"
               style={{ color: "var(--text-secondary)" }}
             >
-              Thông tin hội thoại
+              {t("drawerTitle")}
             </h3>
             <button
               type="button"
               onClick={() => setDrawerOpen(false)}
               className="rounded-lg p-1 hover:bg-white/10"
               style={{ color: "var(--text-secondary)" }}
-              title="Đóng"
+              title={t("close")}
             >
               <X className="h-4 w-4" />
             </button>
@@ -3233,11 +4203,11 @@ export default function App() {
             <div className="text-[13px]" style={{ color: "var(--text-secondary)" }}>
               {activeThread.kind === "group"
                 ? threadDetails?.total_members
-                  ? `Nhóm · ${threadDetails.total_members} thành viên`
-                  : "Nhóm trò chuyện"
+                  ? t("groupMembersLine", { count: threadDetails.total_members })
+                  : t("groupChatLabel")
                 : activeThread.kind === "cloud"
-                  ? "Cloud của tôi"
-                  : "Trò chuyện 1-1"}
+                  ? t("myCloudShort")
+                  : t("directChatLabel")}
             </div>
             {activeThread.kind === "direct" && (
               <button
@@ -3246,13 +4216,13 @@ export default function App() {
                 className="mt-1 text-xs hover:underline"
                 style={{ color: "var(--accent)" }}
               >
-                Tra cứu thông tin tài khoản
+                {t("lookupProfile")}
               </button>
             )}
             <div className="mt-0.5 text-xs opacity-60">ID: {activeThread.id}</div>
           </div>
 
-          <div className="mt-4 grid grid-cols-3 gap-1.5 text-xs">
+          <div className="mt-4 grid grid-cols-4 gap-1.5 text-xs">
             <button
               type="button"
               onClick={() => void handleTogglePin(activeThread)}
@@ -3263,19 +4233,35 @@ export default function App() {
               }}
             >
               {activeThread.is_pinned ? <PinOff className="h-4 w-4" /> : <Pin className="h-4 w-4" />}
-              <span>{activeThread.is_pinned ? "Bỏ ghim" : "Ghim"}</span>
+              <span>{activeThread.is_pinned ? t("unpinShort") : t("pinShort")}</span>
             </button>
             <button
               type="button"
-              onClick={() => void handleToggleMute(activeThread)}
+              onClick={() => {
+                if (isThreadCurrentlyMuted(activeThread)) {
+                  void handleToggleMute(activeThread);
+                } else {
+                  setDrawerMuteOpen((v) => !v);
+                }
+              }}
               className="flex flex-col items-center gap-1 rounded-xl py-2 transition hover:opacity-85"
               style={{
                 background: "var(--bg-surface)",
-                color: activeThread.is_muted ? "#fbbf24" : "var(--text-secondary)",
+                color: isThreadCurrentlyMuted(activeThread) ? "#fbbf24" : "var(--text-secondary)",
               }}
             >
-              {activeThread.is_muted ? <Bell className="h-4 w-4" /> : <BellOff className="h-4 w-4" />}
-              <span>{activeThread.is_muted ? "Bật TB" : "Tắt TB"}</span>
+              {isThreadCurrentlyMuted(activeThread) ? (
+                <Bell className="h-4 w-4" />
+              ) : (
+                <BellOff className="h-4 w-4" />
+              )}
+              <span>
+                {isThreadCurrentlyMuted(activeThread)
+                  ? formatMuteUntil(activeThread.muted_until_ts)
+                    ? t("unmuteUntilShort", { time: formatMuteUntil(activeThread.muted_until_ts) ?? "" })
+                    : t("unmuteShort")
+                  : t("muteShort")}
+              </span>
             </button>
             <button
               type="button"
@@ -3293,28 +4279,94 @@ export default function App() {
               {activeThread.unread_count > 0 ? (
                 <>
                   <CheckCheck className="h-4 w-4" />
-                  <span>Đã đọc</span>
+                  <span>{t("readShort")}</span>
                 </>
               ) : (
                 <>
                   <MessageSquare className="h-4 w-4" />
-                  <span>Chưa đọc</span>
+                  <span>{t("unreadShort")}</span>
+                </>
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleToggleArchive(activeThread, !activeThread.is_archived)}
+              className="flex flex-col items-center gap-1 rounded-xl py-2 transition hover:opacity-85"
+              style={{
+                background: "var(--bg-surface)",
+                color: activeThread.is_archived ? "var(--accent)" : "var(--text-secondary)",
+              }}
+            >
+              {activeThread.is_archived ? (
+                <>
+                  <ArchiveRestore className="h-4 w-4" />
+                  <span>{t("unarchiveShort")}</span>
+                </>
+              ) : (
+                <>
+                  <Archive className="h-4 w-4" />
+                  <span>{t("archiveShort")}</span>
                 </>
               )}
             </button>
           </div>
 
+          {drawerMuteOpen && !isThreadCurrentlyMuted(activeThread) && (
+            <div
+              className="mt-2 rounded-xl p-2"
+              style={{ background: "var(--bg-surface)", border: "1px solid var(--border-subtle)" }}
+            >
+              <div className="mb-1.5 text-[11px] font-medium" style={{ color: "var(--text-secondary)" }}>
+                {t("muteDurationTitle")}
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {[
+                  { label: t("mute1h"), secs: 3600 },
+                  { label: t("mute4h"), secs: 14400 },
+                  { label: t("mute8h"), secs: 28800 },
+                  { label: t("mute24h"), secs: 86400 },
+                  { label: t("muteForever"), secs: undefined },
+                ].map((opt) => (
+                  <button
+                    key={opt.label}
+                    type="button"
+                    onClick={() => void handleToggleMute(activeThread, opt.secs)}
+                    className="hover-menu rounded-lg px-2 py-1 text-[11.5px] font-medium transition"
+                    style={{
+                      background: "var(--bg-sidebar)",
+                      color: "var(--text-primary)",
+                    }}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
           <div className="mt-4 flex-1 overflow-y-auto pr-0.5">
             {activeThread.kind === "group" && (
               <div className="mb-4">
-                <div
-                  className="mb-2 text-[13px] font-semibold"
-                  style={{ color: "var(--text-secondary)" }}
-                >
-                  Thành viên ({threadDetails?.total_members ?? threadDetails?.members.length ?? "..."})
+                <div className="mb-2 flex items-center justify-between gap-2">
+                  <div
+                    className="text-[13px] font-semibold"
+                    style={{ color: "var(--text-secondary)" }}
+                  >
+                    {t("membersTitle", { count: threadDetails?.total_members ?? threadDetails?.members.length ?? "..." })}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setAddMembersOpen(true)}
+                    title={t("addGroupMembersTitle")}
+                    className="hover-menu inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[11.5px] font-semibold transition"
+                    style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
+                  >
+                    <UserPlus className="h-3.5 w-3.5" />
+                    <span>{t("add")}</span>
+                  </button>
                 </div>
                 {detailsLoading && !threadDetails ? (
-                  <div className="text-[13px] opacity-60">Đang tải thành viên...</div>
+                  <div className="text-[13px] opacity-60">{t("loadingMembers")}</div>
                 ) : threadDetails && threadDetails.members.length > 0 ? (
                   <div className="max-h-48 space-y-1.5 overflow-y-auto">
                     {threadDetails.members.map((mem) => (
@@ -3322,7 +4374,7 @@ export default function App() {
                         key={mem.id}
                         type="button"
                         onClick={() => setProfileUid(mem.id)}
-                        title="Tra cứu thông tin tài khoản"
+                        title={t("lookupProfile")}
                         className="hover-menu flex w-full items-center gap-2 rounded-lg px-1.5 py-1 text-left transition"
                       >
                         <ThreadAvatar avatar={mem.avatar} title={mem.name} kind="direct" size="sm" />
@@ -3338,7 +4390,7 @@ export default function App() {
                     ))}
                   </div>
                 ) : (
-                  <div className="text-[13px] opacity-60">Chưa có danh sách thành viên</div>
+                  <div className="text-[13px] opacity-60">{t("noMembersList")}</div>
                 )}
               </div>
             )}
@@ -3355,7 +4407,7 @@ export default function App() {
                   }}
                 >
                   <ImageIcon className="h-3.5 w-3.5" />
-                  Ảnh ({threadDetails?.media_items.length ?? 0})
+                  {t("tabMedia", { count: threadDetails?.media_items.length ?? 0 })}
                 </button>
                 <button
                   type="button"
@@ -3367,7 +4419,7 @@ export default function App() {
                   }}
                 >
                   <FileText className="h-3.5 w-3.5" />
-                  Tệp ({threadDetails?.file_items.length ?? 0})
+                  {t("tabFiles", { count: threadDetails?.file_items.length ?? 0 })}
                 </button>
                 <button
                   type="button"
@@ -3379,7 +4431,7 @@ export default function App() {
                   }}
                 >
                   <Link2 className="h-3.5 w-3.5" />
-                  Link ({threadDetails?.link_items?.length ?? 0})
+                  {t("tabLinks", { count: threadDetails?.link_items?.length ?? 0 })}
                 </button>
               </div>
 
@@ -3435,7 +4487,7 @@ export default function App() {
                     })}
                   </div>
                 ) : (
-                  <div className="py-4 text-center text-xs opacity-60">Chưa có ảnh/video đã lưu</div>
+                  <div className="py-4 text-center text-xs opacity-60">{t("noMediaYet")}</div>
                 )
               ) : detailsTab === "files" ? (
                 threadDetails && threadDetails.file_items.length > 0 ? (
@@ -3454,7 +4506,7 @@ export default function App() {
                           void jumpToMsg(item.msg_id);
                         }
                       }}
-                      title="Nhấn để tải tệp về máy"
+                      title={t("clickToDownloadFile")}
                       className="hover-menu flex w-full items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-left text-xs transition"
                       style={{ background: "var(--bg-surface)" }}
                     >
@@ -3467,7 +4519,7 @@ export default function App() {
                   ))}
                 </div>
                 ) : (
-                  <div className="py-4 text-center text-xs opacity-60">Chưa có tệp đính kèm</div>
+                  <div className="py-4 text-center text-xs opacity-60">{t("noFilesYet")}</div>
                 )
               ) : threadDetails && (threadDetails.link_items?.length ?? 0) > 0 ? (
                 <div className="space-y-1.5">
@@ -3482,14 +4534,14 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => void jumpToMsg(item.msg_id)}
-                          title="Nhảy tới tin nhắn trong đoạn chat"
+                          title={t("jumpToMsgTitle")}
                           className="min-w-0 flex-1 text-left transition hover:opacity-85"
                         >
                           <div className="truncate font-medium" style={{ color: "var(--accent)" }}>
                             {url || item.text}
                           </div>
                           <div className="truncate text-[11px] opacity-75">
-                            {item.sender_name || "Tin nhắn"} · {formatThreadTime(item.ts)}
+                            {item.sender_name || t("msgFallbackLabel")} · {formatThreadTime(item.ts, lang)}
                           </div>
                         </button>
                         {url && (
@@ -3497,7 +4549,7 @@ export default function App() {
                             href={url}
                             target="_blank"
                             rel="noreferrer"
-                            title="Mở liên kết"
+                            title={url}
                             className="hover-menu shrink-0 rounded p-1"
                             style={{ color: "var(--accent)" }}
                           >
@@ -3509,11 +4561,13 @@ export default function App() {
                   })}
                 </div>
               ) : (
-                <div className="py-4 text-center text-xs opacity-60">Chưa có liên kết nào</div>
+                <div className="py-4 text-center text-xs opacity-60">{t("noLinksYet")}</div>
               )}
             </div>
           </div>
         </aside>
+        </>
+      )}
         </>
       )}
 
@@ -3522,7 +4576,7 @@ export default function App() {
           className="fixed z-50 max-h-[75vh] w-56 overflow-y-auto rounded-xl py-1 shadow-2xl"
           style={{
             left: Math.min(threadMenu.x, window.innerWidth - 232),
-            top: Math.min(threadMenu.y, window.innerHeight - 280),
+            top: Math.min(threadMenu.y, window.innerHeight - 330),
             background: "var(--bg-sidebar)",
             border: "1px solid var(--border-subtle)",
           }}
@@ -3538,11 +4592,11 @@ export default function App() {
           >
             {threadMenu.thread.is_pinned ? (
               <>
-                <PinOff className="h-3.5 w-3.5" /> Bỏ ghim hội thoại
+                <PinOff className="h-3.5 w-3.5" /> {t("unpinThread")}
               </>
             ) : (
               <>
-                <Pin className="h-3.5 w-3.5" /> Ghim lên đầu
+                <Pin className="h-3.5 w-3.5" /> {t("pinThread")}
               </>
             )}
           </button>
@@ -3558,53 +4612,125 @@ export default function App() {
           >
             {threadMenu.thread.unread_count > 0 ? (
               <>
-                <CheckCheck className="h-3.5 w-3.5" /> Đánh dấu đã đọc
+                <CheckCheck className="h-3.5 w-3.5" /> {t("markAsRead")}
               </>
             ) : (
               <>
-                <MessageSquare className="h-3.5 w-3.5" /> Đánh dấu chưa đọc
+                <MessageSquare className="h-3.5 w-3.5" /> {t("markAsUnread")}
               </>
             )}
           </button>
+          {isThreadCurrentlyMuted(threadMenu.thread) ? (
+            <button
+              type="button"
+              onClick={() => {
+                void handleToggleMute(threadMenu.thread);
+                setThreadMenu(null);
+              }}
+              className="hover-menu flex w-full items-center gap-2 px-3 py-2 text-left text-[13.5px]"
+            >
+              <Bell className="h-3.5 w-3.5" />
+              <span>
+                {formatMuteUntil(threadMenu.thread.muted_until_ts)
+                  ? t("unmuteUntil", { time: formatMuteUntil(threadMenu.thread.muted_until_ts) ?? "" })
+                  : t("unmuteThread")}
+              </span>
+            </button>
+          ) : (
+            <div className="px-3 py-1.5">
+              <div
+                className="mb-1.5 flex items-center gap-1.5 text-[12px] font-medium"
+                style={{ color: "var(--text-secondary)" }}
+              >
+                <BellOff className="h-3.5 w-3.5" />
+                <span>{t("muteTitle")}</span>
+              </div>
+              <div className="flex flex-wrap gap-1">
+                {[
+                  { label: "1h", secs: 3600 },
+                  { label: "4h", secs: 14400 },
+                  { label: "8h", secs: 28800 },
+                  { label: "24h", secs: 86400 },
+                  { label: t("muteForever"), secs: undefined },
+                ].map((opt) => (
+                  <button
+                    key={opt.label}
+                    type="button"
+                    onClick={() => {
+                      void handleToggleMute(threadMenu.thread, opt.secs);
+                      setThreadMenu(null);
+                    }}
+                    className="hover-menu rounded-md px-2 py-1 text-[11px] font-medium transition"
+                    style={{
+                      background: "var(--bg-surface)",
+                      color: "var(--text-primary)",
+                    }}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          <div className="my-1 h-px" style={{ background: "var(--border-subtle)" }} />
           <button
             type="button"
             onClick={() => {
-              void handleToggleMute(threadMenu.thread);
+              void handleToggleArchive(threadMenu.thread, !threadMenu.thread.is_archived);
               setThreadMenu(null);
             }}
             className="hover-menu flex w-full items-center gap-2 px-3 py-2 text-left text-[13.5px]"
           >
-            {threadMenu.thread.is_muted ? (
+            {threadMenu.thread.is_archived ? (
               <>
-                <Bell className="h-3.5 w-3.5" /> Bật thông báo
+                <ArchiveRestore className="h-3.5 w-3.5" /> {t("unarchiveThread")}
               </>
             ) : (
               <>
-                <BellOff className="h-3.5 w-3.5" /> Tắt thông báo
+                <Archive className="h-3.5 w-3.5" /> {t("archiveThread")}
               </>
             )}
           </button>
           <div className="my-1 h-px" style={{ background: "var(--border-subtle)" }} />
-          {customFolders.map((cf) => {
-            const added = cf.thread_ids.includes(threadMenu.thread.id);
-            return (
-              <button
-                key={cf.id}
-                type="button"
-                onClick={() => {
-                  void handleToggleThreadInFolder(cf, threadMenu.thread.id);
-                  setThreadMenu(null);
-                }}
-                className="hover-menu flex w-full items-center justify-between gap-2 px-3 py-1.5 text-left text-[13px]"
-              >
-                <span className="flex min-w-0 items-center gap-2">
-                  {renderFolderIcon(cf.icon, "h-3.5 w-3.5 shrink-0")}
-                  <span className="truncate">{cf.name}</span>
-                </span>
-                {added && <Check className="h-3.5 w-3.5 shrink-0" style={{ color: "var(--accent)" }} />}
-              </button>
-            );
-          })}
+          {customFolders.length > 3 && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setThreadMenuFoldersExpanded((v) => !v);
+              }}
+              className="hover-menu flex w-full items-center justify-between gap-2 px-3 py-1.5 text-left text-[13px]"
+              style={{ color: "var(--text-secondary)" }}
+            >
+              <span>{t("addToFolderCount", { count: customFolders.length })}</span>
+              {threadMenuFoldersExpanded ? (
+                <ChevronUp className="h-3.5 w-3.5 shrink-0" />
+              ) : (
+                <ChevronDown className="h-3.5 w-3.5 shrink-0" />
+              )}
+            </button>
+          )}
+          {(customFolders.length <= 3 || threadMenuFoldersExpanded) &&
+            customFolders.map((cf) => {
+              const added = cf.thread_ids.includes(threadMenu.thread.id);
+              return (
+                <button
+                  key={cf.id}
+                  type="button"
+                  onClick={() => {
+                    void handleToggleThreadInFolder(cf, threadMenu.thread.id);
+                    setThreadMenu(null);
+                  }}
+                  className="hover-menu flex w-full items-center justify-between gap-2 px-3 py-1.5 text-left text-[13px]"
+                >
+                  <span className="flex min-w-0 items-center gap-2">
+                    {renderFolderIcon(cf.icon, "h-3.5 w-3.5 shrink-0")}
+                    <span className="truncate">{cf.name}</span>
+                  </span>
+                  {added && <Check className="h-3.5 w-3.5 shrink-0" style={{ color: "var(--accent)" }} />}
+                </button>
+              );
+            })}
           <button
             type="button"
             onClick={() => {
@@ -3615,7 +4741,7 @@ export default function App() {
             className="hover-menu flex w-full items-center gap-2 px-3 py-2 text-left text-[13px]"
             style={{ color: "var(--accent)" }}
           >
-            <FolderPlus className="h-3.5 w-3.5" /> Quản lý thư mục...
+            <FolderPlus className="h-3.5 w-3.5" /> {t("manageFoldersEllipsis")}
           </button>
         </div>
       )}
@@ -3639,7 +4765,7 @@ export default function App() {
             }}
             className="hover-menu flex w-full items-center gap-2 px-3 py-2 text-left text-[13.5px]"
           >
-            <CheckCheck className="h-3.5 w-3.5" /> Đánh dấu tất cả đã đọc
+            <CheckCheck className="h-3.5 w-3.5" /> {t("markFolderAllRead")}
           </button>
           <button
             type="button"
@@ -3650,7 +4776,7 @@ export default function App() {
             }}
             className="hover-menu flex w-full items-center gap-2 px-3 py-2 text-left text-[13.5px]"
           >
-            <FolderPlus className="h-3.5 w-3.5" /> Chỉnh sửa thư mục
+            <FolderPlus className="h-3.5 w-3.5" /> {t("editFolder")}
           </button>
           <button
             type="button"
@@ -3664,7 +4790,7 @@ export default function App() {
             }}
             className="hover-menu flex w-full items-center gap-2 px-3 py-2 text-left text-[13.5px] text-rose-500"
           >
-            <Trash2 className="h-3.5 w-3.5" /> Xóa thư mục
+            <Trash2 className="h-3.5 w-3.5" /> {t("deleteFolder")}
           </button>
         </div>
       )}
@@ -3681,6 +4807,63 @@ export default function App() {
           setFindUserOpen(true);
         }}
       />
+
+      {activeThread && activeThread.kind === "group" && (
+        <AddGroupMembersModal
+          open={addMembersOpen}
+          threadId={activeThread.id}
+          groupTitle={activeThread.title}
+          threads={threads}
+          existingMemberIds={(threadDetails?.members ?? []).map((m) => m.id)}
+          onClose={() => setAddMembersOpen(false)}
+          onAdded={(res) => {
+            if (res.added.length > 0) {
+              setDetailsRefreshTick((n) => n + 1);
+            }
+          }}
+        />
+      )}
+
+      {activeThread && (
+        <CreateReminderModal
+          open={createReminderOpen}
+          threadTitle={activeThread.title}
+          onClose={() => setCreateReminderOpen(false)}
+          onSubmit={async (title, startTimeMs, repeat) => {
+            const msg = await bridge.createReminder(
+              activeThread.id,
+              title,
+              startTimeMs,
+              repeat,
+            );
+            setMessages((prev) => upsertMsg(prev, msg));
+            setThreads((prev) => bumpThreadList(prev, msg, false));
+            setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
+          }}
+        />
+      )}
+
+      {activeThread && activeThread.kind === "group" && (
+        <CreatePollModal
+          open={createPollOpen}
+          groupTitle={activeThread.title}
+          onClose={() => setCreatePollOpen(false)}
+          onSubmit={async (payload) => {
+            const msg = await bridge.createPoll(
+              activeThread.id,
+              payload.question,
+              payload.options,
+              payload.expiredTimeMs,
+              payload.allowMulti,
+              payload.allowAddOption,
+              payload.isAnonymous,
+            );
+            setMessages((prev) => upsertMsg(prev, msg));
+            setThreads((prev) => bumpThreadList(prev, msg, false));
+            setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
+          }}
+        />
+      )}
 
       <ForwardModal
         messages={forwardMessages}
@@ -3729,7 +4912,105 @@ export default function App() {
           setProfileInitial(null);
         }}
         onOpenImage={openLightboxForUrl}
+        onOpenGroup={(gid) => {
+          setSelectedId(gid);
+          setMobilePane("chat");
+        }}
         onStartChat={handleStartChatFromProfile}
+      />
+
+      {webNotifyToast && !isLocked && (
+        <div
+          role="button"
+          tabIndex={0}
+          onClick={() => {
+            const targetId = webNotifyToast.thread_id;
+            setWebNotifyToast(null);
+            openThreadById(targetId);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              const targetId = webNotifyToast.thread_id;
+              setWebNotifyToast(null);
+              openThreadById(targetId);
+            }
+          }}
+          className={`fixed z-[75] flex w-[340px] max-w-[calc(100vw-2rem)] cursor-pointer items-center gap-3 overflow-hidden rounded-2xl p-3 shadow-2xl transition hover:brightness-105 ${
+            webNotifyToast.position === "top-left"
+              ? "left-4 top-4"
+              : webNotifyToast.position === "top-right"
+                ? "right-4 top-4"
+                : webNotifyToast.position === "bottom-left"
+                  ? "bottom-4 left-4"
+                  : "bottom-4 right-4"
+          }`}
+          style={{
+            background: "var(--bg-sidebar)",
+            border: "1px solid var(--border-subtle)",
+            color: "var(--text-primary)",
+          }}
+        >
+          <span
+            aria-hidden="true"
+            className="absolute inset-y-0 left-0 w-[3px]"
+            style={{ background: "var(--accent)" }}
+          />
+          <div className="pl-1">
+            <ThreadAvatar
+              avatar={webNotifyToast.avatar}
+              title={webNotifyToast.title}
+              kind="direct"
+              size="md"
+            />
+          </div>
+          <div className="min-w-0 flex-1 pr-5">
+            <div className="truncate text-[13.5px] font-semibold">{webNotifyToast.title}</div>
+            <div
+              className="mt-0.5 line-clamp-2 text-[12px] leading-snug"
+              style={{ color: "var(--text-secondary)" }}
+            >
+              {webNotifyToast.body}
+            </div>
+            <div className="mt-0.5 text-[10.5px] font-medium" style={{ color: "var(--accent)" }}>
+              Teza · Bấm để mở hội thoại
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setWebNotifyToast(null);
+            }}
+            className="hover-menu absolute right-2 top-2 rounded-lg p-1"
+            style={{ color: "var(--text-secondary)" }}
+            title="Đóng thông báo"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
+
+      <PasscodeLockScreen
+        open={authed && isLocked}
+        myName={myProfile?.display_name}
+        onUnlock={async (pin) => {
+          const ok = await verifyPasscode(pin, passcodeCfg);
+          if (ok) {
+            lastActivityAtRef.current = Date.now();
+            setIsLocked(false);
+          }
+          return ok;
+        }}
+        onLogout={() => {
+          savePasscodeConfig(DEFAULT_PASSCODE_CONFIG);
+          setPasscodeCfg(DEFAULT_PASSCODE_CONFIG);
+          void bridge.logout().then(() => {
+            setAuthed(false);
+            resetSessionUi();
+            void refreshQr();
+          });
+        }}
       />
     </div>
   );

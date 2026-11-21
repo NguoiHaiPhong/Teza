@@ -8,9 +8,9 @@ import { isTauri } from "../bridge";
 let lastSoundAt = 0;
 
 /** Synthesize a soft two-note incoming message chime via Web Audio API. */
-export function playMessageSound(): void {
+export function playMessageSound(force = false): void {
   const nowMs = Date.now();
-  if (nowMs - lastSoundAt < 900) return;
+  if (!force && nowMs - lastSoundAt < 900) return;
   lastSoundAt = nowMs;
 
   try {

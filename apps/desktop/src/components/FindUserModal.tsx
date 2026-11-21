@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Loader2, MessageSquare, Phone, Search, User, X } from "lucide-react";
 import { bridge } from "../bridge";
+import { useI18n } from "../i18n";
 import type { UserProfileDto } from "../types";
 import { ThreadAvatar } from "./ThreadAvatar";
 
@@ -19,6 +20,7 @@ export function FindUserModal({
   onOpenProfile,
   onStartChat,
 }: Props) {
+  const { t } = useI18n();
   const [phone, setPhone] = useState("");
   const [searching, setSearching] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -94,13 +96,13 @@ export function FindUserModal({
         >
           <div className="flex items-center gap-2 font-semibold">
             <Phone className="h-4 w-4" style={{ color: "var(--accent)" }} />
-            <span>Tìm bạn mới theo số điện thoại</span>
+            <span>{t("findNewFriendMenu")}</span>
           </div>
           <button
             type="button"
             onClick={onClose}
             className="hover-menu rounded-lg p-1"
-            title="Đóng (Esc)"
+            title={t("close")}
           >
             <X className="h-4 w-4" style={{ color: "var(--text-secondary)" }} />
           </button>
@@ -123,7 +125,7 @@ export function FindUserModal({
                 ref={inputRef}
                 value={phone}
                 onChange={(e) => setPhone(e.target.value)}
-                placeholder="Nhập số điện thoại (vd: 0912345678 hoặc +84...)"
+                placeholder={t("findUserPhonePlaceholder")}
                 className="w-full bg-transparent text-[14.5px] outline-none"
               />
             </div>
@@ -132,7 +134,7 @@ export function FindUserModal({
               disabled={searching}
               className="tf-btn flex shrink-0 items-center gap-1.5 rounded-xl px-4 py-2 text-[14px] font-medium disabled:opacity-50"
             >
-              {searching ? <Loader2 className="h-4 w-4 animate-spin" /> : "Tìm"}
+              {searching ? <Loader2 className="h-4 w-4 animate-spin" /> : t("findShortBtn")}
             </button>
           </div>
 
@@ -167,10 +169,10 @@ export function FindUserModal({
                       }}
                     >
                       {result.is_self
-                        ? "Tài khoản của bạn"
+                        ? t("badgeSelfAccount")
                         : result.is_friend
-                          ? "Bạn bè"
-                          : "Chưa kết bạn"}
+                          ? t("badgeFriend")
+                          : t("badgeNotFriend")}
                     </span>
                   </div>
                   {result.phone_number && (
@@ -195,7 +197,7 @@ export function FindUserModal({
                   }}
                 >
                   <User className="h-4 w-4" />
-                  <span>Xem hồ sơ</span>
+                  <span>{t("viewProfileBtn")}</span>
                 </button>
                 {!result.is_self && (
                   <button
@@ -207,7 +209,7 @@ export function FindUserModal({
                     className="tf-btn flex flex-1 items-center justify-center gap-1.5 rounded-xl px-3 py-2 text-[13.5px] font-semibold"
                   >
                     <MessageSquare className="h-4 w-4" />
-                    <span>Nhắn tin</span>
+                    <span>{t("startChatBtn")}</span>
                   </button>
                 )}
               </div>

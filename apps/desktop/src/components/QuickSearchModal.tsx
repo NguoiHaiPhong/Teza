@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Search, UserPlus, X } from "lucide-react";
 import { bridge } from "../bridge";
+import { useI18n } from "../i18n";
 import type { MessageDto, ThreadDto } from "../types";
 import { looksLikePhoneQuery } from "../utils/threadState";
 
@@ -12,10 +13,10 @@ interface Props {
   onFindPhone?: (phone: string) => void;
 }
 
-function formatResultTime(ts: number): string {
+function formatResultTime(ts: number, locale: string): string {
   if (!ts) return "";
   const ms = ts > 1e12 ? ts : ts * 1000;
-  return new Date(ms).toLocaleString("vi-VN", {
+  return new Date(ms).toLocaleString(locale, {
     day: "2-digit",
     month: "2-digit",
     hour: "2-digit",
@@ -24,6 +25,7 @@ function formatResultTime(ts: number): string {
 }
 
 export function QuickSearchModal({ open, threads, onClose, onSelectMessage, onFindPhone }: Props) {
+  const { locale, t } = useI18n();
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<MessageDto[]>([]);
   const [activeIndex, setActiveIndex] = useState(0);
@@ -96,14 +98,14 @@ export function QuickSearchModal({ open, threads, onClose, onSelectMessage, onFi
                 onClose();
               }
             }}
-            placeholder="Tìm tin nhắn theo nội dung hoặc tên người gửi (hỗ trợ không dấu)..."
+            placeholder={t("quickSearchPlaceholder")}
             className="w-full bg-transparent text-[15px] outline-none"
           />
           <button
             type="button"
             onClick={onClose}
             className="hover-menu rounded p-1"
-            title="Đóng (Esc)"
+            title={t("close")}
           >
             <X className="h-4 w-4" style={{ color: "var(--text-secondary)" }} />
           </button>
@@ -125,14 +127,14 @@ export function QuickSearchModal({ open, threads, onClose, onSelectMessage, onFi
               }}
             >
               <UserPlus className="h-4 w-4 shrink-0" />
-              <span>Tìm người dùng theo số điện thoại &ldquo;{query.trim()}&rdquo;</span>
+              <span>{t("findFriendByPhonePrompt", { query: query.trim() })}</span>
             </button>
           )}
           {results.length === 0 ? (
             <p className="py-8 text-center text-[13px]" style={{ color: "var(--text-secondary)" }}>
               {query.trim()
-                ? "Không tìm thấy kết quả phù hợp"
-                : "Nhập từ khóa để tìm toàn bộ lịch sử (Ctrl+K)"}
+                ? t("quickSearchNoResults")
+                : t("quickSearchHint")}
             </p>
           ) : (
             results.map((m, idx) => {
@@ -161,7 +163,7 @@ export function QuickSearchModal({ open, threads, onClose, onSelectMessage, onFi
                       </span>
                     </span>
                     <span className="shrink-0 text-xs" style={{ color: "var(--text-secondary)" }}>
-                      {formatResultTime(m.ts)}
+                      {formatResultTime(m.ts, locale)}
                     </span>
                   </div>
                   <span className="truncate text-[15px]">{m.text}</span>

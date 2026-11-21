@@ -1,10 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  ArrowDown,
+  ArrowUp,
+  Ban,
   Bookmark,
   Briefcase,
   Check,
   Flame,
   Folder,
+  GripVertical,
   Heart,
   Loader2,
   Plus,
@@ -18,7 +22,9 @@ import {
   Users,
   X,
 } from "lucide-react";
+import { useI18n } from "../i18n";
 import type { ChatFolderDto, ThreadDto, ThreadKind } from "../types";
+import { moveArrayItem } from "../utils/threadState";
 import { ThreadAvatar } from "./ThreadAvatar";
 
 export const FOLDER_ICON_OPTIONS: { id: string; label: string; icon: typeof Folder }[] = [
@@ -48,6 +54,7 @@ interface Props {
   onClose: () => void;
   onSaveFolder: (folder: ChatFolderDto) => Promise<void>;
   onDeleteFolder: (folderId: string) => Promise<void>;
+  onReorderFolders?: (orderedIds: string[]) => Promise<void>;
   onSyncRemoteLabels: () => Promise<number>;
 }
 
@@ -58,6 +65,7 @@ function emptyDraft(position: number): ChatFolderDto {
     icon: "folder",
     color: "",
     thread_ids: [],
+    excluded_thread_ids: [],
     include_kinds: [],
     only_unread: false,
     exclude_muted: false,
@@ -74,10 +82,14 @@ export function FolderEditorModal({
   onClose,
   onSaveFolder,
   onDeleteFolder,
+  onReorderFolders,
   onSyncRemoteLabels,
 }: Props) {
+  const { t } = useI18n();
   const [editing, setEditing] = useState<ChatFolderDto>(() => emptyDraft(1));
   const [threadSearch, setThreadSearch] = useState("");
+  const [threadListTab, setThreadListTab] = useState<"include" | "exclude">("include");
+  const [dragFolderIdx, setDragFolderIdx] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
@@ -86,10 +98,15 @@ export function FolderEditorModal({
   useEffect(() => {
     if (!open) return;
     setThreadSearch("");
+    setThreadListTab("include");
+    setDragFolderIdx(null);
     setStatusMsg(null);
     setErrorMsg(null);
     if (initialEditingFolder) {
-      setEditing({ ...initialEditingFolder });
+      setEditing({
+        ...initialEditingFolder,
+        excluded_thread_ids: initialEditingFolder.excluded_thread_ids ?? [],
+      });
     } else {
       const nextPos = folders.reduce((m, f) => Math.max(m, f.position), 0) + 1;
       setEditing(emptyDraft(nextPos));
@@ -123,8 +140,35 @@ export function FolderEditorModal({
         thread_ids: exists
           ? prev.thread_ids.filter((x) => x !== tid)
           : [...prev.thread_ids, tid],
+        excluded_thread_ids: exists
+          ? (prev.excluded_thread_ids ?? [])
+          : (prev.excluded_thread_ids ?? []).filter((x) => x !== tid),
       };
     });
+  };
+
+  const toggleExcludedThreadId = (tid: string) => {
+    setEditing((prev) => {
+      const curr = prev.excluded_thread_ids ?? [];
+      const exists = curr.includes(tid);
+      return {
+        ...prev,
+        excluded_thread_ids: exists ? curr.filter((x) => x !== tid) : [...curr, tid],
+        thread_ids: exists ? prev.thread_ids : prev.thread_ids.filter((x) => x !== tid),
+      };
+    });
+  };
+
+  const handleMoveFolder = async (fromIdx: number, toIdx: number) => {
+    if (!onReorderFolders || fromIdx === toIdx) return;
+    const reordered = moveArrayItem(folders, fromIdx, toIdx);
+    if (reordered === folders) return;
+    setErrorMsg(null);
+    try {
+      await onReorderFolders(reordered.map((f) => f.id));
+    } catch (err) {
+      setErrorMsg(String(err));
+    }
   };
 
   const toggleKind = (kind: ThreadKind) => {
@@ -200,13 +244,13 @@ export function FolderEditorModal({
         >
           <div className="flex items-center gap-2 font-semibold">
             <Folder className="h-5 w-5" style={{ color: "var(--accent)" }} />
-            <span className="text-[16px]">Quản lý thư mục hội thoại</span>
+            <span className="text-[16px]">{t("folderModalTitle")}</span>
           </div>
           <button
             type="button"
             onClick={onClose}
             className="hover-menu rounded-lg p-1.5"
-            title="Đóng (Esc)"
+            title={t("close")}
           >
             <X className="h-4 w-4" style={{ color: "var(--text-secondary)" }} />
           </button>
@@ -230,13 +274,13 @@ export function FolderEditorModal({
                 className="tf-btn flex flex-1 items-center justify-center gap-1.5 rounded-xl px-3 py-2 text-xs font-semibold"
               >
                 <Plus className="h-3.5 w-3.5" />
-                <span>Tạo thư mục</span>
+                <span>{t("createFolderBtn")}</span>
               </button>
               <button
                 type="button"
                 disabled={syncing}
                 onClick={() => void handleSyncLabels()}
-                title="Đồng bộ thẻ phân loại từ máy chủ"
+                title={t("syncTagsTitle")}
                 className="hover-menu flex items-center justify-center gap-1 rounded-xl px-2.5 py-2 text-xs font-medium disabled:opacity-50"
                 style={{
                   background: "var(--bg-surface)",
@@ -248,31 +292,62 @@ export function FolderEditorModal({
                 ) : (
                   <RefreshCw className="h-3.5 w-3.5" />
                 )}
-                <span>Đồng bộ thẻ</span>
+                <span>{t("syncTagsBtn")}</span>
               </button>
             </div>
 
             <div className="max-h-48 flex-1 space-y-1 overflow-y-auto md:max-h-none">
               {folders.length === 0 ? (
                 <div className="py-6 text-center text-xs" style={{ color: "var(--text-secondary)" }}>
-                  Chưa có thư mục tùy chỉnh nào. Hãy tạo mới hoặc đồng bộ thẻ phân loại.
+                  {t("noCustomFoldersHint")}
                 </div>
               ) : (
-                folders.map((f) => {
+                folders.map((f, idx) => {
                   const active = f.id === editing.id;
                   return (
                     <div
                       key={f.id}
-                      className="flex items-center justify-between gap-1 rounded-xl px-2.5 py-2 transition"
+                      draggable={Boolean(onReorderFolders)}
+                      onDragStart={(e) => {
+                        setDragFolderIdx(idx);
+                        e.dataTransfer.effectAllowed = "move";
+                        e.dataTransfer.setData("text/plain", f.id);
+                      }}
+                      onDragOver={(e) => {
+                        if (dragFolderIdx === null) return;
+                        e.preventDefault();
+                        e.dataTransfer.dropEffect = "move";
+                      }}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        if (dragFolderIdx !== null && dragFolderIdx !== idx) {
+                          void handleMoveFolder(dragFolderIdx, idx);
+                        }
+                        setDragFolderIdx(null);
+                      }}
+                      onDragEnd={() => setDragFolderIdx(null)}
+                      className="flex items-center justify-between gap-1 rounded-xl px-2 py-2 transition"
                       style={{
                         background: active ? "var(--bg-active)" : "var(--bg-surface)",
                         color: active ? "var(--text-on-active)" : "var(--text-primary)",
+                        opacity: dragFolderIdx === idx ? 0.55 : 1,
                       }}
                     >
+                      {onReorderFolders && (
+                        <span
+                          className="cursor-grab opacity-55 hover:opacity-100"
+                          title="Kéo thả để đổi thứ tự"
+                        >
+                          <GripVertical className="h-3.5 w-3.5" />
+                        </span>
+                      )}
                       <button
                         type="button"
                         onClick={() => {
-                          setEditing({ ...f });
+                          setEditing({
+                            ...f,
+                            excluded_thread_ids: f.excluded_thread_ids ?? [],
+                          });
                           setErrorMsg(null);
                           setStatusMsg(null);
                         }}
@@ -286,6 +361,28 @@ export function FolderEditorModal({
                           ({f.thread_ids.length})
                         </span>
                       </button>
+                      {onReorderFolders && folders.length > 1 && (
+                        <div className="flex shrink-0 items-center">
+                          <button
+                            type="button"
+                            disabled={idx === 0}
+                            onClick={() => void handleMoveFolder(idx, idx - 1)}
+                            title={t("moveUpTitle")}
+                            className="rounded p-0.5 opacity-65 transition hover:opacity-100 disabled:opacity-25"
+                          >
+                            <ArrowUp className="h-3 w-3" />
+                          </button>
+                          <button
+                            type="button"
+                            disabled={idx === folders.length - 1}
+                            onClick={() => void handleMoveFolder(idx, idx + 1)}
+                            title={t("moveDownTitle")}
+                            className="rounded p-0.5 opacity-65 transition hover:opacity-100 disabled:opacity-25"
+                          >
+                            <ArrowDown className="h-3 w-3" />
+                          </button>
+                        </div>
+                      )}
                       <button
                         type="button"
                         onClick={() => {
@@ -296,7 +393,7 @@ export function FolderEditorModal({
                             }
                           });
                         }}
-                        title="Xóa thư mục"
+                        title={t("deleteFolder")}
                         className="rounded-lg p-1 opacity-70 transition hover:text-rose-400 hover:opacity-100"
                       >
                         <Trash2 className="h-3.5 w-3.5" />
@@ -324,12 +421,12 @@ export function FolderEditorModal({
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-[1fr_auto]">
               <div>
                 <label className="mb-1 block text-xs font-medium" style={{ color: "var(--text-secondary)" }}>
-                  Tên thư mục
+                  {t("folderNameLabel")}
                 </label>
                 <input
                   value={editing.name}
                   onChange={(e) => setEditing((prev) => ({ ...prev, name: e.target.value }))}
-                  placeholder="Ví dụ: Công việc, Khách VIP, Dự án A..."
+                  placeholder={t("folderNamePlaceholder")}
                   className="w-full rounded-xl px-3 py-2 text-[14px] outline-none"
                   style={{
                     background: "var(--bg-surface)",
@@ -339,7 +436,7 @@ export function FolderEditorModal({
               </div>
               <div>
                 <label className="mb-1 block text-xs font-medium" style={{ color: "var(--text-secondary)" }}>
-                  Biểu tượng
+                  {t("folderIconLabel")}
                 </label>
                 <div className="flex flex-wrap gap-1">
                   {FOLDER_ICON_OPTIONS.map((opt) => {
@@ -367,15 +464,15 @@ export function FolderEditorModal({
 
             <div>
               <div className="mb-1.5 text-xs font-medium" style={{ color: "var(--text-secondary)" }}>
-                Quy tắc lọc tự động (tùy chọn)
+                {t("folderAutoRulesLabel")}
               </div>
               <div className="flex flex-wrap gap-2 text-xs">
                 {(
                   [
-                    { label: "Bao gồm chat 1-1", active: editing.include_kinds.includes("direct"), toggle: () => toggleKind("direct") },
-                    { label: "Bao gồm nhóm", active: editing.include_kinds.includes("group"), toggle: () => toggleKind("group") },
-                    { label: "Chỉ tin chưa đọc", active: editing.only_unread, toggle: () => setEditing((p) => ({ ...p, only_unread: !p.only_unread })) },
-                    { label: "Ẩn hội thoại tắt thông báo", active: editing.exclude_muted, toggle: () => setEditing((p) => ({ ...p, exclude_muted: !p.exclude_muted })) },
+                    { label: t("ruleIncludeDirect"), active: editing.include_kinds.includes("direct"), toggle: () => toggleKind("direct") },
+                    { label: t("ruleIncludeGroup"), active: editing.include_kinds.includes("group"), toggle: () => toggleKind("group") },
+                    { label: t("ruleOnlyUnread"), active: editing.only_unread, toggle: () => setEditing((p) => ({ ...p, only_unread: !p.only_unread })) },
+                    { label: t("ruleExcludeMuted"), active: editing.exclude_muted, toggle: () => setEditing((p) => ({ ...p, exclude_muted: !p.exclude_muted })) },
                   ] as const
                 ).map((rule) => (
                   <button
@@ -397,10 +494,38 @@ export function FolderEditorModal({
             </div>
 
             <div className="flex min-h-0 flex-1 flex-col">
-              <div className="mb-1.5 flex items-center justify-between gap-2">
-                <span className="text-xs font-medium" style={{ color: "var(--text-secondary)" }}>
-                  Hội thoại trong thư mục ({editing.thread_ids.length} đã chọn)
-                </span>
+              <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
+                <div
+                  className="flex items-center gap-1 rounded-xl p-0.5"
+                  style={{ background: "var(--bg-surface)" }}
+                >
+                  <button
+                    type="button"
+                    onClick={() => setThreadListTab("include")}
+                    className="rounded-lg px-2.5 py-1 text-xs font-medium transition"
+                    style={{
+                      background: threadListTab === "include" ? "var(--bg-active)" : "transparent",
+                      color:
+                        threadListTab === "include"
+                          ? "var(--text-on-active)"
+                          : "var(--text-secondary)",
+                    }}
+                  >
+                    {t("folderTabInclude", { count: editing.thread_ids.length })}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setThreadListTab("exclude")}
+                    className="rounded-lg px-2.5 py-1 text-xs font-medium transition"
+                    style={{
+                      background:
+                        threadListTab === "exclude" ? "rgba(244,63,94,0.22)" : "transparent",
+                      color: threadListTab === "exclude" ? "#fda4af" : "var(--text-secondary)",
+                    }}
+                  >
+                    {t("folderTabExclude", { count: (editing.excluded_thread_ids ?? []).length })}
+                  </button>
+                </div>
                 <div
                   className="flex w-52 items-center gap-1.5 rounded-lg px-2.5 py-1"
                   style={{ background: "var(--bg-surface)" }}
@@ -409,7 +534,7 @@ export function FolderEditorModal({
                   <input
                     value={threadSearch}
                     onChange={(e) => setThreadSearch(e.target.value)}
-                    placeholder="Lọc hội thoại..."
+                    placeholder={t("filterThreadsPlaceholder")}
                     className="w-full bg-transparent text-xs outline-none"
                   />
                 </div>
@@ -419,34 +544,61 @@ export function FolderEditorModal({
                 className="max-h-56 flex-1 space-y-1 overflow-y-auto rounded-xl p-2"
                 style={{ background: "var(--bg-stage)", border: "1px solid var(--border-subtle)" }}
               >
-                {filteredThreads.map((t) => {
-                  const picked = editing.thread_ids.includes(t.id);
+                {filteredThreads.map((thread) => {
+                  const excluded = (editing.excluded_thread_ids ?? []).includes(thread.id);
+                  const picked =
+                    threadListTab === "include" ? editing.thread_ids.includes(thread.id) : excluded;
                   return (
                     <button
-                      key={t.id}
+                      key={thread.id}
                       type="button"
-                      onClick={() => toggleThreadId(t.id)}
+                      onClick={() =>
+                        threadListTab === "include"
+                          ? toggleThreadId(thread.id)
+                          : toggleExcludedThreadId(thread.id)
+                      }
                       className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left transition"
                       style={{
-                        background: picked ? "var(--accent-soft)" : "transparent",
+                        background: picked
+                          ? threadListTab === "exclude"
+                            ? "rgba(244,63,94,0.16)"
+                            : "var(--accent-soft)"
+                          : "transparent",
                       }}
                     >
                       <span
                         className="flex h-4 w-4 shrink-0 items-center justify-center rounded border"
                         style={{
-                          borderColor: picked ? "var(--accent)" : "var(--border-subtle)",
-                          background: picked ? "var(--accent)" : "transparent",
+                          borderColor: picked
+                            ? threadListTab === "exclude"
+                              ? "#fb7185"
+                              : "var(--accent)"
+                            : "var(--border-subtle)",
+                          background: picked
+                            ? threadListTab === "exclude"
+                              ? "#e11d48"
+                              : "var(--accent)"
+                            : "transparent",
                           color: "var(--text-on-accent)",
                         }}
                       >
-                        {picked && <Check className="h-3 w-3" />}
+                        {picked &&
+                          (threadListTab === "exclude" ? (
+                            <Ban className="h-3 w-3" />
+                          ) : (
+                            <Check className="h-3 w-3" />
+                          ))}
                       </span>
-                      <ThreadAvatar avatar={t.avatar} title={t.title} kind={t.kind} size="sm" />
+                      <ThreadAvatar avatar={thread.avatar} title={thread.title} kind={thread.kind} size="sm" />
                       <div className="min-w-0 flex-1">
-                        <div className="truncate text-[13.5px] font-medium">{t.title}</div>
+                        <div className="truncate text-[13.5px] font-medium">{thread.title}</div>
                       </div>
                       <span className="shrink-0 text-[11px]" style={{ color: "var(--text-secondary)" }}>
-                        {t.kind === "group" ? "Nhóm" : t.kind === "cloud" ? "Cloud" : "1-1"}
+                        {thread.kind === "group"
+                          ? t("threadKindGroupShort")
+                          : thread.kind === "cloud"
+                            ? t("folderCloud")
+                            : t("threadKindDirectShort")}
                       </span>
                     </button>
                   );
@@ -461,7 +613,7 @@ export function FolderEditorModal({
                 className="hover-menu rounded-xl px-4 py-2 text-[13.5px] font-medium"
                 style={{ background: "var(--bg-surface)" }}
               >
-                Đóng
+                {t("close")}
               </button>
               <button
                 type="button"
@@ -470,7 +622,7 @@ export function FolderEditorModal({
                 className="tf-btn flex items-center gap-1.5 rounded-xl px-4 py-2 text-[13.5px] font-semibold disabled:opacity-50"
               >
                 {saving && <Loader2 className="h-4 w-4 animate-spin" />}
-                <span>{isExisting ? "Cập nhật thư mục" : "Lưu thư mục mới"}</span>
+                <span>{isExisting ? t("updateFolderBtn") : t("saveNewFolderBtn")}</span>
               </button>
             </div>
           </div>

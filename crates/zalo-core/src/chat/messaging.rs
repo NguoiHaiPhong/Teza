@@ -9,7 +9,7 @@ use md5::{Digest, Md5};
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
 
-use crate::chat::parser::{clean_group_id, pick_str, sticker_image_url};
+use crate::chat::parser::{clean_group_id, normalize_media_url, pick_str, sticker_image_url};
 use crate::chat::{MessageDto, QuoteRef, ThreadKind};
 use crate::session::{Session, SessionError};
 
@@ -19,6 +19,8 @@ pub struct StickerItem {
     pub cate_id: u64,
     pub sticker_type: u64,
     pub url: String,
+    #[serde(default)]
+    pub category: String,
 }
 
 pub fn default_stickers() -> Vec<StickerItem> {
@@ -29,49 +31,152 @@ pub fn default_stickers() -> Vec<StickerItem> {
                 cate_id: 0,
                 sticker_type: 1,
                 url,
+                category: "Mặc định".into(),
             })
         })
         .collect()
 }
 
-pub async fn list_stickers(session: &Session) -> Result<Vec<StickerItem>> {
-    let mut out = default_stickers();
-    if !session.is_authenticated() {
-        return Ok(out);
-    }
-    let mut seen: std::collections::HashSet<u64> = out.iter().map(|s| s.id).collect();
-    let body = obj(&[("keyword", json!("")), ("imei", json!(session.imei))]);
-    if let Ok(params) = session.encoded_params(&body) {
-        let base = session.domains.sticker.trim_end_matches('/');
-        if !base.is_empty() {
-            let url = format!("{base}/api/message/sticker/suggest?{}&params={params}", session.common_params());
-            if let Ok(raw) = session.get_json(&url).await {
-                let dec = session.maybe_decrypt(raw, session.session_key_bytes());
-                let arr = dec
-                    .get("data")
-                    .and_then(|d| d.get("suggSticker").or(Some(d)))
-                    .and_then(Value::as_array);
-                if let Some(items) = arr {
-                    for it in items {
-                        let id = it.get("stickerId").or_else(|| it.get("id")).and_then(Value::as_u64).unwrap_or(0);
-                        let cate_id = it.get("cateId").and_then(Value::as_u64).unwrap_or(0);
-                        let st_type = it.get("type").and_then(Value::as_u64).unwrap_or(1);
-                        if id > 0 && seen.insert(id) {
-                            if let Some(img_url) = sticker_image_url(id, cate_id) {
-                                out.push(StickerItem {
-                                    id,
-                                    cate_id,
-                                    sticker_type: st_type,
-                                    url: img_url,
-                                });
-                            }
-                        }
+pub fn parse_sticker_response_items(dec: &Value, category: &str) -> Vec<StickerItem> {
+    let data_owned: Option<Value> = match dec.get("data") {
+        Some(Value::String(s)) => serde_json::from_str::<Value>(s.trim()).ok(),
+        Some(v) => Some(v.clone()),
+        None => Some(dec.clone()),
+    };
+    let Some(data_node) = data_owned else {
+        return Vec::new();
+    };
+
+    let mut raw_items: Vec<Value> = Vec::new();
+    if let Some(arr) = data_node.as_array() {
+        raw_items.extend(arr.iter().cloned());
+    } else {
+        for key in ["suggSticker", "stickers", "items", "list"] {
+            if let Some(arr) = data_node.get(key).and_then(Value::as_array) {
+                raw_items.extend(arr.iter().cloned());
+            }
+        }
+        if let Some(cates) = data_node.get("cateList").and_then(Value::as_array) {
+            for cat in cates {
+                for key in ["stickers", "items", "list"] {
+                    if let Some(arr) = cat.get(key).and_then(Value::as_array) {
+                        raw_items.extend(arr.iter().cloned());
                     }
                 }
             }
         }
     }
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for it in raw_items {
+        let id = it
+            .get("stickerId")
+            .or_else(|| it.get("id"))
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .unwrap_or(0);
+        if id == 0 || !seen.insert(id) {
+            continue;
+        }
+        let cate_id = it
+            .get("cateId")
+            .or_else(|| it.get("catId"))
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .unwrap_or(0);
+        let sticker_type = it
+            .get("type")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .unwrap_or(1);
+        let direct_url = pick_str(&it, &["stickerWebpUrl", "stickerUrl", "url"])
+            .map(|u| normalize_media_url(&u))
+            .filter(|u| u.starts_with("https://"));
+        let Some(url) = direct_url.or_else(|| sticker_image_url(id, cate_id)) else {
+            continue;
+        };
+        out.push(StickerItem {
+            id,
+            cate_id,
+            sticker_type,
+            url,
+            category: category.to_string(),
+        });
+    }
+    out
+}
+
+async fn fetch_sticker_suggest(session: &Session, keyword: &str, category: &str) -> Vec<StickerItem> {
+    let base = session.domains.sticker.trim_end_matches('/');
+    if base.is_empty() {
+        return Vec::new();
+    }
+    let body = obj(&[("keyword", json!(keyword)), ("imei", json!(session.imei))]);
+    let Ok(params) = session.encoded_params(&body) else {
+        return Vec::new();
+    };
+    let url = format!(
+        "{base}/api/message/sticker/suggest?{}&params={params}",
+        session.common_params()
+    );
+    let Ok(Ok(raw)) =
+        tokio::time::timeout(std::time::Duration::from_secs(4), session.get_json(&url)).await
+    else {
+        return Vec::new();
+    };
+    let dec = session.maybe_decrypt(raw, session.session_key_bytes());
+    parse_sticker_response_items(&dec, category)
+}
+
+pub async fn list_stickers(session: &Session, recent: Vec<StickerItem>) -> Result<Vec<StickerItem>> {
+    let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for mut s in recent {
+        if s.id > 0 && seen.insert(s.id) {
+            if s.category.is_empty() {
+                s.category = "Gần đây".into();
+            }
+            out.push(s);
+        }
+    }
+
+    if session.is_authenticated() {
+        let keywords = [
+            "", "haha", "hi", "love", "ok", "cry", "thanks", "angry", "happy", "cute", "bye",
+            "good",
+        ];
+        let mut set = tokio::task::JoinSet::new();
+        for kw in keywords {
+            let sess_c = session.clone_shallow();
+            let kw_s = kw.to_string();
+            set.spawn(async move { fetch_sticker_suggest(&sess_c, &kw_s, "Gợi ý").await });
+        }
+        while let Some(res) = set.join_next().await {
+            if let Ok(items) = res {
+                for s in items {
+                    if seen.insert(s.id) {
+                        out.push(s);
+                    }
+                }
+            }
+        }
+    }
+
+    for s in default_stickers() {
+        if seen.insert(s.id) {
+            out.push(s);
+        }
+    }
     Ok(out)
+}
+
+pub async fn search_stickers(session: &Session, keyword: &str) -> Result<Vec<StickerItem>> {
+    let trimmed = keyword.trim();
+    if trimmed.is_empty() {
+        return list_stickers(session, Vec::new()).await;
+    }
+    if !session.is_authenticated() {
+        return Ok(Vec::new());
+    }
+    Ok(fetch_sticker_suggest(session, trimmed, "Tìm kiếm").await)
 }
 
 pub async fn send_sticker(
@@ -1051,5 +1156,33 @@ mod tests {
             assert_eq!(second.len(), 4);
             assert_eq!(third.len(), 2);
         });
+    }
+
+    #[test]
+    fn parse_sticker_response_items_extracts_nested_and_direct_urls() {
+        let resp = json!({
+            "error_code": 0,
+            "data": {
+                "suggSticker": [
+                    { "stickerId": 2101, "cateId": 45, "type": 7, "stickerWebpUrl": "//stk.zdn.vn/2101.webp" }
+                ],
+                "cateList": [
+                    {
+                        "stickers": [
+                            { "id": "2102", "catId": "46", "type": 1 },
+                            { "stickerId": 2101, "cateId": 45 }
+                        ]
+                    }
+                ]
+            }
+        });
+        let parsed = parse_sticker_response_items(&resp, "Gợi ý");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].id, 2101);
+        assert_eq!(parsed[0].cate_id, 45);
+        assert_eq!(parsed[0].url, "https://stk.zdn.vn/2101.webp");
+        assert_eq!(parsed[0].category, "Gợi ý");
+        assert_eq!(parsed[1].id, 2102);
+        assert_eq!(parsed[1].cate_id, 46);
     }
 }

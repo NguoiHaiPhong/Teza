@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ArrowDownToLine, CheckCircle2, RefreshCw, Sparkles, X } from "lucide-react";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { bridge } from "../bridge";
+import { useI18n } from "../i18n";
 import type { AppUpdateInfo } from "../types";
 
 interface Props {
@@ -26,6 +27,7 @@ export function UpdateModal({
   onCheckNow,
   onClose,
 }: Props) {
+  const { t } = useI18n();
   const [installing, setInstalling] = useState(false);
   const [installError, setInstallError] = useState<string | null>(null);
   const [downloadedBytes, setDownloadedBytes] = useState(0);
@@ -45,7 +47,7 @@ export function UpdateModal({
     setInstallError(null);
     setDownloadedBytes(0);
     setTotalBytes(null);
-    setStageText("Đang tải bản cập nhật...");
+    setStageText(t("updateDownloading"));
     let unlisten: UnlistenFn | null = null;
     try {
       unlisten = await listen<{ event: string; total?: number | null; chunk?: number }>(
@@ -54,11 +56,11 @@ export function UpdateModal({
           const p = ev.payload;
           if (p.event === "started") {
             setTotalBytes(p.total ?? null);
-            setStageText("Đang tải gói cài đặt...");
+            setStageText(t("updateDownloadingPkg"));
           } else if (p.event === "progress" && p.chunk) {
             setDownloadedBytes((prev) => prev + (p.chunk ?? 0));
           } else if (p.event === "finished") {
-            setStageText("Đang hoàn tất cài đặt và khởi động lại...");
+            setStageText(t("updateFinishingRestart"));
           }
         },
       );
@@ -92,13 +94,13 @@ export function UpdateModal({
         >
           <div className="flex items-center gap-2">
             <ArrowDownToLine className="h-5 w-5" style={{ color: "var(--accent)" }} />
-            <h3 className="text-[16px] font-semibold">Cập nhật ứng dụng</h3>
+            <h3 className="text-[16px] font-semibold">{t("updateModalTitle")}</h3>
           </div>
           <button
             type="button"
             onClick={onClose}
             className="rounded-lg p-1.5 hover:bg-black/10"
-            title="Đóng"
+            title={t("close")}
           >
             <X className="h-4 w-4" />
           </button>
@@ -109,7 +111,7 @@ export function UpdateModal({
             className="flex items-center justify-between rounded-xl px-4 py-3 text-[13.5px]"
             style={{ background: "var(--bg-surface)" }}
           >
-            <span style={{ color: "var(--text-secondary)" }}>Phiên bản hiện tại</span>
+            <span style={{ color: "var(--text-secondary)" }}>{t("currentVersionLabel")}</span>
             <span className="font-mono font-semibold">v{currentVersion || "0.1.0"}</span>
           </div>
 
@@ -123,7 +125,7 @@ export function UpdateModal({
             >
               <div className="flex items-center gap-2 text-[15px] font-semibold" style={{ color: "var(--accent)" }}>
                 <Sparkles className="h-4 w-4" />
-                <span>Đã có phiên bản mới v{availableUpdate.version}</span>
+                <span>{t("newVersionReady", { version: availableUpdate.version })}</span>
               </div>
               {availableUpdate.body && (
                 <p
@@ -142,10 +144,10 @@ export function UpdateModal({
               <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-400" />
               <span>
                 {checking
-                  ? "Đang kiểm tra phiên bản mới từ GitHub Releases..."
+                  ? t("updateCheckingGithub")
                   : lastCheckedAt
-                    ? "Bạn đang sử dụng phiên bản mới nhất."
-                    : "Nhấn Kiểm tra ngay để tìm bản cập nhật mới."}
+                    ? t("updateUpToDate")
+                    : t("updateClickCheckHint")}
               </span>
             </div>
           )}
@@ -195,7 +197,7 @@ export function UpdateModal({
               }}
             >
               <RefreshCw className={`h-4 w-4 ${checking ? "animate-spin" : ""}`} />
-              <span>Kiểm tra</span>
+              <span>{t("checkBtn")}</span>
             </button>
             {availableUpdate && (
               <button
@@ -205,7 +207,7 @@ export function UpdateModal({
                 className="tf-btn flex items-center gap-1.5 rounded-xl px-4 py-2 text-[14px] font-semibold disabled:opacity-60"
               >
                 <ArrowDownToLine className="h-4 w-4" />
-                <span>{installing ? "Đang cài đặt..." : "Cập nhật & khởi động lại"}</span>
+                <span>{installing ? t("updateInstallingBtn") : t("updateInstallRestartBtn")}</span>
               </button>
             )}
           </div>

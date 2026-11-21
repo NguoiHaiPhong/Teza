@@ -33,6 +33,43 @@ export interface TranslationResult {
 
 export type FolderFilter = "all" | "unread" | "direct" | "group" | "cloud";
 
+export type BuiltInRailFolderId = "unread" | "direct" | "group" | "cloud";
+
+export type RailDisplayMode = "icon-text" | "icon-only" | "text-only";
+
+export interface AddGroupMembersResultDto {
+  added: string[];
+  pending: string[];
+  failed: string[];
+  message: string;
+}
+
+export interface PollOptionDto {
+  id: number;
+  content: string;
+  votes: number;
+  voted: boolean;
+}
+
+export interface PollDto {
+  poll_id: number;
+  question: string;
+  options: PollOptionDto[];
+  allow_multi: boolean;
+  allow_add_option: boolean;
+  is_anonymous: boolean;
+  expired_time: number;
+  closed: boolean;
+}
+
+export interface ReminderPayload {
+  title: string;
+  startTime: number;
+  repeat: number;
+  reminderId: string;
+  scheduleText?: string;
+}
+
 export type ThreadKind = "direct" | "group" | "cloud";
 
 export type ConnectionStatus = "connecting" | "connected" | "reconnecting";
@@ -47,6 +84,40 @@ export interface ThreadDto {
   unread_count: number;
   is_pinned: boolean;
   is_muted: boolean;
+  last_read_in_ts?: number;
+  peer_read_ts?: number;
+  muted_until_ts?: number;
+  is_archived?: boolean;
+}
+
+export type NotifyPosition = "top-left" | "top-right" | "bottom-left" | "bottom-right";
+export type NotifyPreviewMode = "full" | "sender_only" | "hidden";
+export type NotifyBadgeMode = "unread_messages" | "unread_chats";
+
+export interface NotificationPrefs {
+  enabled: boolean;
+  sound: boolean;
+  buzz: boolean;
+  notifyDirect: boolean;
+  notifyGroup: boolean;
+  mentionOverride: boolean;
+  notifyWhenFocused: boolean;
+  previewMode: NotifyPreviewMode;
+  position: NotifyPosition;
+  durationSec: number;
+  badgeMode: NotifyBadgeMode;
+  includeMutedInBadge: boolean;
+  useCustomPopup: boolean;
+}
+
+export interface NotifyToastPayload {
+  thread_id: string;
+  title: string;
+  body: string;
+  avatar: string;
+  theme: string;
+  position: NotifyPosition;
+  duration_ms: number;
 }
 
 export interface ThreadMemberDto {
@@ -71,11 +142,26 @@ export interface ChatFolderDto {
   icon: string;
   color: string;
   thread_ids: string[];
+  excluded_thread_ids: string[];
   include_kinds: ThreadKind[];
   only_unread: boolean;
   exclude_muted: boolean;
   position: number;
   remote_label_id: string | null;
+}
+
+export interface PasscodeConfig {
+  enabled: boolean;
+  salt: string;
+  hash: string;
+  autoLockMinutes: number;
+}
+
+export interface MutualGroupDto {
+  id: string;
+  title: string;
+  avatar: string;
+  total_members: number | null;
 }
 
 export interface UserProfileDto {
@@ -90,6 +176,10 @@ export interface UserProfileDto {
   phone_number: string;
   is_friend: boolean | null;
   is_self: boolean;
+  mutual_groups?: MutualGroupDto[];
+  local_message_count?: number;
+  local_media_count?: number;
+  last_interaction_ts?: number;
 }
 
 export interface QuoteRef {
@@ -135,6 +225,7 @@ export interface StickerItem {
   cate_id: number;
   sticker_type: number;
   url: string;
+  category?: string;
 }
 
 export type RelayMode = "socks5" | "http";

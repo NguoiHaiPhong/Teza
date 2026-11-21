@@ -1,11 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AccountProfile,
+  AddGroupMembersResultDto,
   AppUpdateInfo,
   AttachmentMeta,
   ChatFolderDto,
   FolderFilter,
   MessageDto,
+  NotifyToastPayload,
+  PollDto,
   RelayConfigSummary,
   RelayConfigUpdate,
   RelayTestResult,
@@ -50,6 +53,10 @@ const DEMO_THREADS: ThreadDto[] = [
     unread_count: 0,
     is_pinned: true,
     is_muted: false,
+    last_read_in_ts: 0,
+    peer_read_ts: 0,
+    muted_until_ts: 0,
+    is_archived: false,
   },
   {
     id: "grp-rust-vn",
@@ -61,6 +68,10 @@ const DEMO_THREADS: ThreadDto[] = [
     unread_count: 2,
     is_pinned: true,
     is_muted: false,
+    last_read_in_ts: 0,
+    peer_read_ts: 0,
+    muted_until_ts: 0,
+    is_archived: false,
   },
   {
     id: "dm-minh",
@@ -72,6 +83,10 @@ const DEMO_THREADS: ThreadDto[] = [
     unread_count: 1,
     is_pinned: false,
     is_muted: false,
+    last_read_in_ts: 0,
+    peer_read_ts: 0,
+    muted_until_ts: 0,
+    is_archived: false,
   },
 ];
 
@@ -82,6 +97,7 @@ const DEMO_FOLDERS: ChatFolderDto[] = [
     icon: "briefcase",
     color: "#cfa13a",
     thread_ids: ["grp-rust-vn"],
+    excluded_thread_ids: [],
     include_kinds: [],
     only_unread: false,
     exclude_muted: false,
@@ -175,6 +191,10 @@ export const bridge = {
     if (!isTauri()) return this.listThreads(folder);
     return invoke<ThreadDto[]>("threads_sync", { folder });
   },
+  async setActiveThread(threadId: string | null): Promise<void> {
+    if (!isTauri()) return;
+    return invoke("thread_set_active", { threadId });
+  },
   async markRead(threadId: string): Promise<void> {
     if (!isTauri()) {
       const thread = DEMO_THREADS.find((t) => t.id === threadId);
@@ -199,13 +219,46 @@ export const bridge = {
     }
     return invoke("thread_toggle_pin", { threadId, pinned });
   },
-  async toggleMute(threadId: string, muted: boolean): Promise<void> {
+  async toggleMute(threadId: string, muted: boolean, durationSecs?: number): Promise<number> {
+    const until =
+      muted && durationSecs && durationSecs > 0 ? Date.now() + durationSecs * 1000 : 0;
     if (!isTauri()) {
       const thread = DEMO_THREADS.find((t) => t.id === threadId);
-      if (thread) thread.is_muted = muted;
+      if (thread) {
+        thread.is_muted = muted;
+        thread.muted_until_ts = until;
+      }
+      return until;
+    }
+    return invoke<number>("thread_toggle_mute", {
+      threadId,
+      muted,
+      durationSecs: durationSecs ?? null,
+    });
+  },
+  async toggleArchive(threadId: string, archived: boolean): Promise<void> {
+    if (!isTauri()) {
+      const thread = DEMO_THREADS.find((t) => t.id === threadId);
+      if (thread) thread.is_archived = archived;
       return;
     }
-    return invoke("thread_toggle_mute", { threadId, muted });
+    return invoke("thread_toggle_archive", { threadId, archived });
+  },
+  async showNotifyPopup(payload: NotifyToastPayload): Promise<void> {
+    if (!isTauri()) return;
+    return invoke("notify_show_popup", { payload });
+  },
+  async getCurrentNotifyPopup(): Promise<NotifyToastPayload | null> {
+    if (!isTauri()) return null;
+    return invoke<NotifyToastPayload | null>("notify_get_current");
+  },
+  async dismissNotifyPopup(): Promise<void> {
+    if (!isTauri()) return;
+    return invoke("notify_dismiss");
+  },
+  async clickNotifyPopup(threadId: string): Promise<void> {
+    if (!isTauri()) return;
+    return invoke("notify_click", { threadId });
   },
   async getThreadDetails(threadId: string): Promise<ThreadDetailsDto> {
     if (!isTauri()) {
@@ -242,6 +295,18 @@ export const bridge = {
     }
     return invoke<ChatFolderDto[]>("folder_delete", { folderId });
   },
+  async reorderChatFolders(orderedIds: string[]): Promise<ChatFolderDto[]> {
+    if (!isTauri()) {
+      const posMap = new Map<string, number>();
+      orderedIds.forEach((id, idx) => posMap.set(id, idx + 1));
+      for (const f of DEMO_FOLDERS) {
+        const nextPos = posMap.get(f.id);
+        if (nextPos !== undefined) f.position = nextPos;
+      }
+      return [...DEMO_FOLDERS].sort((a, b) => a.position - b.position);
+    }
+    return invoke<ChatFolderDto[]>("folders_reorder", { orderedIds });
+  },
   async syncRemoteLabelFolders(): Promise<ChatFolderDto[]> {
     if (!isTauri()) return [...DEMO_FOLDERS].sort((a, b) => a.position - b.position);
     return invoke<ChatFolderDto[]>("folders_sync_remote_labels");
@@ -261,6 +326,15 @@ export const bridge = {
         phone_number: "",
         is_friend: t ? true : false,
         is_self: userId === "cloud-me" || userId === "me",
+        mutual_groups: DEMO_THREADS.filter((g) => g.kind === "group").map((g) => ({
+          id: g.id,
+          title: g.title,
+          avatar: g.avatar,
+          total_members: 12,
+        })),
+        local_message_count: (DEMO_MESSAGES[userId] ?? []).length,
+        local_media_count: 0,
+        last_interaction_ts: t?.last_ts ?? 0,
       };
     }
     return invoke<UserProfileDto>("user_get_profile", { userId });
@@ -284,6 +358,10 @@ export const bridge = {
         phone_number: norm,
         is_friend: false,
         is_self: false,
+        mutual_groups: [],
+        local_message_count: 0,
+        local_media_count: 0,
+        last_interaction_ts: 0,
       };
     }
     return invoke<UserProfileDto>("user_find_by_phone", { phone });
@@ -635,10 +713,17 @@ export const bridge = {
           cate_id: 0,
           sticker_type: 1,
           url: `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`,
+          category: "Mặc định",
         };
       });
     }
     return invoke<StickerItem[]>("stickers_list");
+  },
+  async searchStickers(keyword: string): Promise<StickerItem[]> {
+    if (!isTauri()) {
+      return this.listStickers();
+    }
+    return invoke<StickerItem[]>("stickers_search", { keyword });
   },
   async sendSticker(threadId: string, sticker: StickerItem): Promise<MessageDto> {
     if (!isTauri()) {
@@ -716,5 +801,230 @@ export const bridge = {
   async setCloseToTray(enabled: boolean): Promise<void> {
     if (!isTauri()) return;
     return invoke("app_set_close_to_tray", { enabled });
+  },
+  async webappOpen(
+    id: string,
+    url: string,
+    bounds: { x: number; y: number; width: number; height: number },
+  ): Promise<void> {
+    if (!isTauri()) return;
+    return invoke("webapp_open", {
+      id,
+      url,
+      x: bounds.x,
+      y: bounds.y,
+      width: bounds.width,
+      height: bounds.height,
+    });
+  },
+  async webappSetBounds(
+    id: string,
+    bounds: { x: number; y: number; width: number; height: number },
+  ): Promise<void> {
+    if (!isTauri()) return;
+    return invoke("webapp_set_bounds", {
+      id,
+      x: bounds.x,
+      y: bounds.y,
+      width: bounds.width,
+      height: bounds.height,
+    });
+  },
+  async webappHideAll(): Promise<void> {
+    if (!isTauri()) return;
+    return invoke("webapp_hide_all");
+  },
+  async webappClose(id: string): Promise<void> {
+    if (!isTauri()) return;
+    return invoke("webapp_close", { id });
+  },
+  async webappNavigate(
+    id: string,
+    action: "back" | "forward" | "reload" | "home",
+    url?: string,
+  ): Promise<void> {
+    if (!isTauri()) return;
+    return invoke("webapp_navigate", {
+      id,
+      action,
+      url: url ?? null,
+    });
+  },
+  async openExternalUrl(url: string): Promise<void> {
+    if (!isTauri()) {
+      window.open(url, "_blank", "noopener,noreferrer");
+      return;
+    }
+    return invoke("open_external_url", { url });
+  },
+  async addGroupMembers(
+    threadId: string,
+    memberIds: string[],
+  ): Promise<AddGroupMembersResultDto> {
+    if (!isTauri()) {
+      return {
+        added: memberIds,
+        pending: [],
+        failed: [],
+        message: "",
+      };
+    }
+    return invoke<AddGroupMembersResultDto>("group_add_members", {
+      threadId,
+      memberIds,
+    });
+  },
+  async createReminder(
+    threadId: string,
+    title: string,
+    startTimeMs: number,
+    repeat: number,
+  ): Promise<MessageDto> {
+    if (!isTauri()) {
+      const now = Date.now();
+      const meta = JSON.stringify({
+        title: title.trim(),
+        startTime: startTimeMs,
+        repeat,
+        reminderId: `demo-rem-${now}`,
+      });
+      const msg: MessageDto = {
+        msg_id: `demo-rem-${now}`,
+        thread_id: threadId,
+        sender_id: "me",
+        sender_name: "Bạn",
+        text: `Nhắc hẹn: ${title.trim()}`,
+        msg_type: "chat.reminder",
+        ts: now,
+        is_outgoing: true,
+        is_recalled: false,
+        is_pinned: false,
+        quote: null,
+        reactions: [],
+        attachment_url: null,
+        attachment_name: `teza-reminder:${meta}`,
+      };
+      DEMO_MESSAGES[threadId] = [...(DEMO_MESSAGES[threadId] ?? []), msg];
+      touchDemoThread(threadId, msg.text, msg.ts);
+      return msg;
+    }
+    return invoke<MessageDto>("reminder_create", {
+      threadId,
+      title,
+      startTimeMs,
+      repeat,
+    });
+  },
+  async createPoll(
+    threadId: string,
+    question: string,
+    options: string[],
+    expiredTimeMs: number,
+    allowMulti: boolean,
+    allowAddOption: boolean,
+    isAnonymous: boolean,
+  ): Promise<MessageDto> {
+    if (!isTauri()) {
+      const now = Date.now();
+      const dto: PollDto = {
+        poll_id: now,
+        question: question.trim(),
+        options: options
+          .map((o) => o.trim())
+          .filter(Boolean)
+          .map((content, idx) => ({
+            id: idx + 1,
+            content,
+            votes: 0,
+            voted: false,
+          })),
+        allow_multi: allowMulti,
+        allow_add_option: allowAddOption,
+        is_anonymous: isAnonymous,
+        expired_time: expiredTimeMs,
+        closed: false,
+      };
+      const msg: MessageDto = {
+        msg_id: `demo-poll-${now}`,
+        thread_id: threadId,
+        sender_id: "me",
+        sender_name: "Bạn",
+        text: `Bình chọn: ${dto.question}`,
+        msg_type: "chat.poll",
+        ts: now,
+        is_outgoing: true,
+        is_recalled: false,
+        is_pinned: false,
+        quote: null,
+        reactions: [],
+        attachment_url: null,
+        attachment_name: `teza-poll:${JSON.stringify(dto)}`,
+      };
+      DEMO_MESSAGES[threadId] = [...(DEMO_MESSAGES[threadId] ?? []), msg];
+      touchDemoThread(threadId, msg.text, msg.ts);
+      return msg;
+    }
+    return invoke<MessageDto>("poll_create", {
+      threadId,
+      question,
+      options,
+      expiredTimeMs,
+      allowMulti,
+      allowAddOption,
+      isAnonymous,
+    });
+  },
+  async getPollDetail(
+    pollId: number,
+    threadId?: string,
+    msgId?: string,
+  ): Promise<PollDto> {
+    if (!isTauri()) {
+      const list = threadId ? DEMO_MESSAGES[threadId] ?? [] : [];
+      const found = list.find((m) => m.msg_id === msgId);
+      const raw = found?.attachment_name?.replace(/^teza-poll:/, "");
+      if (raw) return JSON.parse(raw) as PollDto;
+      throw new Error("Không tìm thấy bình chọn");
+    }
+    return invoke<PollDto>("poll_get_detail", {
+      pollId,
+      threadId: threadId ?? null,
+      msgId: msgId ?? null,
+    });
+  },
+  async votePoll(
+    pollId: number,
+    optionIds: number[],
+    threadId?: string,
+    msgId?: string,
+  ): Promise<PollDto> {
+    if (!isTauri()) {
+      const list = threadId ? DEMO_MESSAGES[threadId] ?? [] : [];
+      const found = list.find((m) => m.msg_id === msgId);
+      const raw = found?.attachment_name?.replace(/^teza-poll:/, "");
+      if (!found || !raw) throw new Error("Không tìm thấy bình chọn");
+      const poll = JSON.parse(raw) as PollDto;
+      const picked = new Set(optionIds);
+      const next: PollDto = {
+        ...poll,
+        options: poll.options.map((opt) => {
+          const willVote = picked.has(opt.id);
+          const delta = (willVote ? 1 : 0) - (opt.voted ? 1 : 0);
+          return {
+            ...opt,
+            voted: willVote,
+            votes: Math.max(0, opt.votes + delta),
+          };
+        }),
+      };
+      found.attachment_name = `teza-poll:${JSON.stringify(next)}`;
+      return next;
+    }
+    return invoke<PollDto>("poll_vote", {
+      pollId,
+      optionIds,
+      threadId: threadId ?? null,
+      msgId: msgId ?? null,
+    });
   },
 };

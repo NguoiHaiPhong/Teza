@@ -35,6 +35,14 @@ pub struct ThreadDto {
     pub unread_count: u32,
     pub is_pinned: bool,
     pub is_muted: bool,
+    #[serde(default)]
+    pub last_read_in_ts: i64,
+    #[serde(default)]
+    pub peer_read_ts: i64,
+    #[serde(default)]
+    pub muted_until_ts: i64,
+    #[serde(default)]
+    pub is_archived: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +79,8 @@ pub struct ChatFolderDto {
     #[serde(default)]
     pub thread_ids: Vec<String>,
     #[serde(default)]
+    pub excluded_thread_ids: Vec<String>,
+    #[serde(default)]
     pub include_kinds: Vec<ThreadKind>,
     #[serde(default)]
     pub only_unread: bool,
@@ -80,6 +90,14 @@ pub struct ChatFolderDto {
     pub position: i64,
     #[serde(default)]
     pub remote_label_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MutualGroupDto {
+    pub id: String,
+    pub title: String,
+    pub avatar: String,
+    pub total_members: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +113,14 @@ pub struct UserProfileDto {
     pub phone_number: String,
     pub is_friend: Option<bool>,
     pub is_self: bool,
+    #[serde(default)]
+    pub mutual_groups: Vec<MutualGroupDto>,
+    #[serde(default)]
+    pub local_message_count: u64,
+    #[serde(default)]
+    pub local_media_count: u64,
+    #[serde(default)]
+    pub last_interaction_ts: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +128,46 @@ pub struct ReactionSummary {
     pub emoji: String,
     pub count: u32,
     pub me: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AddGroupMembersResultDto {
+    #[serde(default)]
+    pub added: Vec<String>,
+    #[serde(default)]
+    pub pending: Vec<String>,
+    #[serde(default)]
+    pub failed: Vec<String>,
+    #[serde(default)]
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PollOptionDto {
+    pub id: i64,
+    pub content: String,
+    #[serde(default)]
+    pub votes: u32,
+    #[serde(default)]
+    pub voted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PollDto {
+    pub poll_id: i64,
+    pub question: String,
+    #[serde(default)]
+    pub options: Vec<PollOptionDto>,
+    #[serde(default)]
+    pub allow_multi: bool,
+    #[serde(default)]
+    pub allow_add_option: bool,
+    #[serde(default)]
+    pub is_anonymous: bool,
+    #[serde(default)]
+    pub expired_time: i64,
+    #[serde(default)]
+    pub closed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

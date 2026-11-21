@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Check, KeyRound, Languages, Loader2, X } from "lucide-react";
 import { bridge } from "../bridge";
+import { useI18n } from "../i18n";
 import type {
   TranslateConfigSummary,
   TranslateConfigUpdate,
@@ -9,15 +10,15 @@ import type {
 
 export const TRANSLATE_LANG_OPTIONS = [
   { code: "VI", label: "Tiếng Việt (VI)" },
-  { code: "EN", label: "Tiếng Anh (EN)" },
-  { code: "JA", label: "Tiếng Nhật (JA)" },
-  { code: "KO", label: "Tiếng Hàn (KO)" },
-  { code: "ZH", label: "Tiếng Trung (ZH)" },
-  { code: "FR", label: "Tiếng Pháp (FR)" },
-  { code: "DE", label: "Tiếng Đức (DE)" },
-  { code: "RU", label: "Tiếng Nga (RU)" },
-  { code: "TH", label: "Tiếng Thái (TH)" },
-  { code: "ID", label: "Tiếng Indonesia (ID)" },
+  { code: "EN", label: "English (EN)" },
+  { code: "JA", label: "日本語 (JA)" },
+  { code: "KO", label: "한국어 (KO)" },
+  { code: "ZH", label: "中文 (ZH)" },
+  { code: "FR", label: "Français (FR)" },
+  { code: "DE", label: "Deutsch (DE)" },
+  { code: "RU", label: "Русский (RU)" },
+  { code: "TH", label: "ภาษาไทย (TH)" },
+  { code: "ID", label: "Bahasa Indonesia (ID)" },
 ];
 
 interface Props {
@@ -33,6 +34,7 @@ export function TranslateSettingsModal({
   onClose,
   onSaved,
 }: Props) {
+  const { t } = useI18n();
   const [provider, setProvider] = useState<TranslateProvider>("deepl");
   const [targetLang, setTargetLang] = useState("VI");
   const [deeplKey, setDeeplKey] = useState("");
@@ -109,14 +111,14 @@ export function TranslateSettingsModal({
           <div className="flex items-center gap-2.5">
             <Languages className="h-5 w-5" style={{ color: "var(--accent)" }} />
             <h3 className="text-[16px] font-semibold">
-              Cài đặt dịch thuật tin nhắn
+              {t("translateModalTitle")}
             </h3>
           </div>
           <button
             type="button"
             onClick={onClose}
             className="rounded-lg p-1.5 hover:bg-black/10"
-            title="Đóng"
+            title={t("close")}
           >
             <X className="h-4 w-4" />
           </button>
@@ -128,7 +130,7 @@ export function TranslateSettingsModal({
               className="mb-1.5 block text-[13px] font-medium"
               style={{ color: "var(--text-secondary)" }}
             >
-              Nhà cung cấp API dịch
+              {t("translateProviderLabel")}
             </label>
             <div className="grid grid-cols-3 gap-2">
               {(
@@ -158,7 +160,7 @@ export function TranslateSettingsModal({
                         style={{
                           background: active ? "#bbf7d0" : "#22c55e",
                         }}
-                        title="Đã cấu hình khóa API"
+                        title={t("translateApiConfiguredTitle")}
                       />
                     )}
                   </button>
@@ -172,7 +174,7 @@ export function TranslateSettingsModal({
               className="mb-1.5 block text-[13px] font-medium"
               style={{ color: "var(--text-secondary)" }}
             >
-              Ngôn ngữ đích mặc định
+              {t("translateDefaultLangLabel")}
             </label>
             <select
               value={targetLang}
@@ -207,8 +209,8 @@ export function TranslateSettingsModal({
                 </span>
                 <span style={{ color: "var(--text-secondary)" }}>
                   {config?.has_deepl_key
-                    ? `Đã lưu (${config.deepl_preview})`
-                    : "Chưa có key"}
+                    ? t("keySavedPreview", { preview: config.deepl_preview || "" })
+                    : t("keyMissing")}
                 </span>
               </div>
               <input
@@ -217,8 +219,8 @@ export function TranslateSettingsModal({
                 onChange={(e) => setDeeplKey(e.target.value)}
                 placeholder={
                   config?.has_deepl_key
-                    ? "Để trống để giữ nguyên key hiện tại..."
-                    : "Nhập DeepL key (hỗ trợ cả :fx Free & Pro)"
+                    ? t("keepExistingKeyPlaceholder")
+                    : t("deeplKeyPlaceholder")
                 }
                 className="w-full rounded-lg px-3 py-2 text-[14px] outline-none"
                 style={{
@@ -228,8 +230,7 @@ export function TranslateSettingsModal({
                 }}
               />
               <p className="text-xs" style={{ color: "var(--text-secondary)" }}>
-                Key được mã hóa Windows DPAPI tại AppData. Key kết thúc bằng{" "}
-                <code>:fx</code> tự động dùng endpoint DeepL Free.
+                {t("deeplKeyHint")}
               </p>
             </div>
           )}
@@ -249,8 +250,8 @@ export function TranslateSettingsModal({
                 </span>
                 <span style={{ color: "var(--text-secondary)" }}>
                   {config?.has_gemini_key
-                    ? `Đã lưu (${config.gemini_preview})`
-                    : "Chưa có key"}
+                    ? t("keySavedPreview", { preview: config.gemini_preview || "" })
+                    : t("keyMissing")}
                 </span>
               </div>
               <input
@@ -259,8 +260,8 @@ export function TranslateSettingsModal({
                 onChange={(e) => setGeminiKey(e.target.value)}
                 placeholder={
                   config?.has_gemini_key
-                    ? "Để trống để giữ nguyên key hiện tại..."
-                    : "Nhập Google AI Studio API Key"
+                    ? t("keepExistingKeyPlaceholder")
+                    : t("geminiKeyPlaceholder")
                 }
                 className="w-full rounded-lg px-3 py-2 text-[14px] outline-none"
                 style={{
@@ -274,7 +275,7 @@ export function TranslateSettingsModal({
                   className="mb-1 block text-xs"
                   style={{ color: "var(--text-secondary)" }}
                 >
-                  Model Gemini
+                  {t("geminiModelLabel")}
                 </label>
                 <input
                   type="text"
@@ -307,8 +308,8 @@ export function TranslateSettingsModal({
                 </span>
                 <span style={{ color: "var(--text-secondary)" }}>
                   {config?.has_azure_key
-                    ? `Đã lưu (${config.azure_preview})`
-                    : "Chưa có key"}
+                    ? t("keySavedPreview", { preview: config.azure_preview || "" })
+                    : t("keyMissing")}
                 </span>
               </div>
               <input
@@ -317,8 +318,8 @@ export function TranslateSettingsModal({
                 onChange={(e) => setAzureKey(e.target.value)}
                 placeholder={
                   config?.has_azure_key
-                    ? "Để trống để giữ nguyên key hiện tại..."
-                    : "Nhập Azure Cognitive Services Translator Key"
+                    ? t("keepExistingKeyPlaceholder")
+                    : t("azureKeyPlaceholder")
                 }
                 className="w-full rounded-lg px-3 py-2 text-[14px] outline-none"
                 style={{
@@ -332,7 +333,7 @@ export function TranslateSettingsModal({
                   className="mb-1 block text-xs"
                   style={{ color: "var(--text-secondary)" }}
                 >
-                  Azure Region
+                  {t("azureRegionLabel")}
                 </label>
                 <input
                   type="text"
@@ -371,7 +372,7 @@ export function TranslateSettingsModal({
               }}
             >
               <Check className="h-4 w-4" />
-              Đã lưu cấu hình dịch thuật an toàn.
+              {t("translateSavedNotice")}
             </div>
           )}
 
@@ -385,7 +386,7 @@ export function TranslateSettingsModal({
                 border: "1px solid var(--border)",
               }}
             >
-              Đóng
+              {t("close")}
             </button>
             <button
               type="submit"
@@ -394,7 +395,7 @@ export function TranslateSettingsModal({
               style={{ background: "var(--accent)" }}
             >
               {saving && <Loader2 className="h-4 w-4 animate-spin" />}
-              Lưu cài đặt
+              {t("saveSettingsBtn")}
             </button>
           </div>
         </form>

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Forward, Search, X } from "lucide-react";
+import { useI18n } from "../i18n";
 import type { MessageDto, ThreadDto } from "../types";
 import { ThreadAvatar } from "./ThreadAvatar";
 
@@ -11,6 +12,7 @@ interface Props {
 }
 
 export function ForwardModal({ messages, threads, onClose, onForwardTo }: Props) {
+  const { t } = useI18n();
   const [query, setQuery] = useState("");
   const [sendingId, setSendingId] = useState<string | null>(null);
 
@@ -58,8 +60,8 @@ export function ForwardModal({ messages, threads, onClose, onForwardTo }: Props)
             <Forward className="h-4 w-4" style={{ color: "var(--accent)" }} />
             <span>
               {messages.length > 1
-                ? `Chuyển tiếp ${messages.length} tin nhắn`
-                : "Chuyển tiếp tin nhắn"}
+                ? t("forwardManyTitle", { count: messages.length })
+                : t("forwardOneTitle")}
             </span>
           </div>
           <button type="button" onClick={onClose} className="hover-menu rounded-lg p-1">
@@ -73,7 +75,9 @@ export function ForwardModal({ messages, threads, onClose, onForwardTo }: Props)
             style={{ background: "var(--quote-bg)", color: "var(--text-secondary)" }}
           >
             <span className="font-semibold" style={{ color: "var(--text-primary)" }}>
-              {messages.length > 1 ? `Đã chọn ${messages.length} tin:` : "Nội dung:"}{" "}
+              {messages.length > 1
+                ? t("forwardSelectedPrefix", { count: messages.length })
+                : t("forwardContentPrefix")}{" "}
             </span>
             <span className="line-clamp-2">{first.text || first.attachment_name}</span>
           </div>
@@ -87,7 +91,7 @@ export function ForwardModal({ messages, threads, onClose, onForwardTo }: Props)
               autoFocus
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Tìm cuộc hội thoại đích..."
+              placeholder={t("forwardDestPlaceholder")}
               className="w-full bg-transparent text-[15px] outline-none"
             />
           </div>
@@ -96,17 +100,17 @@ export function ForwardModal({ messages, threads, onClose, onForwardTo }: Props)
         <div className="mt-2 flex-1 overflow-y-auto px-2 pb-3">
           {filtered.length === 0 ? (
             <div className="py-8 text-center text-[13px]" style={{ color: "var(--text-secondary)" }}>
-              Không tìm thấy hội thoại phù hợp
+              {t("emptySearch")}
             </div>
           ) : (
-            filtered.map((t) => (
+            filtered.map((tItem) => (
               <button
-                key={t.id}
+                key={tItem.id}
                 type="button"
-                disabled={sendingId === t.id}
+                disabled={sendingId === tItem.id}
                 onClick={() => {
-                  setSendingId(t.id);
-                  void onForwardTo(t.id, messages).finally(() => {
+                  setSendingId(tItem.id);
+                  void onForwardTo(tItem.id, messages).finally(() => {
                     setSendingId(null);
                     onClose();
                   });
@@ -114,16 +118,20 @@ export function ForwardModal({ messages, threads, onClose, onForwardTo }: Props)
                 className="hover-surface flex w-full items-center justify-between gap-3 rounded-xl px-3 py-2 text-left transition disabled:opacity-60"
               >
                 <div className="flex min-w-0 items-center gap-2.5">
-                  <ThreadAvatar avatar={t.avatar} title={t.title} kind={t.kind} size="sm" />
+                  <ThreadAvatar avatar={tItem.avatar} title={tItem.title} kind={tItem.kind} size="sm" />
                   <div className="min-w-0">
-                    <div className="truncate text-[15px] font-medium">{t.title}</div>
+                    <div className="truncate text-[15px] font-medium">{tItem.title}</div>
                     <div className="text-xs" style={{ color: "var(--text-secondary)" }}>
-                      {t.kind === "group" ? "Nhóm" : t.kind === "cloud" ? "Cloud" : "1-1"}
+                      {tItem.kind === "group"
+                        ? t("threadKindGroupShort")
+                        : tItem.kind === "cloud"
+                          ? t("folderCloud")
+                          : t("threadKindDirectShort")}
                     </div>
                   </div>
                 </div>
                 <span className="tf-btn shrink-0 rounded-lg px-2.5 py-1 text-[13px] font-semibold">
-                  {sendingId === t.id ? "Đang gửi..." : "Gửi"}
+                  {sendingId === tItem.id ? t("sendingStatus") : t("sendBtn")}
                 </span>
               </button>
             ))

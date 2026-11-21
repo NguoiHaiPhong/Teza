@@ -11,6 +11,7 @@ import {
   ZoomOut,
 } from "lucide-react";
 import { bridge } from "../bridge";
+import { useI18n } from "../i18n";
 import { copyImageReliable } from "../utils/clipboard";
 import { RelayImage } from "./RelayImage";
 
@@ -34,6 +35,7 @@ export function MediaLightbox({
   onClose,
   onNotify,
 }: Props) {
+  const { t } = useI18n();
   const [zoom, setZoom] = useState(1);
   const [rotation, setRotation] = useState(0);
   const [copied, setCopied] = useState(false);
@@ -120,7 +122,7 @@ export function MediaLightbox({
           <button
             type="button"
             onClick={() => setZoom((z) => Math.max(0.5, +(z - 0.25).toFixed(2)))}
-            title="Thu nhỏ (-)"
+            title={t("zoomOutTitle")}
             className="rounded-lg p-2 hover:bg-white/10"
           >
             <ZoomOut className="h-5 w-5" />
@@ -131,7 +133,7 @@ export function MediaLightbox({
           <button
             type="button"
             onClick={() => setZoom((z) => Math.min(3, +(z + 0.25).toFixed(2)))}
-            title="Phóng to (+)"
+            title={t("zoomInTitle")}
             className="rounded-lg p-2 hover:bg-white/10"
           >
             <ZoomIn className="h-5 w-5" />
@@ -139,7 +141,7 @@ export function MediaLightbox({
           <button
             type="button"
             onClick={() => setRotation((r) => (r + 90) % 360)}
-            title="Xoay 90°"
+            title={t("rotateTitle")}
             className="rounded-lg p-2 hover:bg-white/10"
           >
             <RotateCw className="h-5 w-5" />
@@ -149,7 +151,7 @@ export function MediaLightbox({
               <button
                 type="button"
                 onClick={() => void handleCopyImage()}
-                title="Sao chép hình ảnh vào clipboard"
+                title={t("copyImageClipboardTitle")}
                 className="rounded-lg p-2 hover:bg-white/10"
               >
                 {copied ? (
@@ -162,14 +164,14 @@ export function MediaLightbox({
                 type="button"
                 disabled={saving}
                 onClick={() => void handleSaveAs()}
-                title="Lưu ảnh về máy..."
+                title={t("saveImageLocalTitle")}
                 className="rounded-lg p-2 hover:bg-white/10 disabled:opacity-50"
               >
                 <Download className="h-5 w-5" />
               </button>
             </>
           )}
-          <button onClick={onClose} title="Đóng (Esc)" className="rounded-lg p-2 hover:bg-white/10">
+          <button onClick={onClose} title={t("close")} className="rounded-lg p-2 hover:bg-white/10">
             <X className="h-5 w-5" />
           </button>
         </div>
@@ -193,7 +195,7 @@ export function MediaLightbox({
               e.stopPropagation();
               goPrev();
             }}
-            title="Ảnh trước (←)"
+            title={t("prevPhotoTitle")}
             className="absolute left-4 z-10 rounded-full bg-black/55 p-3 text-white transition hover:bg-black/80"
           >
             <ChevronLeft className="h-6 w-6" />
@@ -223,7 +225,7 @@ export function MediaLightbox({
               e.stopPropagation();
               goNext();
             }}
-            title="Ảnh tiếp theo (→)"
+            title={t("nextPhotoTitle")}
             className="absolute right-4 z-10 rounded-full bg-black/55 p-3 text-white transition hover:bg-black/80"
           >
             <ChevronRight className="h-6 w-6" />
