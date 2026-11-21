@@ -14,7 +14,7 @@
 
 ## Giới thiệu sản phẩm
 
-**Teza** là ứng dụng nhắn tin desktop mã nguồn mở dành cho Windows, được xây dựng với lõi **Rust** hiệu năng cao kết hợp giao diện **Tauri v2 + React + TypeScript + Tailwind CSS**.
+**Teza** là ứng dụng nhắn tin desktop mã nguồn mở (**unofficial client**) dành cho Windows, kết nối tới tài khoản **Zalo** thông qua giao thức Zalo Web trên nền tảng lõi **Rust (`zalo-core`)** kết hợp giao diện **Tauri v2 + React + TypeScript + Tailwind CSS**.
 
 Thay vì phụ thuộc vào trình duyệt nặng nề, Teza tối ưu tốc độ phản hồi khi soạn thảo và chuyển hội thoại, mã hóa cục bộ dữ liệu nhạy cảm bằng **Windows DPAPI**, lưu trữ lịch sử trò chuyện bằng **SQLite FTS5** (hỗ trợ tìm kiếm không dấu), đồng thời bổ sung nhiều tiện ích làm việc chuyên sâu như thư mục phân loại hội thoại, thông báo nổi 4 góc màn hình, dịch tự động đa nhà cung cấp, nhắc hẹn, bình chọn và **Web App nhúng**.
 
@@ -72,9 +72,10 @@ Mở **Menu chính (`☰`) → Kiểm tra cập nhật**, hoặc vào **Cài đ�
 
 ## Hướng dẫn sử dụng
 
-### 1. Đăng nhập lần đầu
-- Mở **Teza**, ứng dụng hiển thị màn hình đăng nhập bằng **mã QR**.
-- Dùng ứng dụng di động tương ứng quét mã QR trên màn hình để xác thực phiên.
+### 1. Đăng nhập lần đầu (Quét mã QR trên Zalo)
+- Mở **Teza**, ứng dụng sẽ hiển thị màn hình đăng nhập bằng **mã QR**.
+- Trên điện thoại, mở ứng dụng **Zalo** → bấm biểu tượng **Quét mã QR** (ở góc trên bên phải) → đưa camera quét mã QR trên màn hình **Teza** → bấm **Đăng nhập** trên điện thoại để xác nhận.
+- Teza **không** yêu cầu nhập mật khẩu tài khoản Zalo; khóa phiên đăng nhập chỉ được lưu cục bộ trên máy của bạn và mã hóa bằng **Windows DPAPI**.
 - Nếu máy tính đang ở trong mạng doanh nghiệp/nội bộ cần đi qua proxy, bấm nút **Mạng Relay** ngay trên màn hình QR để cấu hình trước khi đăng nhập.
 
 ### 2. Bố cục 3 cột & Menu chính (`☰`)
@@ -177,7 +178,16 @@ pnpm tauri build
 
 ---
 
-## Tuyên bố độc lập & Giấy phép
+## Ghi nhận nguồn gốc, Miễn trừ trách nhiệm & Giấy phép
 
-- **Teza** là phần mềm mã nguồn mở độc lập, không liên kết, tài trợ hay đại diện cho bất kỳ nền tảng bên thứ ba nào. Xem chi tiết tại [Pháp lý & Bảo mật](docs/LEGAL_AND_SECURITY.md).
+### Ghi nhận tham khảo (Acknowledgments)
+- Lõi giao thức `zalo-core` được viết mới bằng Rust dựa trên quá trình nghiên cứu giao thức Zalo Web của cộng đồng mã nguồn mở (bao gồm cả các bài học kỹ thuật được ghi nhận từ dự án `ctdozlite`, xem chi tiết trong [Kiến trúc hệ thống](docs/ARCHITECTURE.md) và [Pháp lý & Bảo mật](docs/LEGAL_AND_SECURITY.md)).
+- Dự án **không** sao chép mã nguồn GPLv3 và **không** phân phối tài sản độc quyền hay gói web/binary của bên thứ ba.
+
+### Miễn trừ trách nhiệm (Disclaimer)
+- **Teza** là phần mềm **bên thứ ba không chính thức (unofficial client)**, hoàn toàn độc lập và **không** liên kết, tài trợ, xác nhận hay đại diện cho **Zalo / Công ty Cổ phần VNG**.
+- Tên gọi và thương hiệu **"Zalo"** thuộc quyền sở hữu của chủ sở hữu hợp pháp tương ứng.
+- Người dùng tự chịu trách nhiệm khi sử dụng client bên thứ ba theo Điều khoản dịch vụ (ToS) của nền tảng.
+
+### Giấy phép
 - Phân phối theo giấy phép kép **`MIT OR Apache-2.0`**.
