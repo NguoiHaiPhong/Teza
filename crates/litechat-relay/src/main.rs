@@ -3,22 +3,29 @@
 //! Designed to run on a Windows 10/11 or Linux bridge machine (`10.7.12.233`) so internal
 //! workstations without Internet access can run `litechat` through a single authenticated port.
 
-use std::net::{IpAddr, SocketAddr};
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::{RwLock, Semaphore};
 
 const DEFAULT_LISTEN: &str = "0.0.0.0:1088";
 const MAX_CONCURRENT_CONNS: usize = 512;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+const SYSTEM_DNS_TIMEOUT: Duration = Duration::from_secs(20);
+const UDP_DNS_TIMEOUT: Duration = Duration::from_secs(3);
+const DNS_CACHE_MAX_ENTRIES: usize = 1024;
+const DNS_TTL_MIN_SECS: u32 = 30;
+const DNS_TTL_MAX_SECS: u32 = 300;
 
 const DEFAULT_ALLOWED_SUFFIXES: &[&str] = &[
     "zalo.me",
@@ -43,6 +50,7 @@ pub struct RelayServerConfig {
     pub allow_all: bool,
     pub extra_allowed_hosts: Vec<String>,
     pub allow_private_targets: bool,
+    pub dns_servers: Vec<String>,
     pub verbose: bool,
 }
 
@@ -55,6 +63,7 @@ impl Default for RelayServerConfig {
             allow_all: false,
             extra_allowed_hosts: Vec::new(),
             allow_private_targets: false,
+            dns_servers: Vec::new(),
             verbose: false,
         }
     }
@@ -139,31 +148,289 @@ fn is_allowed_target(host: &str, port: u16, cfg: &RelayServerConfig) -> bool {
         .any(|s| host_matches_suffix(host, s))
 }
 
+type DnsCacheMap = HashMap<String, (Instant, Vec<IpAddr>)>;
+static DNS_CACHE: OnceLock<RwLock<DnsCacheMap>> = OnceLock::new();
+static DNS_TXID: AtomicU16 = AtomicU16::new(1);
+
+fn dns_cache() -> &'static RwLock<DnsCacheMap> {
+    DNS_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn normalize_dns_server(raw: &str) -> Option<SocketAddr> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(sock) = trimmed.parse::<SocketAddr>() {
+        return Some(sock);
+    }
+    let bare = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    bare.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, 53))
+}
+
+fn parse_dns_server_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn build_dns_query(host: &str, qtype: u16, txid: u16) -> Result<Vec<u8>> {
+    let clean = host.trim().trim_end_matches('.');
+    if clean.is_empty() || clean.len() > 253 {
+        bail!("Tên miền DNS không hợp lệ: {host}");
+    }
+    let mut pkt = Vec::with_capacity(32 + clean.len());
+    pkt.extend_from_slice(&txid.to_be_bytes());
+    pkt.extend_from_slice(&0x0100u16.to_be_bytes()); // standard recursive query (RD=1)
+    pkt.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT = 1
+    pkt.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT = 0
+    pkt.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT = 0
+    pkt.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT = 0
+
+    for label in clean.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            bail!("Nhãn tên miền DNS không hợp lệ: {host}");
+        }
+        pkt.push(label.len() as u8);
+        pkt.extend_from_slice(label.as_bytes());
+    }
+    pkt.push(0);
+    pkt.extend_from_slice(&qtype.to_be_bytes());
+    pkt.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
+    Ok(pkt)
+}
+
+fn skip_dns_name(pkt: &[u8], start: usize) -> Result<usize> {
+    let mut pos = start;
+    for _ in 0..128 {
+        let len_byte = *pkt
+            .get(pos)
+            .context("Gói tin DNS bị cắt cụt khi đọc tên miền")?;
+        if len_byte == 0 {
+            return Ok(pos + 1);
+        }
+        if (len_byte & 0xC0) == 0xC0 {
+            if pos + 1 >= pkt.len() {
+                bail!("Con trỏ nén DNS bị cắt cụt");
+            }
+            return Ok(pos + 2);
+        }
+        if (len_byte & 0xC0) != 0 {
+            bail!("Cờ nhãn DNS không hợp lệ");
+        }
+        let next = pos + 1 + len_byte as usize;
+        if next > pkt.len() {
+            bail!("Nhãn tên miền DNS vượt quá kích thước gói");
+        }
+        pos = next;
+    }
+    bail!("Tên miền DNS vượt quá giới hạn nhãn");
+}
+
+fn parse_dns_response(pkt: &[u8], expected_txid: u16) -> Result<(Vec<IpAddr>, u32)> {
+    if pkt.len() < 12 {
+        bail!("Gói tin phản hồi DNS quá ngắn");
+    }
+    let txid = u16::from_be_bytes([pkt[0], pkt[1]]);
+    if txid != expected_txid {
+        bail!("Mã giao dịch DNS không khớp");
+    }
+    let flags = u16::from_be_bytes([pkt[2], pkt[3]]);
+    if (flags & 0x8000) == 0 {
+        bail!("Gói tin DNS không phải phản hồi");
+    }
+    let rcode = flags & 0x000F;
+    if rcode != 0 {
+        bail!("Máy chủ DNS trả mã lỗi RCODE={rcode}");
+    }
+
+    let qdcount = u16::from_be_bytes([pkt[4], pkt[5]]);
+    let ancount = u16::from_be_bytes([pkt[6], pkt[7]]);
+    let mut pos = 12usize;
+
+    for _ in 0..qdcount {
+        pos = skip_dns_name(pkt, pos)?;
+        if pos + 4 > pkt.len() {
+            bail!("Phần Question DNS bị cắt cụt");
+        }
+        pos += 4;
+    }
+
+    let mut ips = Vec::new();
+    let mut min_ttl: Option<u32> = None;
+
+    for _ in 0..ancount {
+        pos = skip_dns_name(pkt, pos)?;
+        if pos + 10 > pkt.len() {
+            bail!("Phần Answer header DNS bị cắt cụt");
+        }
+        let rtype = u16::from_be_bytes([pkt[pos], pkt[pos + 1]]);
+        let rclass = u16::from_be_bytes([pkt[pos + 2], pkt[pos + 3]]);
+        let ttl = u32::from_be_bytes([pkt[pos + 4], pkt[pos + 5], pkt[pos + 6], pkt[pos + 7]]);
+        let rdlen = u16::from_be_bytes([pkt[pos + 8], pkt[pos + 9]]) as usize;
+        pos += 10;
+        if pos + rdlen > pkt.len() {
+            bail!("Phần dữ liệu RR DNS bị cắt cụt");
+        }
+        if rclass == 1 {
+            if rtype == 1 && rdlen == 4 {
+                let ip = Ipv4Addr::new(pkt[pos], pkt[pos + 1], pkt[pos + 2], pkt[pos + 3]);
+                ips.push(IpAddr::V4(ip));
+                min_ttl = Some(min_ttl.map_or(ttl, |cur| cur.min(ttl)));
+            } else if rtype == 28 && rdlen == 16 {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&pkt[pos..pos + 16]);
+                ips.push(IpAddr::V6(Ipv6Addr::from(octets)));
+                min_ttl = Some(min_ttl.map_or(ttl, |cur| cur.min(ttl)));
+            }
+        }
+        pos += rdlen;
+    }
+
+    Ok((ips, min_ttl.unwrap_or(60)))
+}
+
+async fn query_udp_dns_once(
+    server: SocketAddr,
+    host: &str,
+    qtype: u16,
+) -> Result<(Vec<IpAddr>, u32)> {
+    let txid = DNS_TXID.fetch_add(1, Ordering::Relaxed) ^ ((std::process::id() as u16).rotate_left(5));
+    let query = build_dns_query(host, qtype, txid)?;
+    let bind_addr = if server.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let sock = UdpSocket::bind(bind_addr).await?;
+    sock.connect(server).await?;
+    sock.send(&query).await?;
+    let mut buf = [0u8; 1500];
+    let n = tokio::time::timeout(UDP_DNS_TIMEOUT, sock.recv(&mut buf))
+        .await
+        .context("Timeout chờ phản hồi UDP DNS")??;
+    parse_dns_response(&buf[..n], txid)
+}
+
+async fn resolve_via_udp_dns(host: &str, servers: &[String]) -> Result<(Vec<IpAddr>, Duration)> {
+    let addrs: Vec<SocketAddr> = servers
+        .iter()
+        .filter_map(|s| normalize_dns_server(s))
+        .collect();
+    if addrs.is_empty() {
+        bail!("Không có địa chỉ DNS hợp lệ trong cấu hình");
+    }
+
+    let mut last_err = None;
+    for qtype in [1u16, 28u16] {
+        for &server in &addrs {
+            match query_udp_dns_once(server, host, qtype).await {
+                Ok((ips, ttl)) if !ips.is_empty() => {
+                    let clamped = ttl.clamp(DNS_TTL_MIN_SECS, DNS_TTL_MAX_SECS);
+                    return Ok((ips, Duration::from_secs(clamped as u64)));
+                }
+                Ok(_) => {}
+                Err(e) => last_err = Some(e),
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Không phân giải được IP cho {host}")))
+}
+
+async fn resolve_target_ips(
+    host: &str,
+    port: u16,
+    cfg: &RelayServerConfig,
+) -> Result<(Vec<IpAddr>, Option<String>)> {
+    let bare = host.trim().trim_matches(|c| c == '[' || c == ']');
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return Ok((vec![ip], None));
+    }
+
+    let cache_key = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let now = Instant::now();
+    {
+        let cache = dns_cache().read().await;
+        if let Some((expires_at, cached)) = cache.get(&cache_key) {
+            if now < *expires_at && !cached.is_empty() {
+                return Ok((cached.clone(), Some(cache_key)));
+            }
+        }
+    }
+
+    let mut resolved: Option<(Vec<IpAddr>, Duration)> = None;
+    if !cfg.dns_servers.is_empty() {
+        match resolve_via_udp_dns(host, &cfg.dns_servers).await {
+            Ok(pair) => resolved = Some(pair),
+            Err(e) if cfg.verbose => {
+                eprintln!("[DNS-UDP] {host}: {e}; fallback về DNS hệ thống");
+            }
+            Err(_) => {}
+        }
+    }
+
+    let (ips, ttl_dur) = match resolved {
+        Some(pair) => pair,
+        None => {
+            let addrs: Vec<SocketAddr> =
+                tokio::time::timeout(SYSTEM_DNS_TIMEOUT, tokio::net::lookup_host((host, port)))
+                    .await
+                    .context("Timeout phân giải DNS đích")??
+                    .collect();
+            let mut dedup = Vec::with_capacity(addrs.len());
+            for addr in addrs {
+                let ip = addr.ip();
+                if !dedup.contains(&ip) {
+                    dedup.push(ip);
+                }
+            }
+            (dedup, Duration::from_secs(60))
+        }
+    };
+
+    if ips.is_empty() {
+        bail!("Không phân giải được địa chỉ đích {host}:{port}");
+    }
+
+    {
+        let mut cache = dns_cache().write().await;
+        if cache.len() >= DNS_CACHE_MAX_ENTRIES {
+            let cutoff = Instant::now();
+            cache.retain(|_, (exp, _)| *exp > cutoff);
+            if cache.len() >= DNS_CACHE_MAX_ENTRIES {
+                cache.clear();
+            }
+        }
+        cache.insert(cache_key.clone(), (Instant::now() + ttl_dur, ips.clone()));
+    }
+
+    Ok((ips, Some(cache_key)))
+}
+
 async fn connect_outbound(host: &str, port: u16, cfg: &RelayServerConfig) -> Result<TcpStream> {
     if !is_allowed_target(host, port, cfg) {
         bail!("Target {host}:{port} bị từ chối bởi chính sách relay");
     }
 
-    let addrs: Vec<SocketAddr> = tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio::net::lookup_host((host, port)),
-    )
-    .await
-    .context("Timeout phân giải DNS đích")??
-    .collect();
+    let (ips, cache_key) = resolve_target_ips(host, port, cfg).await?;
 
-    if addrs.is_empty() {
-        bail!("Không phân giải được địa chỉ đích {host}:{port}");
-    }
-
-    let usable: Vec<SocketAddr> = addrs
+    let mut usable: Vec<SocketAddr> = ips
         .into_iter()
-        .filter(|addr| cfg.allow_private_targets || !is_forbidden_ip(addr.ip()))
+        .filter(|ip| cfg.allow_private_targets || !is_forbidden_ip(*ip))
+        .map(|ip| SocketAddr::new(ip, port))
         .collect();
 
     if usable.is_empty() {
         bail!("Địa chỉ IP đích {host}:{port} nằm trong dải nội bộ bị cấm");
     }
+
+    usable.sort_by_key(|a| if a.is_ipv4() { 0u8 } else { 1u8 });
 
     let mut last_err = None;
     for addr in usable {
@@ -175,6 +442,9 @@ async fn connect_outbound(host: &str, port: u16, cfg: &RelayServerConfig) -> Res
             Ok(Err(e)) => last_err = Some(anyhow::anyhow!(e)),
             Err(_) => last_err = Some(anyhow::anyhow!("Hết thời gian kết nối tới {addr}")),
         }
+    }
+    if let Some(key) = cache_key {
+        dns_cache().write().await.remove(&key);
     }
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Không kết nối được tới {host}:{port}")))
 }
@@ -466,7 +736,14 @@ fn load_config_from_args() -> Result<RelayServerConfig> {
     if let Ok(v) = std::env::var("LITECHAT_RELAY_PASS") {
         cfg.password = v;
     }
+    if let Ok(v) = std::env::var("LITECHAT_RELAY_DNS") {
+        let parsed = parse_dns_server_list(&v);
+        if !parsed.is_empty() {
+            cfg.dns_servers = parsed;
+        }
+    }
 
+    let mut cli_dns = Vec::new();
     let mut i = 1usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -483,6 +760,10 @@ fn load_config_from_args() -> Result<RelayServerConfig> {
                 cfg.password = args[i + 1].clone();
                 i += 2;
             }
+            "--dns" if i + 1 < args.len() => {
+                cli_dns.extend(parse_dns_server_list(&args[i + 1]));
+                i += 2;
+            }
             "--allow-all" => {
                 cfg.allow_all = true;
                 i += 1;
@@ -493,6 +774,9 @@ fn load_config_from_args() -> Result<RelayServerConfig> {
             }
             _ => i += 1,
         }
+    }
+    if !cli_dns.is_empty() {
+        cfg.dns_servers = cli_dns;
     }
     Ok(cfg)
 }
@@ -526,11 +810,17 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(&cfg.listen)
         .await
         .with_context(|| format!("Không mở được cổng relay {}", cfg.listen))?;
+    let dns_label = if cfg.dns_servers.is_empty() {
+        "system".to_string()
+    } else {
+        format!("custom({})", cfg.dns_servers.len())
+    };
     eprintln!(
-        "litechat-relay đang lắng nghe trên {} (auth: {}, mode: {})",
+        "litechat-relay đang lắng nghe trên {} (auth: {}, mode: {}, dns: {})",
         cfg.listen,
         if cfg.auth_required() { "bật" } else { "tắt" },
-        if cfg.allow_all { "allow_all" } else { "allowlist" }
+        if cfg.allow_all { "allow_all" } else { "allowlist" },
+        dns_label
     );
     run_server(listener, cfg).await;
     Ok(())
@@ -762,5 +1052,101 @@ mod tests {
         let mut echo2 = [0u8; 9];
         h.read_exact(&mut echo2).await.unwrap();
         assert_eq!(&echo2, b"ping-http");
+    }
+
+    #[test]
+    fn dns_config_normalization_query_and_response_parsing() {
+        assert_eq!(
+            normalize_dns_server("8.8.8.8"),
+            Some("8.8.8.8:53".parse().unwrap())
+        );
+        assert_eq!(
+            normalize_dns_server("1.1.1.1:5353"),
+            Some("1.1.1.1:5353".parse().unwrap())
+        );
+        assert_eq!(
+            normalize_dns_server("[::1]"),
+            Some("[::1]:53".parse().unwrap())
+        );
+        assert_eq!(normalize_dns_server("not-an-ip"), None);
+        assert_eq!(
+            parse_dns_server_list(" 8.8.8.8 , 1.1.1.1:53 , "),
+            vec!["8.8.8.8".to_string(), "1.1.1.1:53".to_string()]
+        );
+
+        let q = build_dns_query("chat.zalo.me", 1, 0x1234).unwrap();
+        assert_eq!(&q[0..2], &[0x12, 0x34]);
+        assert_eq!(&q[12..26], b"\x04chat\x04zalo\x02me\x00");
+        assert!(build_dns_query("", 1, 1).is_err());
+        assert!(build_dns_query("bad..host", 1, 1).is_err());
+
+        // Craft DNS response containing: 1 Question (chat.zalo.me) + CNAME (compressed pointer) + two A records
+        let mut resp = q.clone();
+        resp[2] = 0x81; // QR=1, RD=1
+        resp[3] = 0x80; // RA=1, RCODE=0
+        resp[6..8].copy_from_slice(&3u16.to_be_bytes()); // ANCOUNT = 3
+        // Answer 1: CNAME -> alias.zalo.me (TTL 120)
+        resp.extend_from_slice(&[0xC0, 0x0C]); // compressed name -> offset 12
+        resp.extend_from_slice(&5u16.to_be_bytes()); // CNAME
+        resp.extend_from_slice(&1u16.to_be_bytes()); // IN
+        resp.extend_from_slice(&120u32.to_be_bytes());
+        let cname_target = b"\x05alias\xC0\x11"; // "alias." + pointer to "zalo.me"
+        resp.extend_from_slice(&(cname_target.len() as u16).to_be_bytes());
+        resp.extend_from_slice(cname_target);
+        // Answer 2: A 49.213.95.122 (TTL 45)
+        resp.extend_from_slice(&[0xC0, 0x0C]);
+        resp.extend_from_slice(&1u16.to_be_bytes()); // A
+        resp.extend_from_slice(&1u16.to_be_bytes()); // IN
+        resp.extend_from_slice(&45u32.to_be_bytes());
+        resp.extend_from_slice(&4u16.to_be_bytes());
+        resp.extend_from_slice(&[49, 213, 95, 122]);
+        // Answer 3: A 49.213.95.137 (TTL 90)
+        resp.extend_from_slice(&[0xC0, 0x0C]);
+        resp.extend_from_slice(&1u16.to_be_bytes()); // A
+        resp.extend_from_slice(&1u16.to_be_bytes()); // IN
+        resp.extend_from_slice(&90u32.to_be_bytes());
+        resp.extend_from_slice(&4u16.to_be_bytes());
+        resp.extend_from_slice(&[49, 213, 95, 137]);
+
+        let (ips, min_ttl) = parse_dns_response(&resp, 0x1234).unwrap();
+        assert_eq!(min_ttl, 45);
+        assert_eq!(
+            ips,
+            vec![
+                "49.213.95.122".parse::<IpAddr>().unwrap(),
+                "49.213.95.137".parse::<IpAddr>().unwrap(),
+            ]
+        );
+        assert!(parse_dns_response(&resp, 0x9999).is_err());
+        assert!(parse_dns_response(&resp[..8], 0x1234).is_err());
+    }
+
+    #[tokio::test]
+    async fn udp_dns_resolves_from_mock_server() {
+        let dns_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dns_addr = dns_sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            if let Ok((n, peer)) = dns_sock.recv_from(&mut buf).await {
+                if n >= 12 {
+                    let mut reply = buf[..n].to_vec();
+                    reply[2] = 0x81;
+                    reply[3] = 0x80;
+                    reply[6..8].copy_from_slice(&1u16.to_be_bytes());
+                    reply.extend_from_slice(&[0xC0, 0x0C]);
+                    reply.extend_from_slice(&1u16.to_be_bytes());
+                    reply.extend_from_slice(&1u16.to_be_bytes());
+                    reply.extend_from_slice(&15u32.to_be_bytes()); // TTL 15 -> clamped to min 30
+                    reply.extend_from_slice(&4u16.to_be_bytes());
+                    reply.extend_from_slice(&[49, 213, 95, 122]);
+                    let _ = dns_sock.send_to(&reply, peer).await;
+                }
+            }
+        });
+
+        let (ips, ttl) =
+            resolve_via_udp_dns("chat.zalo.me", &[dns_addr.to_string()]).await.unwrap();
+        assert_eq!(ips, vec!["49.213.95.122".parse::<IpAddr>().unwrap()]);
+        assert_eq!(ttl, Duration::from_secs(DNS_TTL_MIN_SECS as u64));
     }
 }
