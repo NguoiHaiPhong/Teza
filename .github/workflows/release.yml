@@ -49,7 +49,16 @@ jobs:
           projectPath: apps/desktop
           tagName: v__VERSION__
           releaseName: "Teza v__VERSION__"
-          releaseBody: "Bản phát hành cài đặt Windows & gói Auto-Update cho Teza v__VERSION__."
+          releaseBody: |
+            Bản phát hành cài đặt Windows & gói Auto-Update cho Teza v__VERSION__.
+
+            ### Cài đặt trên máy không có Internet (Offline / Mạng nội bộ)
+            Nếu máy đích không có Internet hoặc báo thiếu thư viện khi cài/mở app, hãy tải sẵn 2 gói chính thức từ Microsoft rồi cài **trước khi** chạy bộ cài Teza:
+
+            - **Microsoft Edge WebView2 Runtime — Evergreen Standalone (x64, ~280 MB):** [Tải trực tiếp `MicrosoftEdgeWebView2RuntimeInstallerX64.exe`](https://go.microsoft.com/fwlink/?linkid=2124701) · [Trang Microsoft WebView2](https://developer.microsoft.com/en-us/microsoft-edge/webview2/) *(chọn **Evergreen Standalone Installer → x64**, không dùng Bootstrapper)*
+            - **Microsoft Visual C++ 2015–2022 Redistributable (x64, ~24.4 MB):** [Tải trực tiếp `VC_redist.x64.exe`](https://aka.ms/vs/17/release/vc_redist.x64.exe) · [Trang Microsoft Docs](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
+
+            Xem hướng dẫn từng bước & lệnh cài tự động (Silent Install): [docs/OFFLINE_INSTALL.md](https://github.com/NguoiHaiPhong/Teza/blob/main/docs/OFFLINE_INSTALL.md)
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}

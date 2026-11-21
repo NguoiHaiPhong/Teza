@@ -4,7 +4,9 @@
   <p><strong>Ứng dụng nhắn tin desktop gọn nhẹ, tốc độ cao và bảo mật cho Windows</strong></p>
   <p>
     <a href="https://github.com/NguoiHaiPhong/Teza/releases/latest">Tải bản phát hành mới nhất</a> ·
+    <a href="#cài-đặt-trên-máy-không-có-internet-offline--mạng-nội-bộ">Cài đặt Offline</a> ·
     <a href="#hướng-dẫn-sử-dụng">Hướng dẫn sử dụng</a> ·
+    <a href="docs/OFFLINE_INSTALL.md">Tài liệu Offline</a> ·
     <a href="docs/ARCHITECTURE.md">Kiến trúc hệ thống</a> ·
     <a href="docs/LEGAL_AND_SECURITY.md">Pháp lý &amp; Bảo mật</a>
   </p>
@@ -56,7 +58,7 @@ Thay vì phụ thuộc vào trình duyệt nặng nề, Teza tối ưu tốc đ�
 
 ### Yêu cầu hệ thống
 - **Hệ điều hành:** Windows 10 hoặc Windows 11 (64-bit).
-- **Thành phần phụ thuộc:** SQLite, TLS/Crypto và Visual C++ Runtime đã được đóng gói tĩnh trong tệp cài đặt. Nếu máy chưa có **Microsoft Edge WebView2 Runtime**, bộ cài sẽ tự động tải bootstrapper và cài đặt ngầm trong quá trình cài Teza (cần kết nối Internet).
+- **Thành phần phụ thuộc:** SQLite và TLS/Crypto đã được đóng gói tĩnh bên trong ứng dụng. **Microsoft Edge WebView2 Runtime** là thành phần bắt buộc (bộ cài Teza sẽ tự động tải nếu máy có Internet). Một số máy Windows 10 đời cũ, bản LTSC hoặc Windows Server cũng có thể cần cài thêm **Microsoft Visual C++ 2015–2022 Redistributable (x64)**.
 
 ### Tải và cài đặt
 1. Truy cập trang [Releases](https://github.com/NguoiHaiPhong/Teza/releases/latest).
@@ -64,6 +66,22 @@ Thay vì phụ thuộc vào trình duyệt nặng nề, Teza tối ưu tốc đ�
    - `Teza_<phiên_bản>_x64-setup.exe` *(khuyến nghị cho cài đặt cá nhân)*, hoặc
    - `Teza_<phiên_bản>_x64_en-US.msi`
 3. Chạy tệp cài đặt và làm theo hướng dẫn trên màn hình.
+
+### Cài đặt trên máy không có Internet (Offline / Mạng nội bộ)
+Nếu máy không có kết nối Internet hoặc báo thiếu thư viện khi cài/khởi chạy (`WebView2`, `VCRUNTIME140.dll`, `MSVCP140.dll`, `api-ms-win-crt-runtime-l1-1-0.dll`), hãy tải sẵn các gói chính thức từ Microsoft trên một máy có mạng rồi chép sang:
+
+| Thành phần cần chuẩn bị | Link tải trực tiếp (Microsoft) | Trang tải chính thức |
+| :--- | :--- | :--- |
+| **Microsoft Edge WebView2 Runtime** *(Evergreen Standalone x64, ~280 MB)* | [Tải trực tiếp `MicrosoftEdgeWebView2RuntimeInstallerX64.exe`](https://go.microsoft.com/fwlink/?linkid=2124701) | [Microsoft Edge WebView2](https://developer.microsoft.com/en-us/microsoft-edge/webview2/) *(chọn **Evergreen Standalone Installer → x64**, không chọn Bootstrapper)* |
+| **Visual C++ 2015–2022 Redistributable** *(x64, ~24.4 MB)* | [Tải trực tiếp `VC_redist.x64.exe`](https://aka.ms/vs/17/release/vc_redist.x64.exe) | [Microsoft Docs VC++ Redist](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist) |
+
+**Thứ tự cài đặt khuyến nghị trên máy offline:**
+1. Chạy **`VC_redist.x64.exe`** để bổ sung thư viện C++ / Universal CRT (nếu máy chưa có).
+2. Chuột phải **`MicrosoftEdgeWebView2RuntimeInstallerX64.exe`** → **Run as administrator** để cài WebView2 dùng chung cho toàn máy.
+3. Chạy bộ cài **`Teza_<phiên_bản>_x64-setup.exe`** (hoặc `.msi`).
+4. Nếu máy chỉ thông mạng nội bộ LAN, bấm **Mạng Relay** ngay trên màn hình QR để kết nối qua máy chủ `litechat-relay`.
+
+> Xem thêm: [Hướng dẫn cài đặt Offline chi tiết (kèm lệnh kiểm tra Registry & cài tự động hàng loạt)](docs/OFFLINE_INSTALL.md) · [Hướng dẫn triển khai máy chủ Relay nội bộ](deploy/relay-windows/README.md)
 
 ### Kiểm tra & cài đặt bản cập nhật
 Mở **Menu chính (`☰`) → Kiểm tra cập nhật**, hoặc vào **Cài đặt → Hệ thống & Phím tắt → Khay hệ thống & Cập nhật** để kiểm tra và nâng cấp phiên bản mới trực tiếp trong ứng dụng.
