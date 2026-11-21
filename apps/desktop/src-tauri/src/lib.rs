@@ -2403,8 +2403,9 @@ async fn save_remote_file(
     url: String,
     suggested_name: String,
 ) -> Result<Option<String>, String> {
-    let bytes = if url.trim_start().starts_with("data:") {
-        let (data, _) = zalo_core::session::decode_data_url_bytes(&url, 25 * 1024 * 1024)
+    let trimmed = url.trim_start();
+    let bytes = if trimmed.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("data:")) {
+        let (data, _) = zalo_core::session::decode_data_url_bytes(trimmed, 25 * 1024 * 1024)
             .map_err(|e| e.to_string())?;
         data
     } else {
@@ -2439,11 +2440,12 @@ async fn fetch_image_data_url(
     url: String,
 ) -> Result<String, String> {
     let trimmed = url.trim_start();
-    if trimmed.starts_with("data:image/")
-        || trimmed.starts_with("data:audio/")
-        || trimmed.starts_with("data:video/")
-    {
-        return Ok(url);
+    if trimmed.get(..11).is_some_and(|p| {
+        p.eq_ignore_ascii_case("data:image/")
+            || p.eq_ignore_ascii_case("data:audio/")
+            || p.eq_ignore_ascii_case("data:video/")
+    }) {
+        return Ok(trimmed.to_string());
     }
     let sess_snapshot = {
         let sess = state.session.lock().await;

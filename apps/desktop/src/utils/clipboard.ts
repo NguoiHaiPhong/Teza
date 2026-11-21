@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { bridge, isTauri } from "../bridge";
+import { isBlobUrl, isDataUrl, normalizeMediaRequestUrl } from "./mediaCache";
 
 function execCommandCopyText(text: string): boolean {
   const ta = document.createElement("textarea");
@@ -45,10 +46,14 @@ export async function copyTextReliable(text: string): Promise<void> {
 }
 
 async function decodeUrlToCanvas(url: string): Promise<HTMLCanvasElement> {
+  const normalized = normalizeMediaRequestUrl(url);
+  if (!normalized) {
+    throw new Error("Không có địa chỉ ảnh hợp lệ để sao chép");
+  }
   const safeSrc =
-    url.startsWith("data:") || url.startsWith("blob:")
-      ? url
-      : await bridge.fetchImageDataUrl(url);
+    isDataUrl(normalized) || isBlobUrl(normalized)
+      ? normalized
+      : await bridge.fetchImageDataUrl(normalized);
 
   const img = await new Promise<HTMLImageElement>((resolve, reject) => {
     const el = new Image();

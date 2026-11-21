@@ -1056,9 +1056,31 @@ pub fn parse_pinned_board_response(
             )
             .or_else(|| pick_str(&item, &["title", "content", "text", "message", "description"]))
             .unwrap_or_default();
-            let attachment_url = pick_str(&params_obj, &["href", "url", "thumb"])
-                .or_else(|| pick_str(&item, &["href", "url", "thumb"]))
-                .map(|u| normalize_media_url(&u));
+            let msg_type = pick_str(&params_obj, &["msgType", "msg_type"])
+                .or_else(|| pick_str(&item, &["msgType", "msg_type"]))
+                .unwrap_or_else(|| "chat.text".to_string());
+            let is_link_or_card = matches!(
+                msg_type.to_ascii_lowercase().as_str(),
+                "chat.link"
+                    | "link"
+                    | "chat.location"
+                    | "chat.location.new"
+                    | "chat.recommended"
+                    | "chat.ecard"
+            );
+            let attachment_url = if is_link_or_card {
+                pick_str(&params_obj, &["thumb", "thumbUrl"])
+                    .or_else(|| pick_str(&item, &["thumb", "thumbUrl"]))
+                    .and_then(|u| crate::session::normalize_allowed_media_url(&u).ok())
+                    .map(|u| u.to_string())
+            } else {
+                pick_str(&params_obj, &["oriUrl", "hdUrl", "fileUrl", "href", "url", "thumb"])
+                    .or_else(|| {
+                        pick_str(&item, &["oriUrl", "hdUrl", "fileUrl", "href", "url", "thumb"])
+                    })
+                    .map(|u| normalize_media_url(&u))
+                    .filter(|u| !u.is_empty())
+            };
             let attachment_name = pick_str(&params_obj, &["fileName", "title"])
                 .filter(|_| attachment_url.is_some());
             if text.is_empty() && attachment_url.is_none() {
@@ -1074,9 +1096,6 @@ pub fn parse_pinned_board_response(
                 .and_then(value_as_i64)
                 .unwrap_or(0);
             let ts = normalize_ts_ms(raw_ts);
-            let msg_type = pick_str(&params_obj, &["msgType", "msg_type"])
-                .or_else(|| pick_str(&item, &["msgType", "msg_type"]))
-                .unwrap_or_else(|| "chat.text".to_string());
             let is_outgoing = !self_uid.is_empty() && sender_id == self_uid;
             MessageDto {
                 msg_id,
@@ -2920,5 +2939,32 @@ mod tests {
         assert_eq!(dto.expired_time, 1_700_010_000_000);
         assert_eq!(dto.options[0].votes, 4);
         assert!(dto.options[1].voted);
+    }
+
+    #[test]
+    fn parse_pinned_board_response_filters_empty_and_external_link_urls() {
+        let resp = json!({
+            "error_code": 0,
+            "data": {
+                "items": [
+                    {
+                        "id": "b-empty",
+                        "creatorId": "1001",
+                        "createTime": 1_700_000_050_000_i64,
+                        "params": "{\"msgId\":\"pin-bad-url\",\"title\":\"Ghi chú\",\"href\":\"http://evil.example/a.png\"}"
+                    },
+                    {
+                        "id": "b-link",
+                        "creatorId": "1001",
+                        "createTime": 1_700_000_051_000_i64,
+                        "params": "{\"msgId\":\"pin-link\",\"msgType\":\"chat.link\",\"title\":\"Link ngoài\",\"href\":\"https://vnexpress.net/bai-1\"}"
+                    }
+                ]
+            }
+        });
+        let pins = parse_pinned_board_response(&resp, "grp-9", "9999", "", true, &HashMap::new());
+        assert_eq!(pins.len(), 2);
+        assert!(pins[0].attachment_url.is_none());
+        assert!(pins[1].attachment_url.is_none());
     }
 }

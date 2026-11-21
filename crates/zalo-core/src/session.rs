@@ -49,16 +49,108 @@ pub fn is_allowed_zalo_host(host: &str) -> bool {
         || h.ends_with(".zaloapp.com")
 }
 
-/// Returns `true` for trusted media/CDN hosts (`*.zalo.me`, `*.zaloapp.com`, `*.zdn.vn`, `*.zadn.vn`, `*.zalo.vn`).
+/// Official Zalo / VNG media & CDN host suffixes (kept synchronized with `litechat-relay`).
+pub const ALLOWED_MEDIA_HOST_SUFFIXES: &[&str] = &[
+    "zalo.me",
+    "zaloapp.com",
+    "zdn.vn",
+    "zadn.vn",
+    "zalo.vn",
+    "zalo.com",
+    "zalo.cloud",
+    "zbox.vn",
+    "zalo.video",
+    "zapps.me",
+    "zaloplatforms.com",
+    "zing.vn",
+];
+
+fn host_matches_suffix(normalized_host: &str, suffix: &str) -> bool {
+    normalized_host == suffix
+        || normalized_host
+            .strip_suffix(suffix)
+            .is_some_and(|prefix| prefix.len() > 1 && prefix.ends_with('.'))
+}
+
+/// Returns `true` for trusted official Zalo/VNG media & CDN hosts.
 pub fn is_allowed_media_host(host: &str) -> bool {
     let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    is_allowed_zalo_host(&h)
-        || h == "zdn.vn"
-        || h.ends_with(".zdn.vn")
-        || h == "zadn.vn"
-        || h.ends_with(".zadn.vn")
-        || h == "zalo.vn"
-        || h.ends_with(".zalo.vn")
+    if h.is_empty() {
+        return false;
+    }
+    ALLOWED_MEDIA_HOST_SUFFIXES
+        .iter()
+        .any(|suffix| host_matches_suffix(&h, suffix))
+}
+
+fn sanitize_url_origin_for_log(url: &reqwest::Url) -> String {
+    match url.host_str() {
+        Some(host) if !host.is_empty() => match url.port() {
+            Some(port) => format!("{}://{host}:{port}", url.scheme()),
+            None => format!("{}://{host}", url.scheme()),
+        },
+        _ => format!("{}:", url.scheme()),
+    }
+}
+
+/// Canonicalize a candidate media URL to HTTPS and validate against `is_allowed_media_host`.
+///
+/// - Trims whitespace, unescapes `\/` -> `/`, and expands protocol-relative `//...` to `https://...`.
+/// - Accepts `https` (default/443) and upgrades `http` (default/80) when the host is in
+///   `ALLOWED_MEDIA_HOST_SUFFIXES`.
+/// - Rejects userinfo, non-standard ports, and untrusted hosts, returning a privacy-safe
+///   origin-only diagnostic (`scheme://host[:port]` or generic parse reason — never paths/queries).
+pub fn normalize_allowed_media_url(raw: &str) -> std::result::Result<reqwest::Url, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("URL trống".to_string());
+    }
+    let unescaped: std::borrow::Cow<'_, str> = if trimmed.contains(r"\/") {
+        std::borrow::Cow::Owned(trimmed.replace(r"\/", "/"))
+    } else {
+        std::borrow::Cow::Borrowed(trimmed)
+    };
+    let candidate: std::borrow::Cow<'_, str> = if unescaped.starts_with("//") {
+        std::borrow::Cow::Owned(format!("https:{unescaped}"))
+    } else {
+        unescaped
+    };
+    let Ok(mut url) = reqwest::Url::parse(&candidate) else {
+        return Err("URL không hợp lệ".to_string());
+    };
+    let origin = sanitize_url_origin_for_log(&url);
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!("{origin} (chứa thông tin xác thực)"));
+    }
+    match url.scheme() {
+        "https" => {
+            if let Some(port) = url.port() {
+                if port != 443 {
+                    return Err(origin);
+                }
+            }
+            if !url.host_str().is_some_and(is_allowed_media_host) {
+                return Err(origin);
+            }
+            Ok(url)
+        }
+        "http" => {
+            if let Some(port) = url.port() {
+                if port != 80 {
+                    return Err(origin);
+                }
+            }
+            if !url.host_str().is_some_and(is_allowed_media_host) {
+                return Err(origin);
+            }
+            let _ = url.set_port(None);
+            if url.set_scheme("https").is_err() {
+                return Err(origin);
+            }
+            Ok(url)
+        }
+        _ => Err(origin),
+    }
 }
 
 fn is_allowed_url_with(raw: &str, expected_scheme: &str, host_check: fn(&str) -> bool) -> bool {
@@ -93,10 +185,12 @@ pub fn is_allowed_zalo_ws_url(raw: &str) -> bool {
 
 /// Decode a `data:<mime>;base64,<payload>` URL with a strict size limit.
 pub fn decode_data_url_bytes(raw: &str, max_bytes: usize) -> Result<(Vec<u8>, String)> {
-    let rest = raw
-        .trim()
-        .strip_prefix("data:")
-        .context("URL data không hợp lệ")?;
+    let trimmed = raw.trim();
+    let rest = if trimmed.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("data:")) {
+        &trimmed[5..]
+    } else {
+        anyhow::bail!("URL data không hợp lệ");
+    };
     let (meta, payload) = rest
         .split_once(',')
         .context("Định dạng data URL không hợp lệ")?;
@@ -626,7 +720,7 @@ impl Session {
             .get("avatar")
             .or_else(|| data.get("account").and_then(|a| a.get("avatar")));
         if let Some(avatar) = value_as_nonempty_str(avatar_val) {
-            self.profile.avatar = avatar;
+            self.profile.avatar = crate::chat::parser::normalize_avatar_url(&avatar);
         }
         if let Some(send2me) = value_as_nonempty_str(data.get("send2me_id")) {
             self.profile.send2me_id = send2me;
@@ -696,6 +790,9 @@ impl Session {
             }
         };
 
+        let mut profile = saved.profile;
+        profile.avatar = crate::chat::parser::normalize_avatar_url(&profile.avatar);
+
         Ok(Self {
             imei: saved.imei,
             computer_name: saved.computer_name,
@@ -703,7 +800,7 @@ impl Session {
             zpw_sek,
             secret_key,
             domains,
-            profile: saved.profile,
+            profile,
             relay,
             jar,
             http,
@@ -946,7 +1043,7 @@ impl Session {
                 }
                 if let Some(avt) = value_as_nonempty_str(p.get("avatar").or_else(|| p.get("avt")))
                 {
-                    self.profile.avatar = avt;
+                    self.profile.avatar = crate::chat::parser::normalize_avatar_url(&avt);
                 }
             }
         }
@@ -1006,16 +1103,66 @@ impl Session {
     }
 
     pub async fn download_media_bytes(&self, url: &str, max_bytes: usize) -> Result<(Vec<u8>, String)> {
-        if !is_allowed_media_url(url) {
-            anyhow::bail!("Từ chối tải tệp từ URL không nằm trong danh sách CDN tin cậy");
-        }
-        let mut resp = self
-            .media_http
-            .get(url.trim())
-            .header(REFERER, "https://chat.zalo.me/")
-            .send()
-            .await
-            .map_err(|e| SessionError::Network(e.to_string()))?;
+        let mut current_url = match normalize_allowed_media_url(url) {
+            Ok(u) => u,
+            Err(origin) => {
+                eprintln!("[litechat][media] blocked untrusted media URL: {origin}");
+                anyhow::bail!(
+                    "Từ chối tải tệp từ URL không nằm trong danh sách CDN tin cậy ({origin})"
+                );
+            }
+        };
+
+        const MAX_MANUAL_REDIRECT_HOPS: usize = 3;
+        let mut resp = {
+            let mut hops = 0usize;
+            loop {
+                let r = self
+                    .media_http
+                    .get(current_url.clone())
+                    .header(REFERER, "https://chat.zalo.me/")
+                    .send()
+                    .await
+                    .map_err(|e| SessionError::Network(e.to_string()))?;
+
+                if r.status().is_redirection() {
+                    let Some(loc) = r
+                        .headers()
+                        .get(reqwest::header::LOCATION)
+                        .and_then(|v| v.to_str().ok())
+                    else {
+                        break r;
+                    };
+                    let resolved_raw = match r.url().join(loc.trim()) {
+                        Ok(u) => u.to_string(),
+                        Err(_) => loc.to_string(),
+                    };
+                    if hops >= MAX_MANUAL_REDIRECT_HOPS {
+                        let target_origin = reqwest::Url::parse(&resolved_raw)
+                            .map(|u| sanitize_url_origin_for_log(&u))
+                            .unwrap_or_else(|_| "URL chuyển hướng không hợp lệ".to_string());
+                        eprintln!("[litechat][media] too many redirects -> {target_origin}");
+                        anyhow::bail!("Tải tệp thất bại: quá nhiều chuyển hướng ({target_origin})");
+                    }
+                    match normalize_allowed_media_url(&resolved_raw) {
+                        Ok(next_url) => {
+                            current_url = next_url;
+                            hops += 1;
+                            continue;
+                        }
+                        Err(origin) => {
+                            eprintln!(
+                                "[litechat][media] blocked redirect to untrusted URL: {origin}"
+                            );
+                            anyhow::bail!(
+                                "Từ chối tải tệp từ URL chuyển hướng không nằm trong danh sách CDN tin cậy ({origin})"
+                            );
+                        }
+                    }
+                }
+                break r;
+            }
+        };
 
         let status = resp.status();
         if !status.is_success() {
@@ -1420,5 +1567,151 @@ mod tests {
             infer_media_data_url_mime("https://f.zdn.vn/blob", "application/octet-stream"),
             "image/png"
         );
+    }
+
+    #[test]
+    fn media_host_allowlist_covers_verified_official_domains_and_blocks_unsafe() {
+        for host in [
+            "f10-zpc.zdn.vn",
+            "zdn.vn",
+            "s120-ava-talk.zadn.vn",
+            "chat.zalo.me",
+            "api.zaloapp.com",
+            "static.zalo.vn",
+            "photo.zalo.com",
+            "files.zalo.cloud",
+            "dl.zbox.vn",
+            "cdn.zalo.video",
+            "assets.zapps.me",
+            "stc.zaloplatforms.com",
+            "mp3.zing.vn",
+            "FILES.ZALO.CLOUD.",
+        ] {
+            assert!(is_allowed_media_host(host), "expected allowed: {host}");
+        }
+        for unsafe_host in [
+            "cdn.zalocdn.com",
+            "zalocdn.com",
+            "api.zaloapi.com",
+            "bucket.vngcloud.vn",
+            "cdn.vcdn.vn",
+            "cdn.vcdn.com.vn",
+            "evilzalo.cloud",
+            "zalo.cloud.evil.com",
+            ".zdn.vn",
+            "",
+        ] {
+            assert!(
+                !is_allowed_media_host(unsafe_host),
+                "expected blocked: {unsafe_host}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_allowed_media_url_upgrades_and_sanitizes_diagnostics() {
+        assert_eq!(
+            normalize_allowed_media_url("http://f10-zpc.zdn.vn/photo.jpg?k=1")
+                .unwrap()
+                .as_str(),
+            "https://f10-zpc.zdn.vn/photo.jpg?k=1"
+        );
+        assert_eq!(
+            normalize_allowed_media_url("HTTP://files.zalo.cloud:80/doc.pdf")
+                .unwrap()
+                .as_str(),
+            "https://files.zalo.cloud/doc.pdf"
+        );
+        assert_eq!(
+            normalize_allowed_media_url("  //dl.zbox.vn/a/b.zip  ")
+                .unwrap()
+                .as_str(),
+            "https://dl.zbox.vn/a/b.zip"
+        );
+        assert_eq!(
+            normalize_allowed_media_url(r"https:\/\/f7-group-zf.zdn.vn\/dir\/file.pdf")
+                .unwrap()
+                .as_str(),
+            "https://f7-group-zf.zdn.vn/dir/file.pdf"
+        );
+        assert_eq!(
+            normalize_allowed_media_url(r"http:\/\/s160-ava-talk.zadn.vn\/14\/ava.jpg")
+                .unwrap()
+                .as_str(),
+            "https://s160-ava-talk.zadn.vn/14/ava.jpg"
+        );
+
+        // Non-standard ports rejected with origin-only diagnostic (no path/query leak)
+        let port_err =
+            normalize_allowed_media_url("https://f10-zpc.zdn.vn:8443/secret/path?token=topsecret")
+                .unwrap_err();
+        assert_eq!(port_err, "https://f10-zpc.zdn.vn:8443");
+        assert!(!port_err.contains("secret"));
+        assert!(!port_err.contains("topsecret"));
+
+        let http_port_err =
+            normalize_allowed_media_url("http://f10-zpc.zdn.vn:8080/a?sig=xyz").unwrap_err();
+        assert_eq!(http_port_err, "http://f10-zpc.zdn.vn:8080");
+        assert!(!http_port_err.contains("sig"));
+
+        // Userinfo rejected without leaking credentials or query
+        let auth_err = normalize_allowed_media_url(
+            "https://alice:hunter2@f10-zpc.zdn.vn/pic.jpg?token=leaked",
+        )
+        .unwrap_err();
+        assert!(auth_err.starts_with("https://f10-zpc.zdn.vn"));
+        assert!(!auth_err.contains("alice"));
+        assert!(!auth_err.contains("hunter2"));
+        assert!(!auth_err.contains("leaked"));
+
+        // External host diagnostic exposes ONLY scheme://host
+        let ext_err = normalize_allowed_media_url(
+            "https://vnexpress.net/private/article?auth_token=abc123",
+        )
+        .unwrap_err();
+        assert_eq!(ext_err, "https://vnexpress.net");
+        assert!(!ext_err.contains("private"));
+        assert!(!ext_err.contains("abc123"));
+
+        // Non-http(s) & malformed inputs never echo secrets
+        let blob_err =
+            normalize_allowed_media_url("blob:https://tauri.localhost/secret-uuid").unwrap_err();
+        assert_eq!(blob_err, "blob:");
+        assert!(!blob_err.contains("secret-uuid"));
+
+        let empty_err = normalize_allowed_media_url("   ").unwrap_err();
+        assert_eq!(empty_err, "URL trống");
+    }
+
+    #[tokio::test]
+    async fn download_media_bytes_error_includes_sanitized_origin_only() {
+        let s = Session::new().unwrap();
+        let err = s
+            .download_media_bytes("https://untrusted.example/doc.pdf?secret_token=xyz", 1024)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Từ chối tải tệp từ URL không nằm trong danh sách CDN tin cậy"));
+        assert!(err.contains("(https://untrusted.example)"));
+        assert!(!err.contains("doc.pdf"));
+        assert!(!err.contains("secret_token"));
+    }
+
+    #[test]
+    fn decode_data_url_is_case_insensitive_and_login_normalizes_avatar() {
+        let (bytes, mime) = decode_data_url_bytes("DATA:IMAGE/PNG;BASE64,aGVsbG8=", 32).unwrap();
+        assert_eq!(bytes, b"hello");
+        assert_eq!(mime, "IMAGE/PNG");
+
+        let mut s = Session::new().unwrap();
+        s.apply_login_config(&serde_json::json!({
+            "avatar": "http://s160-ava-talk.zadn.vn/u/pic.jpg"
+        }));
+        assert_eq!(s.profile.avatar, "https://s160-ava-talk.zadn.vn/u/pic.jpg");
+
+        s.apply_login_config(&serde_json::json!({
+            "avatar": "https://s160-ava-talk.zadn.vn/default"
+        }));
+        assert_eq!(s.profile.avatar, "");
     }
 }

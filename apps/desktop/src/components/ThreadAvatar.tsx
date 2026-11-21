@@ -1,7 +1,11 @@
 import { useEffect, useState } from "react";
 import { Bookmark, Users } from "lucide-react";
 import type { ThreadKind } from "../types";
-import { useResolvedMediaUrl } from "../utils/mediaCache";
+import {
+  isRemoteMediaUrl,
+  normalizeMediaRequestUrl,
+  useResolvedMediaUrl,
+} from "../utils/mediaCache";
 
 interface Props {
   avatar: string;
@@ -53,14 +57,15 @@ function SingleImg({
   className: string;
   fallback: React.ReactNode;
 }) {
-  const { src: resolvedSrc, requestFallback } = useResolvedMediaUrl(src);
+  const normalizedSrc = normalizeMediaRequestUrl(src);
+  const { src: resolvedSrc, requestFallback } = useResolvedMediaUrl(normalizedSrc);
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
     setFailed(false);
-  }, [src]);
+  }, [normalizedSrc]);
 
-  if (!src || failed || !resolvedSrc) {
+  if (!normalizedSrc || failed || !resolvedSrc) {
     return <>{fallback}</>;
   }
 
@@ -72,11 +77,14 @@ function SingleImg({
       decoding="async"
       referrerPolicy="no-referrer"
       onError={() => {
-        if (resolvedSrc === src && /^https:\/\//i.test(src)) {
-          requestFallback();
-        } else {
-          setFailed(true);
+        if (
+          resolvedSrc === normalizedSrc &&
+          isRemoteMediaUrl(normalizedSrc) &&
+          requestFallback()
+        ) {
+          return;
         }
+        setFailed(true);
       }}
       className={className}
     />

@@ -9,6 +9,7 @@ import {
   Copy,
   CornerUpLeft,
   Download,
+  ExternalLink,
   FileText,
   Forward,
   Image as ImageIcon,
@@ -23,10 +24,20 @@ import {
   Trash2,
   Zap,
 } from "lucide-react";
+import { bridge } from "../bridge";
 import type { MessageDto, ThreadKind } from "../types";
 import { useI18n } from "../i18n";
 import { isBuzzMessage } from "../utils/buzz";
 import { copyImageReliable, copyTextReliable } from "../utils/clipboard";
+import {
+  classifyNonMediaAttachment,
+  extractLinkHost,
+  isBlobUrl,
+  isDataImageUrl,
+  isDataUrl,
+  isRemoteMediaUrl,
+  normalizeMediaRequestUrl,
+} from "../utils/mediaCache";
 import {
   formatReminderCountdown,
   parsePollPayload,
@@ -78,6 +89,7 @@ interface Props {
   onRetrySend?: (msg: MessageDto) => void;
   onDiscardFailed?: (msgId: string) => void;
   onSaveFile?: (url: string, name: string) => void;
+  onOpenExternal?: (url: string) => void;
   onCopyError?: (err: unknown) => void;
   onVotePoll?: (msg: MessageDto, optionIds: number[]) => Promise<void> | void;
   onRefreshPoll?: (msg: MessageDto) => Promise<void> | void;
@@ -89,27 +101,27 @@ function formatClock(ts: number): string {
   return d.toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" });
 }
 
-function isStickerMessage(msg: MessageDto): boolean {
+function isStickerMessage(msg: MessageDto, normalizedUrl: string): boolean {
   const t = msg.msg_type.toLowerCase();
   return (
-    !!msg.attachment_url &&
+    !!normalizedUrl &&
     (t.includes("sticker") || t === "5" || t === "35" || t === "36")
   );
 }
 
-function isVoiceAttachment(msg: MessageDto): boolean {
+function isVoiceAttachment(msg: MessageDto, normalizedUrl: string): boolean {
+  const t = msg.msg_type.toLowerCase();
   return (
-    !!msg.attachment_url &&
-    /^https:\/\//i.test(msg.attachment_url) &&
-    (msg.msg_type.includes("voice") || msg.msg_type === "3")
+    (isRemoteMediaUrl(normalizedUrl) || /^data:audio\//i.test(normalizedUrl)) &&
+    (t.includes("voice") || t === "3")
   );
 }
 
-function isVideoAttachment(msg: MessageDto): boolean {
+function isVideoAttachment(msg: MessageDto, normalizedUrl: string): boolean {
+  const t = msg.msg_type.toLowerCase();
   return (
-    !!msg.attachment_url &&
-    /^https:\/\//i.test(msg.attachment_url) &&
-    (msg.msg_type.includes("video") || msg.msg_type === "4")
+    (isRemoteMediaUrl(normalizedUrl) || /^data:video\//i.test(normalizedUrl)) &&
+    (t.includes("video") || t === "4" || t === "44")
   );
 }
 
@@ -173,12 +185,22 @@ function renderLinkedText(text: string, isOutgoing: boolean, highlightQuery?: st
   );
 }
 
-function isImageAttachment(msg: MessageDto): boolean {
-  if (!msg.attachment_url) return false;
-  if (isStickerMessage(msg)) return false;
-  if (msg.msg_type.includes("photo") || msg.msg_type === "2") return true;
-  if (msg.attachment_url.startsWith("data:image/")) return true;
-  return /\.(png|jpe?g|webp|gif|bmp)(\?|$)/i.test(msg.attachment_url);
+function isImageAttachment(msg: MessageDto, normalizedUrl: string): boolean {
+  if (!normalizedUrl) return false;
+  if (isStickerMessage(msg, normalizedUrl)) return false;
+  const t = msg.msg_type.toLowerCase();
+  if (t.includes("photo") || t === "2" || t.includes("gif")) {
+    return (
+      isRemoteMediaUrl(normalizedUrl) ||
+      isDataImageUrl(normalizedUrl) ||
+      isBlobUrl(normalizedUrl)
+    );
+  }
+  if (isDataImageUrl(normalizedUrl)) return true;
+  return (
+    isRemoteMediaUrl(normalizedUrl) &&
+    /\.(png|jpe?g|webp|gif|bmp)(\?|$)/i.test(normalizedUrl)
+  );
 }
 
 export const MessageBubble = memo(function MessageBubble({
@@ -213,6 +235,7 @@ export const MessageBubble = memo(function MessageBubble({
   onRetrySend,
   onDiscardFailed,
   onSaveFile,
+  onOpenExternal,
   onCopyError,
   onVotePoll,
   onRefreshPoll,
@@ -221,32 +244,46 @@ export const MessageBubble = memo(function MessageBubble({
   const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
   const [pickerPos, setPickerPos] = useState<{ left: number; top: number } | null>(null);
   const [mediaError, setMediaError] = useState(false);
+  const [mediaRetryKey, setMediaRetryKey] = useState(0);
   const [showOriginal, setShowOriginal] = useState(false);
   const [pollBusy, setPollBusy] = useState(false);
 
   useEffect(() => {
     setMediaError(false);
+    setMediaRetryKey(0);
   }, [msg.attachment_url, msg.msg_type]);
+  const normalizedAttachmentUrl = normalizeMediaRequestUrl(msg.attachment_url);
   const isReplaced = Boolean(replaceWithTranslation && translation?.text && !showOriginal);
   const reminderData = !msg.is_recalled ? parseReminderPayload(msg) : null;
   const pollData = !msg.is_recalled && !reminderData ? parsePollPayload(msg) : null;
   const isRichCard = Boolean(reminderData || pollData);
   const isBuzz = !isRichCard && isBuzzMessage(msg);
-  const isSticker = !msg.is_recalled && !isRichCard && isStickerMessage(msg) && !mediaError;
-  const isVoice = !msg.is_recalled && !isRichCard && isVoiceAttachment(msg) && !mediaError;
-  const isVideo = !msg.is_recalled && !isRichCard && isVideoAttachment(msg) && !mediaError;
-  const isImage =
-    !msg.is_recalled && !isRichCard && !isVoice && !isVideo && isImageAttachment(msg) && !mediaError;
-  const isFileAttachment =
+  const isStickerKind =
+    !msg.is_recalled && !isRichCard && isStickerMessage(msg, normalizedAttachmentUrl);
+  const isVoiceKind =
+    !msg.is_recalled && !isRichCard && isVoiceAttachment(msg, normalizedAttachmentUrl);
+  const isVideoKind =
+    !msg.is_recalled && !isRichCard && isVideoAttachment(msg, normalizedAttachmentUrl);
+  const isImageKind =
     !msg.is_recalled &&
     !isRichCard &&
-    !isSticker &&
-    !isVoice &&
-    !isVideo &&
-    !isImage &&
-    (!!msg.attachment_url ||
-      msg.msg_type.includes("file") ||
-      msg.msg_type === "19");
+    !isVoiceKind &&
+    !isVideoKind &&
+    isImageAttachment(msg, normalizedAttachmentUrl);
+  const isAnyMediaKind = isStickerKind || isVoiceKind || isVideoKind || isImageKind;
+  const isSticker = isStickerKind && !mediaError;
+  const isVoice = isVoiceKind && !mediaError;
+  const isVideo = isVideoKind && !mediaError;
+  const isImage = isImageKind && !mediaError;
+  const isMediaFailed = isAnyMediaKind && mediaError;
+  const nonMediaAction =
+    !msg.is_recalled && !isRichCard && !isAnyMediaKind
+      ? classifyNonMediaAttachment(msg)
+      : "none";
+  const isExternalLinkCard =
+    nonMediaAction === "open_external" && isRemoteMediaUrl(normalizedAttachmentUrl);
+  const isFileAttachment =
+    nonMediaAction === "save_file" || nonMediaAction === "file_no_url";
   const displayText = msg.is_recalled
     ? msg.text
     : isReplaced && translation?.text
@@ -260,9 +297,15 @@ export const MessageBubble = memo(function MessageBubble({
     !isBuzz &&
     !(threadKind === "group" && !msg.is_outgoing && !groupedWithPrev);
   const safeDownloadUrl =
-    msg.attachment_url && /^https:\/\//i.test(msg.attachment_url)
-      ? msg.attachment_url
+    nonMediaAction === "save_file" &&
+    (isRemoteMediaUrl(normalizedAttachmentUrl) || isDataUrl(normalizedAttachmentUrl))
+      ? normalizedAttachmentUrl
       : null;
+  const canCopyImage =
+    isImage &&
+    (isRemoteMediaUrl(normalizedAttachmentUrl) ||
+      isDataImageUrl(normalizedAttachmentUrl) ||
+      isBlobUrl(normalizedAttachmentUrl));
 
   useEffect(() => {
     if (!menuPos && !pickerPos) return;
@@ -292,10 +335,17 @@ export const MessageBubble = memo(function MessageBubble({
   };
 
   const handleCopyImage = () => {
-    if (!msg.attachment_url) return;
-    const url = msg.attachment_url;
+    if (!canCopyImage) return;
     setMenuPos(null);
-    void copyImageReliable(url).catch((err) => onCopyError?.(err));
+    void copyImageReliable(normalizedAttachmentUrl).catch((err) => onCopyError?.(err));
+  };
+
+  const handleOpenExternalLink = (url: string) => {
+    if (onOpenExternal) {
+      onOpenExternal(url);
+    } else {
+      void bridge.openExternalUrl(url).catch((err) => onCopyError?.(err));
+    }
   };
 
   const bubbleCornerClass = msg.is_outgoing
@@ -626,10 +676,11 @@ export const MessageBubble = memo(function MessageBubble({
           </button>
         )}
 
-        {isSticker && msg.attachment_url && (
+        {isSticker && normalizedAttachmentUrl && (
           <RelayImage
-            src={msg.attachment_url}
-            alt="Nhãn dán"
+            key={mediaRetryKey}
+            src={normalizedAttachmentUrl}
+            alt={t("stickerAlt")}
             referrerPolicy="no-referrer"
             onFallbackFail={() => setMediaError(true)}
             className="mb-1 h-32 w-32 object-contain drop-shadow-sm"
@@ -637,40 +688,121 @@ export const MessageBubble = memo(function MessageBubble({
           />
         )}
 
-        {isVoice && msg.attachment_url && (
+        {isVoice && normalizedAttachmentUrl && (
           <RelayAudio
+            key={mediaRetryKey}
             controls
             preload="none"
-            src={msg.attachment_url}
+            src={normalizedAttachmentUrl}
             onFallbackFail={() => setMediaError(true)}
             className="mb-1 max-w-full"
           />
         )}
 
-        {isVideo && msg.attachment_url && (
+        {isVideo && normalizedAttachmentUrl && (
           <RelayVideo
+            key={mediaRetryKey}
             controls
             preload="metadata"
-            src={msg.attachment_url}
+            src={normalizedAttachmentUrl}
             onFallbackFail={() => setMediaError(true)}
             className="mb-1 max-h-72 w-full rounded-xl bg-black/40"
           />
         )}
 
-        {isImage && msg.attachment_url && (
+        {isImage && normalizedAttachmentUrl && (
           <button
             type="button"
-            onClick={() => onOpenImage(msg.attachment_url!, msg.attachment_name || "Hình ảnh")}
+            onClick={() =>
+              onOpenImage(normalizedAttachmentUrl, msg.attachment_name || t("photoAlt"))
+            }
             className="mb-1 block overflow-hidden rounded-xl"
           >
             <RelayImage
-              src={msg.attachment_url}
-              alt={msg.attachment_name || "Hình ảnh"}
+              key={mediaRetryKey}
+              src={normalizedAttachmentUrl}
+              alt={msg.attachment_name || t("photoAlt")}
               referrerPolicy="no-referrer"
               onFallbackFail={() => setMediaError(true)}
               className="max-h-72 w-auto rounded-xl object-cover transition hover:brightness-95"
               loading="lazy"
             />
+          </button>
+        )}
+
+        {isMediaFailed && (
+          <div
+            className="mb-1 flex items-center gap-2.5 rounded-xl px-3 py-2"
+            style={{ background: "var(--card-bg)" }}
+          >
+            <ImageIcon
+              className="h-4 w-4 shrink-0 opacity-75"
+              style={{ color: msg.is_outgoing ? "var(--link-out)" : "var(--text-secondary)" }}
+            />
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-[13px] font-medium">
+                {isStickerKind
+                  ? t("stickerAlt")
+                  : isVideoKind
+                    ? "Video"
+                    : isVoiceKind
+                      ? lang === "en"
+                        ? "Voice message"
+                        : lang === "ko"
+                          ? "음성 메시지"
+                          : "Tin nhắn thoại"
+                      : msg.attachment_name || t("photoAlt")}
+              </div>
+              <div className="text-xs opacity-75" style={{ color: "var(--text-secondary)" }}>
+                {lang === "en"
+                  ? "Unable to load media"
+                  : lang === "ko"
+                    ? "미디어를 불러올 수 없습니다"
+                    : "Không tải được nội dung media"}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setMediaRetryKey((k) => k + 1);
+                setMediaError(false);
+              }}
+              title={t("reload")}
+              className="hover-menu inline-flex shrink-0 items-center gap-1 rounded-lg px-2 py-1 text-xs font-medium transition"
+              style={{ color: msg.is_outgoing ? "var(--link-out)" : "var(--accent)" }}
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              <span>{t("retryShort")}</span>
+            </button>
+          </div>
+        )}
+
+        {isExternalLinkCard && (
+          <button
+            type="button"
+            onClick={() => handleOpenExternalLink(normalizedAttachmentUrl)}
+            title={t("openExternalBrowser")}
+            className="mb-1 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left transition hover:brightness-95"
+            style={{ background: "var(--card-bg)" }}
+          >
+            <ExternalLink
+              className="h-4 w-4 shrink-0"
+              style={{ color: msg.is_outgoing ? "var(--link-out)" : "var(--accent)" }}
+            />
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-[13.5px] font-medium">
+                {msg.attachment_name || normalizedAttachmentUrl}
+              </div>
+              <div className="truncate text-xs" style={{ color: "var(--text-secondary)" }}>
+                {extractLinkHost(normalizedAttachmentUrl) || t("openExternalBrowser")}
+              </div>
+            </div>
+            <span
+              className="rounded-lg p-1.5"
+              style={{ color: msg.is_outgoing ? "var(--link-out)" : "var(--accent)" }}
+            >
+              <ExternalLink className="h-4 w-4" />
+            </span>
           </button>
         )}
 
@@ -1203,7 +1335,7 @@ export const MessageBubble = memo(function MessageBubble({
                 <CheckSquare className="h-3.5 w-3.5" /> {t("selectMultiple")}
               </button>
             )}
-            {isImage && msg.attachment_url && (
+            {canCopyImage && (
               <button
                 onClick={handleCopyImage}
                 className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"

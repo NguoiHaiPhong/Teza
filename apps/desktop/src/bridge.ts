@@ -669,9 +669,14 @@ export const bridge = {
     });
   },
   async saveRemoteFile(url: string, suggestedName: string): Promise<string | null> {
+    const trimmed = url.trim();
+    const targetUrl =
+      /^data:/i.test(trimmed) || /^blob:/i.test(trimmed)
+        ? trimmed
+        : trimmed.replace(/\\\//g, "/").replace(/^\/\//, "https://");
     if (!isTauri()) {
       const a = document.createElement("a");
-      a.href = url;
+      a.href = targetUrl;
       a.download = suggestedName || "download";
       a.target = "_blank";
       a.rel = "noreferrer";
@@ -680,13 +685,19 @@ export const bridge = {
       a.remove();
       return null;
     }
-    return invoke<string | null>("save_remote_file", { url, suggestedName });
+    return invoke<string | null>("save_remote_file", { url: targetUrl, suggestedName });
   },
   async fetchImageDataUrl(url: string): Promise<string> {
-    if (!isTauri() || url.startsWith("data:image/")) {
-      return url;
+    const trimmed = url.trim();
+    if (
+      !isTauri() ||
+      /^data:(?:image|audio|video)\//i.test(trimmed) ||
+      /^blob:/i.test(trimmed)
+    ) {
+      return trimmed;
     }
-    return invoke<string>("fetch_image_data_url", { url });
+    const normalized = trimmed.replace(/\\\//g, "/").replace(/^\/\//, "https://");
+    return invoke<string>("fetch_image_data_url", { url: normalized });
   },
   async togglePinMessage(
     threadId: string,

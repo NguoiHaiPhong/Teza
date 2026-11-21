@@ -868,13 +868,14 @@ async fn send_photo_reader<R: AsyncRead + AsyncSeek + Unpin>(
         .get("data")
         .and_then(|d| pick_str(d, &["msgId", "globalMsgId"]))
         .unwrap_or_else(|| ctx.client_id.to_string());
-    let final_url = if !ori_url.is_empty() {
+    let raw_final_url = if !ori_url.is_empty() {
         ori_url
     } else if !hd_url.is_empty() {
         hd_url
     } else {
         normal_url
     };
+    let final_url = normalize_media_url(&raw_final_url);
 
     Ok(MessageDto {
         msg_id,
@@ -971,10 +972,11 @@ async fn send_file_reader<R: AsyncRead + Unpin>(
         .get("data")
         .and_then(|d| pick_str(d, &["msgId", "globalMsgId"]))
         .unwrap_or_else(|| ctx.client_id.to_string());
-    let final_url = send_dec
+    let raw_final_url = send_dec
         .get("data")
         .and_then(|d| pick_str(d, &["fileUrl", "url", "href"]))
         .unwrap_or(file_url);
+    let final_url = normalize_media_url(&raw_final_url);
 
     let text = if ctx.caption.trim().is_empty() {
         format!("[Tập tin] {}", ctx.file_name)

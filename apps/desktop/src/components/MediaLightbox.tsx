@@ -13,7 +13,56 @@ import {
 import { bridge } from "../bridge";
 import { useI18n } from "../i18n";
 import { copyImageReliable } from "../utils/clipboard";
+import {
+  isBlobUrl,
+  isDataImageUrl,
+  isRemoteMediaUrl,
+  normalizeMediaRequestUrl,
+} from "../utils/mediaCache";
 import { RelayImage } from "./RelayImage";
+
+async function blobUrlToDataUrl(blobUrl: string): Promise<string> {
+  try {
+    const res = await fetch(blobUrl);
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const blob = await res.blob();
+    return await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (typeof reader.result === "string" && reader.result.length > 0) {
+          resolve(reader.result);
+        } else {
+          reject(new Error("Không chuyển đổi được dữ liệu ảnh cục bộ"));
+        }
+      };
+      reader.onerror = () => reject(new Error("Không đọc được dữ liệu ảnh cục bộ"));
+      reader.readAsDataURL(blob);
+    });
+  } catch {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error("Không đọc được ảnh cục bộ để lưu"));
+      el.src = blobUrl;
+    });
+    const w = img.naturalWidth || img.width;
+    const h = img.naturalHeight || img.height;
+    if (!w || !h) {
+      throw new Error("Ảnh cục bộ không có kích thước hợp lệ");
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      throw new Error("Không khởi tạo được bộ đệm ảnh");
+    }
+    ctx.drawImage(img, 0, 0);
+    return canvas.toDataURL("image/png");
+  }
+}
 
 export interface LightboxItem {
   url: string;
@@ -75,12 +124,16 @@ export function MediaLightbox({
 
   if (!current) return null;
 
-  const canExport = /^(https:\/\/|data:image\/|blob:)/i.test(current.url);
+  const normalizedUrl = normalizeMediaRequestUrl(current.url);
+  const canExport =
+    isRemoteMediaUrl(normalizedUrl) ||
+    isDataImageUrl(normalizedUrl) ||
+    isBlobUrl(normalizedUrl);
 
   const handleCopyImage = async () => {
     if (!canExport || copied) return;
     try {
-      await copyImageReliable(current.url);
+      await copyImageReliable(normalizedUrl);
       setCopied(true);
       setTimeout(() => setCopied(false), 1800);
     } catch (err) {
@@ -92,7 +145,10 @@ export function MediaLightbox({
     if (!canExport || saving) return;
     setSaving(true);
     try {
-      await bridge.saveRemoteFile(current.url, current.title || "teza-image.png");
+      const targetUrl = isBlobUrl(normalizedUrl)
+        ? await blobUrlToDataUrl(normalizedUrl)
+        : normalizedUrl;
+      await bridge.saveRemoteFile(targetUrl, current.title || "teza-image.png");
     } catch (err) {
       onNotify?.(String(err));
     } finally {
@@ -203,7 +259,7 @@ export function MediaLightbox({
         )}
 
         <RelayImage
-          src={current.url}
+          src={normalizedUrl}
           alt={current.title}
           referrerPolicy="no-referrer"
           onClick={(e) => {

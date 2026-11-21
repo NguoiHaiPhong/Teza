@@ -28,11 +28,20 @@ const DNS_TTL_MIN_SECS: u32 = 30;
 const DNS_TTL_MAX_SECS: u32 = 300;
 
 const DEFAULT_ALLOWED_SUFFIXES: &[&str] = &[
+    // Official Zalo / VNG domains (kept synchronized with zalo-core::session::ALLOWED_MEDIA_HOST_SUFFIXES)
     "zalo.me",
     "zaloapp.com",
     "zdn.vn",
     "zadn.vn",
     "zalo.vn",
+    "zalo.com",
+    "zalo.cloud",
+    "zbox.vn",
+    "zalo.video",
+    "zapps.me",
+    "zaloplatforms.com",
+    "zing.vn",
+    // Translation & updater endpoints
     "api-free.deepl.com",
     "api.deepl.com",
     "generativelanguage.googleapis.com",
@@ -177,6 +186,27 @@ fn parse_dns_server_list(raw: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn parse_extra_host_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| {
+            s.trim()
+                .trim_start_matches("*.")
+                .trim_start_matches('.')
+                .trim_end_matches('.')
+                .to_ascii_lowercase()
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn extend_unique_hosts(target: &mut Vec<String>, extra: impl IntoIterator<Item = String>) {
+    for host in extra {
+        if !host.is_empty() && !target.iter().any(|h| h.eq_ignore_ascii_case(&host)) {
+            target.push(host);
+        }
+    }
 }
 
 fn build_dns_query(host: &str, qtype: u16, txid: u16) -> Result<Vec<u8>> {
@@ -706,6 +736,13 @@ async fn handle_http_connect(
 
 fn load_config_from_args() -> Result<RelayServerConfig> {
     let args: Vec<String> = std::env::args().collect();
+    parse_config_with(&args, |key| std::env::var(key).ok())
+}
+
+fn parse_config_with<F>(args: &[String], env_lookup: F) -> Result<RelayServerConfig>
+where
+    F: Fn(&str) -> Option<String>,
+{
     let mut config_path: Option<PathBuf> = None;
     let mut i = 1usize;
     while i < args.len() {
@@ -725,22 +762,25 @@ fn load_config_from_args() -> Result<RelayServerConfig> {
         RelayServerConfig::default()
     };
 
-    if let Ok(v) = std::env::var("LITECHAT_RELAY_LISTEN") {
+    if let Some(v) = env_lookup("LITECHAT_RELAY_LISTEN") {
         if !v.trim().is_empty() {
             cfg.listen = v.trim().to_string();
         }
     }
-    if let Ok(v) = std::env::var("LITECHAT_RELAY_USER") {
+    if let Some(v) = env_lookup("LITECHAT_RELAY_USER") {
         cfg.username = v;
     }
-    if let Ok(v) = std::env::var("LITECHAT_RELAY_PASS") {
+    if let Some(v) = env_lookup("LITECHAT_RELAY_PASS") {
         cfg.password = v;
     }
-    if let Ok(v) = std::env::var("LITECHAT_RELAY_DNS") {
+    if let Some(v) = env_lookup("LITECHAT_RELAY_DNS") {
         let parsed = parse_dns_server_list(&v);
         if !parsed.is_empty() {
             cfg.dns_servers = parsed;
         }
+    }
+    if let Some(v) = env_lookup("LITECHAT_RELAY_EXTRA_HOSTS") {
+        extend_unique_hosts(&mut cfg.extra_allowed_hosts, parse_extra_host_list(&v));
     }
 
     let mut cli_dns = Vec::new();
@@ -763,6 +803,19 @@ fn load_config_from_args() -> Result<RelayServerConfig> {
             "--dns" if i + 1 < args.len() => {
                 cli_dns.extend(parse_dns_server_list(&args[i + 1]));
                 i += 2;
+            }
+            "--extra-host" if i + 1 < args.len() => {
+                extend_unique_hosts(
+                    &mut cfg.extra_allowed_hosts,
+                    parse_extra_host_list(&args[i + 1]),
+                );
+                i += 2;
+            }
+            arg if arg.starts_with("--extra-host=") => {
+                if let Some(val) = arg.strip_prefix("--extra-host=") {
+                    extend_unique_hosts(&mut cfg.extra_allowed_hosts, parse_extra_host_list(val));
+                }
+                i += 1;
             }
             "--allow-all" => {
                 cfg.allow_all = true;
@@ -1148,5 +1201,70 @@ mod tests {
             resolve_via_udp_dns("chat.zalo.me", &[dns_addr.to_string()]).await.unwrap();
         assert_eq!(ips, vec!["49.213.95.122".parse::<IpAddr>().unwrap()]);
         assert_eq!(ttl, Duration::from_secs(DNS_TTL_MIN_SECS as u64));
+    }
+
+    #[test]
+    fn relay_allowlist_syncs_official_domains_and_parses_extra_hosts() {
+        let cfg = RelayServerConfig::default();
+        for host in [
+            "chat.zalo.me",
+            "api.zaloapp.com",
+            "f10-zpc.zdn.vn",
+            "s120-ava-talk.zadn.vn",
+            "static.zalo.vn",
+            "photo.zalo.com",
+            "files.zalo.cloud",
+            "dl.zbox.vn",
+            "cdn.zalo.video",
+            "assets.zapps.me",
+            "stc.zaloplatforms.com",
+            "mp3.zing.vn",
+        ] {
+            assert!(is_allowed_target(host, 443, &cfg), "expected 443 allowed: {host}");
+            assert!(!is_allowed_target(host, 80, &cfg), "expected 80 blocked: {host}");
+        }
+        for blocked in [
+            "cdn.zalocdn.com",
+            "api.zaloapi.com",
+            "bucket.vngcloud.vn",
+            "cdn.vcdn.vn",
+            "cdn.vcdn.com.vn",
+        ] {
+            assert!(
+                !is_allowed_target(blocked, 443, &cfg),
+                "expected blocked: {blocked}"
+            );
+        }
+
+        let args = vec![
+            "litechat-relay".to_string(),
+            "--extra-host".to_string(),
+            "media.tenor.com, *.extra-a.example.".to_string(),
+            "--extra-host".to_string(),
+            "extra-b.example".to_string(),
+            "--extra-host=.extra-c.example,media.tenor.com".to_string(),
+        ];
+        let parsed = parse_config_with(&args, |key| {
+            if key == "LITECHAT_RELAY_EXTRA_HOSTS" {
+                Some("env-a.example, *.env-b.example".to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            parsed.extra_allowed_hosts,
+            vec![
+                "env-a.example",
+                "env-b.example",
+                "media.tenor.com",
+                "extra-a.example",
+                "extra-b.example",
+                "extra-c.example",
+            ]
+        );
+        assert!(is_allowed_target("c.media.tenor.com", 443, &parsed));
+        assert!(is_allowed_target("cdn.env-b.example", 443, &parsed));
+        assert!(!is_allowed_target("cdn.env-b.example", 80, &parsed));
     }
 }

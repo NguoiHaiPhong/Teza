@@ -5,14 +5,22 @@ import {
   type ImgHTMLAttributes,
   type VideoHTMLAttributes,
 } from "react";
-import { useResolvedMediaUrl } from "../utils/mediaCache";
+import {
+  isRemoteMediaUrl,
+  normalizeMediaRequestUrl,
+  useResolvedMediaUrl,
+} from "../utils/mediaCache";
 
 function useRelayElement(
   src: string,
   forceRelay: boolean,
   onFallbackFail?: () => void,
 ) {
-  const { src: resolvedSrc, failed, requestFallback } = useResolvedMediaUrl(src, forceRelay);
+  const normalizedSrc = normalizeMediaRequestUrl(src);
+  const { src: resolvedSrc, failed, requestFallback } = useResolvedMediaUrl(
+    normalizedSrc,
+    forceRelay,
+  );
   const onFallbackFailRef = useRef(onFallbackFail);
   onFallbackFailRef.current = onFallbackFail;
 
@@ -20,11 +28,10 @@ function useRelayElement(
     if (failed) {
       onFallbackFailRef.current?.();
     }
-  }, [failed, src]);
+  }, [failed, normalizedSrc]);
 
   const triggerErrorFallback = () => {
-    if (resolvedSrc === src && /^https:\/\//i.test(src)) {
-      requestFallback();
+    if (resolvedSrc === normalizedSrc && isRemoteMediaUrl(normalizedSrc) && requestFallback()) {
       return true;
     }
     onFallbackFailRef.current?.();

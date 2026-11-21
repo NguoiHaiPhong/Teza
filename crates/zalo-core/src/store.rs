@@ -676,10 +676,15 @@ impl MessageStore {
                 quote_json = COALESCE(excluded.quote_json, messages.quote_json),
                 reactions_json = CASE WHEN ?15 = 1 THEN messages.reactions_json ELSE excluded.reactions_json END,
                 attachment_url = CASE
-                    WHEN excluded.is_recalled = 1 OR excluded.msg_type IN ('chat.reminder', 'chat.poll') THEN NULL
+                    WHEN excluded.is_recalled = 1 OR LOWER(excluded.msg_type) IN ('chat.reminder', 'chat.poll') THEN NULL
+                    WHEN LOWER(excluded.msg_type) IN ('chat.link', 'link', 'chat.location', 'chat.location.new', 'chat.recommended', 'chat.ecard') THEN excluded.attachment_url
                     ELSE COALESCE(excluded.attachment_url, messages.attachment_url)
                 END,
-                attachment_name = CASE WHEN excluded.is_recalled = 1 THEN NULL ELSE COALESCE(excluded.attachment_name, messages.attachment_name) END
+                attachment_name = CASE
+                    WHEN excluded.is_recalled = 1 THEN NULL
+                    WHEN LOWER(excluded.msg_type) IN ('chat.link', 'link', 'chat.location', 'chat.location.new', 'chat.recommended', 'chat.ecard') AND excluded.attachment_url IS NULL THEN NULL
+                    ELSE COALESCE(excluded.attachment_name, messages.attachment_name)
+                END
             "#,
             params![
                 m.msg_id,
@@ -1163,7 +1168,7 @@ impl MessageStore {
         )?;
         let mut media = Vec::new();
         let mut files = Vec::new();
-        for m in rows {
+        for mut m in rows {
             if media.len() >= limit && files.len() >= limit {
                 break;
             }
@@ -1171,20 +1176,33 @@ impl MessageStore {
             if mt_lower.contains("sticker")
                 || mt_lower.contains("reminder")
                 || mt_lower.contains("poll")
+                || matches!(
+                    mt_lower.as_str(),
+                    "chat.link"
+                        | "link"
+                        | "chat.location"
+                        | "chat.location.new"
+                        | "chat.recommended"
+                        | "chat.ecard"
+                )
                 || m.msg_type == "5"
                 || m.msg_type == "35"
                 || m.msg_type == "36"
             {
                 continue;
             }
-            let url_lower = m
-                .attachment_url
-                .as_deref()
-                .unwrap_or_default()
-                .to_lowercase();
+            let Some(raw_url) = m.attachment_url.as_deref() else {
+                continue;
+            };
+            let Ok(normalized_url) = crate::session::normalize_allowed_media_url(raw_url) else {
+                continue;
+            };
+            let url_str = normalized_url.to_string();
+            let url_lower = url_str.to_lowercase();
             if url_lower.contains("/reminder_") || url_lower.contains("/reminder-") {
                 continue;
             }
+            m.attachment_url = Some(url_str);
             let is_img_or_video = m.msg_type.contains("photo")
                 || m.msg_type == "2"
                 || m.msg_type.contains("video")
@@ -2638,6 +2656,190 @@ mod tests {
         assert_eq!(folders[1].id, "f-a");
         assert_eq!(folders[1].position, 2);
         assert_eq!(folders[1].excluded_thread_ids, vec!["t2".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_thread_media_skips_stale_external_urls_and_link_resync_clears_them() {
+        let dir = std::env::temp_dir().join(format!("teza-media-filter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = MessageStore::open(&dir.join("media_filter.db")).unwrap();
+
+        // Legacy external link URL persisted in DB
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "stale-link".into(),
+                thread_id: "t1".into(),
+                sender_id: "u1".into(),
+                sender_name: "An".into(),
+                text: "Xem bài viết".into(),
+                msg_type: "chat.link".into(),
+                ts: 1_700_000_001_000,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: Some("https://vnexpress.net/bai-viet.html".into()),
+                attachment_name: Some("VnExpress".into()),
+            })
+            .unwrap();
+
+        // Legacy non-CDN image URL persisted in DB
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "stale-ext-img".into(),
+                thread_id: "t1".into(),
+                sender_id: "u1".into(),
+                sender_name: "An".into(),
+                text: "[Hình ảnh]".into(),
+                msg_type: "chat.photo".into(),
+                ts: 1_700_000_002_000,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: Some("https://untrusted.example/photo.jpg".into()),
+                attachment_name: Some("photo.jpg".into()),
+            })
+            .unwrap();
+
+        // Legacy ecard & recommended rows whose href is on zalo.me must NOT leak into list_thread_media
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "stale-ecard".into(),
+                thread_id: "t1".into(),
+                sender_id: "u1".into(),
+                sender_name: "An".into(),
+                text: "[Thiệp chúc]".into(),
+                msg_type: "chat.ecard".into(),
+                ts: 1_700_000_002_500,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: Some("https://chat.zalo.me".into()),
+                attachment_name: Some("Thiệp".into()),
+            })
+            .unwrap();
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "stale-rec".into(),
+                thread_id: "t1".into(),
+                sender_id: "u1".into(),
+                sender_name: "An".into(),
+                text: "[Danh thiếp]".into(),
+                msg_type: "chat.recommended".into(),
+                ts: 1_700_000_002_700,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: Some("https://zalo.me/g/abc123".into()),
+                attachment_name: Some("Nhóm".into()),
+            })
+            .unwrap();
+
+        // Legacy http:// URL on trusted CDN should still appear and be upgraded to https://
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "legacy-http-file".into(),
+                thread_id: "t1".into(),
+                sender_id: "u1".into(),
+                sender_name: "An".into(),
+                text: "[Tập tin] report.pdf".into(),
+                msg_type: "chat.file".into(),
+                ts: 1_700_000_003_000,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: Some("http://files.zalo.cloud/report.pdf".into()),
+                attachment_name: Some("report.pdf".into()),
+            })
+            .unwrap();
+
+        let (media, files) = store.list_thread_media("t1", 20).unwrap();
+        assert!(media.is_empty());
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].msg_id, "legacy-http-file");
+        assert_eq!(
+            files[0].attachment_url.as_deref(),
+            Some("https://files.zalo.cloud/report.pdf")
+        );
+
+        // Resyncing the chat.link with attachment_url = None must clear the stale external URL
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "stale-link".into(),
+                thread_id: "t1".into(),
+                sender_id: "u1".into(),
+                sender_name: "An".into(),
+                text: "Xem bài viết\nhttps://vnexpress.net/bai-viet.html".into(),
+                msg_type: "chat.link".into(),
+                ts: 1_700_000_001_000,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+        let reloaded = store.get_message("t1", "stale-link").unwrap().unwrap();
+        assert!(reloaded.attachment_url.is_none());
+        assert!(reloaded.attachment_name.is_none());
+
+        // Resyncing legacy chat.ecard / chat.recommended with None clears stale zalo.me hrefs
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "stale-ecard".into(),
+                thread_id: "t1".into(),
+                sender_id: "u1".into(),
+                sender_name: "An".into(),
+                text: "[Thiệp chúc]".into(),
+                msg_type: "chat.ecard".into(),
+                ts: 1_700_000_002_500,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+        let reloaded_ecard = store.get_message("t1", "stale-ecard").unwrap().unwrap();
+        assert!(reloaded_ecard.attachment_url.is_none());
+        assert!(reloaded_ecard.attachment_name.is_none());
+
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "stale-rec".into(),
+                thread_id: "t1".into(),
+                sender_id: "u1".into(),
+                sender_name: "An".into(),
+                text: "[Danh thiếp]".into(),
+                msg_type: "chat.recommended".into(),
+                ts: 1_700_000_002_700,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+        let reloaded_rec = store.get_message("t1", "stale-rec").unwrap().unwrap();
+        assert!(reloaded_rec.attachment_url.is_none());
+        assert!(reloaded_rec.attachment_name.is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

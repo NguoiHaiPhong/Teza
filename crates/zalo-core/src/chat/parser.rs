@@ -54,27 +54,34 @@ pub fn normalize_media_url(raw: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-    let normalized = if let Some(rest) = trimmed.strip_prefix("//") {
-        format!("https://{rest}")
-    } else if let Some(rest) = trimmed.strip_prefix("http://") {
-        let host = rest.split('/').next().unwrap_or("").to_ascii_lowercase();
-        if host.ends_with(".zdn.vn")
-            || host.ends_with(".zadn.vn")
-            || host.ends_with(".zaloapp.com")
-            || host.ends_with(".zalo.me")
-            || host.ends_with(".zalo.vn")
-        {
-            format!("https://{rest}")
-        } else {
-            return String::new();
-        }
+    let unescaped: std::borrow::Cow<'_, str> = if trimmed.contains(r"\/") {
+        std::borrow::Cow::Owned(trimmed.replace(r"\/", "/"))
     } else {
-        trimmed.to_string()
+        std::borrow::Cow::Borrowed(trimmed)
     };
-    if normalized.starts_with("https://") {
-        normalized
+    let candidate: std::borrow::Cow<'_, str> = if unescaped.starts_with("//") {
+        std::borrow::Cow::Owned(format!("https:{unescaped}"))
     } else {
-        String::new()
+        unescaped
+    };
+    let Ok(url) = reqwest::Url::parse(&candidate) else {
+        return String::new();
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return String::new();
+    }
+    match url.scheme() {
+        "https" => {
+            if url.port().is_some_and(|p| p != 443) || url.host_str().is_none() {
+                String::new()
+            } else {
+                url.to_string()
+            }
+        }
+        "http" => crate::session::normalize_allowed_media_url(&candidate)
+            .map(|u| u.to_string())
+            .unwrap_or_default(),
+        _ => String::new(),
     }
 }
 
@@ -549,26 +556,68 @@ pub fn sticker_image_url(sid: u64, cate_id: u64) -> Option<String> {
     }
 }
 
+fn is_link_or_card_msg_type(msg_type: &str) -> bool {
+    matches!(
+        msg_type.to_ascii_lowercase().as_str(),
+        "chat.link"
+            | "link"
+            | "chat.location"
+            | "chat.location.new"
+            | "chat.recommended"
+            | "chat.ecard"
+    )
+}
+
+fn extract_link_href(raw: Option<&Value>) -> Option<String> {
+    let obj = raw.and_then(unwrap_json_object)?;
+    let params_val = obj.get("params").and_then(unwrap_json_object);
+    let candidate = pick_str(&obj, &["href", "url"])
+        .or_else(|| params_val.as_ref().and_then(|p| pick_str(p, &["href", "url"])))?;
+    let cleaned = candidate.trim().replace(r"\/", "/");
+    let parsed = reqwest::Url::parse(&cleaned).ok()?;
+    if matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some() {
+        Some(cleaned)
+    } else {
+        None
+    }
+}
+
 fn extract_attachment(v: &Value, msg_type: &str) -> (Option<String>, Option<String>) {
-    let obj = match v {
-        Value::String(s) if s.trim().starts_with('{') => serde_json::from_str::<Value>(s.trim()).ok(),
-        Value::Object(_) => Some(v.clone()),
-        _ => None,
-    };
-    let Some(o) = obj else {
+    let Some(o) = unwrap_json_object(v) else {
         return (None, None);
     };
-    let params_val = o
-        .get("params")
-        .and_then(Value::as_str)
-        .and_then(|s| serde_json::from_str::<Value>(s.trim()).ok());
-    const URL_PRIORITY: &[&str] = &["oriUrl", "hdUrl", "href", "normalUrl", "thumb", "stickerUrl"];
-    let href = URL_PRIORITY.iter().find_map(|key| {
-        pick_str(&o, &[*key])
-            .or_else(|| params_val.as_ref().and_then(|p| pick_str(p, &[*key])))
-            .map(|u| normalize_media_url(&u))
-            .filter(|u| !u.is_empty())
-    });
+    let params_val = o.get("params").and_then(unwrap_json_object);
+    let is_link_or_card = is_link_or_card_msg_type(msg_type);
+    let href = if is_link_or_card {
+        // Never store external non-CDN hrefs in `attachment_url`; keep only verified CDN thumbnails.
+        ["thumb", "thumbUrl"].iter().find_map(|key| {
+            pick_str(&o, &[*key])
+                .or_else(|| params_val.as_ref().and_then(|p| pick_str(p, &[*key])))
+                .and_then(|u| crate::session::normalize_allowed_media_url(&u).ok())
+                .map(|u| u.to_string())
+        })
+    } else {
+        const URL_PRIORITY: &[&str] = &[
+            "oriUrl",
+            "hdUrl",
+            "fileUrl",
+            "href",
+            "normalUrl",
+            "url",
+            "thumb",
+            "stickerUrl",
+        ];
+        URL_PRIORITY.iter().find_map(|key| {
+            pick_str(&o, &[*key])
+                .or_else(|| params_val.as_ref().and_then(|p| pick_str(p, &[*key])))
+                .map(|u| normalize_media_url(&u))
+                .filter(|u| !u.is_empty())
+        })
+    };
+
+    if is_link_or_card && href.is_none() {
+        return (None, None);
+    }
 
     let mut title = pick_str(&o, &["fileName", "name", "title"]);
     if title.is_none() {
@@ -832,6 +881,19 @@ pub fn parse_chat_message(
     } else {
         raw_content.and_then(extract_content_text).unwrap_or_default()
     };
+
+    if matches!(
+        msg_type.to_ascii_lowercase().as_str(),
+        "chat.link" | "link" | "chat.location" | "chat.location.new"
+    ) {
+        if let Some(link_url) = extract_link_href(raw_content) {
+            if text.is_empty() {
+                text = link_url;
+            } else if !text.contains(&link_url) {
+                text = format!("{text}\n{link_url}");
+            }
+        }
+    }
 
     if text.is_empty() {
         text = match msg_type.as_str() {
@@ -1633,5 +1695,99 @@ mod tests {
         assert_eq!(dto.options.len(), 2);
         assert_eq!(dto.options[0].votes, 3);
         assert!(dto.options[0].voted);
+    }
+
+    #[test]
+    fn chat_link_never_stores_external_href_as_attachment_url() {
+        let link_no_cdn_thumb = json!({
+            "msgId": "link-1",
+            "uidFrom": "100",
+            "idTo": "200",
+            "msgType": "chat.link",
+            "ts": 1_700_000_010_000_i64,
+            "content": {
+                "title": "Bài viết mới",
+                "description": "Tóm tắt bài viết",
+                "href": "https://vnexpress.net/bai-viet-123.html",
+                "thumb": "https://i1-vnexpress.vnecdn.net/og.jpg"
+            }
+        });
+        let parsed = parse_chat_message(&link_no_cdn_thumb, None, "999", "", false).unwrap();
+        assert_eq!(parsed.msg_type, "chat.link");
+        assert!(parsed.attachment_url.is_none());
+        assert!(parsed.attachment_name.is_none());
+        assert!(parsed.text.contains("Tóm tắt bài viết"));
+        assert!(parsed.text.contains("https://vnexpress.net/bai-viet-123.html"));
+
+        // If Zalo cached a thumbnail on an official CDN, keep ONLY the CDN thumb (not external href)
+        let link_with_cdn_thumb = json!({
+            "msgId": "link-2",
+            "uidFrom": "100",
+            "idTo": "200",
+            "msgType": "chat.link",
+            "ts": 1_700_000_011_000_i64,
+            "content": {
+                "title": "Video hay",
+                "href": "https://youtube.com/watch?v=abc",
+                "thumb": "http://f10-zpc.zdn.vn/link-thumb.jpg"
+            }
+        });
+        let parsed2 = parse_chat_message(&link_with_cdn_thumb, None, "999", "", false).unwrap();
+        assert_eq!(
+            parsed2.attachment_url.as_deref(),
+            Some("https://f10-zpc.zdn.vn/link-thumb.jpg")
+        );
+        assert!(parsed2.text.contains("https://youtube.com/watch?v=abc"));
+
+        // External location / ecard / recommended hrefs are also excluded from attachment_url
+        let loc = json!({
+            "msgId": "loc-1",
+            "uidFrom": "100",
+            "idTo": "200",
+            "msgType": "chat.location",
+            "ts": 1_700_000_012_000_i64,
+            "content": {
+                "address": "Hà Nội",
+                "href": "https://maps.google.com/?q=21.0285,105.8542",
+                "thumb": "https://maps.googleapis.com/maps/api/staticmap?center=21,105"
+            }
+        });
+        let parsed_loc = parse_chat_message(&loc, None, "999", "", false).unwrap();
+        assert!(parsed_loc.attachment_url.is_none());
+        assert!(parsed_loc.text.contains("https://maps.google.com/?q=21.0285,105.8542"));
+    }
+
+    #[test]
+    fn normalize_media_url_and_object_params_file_url_extraction() {
+        assert_eq!(
+            normalize_media_url(r"HTTP:\/\/files.zalo.cloud\/a\/b.pdf"),
+            "https://files.zalo.cloud/a/b.pdf"
+        );
+        assert_eq!(
+            normalize_media_url("http://dl.zbox.vn:80/report.docx"),
+            "https://dl.zbox.vn/report.docx"
+        );
+        assert_eq!(normalize_media_url("http://bucket.vngcloud.vn/x.pdf"), "");
+
+        let file_msg = json!({
+            "msgId": "f-obj-1",
+            "uidFrom": "100",
+            "idTo": "200",
+            "msgType": "chat.file",
+            "ts": 1_700_000_020_000_i64,
+            "content": {
+                "title": "bao_cao.xlsx",
+                "params": {
+                    "fileUrl": "http://files.zalo.cloud/dl/bao_cao.xlsx",
+                    "fileName": "bao_cao.xlsx"
+                }
+            }
+        });
+        let parsed = parse_chat_message(&file_msg, None, "999", "", false).unwrap();
+        assert_eq!(
+            parsed.attachment_url.as_deref(),
+            Some("https://files.zalo.cloud/dl/bao_cao.xlsx")
+        );
+        assert_eq!(parsed.attachment_name.as_deref(), Some("bao_cao.xlsx"));
     }
 }

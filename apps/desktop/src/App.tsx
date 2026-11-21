@@ -51,7 +51,12 @@ import {
   isBuzzMessage,
   playBuzzSound,
 } from "./utils/buzz";
-import { setRelayMediaRouting } from "./utils/mediaCache";
+import {
+  classifyDrawerFileAction,
+  isDataImageUrl,
+  normalizeMediaRequestUrl,
+  setRelayMediaRouting,
+} from "./utils/mediaCache";
 import { playMessageSound, showDesktopNotification } from "./utils/notify";
 import {
   computeTotalUnreadBadge,
@@ -326,6 +331,7 @@ export default function App() {
   const themeRef = useRef<ThemeMode>(theme);
   const myProfileRef = useRef<AccountProfile | null>(myProfile);
   const webToastTimerRef = useRef<number | null>(null);
+  const toastErrorTimerRef = useRef<number | null>(null);
   const activeThreadRootIdRef = useRef<string | null>(activeThreadRootId);
   const inChatSearchInputRef = useRef<HTMLInputElement | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
@@ -657,7 +663,22 @@ export default function App() {
 
   const showError = useCallback((err: unknown) => {
     setToastError(String(err));
-    setTimeout(() => setToastError(null), 5000);
+    if (toastErrorTimerRef.current !== null) {
+      window.clearTimeout(toastErrorTimerRef.current);
+    }
+    toastErrorTimerRef.current = window.setTimeout(() => {
+      toastErrorTimerRef.current = null;
+      setToastError(null);
+    }, 5000);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (toastErrorTimerRef.current !== null) {
+        window.clearTimeout(toastErrorTimerRef.current);
+        toastErrorTimerRef.current = null;
+      }
+    };
   }, []);
 
   const refreshQr = useCallback(async () => {
@@ -1957,13 +1978,22 @@ export default function App() {
     [showError],
   );
 
+  const handleOpenExternalUrl = useCallback(
+    (url: string) => {
+      void bridge.openExternalUrl(url).catch(showError);
+    },
+    [showError],
+  );
+
   const openLightboxForUrl = useCallback(
     (url: string, title: string) => {
+      const targetUrl = normalizeMediaRequestUrl(url) || url;
       const gallery: LightboxItem[] = messages
-        .filter(
-          (m) =>
+        .filter((m) => {
+          const norm = normalizeMediaRequestUrl(m.attachment_url);
+          return (
             !m.is_recalled &&
-            !!m.attachment_url &&
+            !!norm &&
             !m.msg_type.includes("sticker") &&
             m.msg_type !== "5" &&
             !m.msg_type.includes("voice") &&
@@ -1972,18 +2002,19 @@ export default function App() {
             m.msg_type !== "4" &&
             (m.msg_type.includes("photo") ||
               m.msg_type === "2" ||
-              m.attachment_url.startsWith("data:image/") ||
-              /\.(png|jpe?g|webp|gif|bmp)(\?|$)/i.test(m.attachment_url)),
-        )
+              isDataImageUrl(norm) ||
+              /\.(png|jpe?g|webp|gif|bmp)(\?|$)/i.test(norm))
+          );
+        })
         .map((m) => ({
-          url: m.attachment_url!,
+          url: normalizeMediaRequestUrl(m.attachment_url),
           title: m.attachment_name || "Hình ảnh",
         }));
-      const foundIdx = gallery.findIndex((item) => item.url === url);
+      const foundIdx = gallery.findIndex((item) => item.url === targetUrl);
       if (foundIdx >= 0) {
         setLightboxState({ items: gallery, index: foundIdx });
       } else {
-        setLightboxState({ items: [{ url, title }], index: 0 });
+        setLightboxState({ items: [{ url: targetUrl, title }], index: 0 });
       }
     },
     [messages],
@@ -3435,11 +3466,6 @@ export default function App() {
             </span>
           </button>
         )}
-        {toastError && (
-          <div className="absolute right-4 top-16 z-40 rounded-xl bg-rose-600/95 px-4 py-2 text-xs text-white shadow-lg">
-            {toastError}
-          </div>
-        )}
 
         {dragHover && activeThread && (
           <div className="pointer-events-none absolute inset-0 z-40 flex flex-col items-center justify-center gap-2 border-2 border-dashed border-sky-400 bg-sky-950/75 text-white backdrop-blur-xs">
@@ -4007,6 +4033,7 @@ export default function App() {
                       onRetrySend={handleRetryFailedMessage}
                       onDiscardFailed={handleDiscardFailedMessage}
                       onSaveFile={handleSaveRemoteFile}
+                      onOpenExternal={handleOpenExternalUrl}
                       onCopyError={showError}
                       onVotePoll={handleVotePoll}
                       onRefreshPoll={handleRefreshPoll}
@@ -4492,31 +4519,49 @@ export default function App() {
               ) : detailsTab === "files" ? (
                 threadDetails && threadDetails.file_items.length > 0 ? (
                 <div className="space-y-1.5">
-                  {threadDetails.file_items.slice(0, 20).map((item) => (
-                    <button
-                      key={item.msg_id}
-                      type="button"
-                      onClick={() => {
-                        if (item.attachment_url && /^https?:\/\//i.test(item.attachment_url)) {
-                          handleSaveRemoteFile(
-                            item.attachment_url,
-                            item.attachment_name || "attachment",
-                          );
-                        } else {
-                          void jumpToMsg(item.msg_id);
+                  {threadDetails.file_items.slice(0, 20).map((item) => {
+                    const drawerAction = classifyDrawerFileAction(item);
+                    const normalizedUrl = normalizeMediaRequestUrl(item.attachment_url);
+                    return (
+                      <button
+                        key={item.msg_id}
+                        type="button"
+                        onClick={() => {
+                          if (drawerAction === "open_external" && normalizedUrl) {
+                            handleOpenExternalUrl(normalizedUrl);
+                          } else if (drawerAction === "save_file" && normalizedUrl) {
+                            handleSaveRemoteFile(
+                              normalizedUrl,
+                              item.attachment_name || "attachment",
+                            );
+                          } else {
+                            void jumpToMsg(item.msg_id);
+                          }
+                        }}
+                        title={
+                          drawerAction === "open_external"
+                            ? t("openExternalBrowser")
+                            : t("clickToDownloadFile")
                         }
-                      }}
-                      title={t("clickToDownloadFile")}
-                      className="hover-menu flex w-full items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-left text-xs transition"
-                      style={{ background: "var(--bg-surface)" }}
-                    >
-                      <div className="flex min-w-0 flex-1 items-center gap-2">
-                        <FileText className="h-4 w-4 shrink-0" style={{ color: "var(--accent)" }} />
-                        <span className="truncate">{item.attachment_name || item.text}</span>
-                      </div>
-                      <Download className="h-3.5 w-3.5 shrink-0 opacity-75" style={{ color: "var(--accent)" }} />
-                    </button>
-                  ))}
+                        className="hover-menu flex w-full items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-left text-xs transition"
+                        style={{ background: "var(--bg-surface)" }}
+                      >
+                        <div className="flex min-w-0 flex-1 items-center gap-2">
+                          {drawerAction === "open_external" ? (
+                            <ExternalLink className="h-4 w-4 shrink-0" style={{ color: "var(--accent)" }} />
+                          ) : (
+                            <FileText className="h-4 w-4 shrink-0" style={{ color: "var(--accent)" }} />
+                          )}
+                          <span className="truncate">{item.attachment_name || item.text}</span>
+                        </div>
+                        {drawerAction === "open_external" ? (
+                          <ExternalLink className="h-3.5 w-3.5 shrink-0 opacity-75" style={{ color: "var(--accent)" }} />
+                        ) : (
+                          <Download className="h-3.5 w-3.5 shrink-0 opacity-75" style={{ color: "var(--accent)" }} />
+                        )}
+                      </button>
+                    );
+                  })}
                 </div>
                 ) : (
                   <div className="py-4 text-center text-xs opacity-60">{t("noFilesYet")}</div>
@@ -4988,6 +5033,15 @@ export default function App() {
           >
             <X className="h-3.5 w-3.5" />
           </button>
+        </div>
+      )}
+
+      {toastError && (
+        <div
+          role="alert"
+          className="fixed right-4 top-16 z-[90] max-w-md rounded-xl bg-rose-600/95 px-4 py-2 text-xs text-white shadow-2xl"
+        >
+          {toastError}
         </div>
       )}
 
