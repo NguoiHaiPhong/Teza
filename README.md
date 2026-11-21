@@ -3,7 +3,7 @@
   <h1>Teza</h1>
   <p><strong>Ứng dụng nhắn tin desktop gọn nhẹ, tốc độ cao và bảo mật cho Windows</strong></p>
   <p>
-    <a href="https://github.com/NguoiHaiPhong/litechat/releases/latest">Tải bản phát hành mới nhất</a> ·
+    <a href="https://github.com/NguoiHaiPhong/Teza/releases/latest">Tải bản phát hành mới nhất</a> ·
     <a href="#hướng-dẫn-sử-dụng">Hướng dẫn sử dụng</a> ·
     <a href="docs/ARCHITECTURE.md">Kiến trúc hệ thống</a> ·
     <a href="docs/LEGAL_AND_SECURITY.md">Pháp lý &amp; Bảo mật</a>
@@ -18,7 +18,7 @@
 
 Thay vì phụ thuộc vào trình duyệt nặng nề, Teza tối ưu tốc độ phản hồi khi soạn thảo và chuyển hội thoại, mã hóa cục bộ dữ liệu nhạy cảm bằng **Windows DPAPI**, lưu trữ lịch sử trò chuyện bằng **SQLite FTS5** (hỗ trợ tìm kiếm không dấu), đồng thời bổ sung nhiều tiện ích làm việc chuyên sâu như thư mục phân loại hội thoại, thông báo nổi 4 góc màn hình, dịch tự động đa nhà cung cấp, nhắc hẹn, bình chọn và **Web App nhúng**.
 
-> **Lưu ý về mã nguồn & lưu trữ:** Teza được phát triển từ nền tảng dự án `litechat` (tên repository hiện tại vẫn là `NguoiHaiPhong/litechat`). Khi chạy lần đầu, ứng dụng tự động di trú dữ liệu từ `%LOCALAPPDATA%\litechat\` (nếu có) sang `%LOCALAPPDATA%\Teza\`.
+> **Lưu ý về lưu trữ dữ liệu:** Teza được phát triển từ nền tảng dự án `litechat`. Khi chạy lần đầu, ứng dụng tự động di trú dữ liệu từ `%LOCALAPPDATA%\litechat\` (nếu có) sang `%LOCALAPPDATA%\Teza\`.
 
 ---
 
@@ -59,7 +59,7 @@ Thay vì phụ thuộc vào trình duyệt nặng nề, Teza tối ưu tốc đ�
 - **Thành phần phụ thuộc:** SQLite, TLS/Crypto và Visual C++ Runtime đã được đóng gói tĩnh trong tệp cài đặt. Nếu máy chưa có **Microsoft Edge WebView2 Runtime**, bộ cài sẽ tự động tải bootstrapper và cài đặt ngầm trong quá trình cài Teza (cần kết nối Internet).
 
 ### Tải và cài đặt
-1. Truy cập trang [Releases](https://github.com/NguoiHaiPhong/litechat/releases/latest).
+1. Truy cập trang [Releases](https://github.com/NguoiHaiPhong/Teza/releases/latest).
 2. Tải về tệp cài đặt Windows mới nhất:
    - `Teza_<phiên_bản>_x64-setup.exe` *(khuyến nghị cho cài đặt cá nhân)*, hoặc
    - `Teza_<phiên_bản>_x64_en-US.msi`
