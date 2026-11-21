@@ -1,13 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
-import { Search, X } from "lucide-react";
+import { Search, UserPlus, X } from "lucide-react";
 import { bridge } from "../bridge";
 import type { MessageDto, ThreadDto } from "../types";
+import { looksLikePhoneQuery } from "../utils/threadState";
 
 interface Props {
   open: boolean;
   threads: ThreadDto[];
   onClose: () => void;
   onSelectMessage: (msg: MessageDto) => void;
+  onFindPhone?: (phone: string) => void;
 }
 
 function formatResultTime(ts: number): string {
@@ -21,7 +23,7 @@ function formatResultTime(ts: number): string {
   });
 }
 
-export function QuickSearchModal({ open, threads, onClose, onSelectMessage }: Props) {
+export function QuickSearchModal({ open, threads, onClose, onSelectMessage, onFindPhone }: Props) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<MessageDto[]>([]);
   const [activeIndex, setActiveIndex] = useState(0);
@@ -108,6 +110,24 @@ export function QuickSearchModal({ open, threads, onClose, onSelectMessage }: Pr
         </div>
 
         <div className="max-h-96 overflow-y-auto p-2">
+          {onFindPhone && looksLikePhoneQuery(query) && (
+            <button
+              type="button"
+              onClick={() => {
+                const phone = query.trim();
+                onClose();
+                onFindPhone(phone);
+              }}
+              className="hover-menu mb-1.5 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-[13.5px] font-medium transition"
+              style={{
+                background: "var(--accent-soft)",
+                color: "var(--accent)",
+              }}
+            >
+              <UserPlus className="h-4 w-4 shrink-0" />
+              <span>Tìm người dùng theo số điện thoại &ldquo;{query.trim()}&rdquo;</span>
+            </button>
+          )}
           {results.length === 0 ? (
             <p className="py-8 text-center text-[13px]" style={{ color: "var(--text-secondary)" }}>
               {query.trim()

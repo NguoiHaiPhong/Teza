@@ -16,16 +16,24 @@ pub struct StoragePaths {
 }
 
 impl StoragePaths {
-    /// Resolve the default OS-appropriate writable directory for `litechat`.
+    /// Resolve the default OS-appropriate writable directory for `Teza`,
+    /// automatically migrating data from the legacy `litechat` directory on first run.
     pub fn resolve_default(profile: Option<&str>) -> Result<Self> {
         let base = default_app_data_dir()?;
-        let root = match profile {
+        let legacy_base = legacy_app_data_dir().ok();
+        let (root, legacy_root) = match profile {
             Some(raw) => {
                 let safe = sanitize_profile_name(raw)?;
-                base.join("profiles").join(safe)
+                (
+                    base.join("profiles").join(&safe),
+                    legacy_base.map(|b| b.join("profiles").join(&safe)),
+                )
             }
-            None => base,
+            None => (base, legacy_base),
         };
+        if let Some(ref legacy) = legacy_root {
+            let _ = migrate_legacy_dir_if_needed(&root, legacy);
+        }
         ensure_private_dir(&root)?;
         Ok(Self { root })
     }
@@ -80,36 +88,80 @@ pub fn sanitize_profile_name(raw: &str) -> Result<String> {
     Ok(safe)
 }
 
-fn default_app_data_dir() -> Result<PathBuf> {
+fn app_data_dir_named(app_folder: &str) -> Result<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         if let Some(local) = std::env::var_os("LOCALAPPDATA") {
             let p = PathBuf::from(local);
             if !p.as_os_str().is_empty() {
-                return Ok(p.join("litechat"));
+                return Ok(p.join(app_folder));
             }
         }
         if let Some(profile) = std::env::var_os("USERPROFILE") {
-            return Ok(PathBuf::from(profile).join("AppData/Local/litechat"));
+            return Ok(PathBuf::from(profile).join("AppData/Local").join(app_folder));
         }
         bail!("Không xác định được thư mục %LOCALAPPDATA% trên Windows");
     }
     #[cfg(target_os = "macos")]
     {
         let home = std::env::var_os("HOME").context("Thiếu biến môi trường HOME")?;
-        return Ok(PathBuf::from(home).join("Library/Application Support/litechat"));
+        return Ok(PathBuf::from(home)
+            .join("Library/Application Support")
+            .join(app_folder));
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
+        let lower = app_folder.to_ascii_lowercase();
         if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
             let p = PathBuf::from(xdg);
             if !p.as_os_str().is_empty() {
-                return Ok(p.join("litechat"));
+                return Ok(p.join(&lower));
             }
         }
         let home = std::env::var_os("HOME").context("Thiếu biến môi trường HOME")?;
-        Ok(PathBuf::from(home).join(".local/share/litechat"))
+        Ok(PathBuf::from(home).join(".local/share").join(lower))
     }
+}
+
+fn default_app_data_dir() -> Result<PathBuf> {
+    app_data_dir_named("Teza")
+}
+
+fn legacy_app_data_dir() -> Result<PathBuf> {
+    app_data_dir_named("litechat")
+}
+
+fn copy_dir_missing(src: &Path, dst: &Path) -> Result<()> {
+    ensure_private_dir(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(".tmp-") {
+            continue;
+        }
+        let src_path = entry.path();
+        let dst_path = dst.join(&name);
+        if entry.file_type()?.is_dir() {
+            copy_dir_missing(&src_path, &dst_path)?;
+        } else if !dst_path.exists() {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn migrate_legacy_dir_if_needed(target: &Path, legacy: &Path) -> Result<bool> {
+    if target == legacy || !legacy.exists() {
+        return Ok(false);
+    }
+    let target_has_data = target.join("session.json").exists()
+        || target.join("history.db").exists()
+        || target.join("accounts").exists();
+    if target_has_data {
+        return Ok(false);
+    }
+    copy_dir_missing(legacy, target)?;
+    Ok(true)
 }
 
 pub fn ensure_private_dir(path: &Path) -> Result<()> {
@@ -176,8 +228,34 @@ mod tests {
         let paths = StoragePaths::resolve_default(Some("work_1")).unwrap();
         let s = paths.root.to_string_lossy().to_lowercase();
         assert!(!s.contains("program files"));
-        assert!(s.contains("litechat"));
+        assert!(s.contains("teza"));
         assert!(s.contains("work_1"));
+    }
+
+    #[test]
+    fn migrates_legacy_litechat_dir_without_overwriting_existing_target() {
+        let root = std::env::temp_dir().join(format!("teza-migrate-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let legacy = root.join("litechat");
+        let target = root.join("Teza");
+        std::fs::create_dir_all(legacy.join("accounts")).unwrap();
+        std::fs::write(legacy.join("session.json"), b"legacy-sess").unwrap();
+        std::fs::write(legacy.join(".tmp-stale"), b"skip").unwrap();
+        std::fs::write(legacy.join("accounts").join("123_history.db"), b"db").unwrap();
+
+        assert!(migrate_legacy_dir_if_needed(&target, &legacy).unwrap());
+        assert_eq!(std::fs::read(target.join("session.json")).unwrap(), b"legacy-sess");
+        assert_eq!(
+            std::fs::read(target.join("accounts").join("123_history.db")).unwrap(),
+            b"db"
+        );
+        assert!(!target.join(".tmp-stale").exists());
+
+        // Subsequent runs must not overwrite newer target data
+        std::fs::write(target.join("session.json"), b"new-sess").unwrap();
+        assert!(!migrate_legacy_dir_if_needed(&target, &legacy).unwrap());
+        assert_eq!(std::fs::read(target.join("session.json")).unwrap(), b"new-sess");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

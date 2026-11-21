@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { CornerUpLeft, FileText, Image as ImageIcon, Loader2, Paperclip, Send, Smile, X, Zap } from "lucide-react";
 import { bridge, isTauri, MAX_ATTACHMENT_BYTES } from "../bridge";
 import type { MessageDto, PendingAttachment, StickerItem, ThreadMemberDto } from "../types";
@@ -22,16 +22,17 @@ const EMOJI_GROUPS: { label: string; items: string[] }[] = [
 ];
 
 interface Props {
+  threadKey?: string;
   replyTo: MessageDto | null;
   draft?: string;
-  onDraftChange?: (val: string) => void;
+  onDraftChange?: (val: string, threadKey?: string) => void;
   pendingAttachment?: PendingAttachment | null;
   onPendingAttachmentChange?: (att: PendingAttachment | null) => void;
   mentionMembers?: ThreadMemberDto[];
   onSendSticker?: (sticker: StickerItem) => Promise<unknown>;
   onCancelReply: () => void;
   onSendText: (text: string) => Promise<boolean | void>;
-  onSendAttachment?: (att: PendingAttachment, caption: string) => Promise<unknown>;
+  onSendAttachment?: (att: PendingAttachment, caption: string) => Promise<boolean | void | unknown>;
   onBuzz?: () => Promise<void>;
   buzzCooldownSec?: number;
   placeholder?: string;
@@ -46,6 +47,7 @@ function formatBytes(bytes: number): string {
 }
 
 export function Composer({
+  threadKey,
   replyTo,
   draft: controlledDraft,
   onDraftChange,
@@ -62,12 +64,71 @@ export function Composer({
   globalPasteFallback = false,
   onError,
 }: Props) {
-  const [localDraft, setLocalDraft] = useState("");
-  const draft = controlledDraft !== undefined ? controlledDraft : localDraft;
+  const [draft, setLocalDraft] = useState(controlledDraft ?? "");
+  const draftRef = useRef(draft);
+  draftRef.current = draft;
+  const threadKeyRef = useRef(threadKey);
+  const onDraftChangeRef = useRef(onDraftChange);
+  onDraftChangeRef.current = onDraftChange;
+  const draftTimerRef = useRef<number | null>(null);
+  const lastHeightRef = useRef<number>(0);
+
+  const flushDraft = (val: string, targetKey: string | undefined) => {
+    if (draftTimerRef.current !== null) {
+      window.clearTimeout(draftTimerRef.current);
+      draftTimerRef.current = null;
+    }
+    onDraftChangeRef.current?.(val, targetKey);
+  };
+
+  useEffect(() => {
+    const prevKey = threadKeyRef.current;
+    if (prevKey !== threadKey) {
+      if (draftTimerRef.current !== null) {
+        flushDraft(draftRef.current, prevKey);
+      }
+      threadKeyRef.current = threadKey;
+      lastHeightRef.current = 0;
+      setLocalDraft(controlledDraft ?? "");
+      return;
+    }
+    if (
+      controlledDraft !== undefined &&
+      controlledDraft !== draftRef.current &&
+      draftTimerRef.current === null
+    ) {
+      setLocalDraft(controlledDraft);
+    }
+  }, [threadKey, controlledDraft]);
+
+  useEffect(() => {
+    return () => {
+      if (draftTimerRef.current !== null) {
+        window.clearTimeout(draftTimerRef.current);
+        draftTimerRef.current = null;
+        onDraftChangeRef.current?.(draftRef.current, threadKeyRef.current);
+      }
+    };
+  }, []);
+
   const setDraft = (next: string | ((prev: string) => string)) => {
-    const val = typeof next === "function" ? next(draft) : next;
-    if (onDraftChange) onDraftChange(val);
-    else setLocalDraft(val);
+    const val = typeof next === "function" ? next(draftRef.current) : next;
+    setLocalDraft(val);
+    draftRef.current = val;
+    if (draftTimerRef.current !== null) {
+      window.clearTimeout(draftTimerRef.current);
+      draftTimerRef.current = null;
+    }
+    if (!onDraftChangeRef.current) return;
+    if (!val) {
+      onDraftChangeRef.current(val, threadKeyRef.current);
+      return;
+    }
+    const scheduledKey = threadKeyRef.current;
+    draftTimerRef.current = window.setTimeout(() => {
+      draftTimerRef.current = null;
+      onDraftChangeRef.current?.(val, scheduledKey);
+    }, 350);
   };
   const [sending, setSending] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
@@ -152,12 +213,43 @@ export function Composer({
     });
   };
 
-  useEffect(() => {
+  const syncTextareaHeight = (forceMeasure = false) => {
     const el = textareaRef.current;
     if (!el) return;
+    const val = el.value;
+    if (!val) {
+      if (lastHeightRef.current !== 0) {
+        el.style.height = "";
+        lastHeightRef.current = 0;
+      }
+      return;
+    }
+    if (!forceMeasure && lastHeightRef.current === 0 && !val.includes("\n") && val.length < 28) {
+      return;
+    }
     el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, 140)}px`;
-  }, [draft]);
+    const nextH = Math.min(el.scrollHeight, 140);
+    if (nextH !== lastHeightRef.current) {
+      el.style.height = `${nextH}px`;
+      lastHeightRef.current = nextH;
+    } else if (lastHeightRef.current > 0) {
+      el.style.height = `${lastHeightRef.current}px`;
+    }
+  };
+
+  useLayoutEffect(() => {
+    syncTextareaHeight();
+  }, [draft, placeholder, pendingAttachment]);
+
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => {
+      syncTextareaHeight(true);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   useEffect(() => {
     const previewUrl =
@@ -254,10 +346,14 @@ export function Composer({
       setSending(true);
       const att = pendingAttachment;
       const cap = draft;
-      onPendingAttachmentChange?.(null);
-      setDraft("");
       try {
-        await onSendAttachment(att, cap);
+        const ok = await onSendAttachment(att, cap);
+        if (ok !== false && ok !== null) {
+          onPendingAttachmentChange?.(null);
+          setDraft("");
+        }
+      } catch {
+        // Keep pendingAttachment and draft intact so user can retry cleanly
       } finally {
         setSending(false);
       }
@@ -615,14 +711,21 @@ export function Composer({
           rows={1}
           value={draft}
           onChange={(e) => {
-            setDraft(e.target.value);
-            setCursorPos(e.currentTarget.selectionStart ?? e.target.value.length);
+            const val = e.target.value;
+            setDraft(val);
+            if (mentionMembers.length > 0 && (val.includes("@") || mentionMatch !== null)) {
+              setCursorPos(e.currentTarget.selectionStart ?? val.length);
+            }
           }}
           onClick={(e) => {
-            setCursorPos(e.currentTarget.selectionStart ?? e.currentTarget.value.length);
+            if (mentionMembers.length > 0 && e.currentTarget.value.includes("@")) {
+              setCursorPos(e.currentTarget.selectionStart ?? e.currentTarget.value.length);
+            }
           }}
           onKeyUp={(e) => {
-            setCursorPos(e.currentTarget.selectionStart ?? e.currentTarget.value.length);
+            if (mentionMembers.length > 0 && (e.currentTarget.value.includes("@") || mentionMatch !== null)) {
+              setCursorPos(e.currentTarget.selectionStart ?? e.currentTarget.value.length);
+            }
           }}
           onPaste={(e) => {
             const pastedFile = extractAttachmentFromClipboard(e.clipboardData);
@@ -680,9 +783,9 @@ export function Composer({
           placeholder={
             pendingAttachment
               ? "Thêm chú thích cho tệp đính kèm..."
-              : placeholder || "Nhập tin nhắn... (Enter gửi, Shift+Enter xuống dòng)"
+              : placeholder || "Nhập tin nhắn..."
           }
-          className="min-h-[42px] max-h-[140px] flex-1 resize-none overflow-y-auto rounded-xl px-3.5 py-2 text-[15px] leading-6 outline-none"
+          className="min-h-[40px] max-h-[140px] flex-1 resize-none overflow-y-auto rounded-xl px-3.5 py-2 text-[15px] leading-6 outline-none"
           style={{ background: "var(--bg-surface)", color: "var(--text-primary)" }}
         />
 

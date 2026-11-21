@@ -1,7 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import type { MessageDto, ThreadDto } from "../src/types.ts";
-import { bumpThreadList, compareThreads, upsertMsg } from "../src/utils/threadState.ts";
+import type { ChatFolderDto, MessageDto, ThreadDto } from "../src/types.ts";
+import {
+  bumpThreadList,
+  compareThreads,
+  computeLayoutMode,
+  countFolderUnread,
+  extractFirstUrl,
+  filterThreadsByFolder,
+  getDisplayBodyText,
+  looksLikePhoneQuery,
+  splitTextLinks,
+  upsertMsg,
+} from "../src/utils/threadState.ts";
 
 function makeMsg(overrides: Partial<MessageDto>): MessageDto {
   return {
@@ -56,16 +67,17 @@ test("upsertMsg maintains ascending timestamp order and replaces existing messag
   assert.equal(list[1].is_pinned, true);
 });
 
-test("compareThreads orders unread first, then newest timestamp, then pinned tie-break", () => {
+test("compareThreads orders pinned first, then newest timestamp regardless of unread", () => {
   const readOld = makeThread({ id: "a", last_ts: 100, unread_count: 0, is_pinned: false });
   const readNew = makeThread({ id: "b", last_ts: 200, unread_count: 0, is_pinned: false });
   const readSamePinned = makeThread({ id: "c", last_ts: 200, unread_count: 0, is_pinned: true });
+  const pinnedOlder = makeThread({ id: "p", last_ts: 50, unread_count: 0, is_pinned: true });
   const unreadOld = makeThread({ id: "d", last_ts: 50, unread_count: 1, is_pinned: false });
 
-  const sorted = [readOld, readNew, readSamePinned, unreadOld].sort(compareThreads);
+  const sorted = [readOld, readNew, readSamePinned, pinnedOlder, unreadOld].sort(compareThreads);
   assert.deepEqual(
     sorted.map((t) => t.id),
-    ["d", "c", "b", "a"],
+    ["c", "p", "b", "a", "d"],
   );
 });
 
@@ -127,4 +139,152 @@ test("bumpThreadList formats group/outgoing previews, increments/clears unread, 
   // Unknown thread returns identical list without throwing
   const unknown = makeMsg({ thread_id: "missing-999", ts: 9999 });
   assert.deepEqual(bumpThreadList(next, unknown, true), next);
+});
+
+test("upsertMsg replaces matching opt- optimistic bubble on confirmed outgoing message", () => {
+  const opt = makeMsg({
+    msg_id: "opt-123",
+    is_outgoing: true,
+    text: "Xin chao",
+    ts: 1_700_000_001_000,
+    send_status: "sending",
+  });
+  const confirmed = makeMsg({
+    msg_id: "srv-456",
+    is_outgoing: true,
+    text: "Xin chao",
+    ts: 1_700_000_002_500,
+  });
+  const list = upsertMsg([opt], confirmed);
+  assert.equal(list.length, 1);
+  assert.equal(list[0].msg_id, "srv-456");
+});
+
+test("getDisplayBodyText suppresses redundant file/media text and preserves captions", () => {
+  assert.equal(
+    getDisplayBodyText(
+      makeMsg({
+        msg_type: "share.file",
+        text: "[Tập tin] bao_cao.pdf",
+        attachment_url: "https://f.zdn.vn/bao_cao.pdf",
+        attachment_name: "bao_cao.pdf",
+      }),
+    ),
+    "",
+  );
+  assert.equal(
+    getDisplayBodyText(
+      makeMsg({
+        msg_type: "chat.file",
+        text: "bao_cao.pdf",
+        attachment_url: "https://f.zdn.vn/bao_cao.pdf",
+        attachment_name: "bao_cao.pdf",
+      }),
+    ),
+    "",
+  );
+  assert.equal(
+    getDisplayBodyText(
+      makeMsg({
+        msg_type: "chat.file",
+        text: "[Tập tin] bao_cao.pdf\nXem trang 2 nha",
+        attachment_url: "https://f.zdn.vn/bao_cao.pdf",
+        attachment_name: "bao_cao.pdf",
+      }),
+    ),
+    "Xem trang 2 nha",
+  );
+  assert.equal(
+    getDisplayBodyText(
+      makeMsg({
+        msg_type: "chat.photo",
+        text: "[Hình ảnh]",
+        attachment_url: "https://f.zdn.vn/a.jpg",
+      }),
+    ),
+    "",
+  );
+});
+
+test("splitTextLinks parses http/https URLs and trims trailing punctuation cleanly", () => {
+  assert.deepEqual(splitTextLinks("Xem http://example.com/a(b)."), [
+    { text: "Xem " },
+    { text: "http://example.com/a(b)", url: "http://example.com/a(b)" },
+    { text: "." },
+  ]);
+  assert.deepEqual(splitTextLinks("(https://litechat.app/test?x=1), ok"), [
+    { text: "(" },
+    { text: "https://litechat.app/test?x=1", url: "https://litechat.app/test?x=1" },
+    { text: "), ok" },
+  ]);
+});
+
+test("computeLayoutMode and looksLikePhoneQuery enforce responsive breakpoints and VN phone detection", () => {
+  assert.deepEqual(computeLayoutMode(500, false), { mode: "single", autoCompactDrawer: true });
+  assert.deepEqual(computeLayoutMode(800, false), { mode: "compact", autoCompactDrawer: true });
+  assert.deepEqual(computeLayoutMode(1000, true), { mode: "compact", autoCompactDrawer: true });
+  assert.deepEqual(computeLayoutMode(1280, true), { mode: "compact", autoCompactDrawer: false });
+  assert.deepEqual(computeLayoutMode(1280, false), { mode: "full", autoCompactDrawer: false });
+
+  assert.equal(looksLikePhoneQuery("0912 345 678"), true);
+  assert.equal(looksLikePhoneQuery("+84912345678"), true);
+  assert.equal(looksLikePhoneQuery("2025"), false);
+  assert.equal(looksLikePhoneQuery("Minh Anh"), false);
+});
+
+test("filterThreadsByFolder, countFolderUnread, and extractFirstUrl support custom folders and links", () => {
+  const threads = [
+    makeThread({ id: "u1", kind: "direct", unread_count: 3, is_muted: false }),
+    makeThread({ id: "g1", kind: "group", unread_count: 5, is_muted: true }),
+    makeThread({ id: "g2", kind: "group", unread_count: 2, is_muted: false }),
+    makeThread({ id: "c1", kind: "cloud", unread_count: 0, is_muted: false }),
+  ];
+  const folders: ChatFolderDto[] = [
+    {
+      id: "work",
+      name: "Cong viec",
+      icon: "briefcase",
+      color: "",
+      thread_ids: ["u1"],
+      include_kinds: ["group"],
+      only_unread: false,
+      exclude_muted: true,
+      position: 1,
+      remote_label_id: null,
+    },
+    {
+      id: "unread-vip",
+      name: "Chua doc VIP",
+      icon: "star",
+      color: "",
+      thread_ids: [],
+      include_kinds: [],
+      only_unread: true,
+      exclude_muted: false,
+      position: 2,
+      remote_label_id: null,
+    },
+  ];
+
+  // Work folder includes u1 + unmuted groups (g2), excluding muted g1 and cloud c1
+  assert.deepEqual(
+    filterThreadsByFolder(threads, "custom:work", folders).map((t) => t.id),
+    ["u1", "g2"],
+  );
+  assert.equal(countFolderUnread(threads, "custom:work", folders), 5);
+
+  // "unread-vip" matches all unread threads including muted g1
+  assert.deepEqual(
+    filterThreadsByFolder(threads, "custom:unread-vip", folders).map((t) => t.id),
+    ["u1", "g1", "g2"],
+  );
+  // Muted threads do not count in normal folder badge (only "unread" counts all)
+  assert.equal(countFolderUnread(threads, "unread", folders), 10);
+  assert.equal(countFolderUnread(threads, "group", folders), 2);
+
+  assert.equal(
+    extractFirstUrl("Tai tai lieu tai https://teza.app/docs(v2)."),
+    "https://teza.app/docs(v2)",
+  );
+  assert.equal(extractFirstUrl("Khong co lien ket"), null);
 });

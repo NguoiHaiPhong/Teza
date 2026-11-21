@@ -3,6 +3,7 @@ import type {
   AccountProfile,
   AppUpdateInfo,
   AttachmentMeta,
+  ChatFolderDto,
   FolderFilter,
   MessageDto,
   RelayConfigSummary,
@@ -71,6 +72,21 @@ const DEMO_THREADS: ThreadDto[] = [
     unread_count: 1,
     is_pinned: false,
     is_muted: false,
+  },
+];
+
+const DEMO_FOLDERS: ChatFolderDto[] = [
+  {
+    id: "work-demo",
+    name: "Công việc",
+    icon: "briefcase",
+    color: "#cfa13a",
+    thread_ids: ["grp-rust-vn"],
+    include_kinds: [],
+    only_unread: false,
+    exclude_muted: false,
+    position: 1,
+    remote_label_id: null,
   },
 ];
 
@@ -148,9 +164,9 @@ export const bridge = {
         return true;
       }).sort(
         (a, b) =>
-          (b.unread_count > 0 ? 1 : 0) - (a.unread_count > 0 ? 1 : 0) ||
           (b.is_pinned ? 1 : 0) - (a.is_pinned ? 1 : 0) ||
-          b.last_ts - a.last_ts,
+          b.last_ts - a.last_ts ||
+          a.id.localeCompare(b.id),
       );
     }
     return invoke<ThreadDto[]>("threads_list", { folder });
@@ -200,9 +216,35 @@ export const bridge = {
         members: [],
         media_items: msgs.filter((m) => !!m.attachment_url && m.msg_type.includes("photo")),
         file_items: msgs.filter((m) => !!m.attachment_url && !m.msg_type.includes("photo")),
+        link_items: msgs.filter((m) => /https?:\/\//i.test(m.text)),
       };
     }
     return invoke<ThreadDetailsDto>("thread_get_details", { threadId });
+  },
+  async listChatFolders(): Promise<ChatFolderDto[]> {
+    if (!isTauri()) return [...DEMO_FOLDERS].sort((a, b) => a.position - b.position);
+    return invoke<ChatFolderDto[]>("folders_list");
+  },
+  async saveChatFolder(folder: ChatFolderDto): Promise<ChatFolderDto[]> {
+    if (!isTauri()) {
+      const idx = DEMO_FOLDERS.findIndex((f) => f.id === folder.id);
+      if (idx >= 0) DEMO_FOLDERS[idx] = folder;
+      else DEMO_FOLDERS.push(folder);
+      return [...DEMO_FOLDERS].sort((a, b) => a.position - b.position);
+    }
+    return invoke<ChatFolderDto[]>("folder_save", { folder });
+  },
+  async deleteChatFolder(folderId: string): Promise<ChatFolderDto[]> {
+    if (!isTauri()) {
+      const idx = DEMO_FOLDERS.findIndex((f) => f.id === folderId);
+      if (idx >= 0) DEMO_FOLDERS.splice(idx, 1);
+      return [...DEMO_FOLDERS].sort((a, b) => a.position - b.position);
+    }
+    return invoke<ChatFolderDto[]>("folder_delete", { folderId });
+  },
+  async syncRemoteLabelFolders(): Promise<ChatFolderDto[]> {
+    if (!isTauri()) return [...DEMO_FOLDERS].sort((a, b) => a.position - b.position);
+    return invoke<ChatFolderDto[]>("folders_sync_remote_labels");
   },
   async getUserProfile(userId: string): Promise<UserProfileDto> {
     if (!isTauri()) {
@@ -213,7 +255,7 @@ export const bridge = {
         zalo_name: t?.title ?? `Người dùng ${userId}`,
         avatar: t?.avatar ?? "",
         cover: "",
-        status: "Đang hoạt động trên LiteChat (Chế độ xem trước)",
+        status: "Đang hoạt động trên Teza (Chế độ xem trước)",
         gender: null,
         sdob: "",
         phone_number: "",
@@ -222,6 +264,35 @@ export const bridge = {
       };
     }
     return invoke<UserProfileDto>("user_get_profile", { userId });
+  },
+  async findUserByPhone(phone: string): Promise<UserProfileDto> {
+    if (!isTauri()) {
+      const cleaned = phone.trim().replace(/[\s\-().\t+]/g, "");
+      if (!/^\d{9,15}$/.test(cleaned)) {
+        throw new Error("Số điện thoại không hợp lệ");
+      }
+      const norm = cleaned.startsWith("0") ? `84${cleaned.slice(1)}` : cleaned;
+      return {
+        uid: `phone-${norm}`,
+        display_name: `Liên hệ ${norm}`,
+        zalo_name: `Liên hệ ${norm}`,
+        avatar: "",
+        cover: "",
+        status: "Tìm kiếm qua số điện thoại (Chế độ xem trước)",
+        gender: null,
+        sdob: "",
+        phone_number: norm,
+        is_friend: false,
+        is_self: false,
+      };
+    }
+    return invoke<UserProfileDto>("user_find_by_phone", { phone });
+  },
+  async listPinnedMessages(threadId: string): Promise<MessageDto[]> {
+    if (!isTauri()) {
+      return (DEMO_MESSAGES[threadId] ?? []).filter((m) => m.is_pinned && !m.is_recalled);
+    }
+    return invoke<MessageDto[]>("messages_list_pinned", { threadId });
   },
   async loadMessages(
     threadId: string,
@@ -605,7 +676,7 @@ export const bridge = {
         mode: "socks5",
         host: "10.7.12.233",
         port: 1088,
-        username: "litechat",
+        username: "teza",
         has_password: false,
         password_preview: "",
         route_webview_media: true,

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import {
   Check,
   CheckSquare,
@@ -20,7 +20,8 @@ import {
 import type { MessageDto, ThreadKind } from "../types";
 import { isBuzzMessage } from "../utils/buzz";
 import { copyImageReliable, copyTextReliable } from "../utils/clipboard";
-import { RelayImage } from "./RelayImage";
+import { getDisplayBodyText, splitTextLinks } from "../utils/threadState";
+import { RelayAudio, RelayImage, RelayVideo } from "./RelayImage";
 import { ThreadAvatar } from "./ThreadAvatar";
 
 export interface MessageTranslationState {
@@ -73,7 +74,11 @@ function formatClock(ts: number): string {
 }
 
 function isStickerMessage(msg: MessageDto): boolean {
-  return !!msg.attachment_url && (msg.msg_type.includes("sticker") || msg.msg_type === "5");
+  const t = msg.msg_type.toLowerCase();
+  return (
+    !!msg.attachment_url &&
+    (t.includes("sticker") || t === "5" || t === "35" || t === "36")
+  );
 }
 
 function isVoiceAttachment(msg: MessageDto): boolean {
@@ -133,21 +138,21 @@ function renderMentionsAndSearch(text: string, isOutgoing: boolean, highlightQue
 }
 
 function renderLinkedText(text: string, isOutgoing: boolean, highlightQuery?: string) {
-  const parts = text.split(/(https:\/\/[^\s<>"]+)/gi);
+  const parts = splitTextLinks(text);
   return parts.map((part, idx) =>
-    /^https:\/\//i.test(part) ? (
+    part.url ? (
       <a
         key={idx}
-        href={part}
+        href={part.url}
         target="_blank"
         rel="noreferrer"
         className="underline underline-offset-2 hover:opacity-80"
         style={{ color: isOutgoing ? "var(--link-out)" : "var(--link-in)" }}
       >
-        {part}
+        {part.text}
       </a>
     ) : (
-      <span key={idx}>{renderMentionsAndSearch(part, isOutgoing, highlightQuery)}</span>
+      <span key={idx}>{renderMentionsAndSearch(part.text, isOutgoing, highlightQuery)}</span>
     ),
   );
 }
@@ -160,7 +165,7 @@ function isImageAttachment(msg: MessageDto): boolean {
   return /\.(png|jpe?g|webp|gif|bmp)(\?|$)/i.test(msg.attachment_url);
 }
 
-export function MessageBubble({
+export const MessageBubble = memo(function MessageBubble({
   msg,
   threadKind,
   groupedWithPrev,
@@ -215,6 +220,18 @@ export function MessageBubble({
     (!!msg.attachment_url ||
       msg.msg_type.includes("file") ||
       msg.msg_type === "19");
+  const displayText = msg.is_recalled
+    ? msg.text
+    : isReplaced && translation?.text
+      ? translation.text
+      : getDisplayBodyText(msg);
+  const isPlainSticker =
+    isSticker &&
+    !msg.quote &&
+    !msg.is_recalled &&
+    !displayText &&
+    !isBuzz &&
+    !(threadKind === "group" && !msg.is_outgoing && !groupedWithPrev);
   const safeDownloadUrl =
     msg.attachment_url && /^https:\/\//i.test(msg.attachment_url)
       ? msg.attachment_url
@@ -417,20 +434,28 @@ export function MessageBubble({
           if (el?.closest("a, button, input, textarea, audio, video")) return;
           onReply(msg);
         }}
-        className={`selectable-text wrap-anywhere relative order-2 min-w-0 max-w-[72%] rounded-2xl px-3.5 shadow-sm transition ${
-          msg.is_outgoing ? "rounded-br-md" : "rounded-bl-md"
+        className={`selectable-text wrap-anywhere relative order-2 min-w-0 max-w-[72%] rounded-2xl transition ${
+          isPlainSticker
+            ? "px-1 py-0.5"
+            : `px-3.5 shadow-sm ${msg.is_outgoing ? "rounded-br-md" : "rounded-bl-md"}`
         } ${highlighted ? "ring-2 ring-sky-400" : ""} ${
           msg.send_status === "sending" ? "opacity-80" : ""
         }`}
         style={{
-          paddingBlock: "var(--bubble-py)",
-          background: msg.is_outgoing ? "var(--bg-bubble-out)" : "var(--bg-bubble-in)",
+          paddingBlock: isPlainSticker ? undefined : "var(--bubble-py)",
+          background: isPlainSticker
+            ? "transparent"
+            : msg.is_outgoing
+              ? "var(--bg-bubble-out)"
+              : "var(--bg-bubble-in)",
           border:
             msg.send_status === "failed"
               ? "1px solid var(--danger-text)"
-              : msg.is_outgoing
-                ? "1px solid var(--bubble-out-border)"
-                : "1px solid var(--bubble-in-border)",
+              : isPlainSticker
+                ? "none"
+                : msg.is_outgoing
+                  ? "1px solid var(--bubble-out-border)"
+                  : "1px solid var(--bubble-in-border)",
         }}
       >
         {!msg.is_outgoing && threadKind === "group" && !groupedWithPrev && (
@@ -474,27 +499,27 @@ export function MessageBubble({
             alt="Nhãn dán"
             referrerPolicy="no-referrer"
             onFallbackFail={() => setMediaError(true)}
-            className="mb-1 h-28 w-28 object-contain"
+            className="mb-1 h-32 w-32 object-contain drop-shadow-sm"
             loading="lazy"
           />
         )}
 
         {isVoice && msg.attachment_url && (
-          <audio
+          <RelayAudio
             controls
             preload="none"
             src={msg.attachment_url}
-            onError={() => setMediaError(true)}
+            onFallbackFail={() => setMediaError(true)}
             className="mb-1.5 max-w-full"
           />
         )}
 
         {isVideo && msg.attachment_url && (
-          <video
+          <RelayVideo
             controls
             preload="metadata"
             src={msg.attachment_url}
-            onError={() => setMediaError(true)}
+            onFallbackFail={() => setMediaError(true)}
             className="mb-1.5 max-h-72 w-full rounded-xl bg-black/40"
           />
         )}
@@ -516,35 +541,52 @@ export function MessageBubble({
           </button>
         )}
 
-        {isFileAttachment && (
-          <div
-            className="mb-1.5 flex items-center gap-2.5 rounded-xl px-3 py-2"
-            style={{ background: "var(--card-bg)" }}
-          >
-            <FileText
-              className="h-5 w-5 shrink-0"
-              style={{ color: msg.is_outgoing ? "var(--link-out)" : "var(--accent)" }}
-            />
-            <div className="min-w-0 flex-1">
-              <div className="truncate text-[13.5px] font-medium">
-                {msg.attachment_name || "Tập tin đính kèm"}
+        {isFileAttachment &&
+          (safeDownloadUrl && onSaveFile ? (
+            <button
+              type="button"
+              onClick={() => onSaveFile(safeDownloadUrl, msg.attachment_name || "download")}
+              title="Nhấn để tải tệp về máy"
+              className="mb-1.5 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left transition hover:brightness-95"
+              style={{ background: "var(--card-bg)" }}
+            >
+              <FileText
+                className="h-5 w-5 shrink-0"
+                style={{ color: msg.is_outgoing ? "var(--link-out)" : "var(--accent)" }}
+              />
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-[13.5px] font-medium">
+                  {msg.attachment_name || "Tập tin đính kèm"}
+                </div>
+                <div className="text-xs" style={{ color: "var(--text-secondary)" }}>
+                  Tệp đính kèm · Nhấn để lưu
+                </div>
               </div>
-              <div className="text-xs" style={{ color: "var(--text-secondary)" }}>
-                Tệp đính kèm
+              <span
+                className="rounded-lg p-1.5"
+                style={{ color: msg.is_outgoing ? "var(--link-out)" : "var(--accent)" }}
+              >
+                <Download className="h-4 w-4" />
+              </span>
+            </button>
+          ) : (
+            <div
+              className="mb-1.5 flex items-center gap-2.5 rounded-xl px-3 py-2"
+              style={{ background: "var(--card-bg)" }}
+            >
+              <FileText
+                className="h-5 w-5 shrink-0"
+                style={{ color: msg.is_outgoing ? "var(--link-out)" : "var(--accent)" }}
+              />
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-[13.5px] font-medium">
+                  {msg.attachment_name || "Tập tin đính kèm"}
+                </div>
+                <div className="text-xs" style={{ color: "var(--text-secondary)" }}>
+                  Tệp đính kèm
+                </div>
               </div>
-            </div>
-            {safeDownloadUrl &&
-              (onSaveFile ? (
-                <button
-                  type="button"
-                  onClick={() => onSaveFile(safeDownloadUrl, msg.attachment_name || "download")}
-                  title="Lưu tệp về máy..."
-                  className="hover-menu rounded-lg p-1.5 transition"
-                  style={{ color: msg.is_outgoing ? "var(--link-out)" : "var(--accent)" }}
-                >
-                  <Download className="h-4 w-4" />
-                </button>
-              ) : (
+              {safeDownloadUrl && (
                 <a
                   href={safeDownloadUrl}
                   target="_blank"
@@ -556,9 +598,9 @@ export function MessageBubble({
                 >
                   <Download className="h-4 w-4" />
                 </a>
-              ))}
-          </div>
-        )}
+              )}
+            </div>
+          ))}
 
         {isBuzz ? (
           <div className="my-0.5 inline-flex items-center gap-2 rounded-xl bg-amber-500/20 px-3 py-1.5 font-extrabold tracking-wider text-amber-400 ring-1 ring-amber-400/40">
@@ -566,17 +608,13 @@ export function MessageBubble({
             <span className="text-[16px]">BUZZ!</span>
           </div>
         ) : (
-          !(isSticker && msg.text === "[Nhãn dán]") && (
+          displayText && (
             <div
               className={`msg-body-text whitespace-pre-wrap wrap-anywhere leading-[1.55] ${
                 msg.is_recalled ? "italic opacity-65" : ""
               } ${replaceWithTranslation && translation?.loading ? "opacity-75" : ""}`}
             >
-              {renderLinkedText(
-                isReplaced && translation?.text ? translation.text : msg.text,
-                msg.is_outgoing,
-                highlightQuery,
-              )}
+              {renderLinkedText(displayText, msg.is_outgoing, highlightQuery)}
             </div>
           )
         )}
@@ -681,7 +719,15 @@ export function MessageBubble({
               <span>Đã dịch · Gốc</span>
             </button>
           )}
-          <span className="flex items-center gap-1 text-xs" style={{ color: "var(--text-secondary)" }}>
+          <span
+            className={`flex items-center gap-1 text-xs ${
+              isPlainSticker ? "rounded-full px-2 py-0.5" : ""
+            }`}
+            style={{
+              color: isPlainSticker ? "var(--pill-text)" : "var(--text-secondary)",
+              background: isPlainSticker ? "var(--pill-bg)" : undefined,
+            }}
+          >
             {msg.is_pinned && (
               <span title="Tin nhắn đã ghim" className="inline-flex items-center">
                 <Pin
@@ -889,4 +935,4 @@ export function MessageBubble({
       </div>
     </div>
   );
-}
+});

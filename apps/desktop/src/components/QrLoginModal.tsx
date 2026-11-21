@@ -32,7 +32,7 @@ export function QrLoginModal({
         >
           <QrCode className="h-6 w-6" />
         </div>
-        <h1 className="text-xl font-semibold">Đăng nhập litechat</h1>
+        <h1 className="text-xl font-semibold">Đăng nhập Teza</h1>
         <p className="mt-1 text-sm" style={{ color: "var(--text-secondary)" }}>
           Mở ứng dụng trên điện thoại và quét mã QR bên dưới
         </p>

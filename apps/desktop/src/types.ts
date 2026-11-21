@@ -62,6 +62,20 @@ export interface ThreadDetailsDto {
   members: ThreadMemberDto[];
   media_items: MessageDto[];
   file_items: MessageDto[];
+  link_items: MessageDto[];
+}
+
+export interface ChatFolderDto {
+  id: string;
+  name: string;
+  icon: string;
+  color: string;
+  thread_ids: string[];
+  include_kinds: ThreadKind[];
+  only_unread: boolean;
+  exclude_muted: boolean;
+  position: number;
+  remote_label_id: string | null;
 }
 
 export interface UserProfileDto {

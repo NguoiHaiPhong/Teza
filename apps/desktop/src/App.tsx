@@ -4,22 +4,32 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
+  ArrowLeft,
   Bell,
   BellOff,
   Bookmark,
+  Check,
+  CheckCheck,
   ChevronDown,
   ChevronUp,
+  Download,
+  ExternalLink,
   FileText,
+  FolderPlus,
   Forward,
   Image as ImageIcon,
   Info,
   Languages,
+  Link2,
   LogOut,
   MessageSquare,
   MessagesSquare,
   Moon,
+  PanelLeftClose,
+  PanelLeftOpen,
   Pin,
   PinOff,
+  Play,
   RefreshCw,
   Search,
   Settings,
@@ -27,6 +37,7 @@ import {
   Trash2,
   UploadCloud,
   User,
+  UserPlus,
   Users,
   Wifi,
   X,
@@ -44,12 +55,19 @@ import { playMessageSound, showDesktopNotification } from "./utils/notify";
 import {
   bumpThreadList,
   compareThreads,
+  computeLayoutMode,
+  countFolderUnread,
   dayKey,
+  extractFirstUrl,
+  filterThreadsByFolder,
   formatDayLabel,
   formatThreadTime,
+  looksLikePhoneQuery,
   upsertMsg,
 } from "./utils/threadState";
 import { Composer } from "./components/Composer";
+import { FindUserModal } from "./components/FindUserModal";
+import { FolderEditorModal, renderFolderIcon } from "./components/FolderEditorModal";
 import { ForwardModal } from "./components/ForwardModal";
 import { MediaLightbox, type LightboxItem } from "./components/MediaLightbox";
 import { MessageBubble, type MessageTranslationState } from "./components/MessageBubble";
@@ -73,6 +91,7 @@ import { UserProfileModal } from "./components/UserProfileModal";
 import type {
   AccountProfile,
   AppUpdateInfo,
+  ChatFolderDto,
   ConnectionStatus,
   FolderFilter,
   MessageDto,
@@ -83,6 +102,7 @@ import type {
   ThreadDetailsDto,
   ThreadDto,
   TranslateConfigSummary,
+  UserProfileDto,
 } from "./types";
 
 const FOLDERS: { id: FolderFilter; label: string; icon: typeof MessageSquare }[] = [
@@ -112,7 +132,13 @@ export default function App() {
   const [syncing, setSyncing] = useState(false);
   const [toastError, setToastError] = useState<string | null>(null);
 
-  const [folder, setFolder] = useState<FolderFilter>("all");
+  const [folder, setFolder] = useState<string>("all");
+  const [customFolders, setCustomFolders] = useState<ChatFolderDto[]>([]);
+  const [folderModalOpen, setFolderModalOpen] = useState(false);
+  const [editingFolder, setEditingFolder] = useState<ChatFolderDto | null>(null);
+  const [folderMenu, setFolderMenu] = useState<{ folder: ChatFolderDto; x: number; y: number } | null>(
+    null,
+  );
   const [threads, setThreads] = useState<ThreadDto[]>([]);
   const [filterText, setFilterText] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -139,16 +165,29 @@ export default function App() {
   const [quickSearchOpen, setQuickSearchOpen] = useState(false);
   const [threadDetails, setThreadDetails] = useState<ThreadDetailsDto | null>(null);
   const [detailsLoading, setDetailsLoading] = useState(false);
-  const [detailsTab, setDetailsTab] = useState<"media" | "files">("media");
+  const [detailsTab, setDetailsTab] = useState<"media" | "files" | "links">("media");
   const [threadMenu, setThreadMenu] = useState<{ thread: ThreadDto; x: number; y: number } | null>(
     null,
   );
   const [myProfile, setMyProfile] = useState<AccountProfile | null>(null);
   const [profileUid, setProfileUid] = useState<string | null>(null);
+  const [profileInitial, setProfileInitial] = useState<UserProfileDto | null>(null);
+  const [findUserOpen, setFindUserOpen] = useState(false);
+  const [findUserInitialPhone, setFindUserInitialPhone] = useState("");
   const [forwardMessages, setForwardMessages] = useState<MessageDto[]>([]);
   const [selectMode, setSelectMode] = useState(false);
   const [selectedMsgIds, setSelectedMsgIds] = useState<Set<string>>(() => new Set());
+  const [pinnedMessages, setPinnedMessages] = useState<MessageDto[]>([]);
   const [pinnedIdx, setPinnedIdx] = useState(0);
+  const [pinnedListOpen, setPinnedListOpen] = useState(false);
+  const [detailsRefreshTick, setDetailsRefreshTick] = useState(0);
+  const [windowWidth, setWindowWidth] = useState<number>(() =>
+    typeof window !== "undefined" ? window.innerWidth : 1280,
+  );
+  const [manualSidebarCompact, setManualSidebarCompact] = useState<boolean>(
+    () => localStorage.getItem("litechat.sidebarCompact") === "1",
+  );
+  const [mobilePane, setMobilePane] = useState<"list" | "chat">("list");
   const [threadRenderLimit, setThreadRenderLimit] = useState(100);
   const [translateCfg, setTranslateCfg] = useState<TranslateConfigSummary | null>(null);
   const [translateModalOpen, setTranslateModalOpen] = useState(false);
@@ -201,7 +240,7 @@ export default function App() {
   } | null>(null);
   const [buzzCooldownUntil, setBuzzCooldownUntil] = useState<Record<string, number>>({});
   const [buzzNow, setBuzzNow] = useState(() => Date.now());
-  const [appVersion, setAppVersion] = useState("0.2.3");
+  const [appVersion, setAppVersion] = useState("0.3.0");
   const [updateModalOpen, setUpdateModalOpen] = useState(false);
   const [availableUpdate, setAvailableUpdate] = useState<AppUpdateInfo | null>(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
@@ -215,7 +254,7 @@ export default function App() {
   });
 
   const selectedIdRef = useRef<string | null>(null);
-  const folderRef = useRef<FolderFilter>(folder);
+  const folderRef = useRef<string>(folder);
   const threadsRef = useRef<ThreadDto[]>(threads);
   const visibleThreadsRef = useRef<ThreadDto[]>([]);
   const buzzEnabledRef = useRef<boolean>(buzzEnabled);
@@ -230,6 +269,8 @@ export default function App() {
   const translationsRef = useRef(translationsByMsg);
   const inFlightTranslateRef = useRef<Set<string>>(new Set());
   const prevConnStatusRef = useRef<ConnectionStatus>(connStatus);
+  const lastOlderCursorRef = useRef<string | null>(null);
+  const pinnedMsgIdsRef = useRef<Set<string>>(new Set());
 
   selectedIdRef.current = selectedId;
   folderRef.current = folder;
@@ -239,6 +280,37 @@ export default function App() {
   soundEnabledRef.current = soundEnabled;
   activeThreadRootIdRef.current = activeThreadRootId;
   translationsRef.current = translationsByMsg;
+  pinnedMsgIdsRef.current = new Set(pinnedMessages.map((p) => p.msg_id));
+
+  const layout = useMemo(
+    () => computeLayoutMode(windowWidth, manualSidebarCompact),
+    [windowWidth, manualSidebarCompact],
+  );
+  const prevAutoCompactDrawerRef = useRef(layout.autoCompactDrawer);
+
+  useEffect(() => {
+    const onResize = () => setWindowWidth(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  useEffect(() => {
+    if (!prevAutoCompactDrawerRef.current && layout.autoCompactDrawer) {
+      setDrawerOpen(false);
+    }
+    prevAutoCompactDrawerRef.current = layout.autoCompactDrawer;
+  }, [layout.autoCompactDrawer]);
+
+  const refreshPinnedMessages = useCallback(async (tid: string) => {
+    try {
+      const list = await bridge.listPinnedMessages(tid);
+      if (selectedIdRef.current === tid) {
+        setPinnedMessages(list);
+      }
+    } catch {
+      // Ignore transient pin sync failures
+    }
+  }, []);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -278,7 +350,7 @@ export default function App() {
 
   useEffect(() => {
     const totalUnread = threads.reduce((acc, t) => acc + (t.is_muted ? 0 : t.unread_count), 0);
-    const title = totalUnread > 0 ? `(${totalUnread}) litechat` : "litechat";
+    const title = totalUnread > 0 ? `(${totalUnread}) Teza` : "Teza";
     document.title = title;
     if (isTauri()) {
       void getCurrentWindow()
@@ -435,6 +507,8 @@ export default function App() {
     setTranslationsByMsg({});
     setThreadAutoTranslate({});
     setThreads([]);
+    setCustomFolders([]);
+    setFolder("all");
     setMessages([]);
     setSelectedId(null);
     setReplyTo(null);
@@ -579,7 +653,7 @@ export default function App() {
   const syncRemoteThreads = useCallback(async () => {
     setSyncing(true);
     try {
-      const list = await bridge.syncThreads(folderRef.current);
+      const list = await bridge.syncThreads("all");
       setThreads(list);
       if (!selectedIdRef.current && list.length > 0) {
         setSelectedId(list[0].id);
@@ -683,12 +757,15 @@ export default function App() {
           );
           if (!hasThread) {
             void bridge
-              .listThreads(folderRef.current)
+              .listThreads("all")
               .then(setThreads)
               .catch(() => undefined);
           }
           if (msg.thread_id === selectedIdRef.current) {
             setMessages((prev) => upsertMsg(prev, msg));
+            if (msg.attachment_url) {
+              setDetailsRefreshTick((n) => n + 1);
+            }
             const el = scrollContainerRef.current;
             const nearBottom = !el || el.scrollHeight - el.scrollTop - el.clientHeight < 180;
             if (nearBottom || msg.is_outgoing) {
@@ -737,17 +814,23 @@ export default function App() {
           const msg = ev.payload;
           if (msg.thread_id === selectedIdRef.current) {
             setMessages((prev) => upsertMsg(prev, msg));
+            if (msg.is_pinned || pinnedMsgIdsRef.current.has(msg.msg_id)) {
+              void refreshPinnedMessages(msg.thread_id);
+            }
           }
         }),
         listen<{ thread_id: string; msg_id: string }>("core://message-deleted", (ev) => {
           if (ev.payload.thread_id === selectedIdRef.current) {
             setMessages((prev) => prev.filter((m) => m.msg_id !== ev.payload.msg_id));
+            if (pinnedMsgIdsRef.current.has(ev.payload.msg_id)) {
+              void refreshPinnedMessages(ev.payload.thread_id);
+            }
           }
         }),
         listen("core://threads-updated", () => {
-          void bridge.listThreads(folderRef.current).then(setThreads);
+          void bridge.listThreads("all").then(setThreads);
         }),
-        listen<{ thread_id: string; messages: MessageDto[] }>(
+        listen<{ thread_id: string; messages: MessageDto[]; has_more?: boolean }>(
           "core://thread-messages-synced",
           (ev) => {
             if (ev.payload.thread_id !== selectedIdRef.current) return;
@@ -760,6 +843,9 @@ export default function App() {
               }
               return next;
             });
+            if (typeof ev.payload.has_more === "boolean") {
+              setHasMoreHistory((prev) => prev || Boolean(ev.payload.has_more));
+            }
             const newest = ev.payload.messages.reduce<MessageDto | null>(
               (best, m) => (!best || m.ts > best.ts ? m : best),
               null,
@@ -789,17 +875,28 @@ export default function App() {
       cancelled = true;
       unlisteners.forEach((fn) => fn());
     };
-  }, [syncRemoteThreads, refreshQr, applyRelaySummary]);
+  }, [syncRemoteThreads, refreshQr, applyRelaySummary, refreshPinnedMessages]);
 
   useEffect(() => {
     if (!authed) return;
-    void bridge.listThreads(folder).then((list) => {
+    void bridge.listThreads("all").then((list) => {
       setThreads(list);
       if (!selectedIdRef.current && list.length > 0) {
         setSelectedId(list[0].id);
       }
     });
-  }, [authed, folder]);
+    void bridge
+      .listChatFolders()
+      .then(setCustomFolders)
+      .catch(() => undefined);
+  }, [authed]);
+
+  useEffect(() => {
+    if (!folderMenu) return;
+    const close = () => setFolderMenu(null);
+    window.addEventListener("click", close);
+    return () => window.removeEventListener("click", close);
+  }, [folderMenu]);
 
   const activeThreadKind = useMemo(
     () => threads.find((t) => t.id === selectedId)?.kind ?? null,
@@ -826,7 +923,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [authed, drawerOpen, selectedId, activeThreadKind]);
+  }, [authed, drawerOpen, selectedId, activeThreadKind, detailsRefreshTick]);
 
   useEffect(() => {
     if (!threadMenu) return;
@@ -910,6 +1007,7 @@ export default function App() {
               setMessages((prev) => upsertMsg(prev, sent));
               setThreads((prev) => bumpThreadList(prev, sent, false));
             }
+            setDetailsRefreshTick((n) => n + 1);
             setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
           }
         } catch (err) {
@@ -936,7 +1034,10 @@ export default function App() {
     setInChatMatchIdx(0);
     setSelectMode(false);
     setSelectedMsgIds(new Set());
+    setPinnedMessages([]);
     setPinnedIdx(0);
+    setPinnedListOpen(false);
+    lastOlderCursorRef.current = null;
     setReplyTo(null);
     setActiveThreadRootId(null);
     setPendingAttachment(null);
@@ -946,6 +1047,7 @@ export default function App() {
     setLoadingMessages(true);
     setShowScrollDown(false);
     setUnreadBelow(0);
+    void refreshPinnedMessages(selectedId);
     void bridge.markRead(selectedId);
     setThreads((prev) => prev.map((t) => (t.id === selectedId ? { ...t, unread_count: 0 } : t)));
     void bridge
@@ -977,7 +1079,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [authed, selectedId, jumpToMsg]);
+  }, [authed, selectedId, jumpToMsg, refreshPinnedMessages]);
 
   const activeThreadLang = selectedId ? threadAutoTranslate[selectedId] : undefined;
   useEffect(() => {
@@ -991,12 +1093,16 @@ export default function App() {
     const container = scrollContainerRef.current;
     const prevScrollHeight = container?.scrollHeight ?? 0;
     const prevScrollTop = container?.scrollTop ?? 0;
+    const existingIds = new Set(messages.map((m) => m.msg_id));
+    const prevCursor = lastOlderCursorRef.current;
+    lastOlderCursorRef.current = oldest.msg_id;
 
     setLoadingOlder(true);
     try {
       const page = await bridge.loadMessages(selectedId, oldest.ts, false, oldest.msg_id);
       if (selectedIdRef.current !== selectedId) return;
-      if (page.messages.length > 0) {
+      const hasFresh = page.messages.some((m) => !existingIds.has(m.msg_id));
+      if (hasFresh) {
         setMessages((prev) => {
           const seen = new Set(prev.map((m) => m.msg_id));
           const fresh = page.messages.filter((m) => !seen.has(m.msg_id));
@@ -1008,8 +1114,10 @@ export default function App() {
             container.scrollTop = prevScrollTop + delta;
           }
         });
+        setHasMoreHistory(page.has_more);
+      } else {
+        setHasMoreHistory(page.has_more && prevCursor !== oldest.msg_id);
       }
-      setHasMoreHistory(page.has_more);
     } catch (err) {
       showError(err);
     } finally {
@@ -1019,6 +1127,7 @@ export default function App() {
 
   const handleSelectSearchResult = useCallback(
     async (hit: MessageDto) => {
+      setMobilePane("chat");
       if (hit.thread_id === selectedId) {
         if (messages.some((m) => m.msg_id === hit.msg_id)) {
           setTimeout(() => jumpToMsg(hit.msg_id), 40);
@@ -1041,10 +1150,11 @@ export default function App() {
   );
 
   const visibleThreads = useMemo(() => {
+    const byFolder = filterThreadsByFolder(threads, folder, customFolders);
     const q = filterText.trim().toLowerCase();
-    const base = q ? threads.filter((t) => t.title.toLowerCase().includes(q)) : [...threads];
+    const base = q ? byFolder.filter((t) => t.title.toLowerCase().includes(q)) : [...byFolder];
     return base.sort(compareThreads);
-  }, [threads, filterText]);
+  }, [threads, folder, customFolders, filterText]);
   visibleThreadsRef.current = visibleThreads;
 
   const activeThread = useMemo(
@@ -1129,6 +1239,20 @@ export default function App() {
     }
   };
 
+  const handleMarkRead = useCallback(
+    async (target: ThreadDto) => {
+      try {
+        await bridge.markRead(target.id);
+        setThreads((prev) =>
+          prev.map((t) => (t.id === target.id ? { ...t, unread_count: 0 } : t)),
+        );
+      } catch (err) {
+        showError(err);
+      }
+    },
+    [showError],
+  );
+
   const handleMarkUnread = async (target: ThreadDto) => {
     try {
       await bridge.markUnread(target.id);
@@ -1143,6 +1267,71 @@ export default function App() {
       showError(err);
     }
   };
+
+  const handleMarkFolderRead = useCallback(
+    async (selection: string) => {
+      const targets = filterThreadsByFolder(threadsRef.current, selection, customFolders).filter(
+        (t) => t.unread_count > 0,
+      );
+      if (targets.length === 0) return;
+      try {
+        await Promise.all(targets.map((t) => bridge.markRead(t.id)));
+        const ids = new Set(targets.map((t) => t.id));
+        setThreads((prev) =>
+          prev.map((t) => (ids.has(t.id) ? { ...t, unread_count: 0 } : t)),
+        );
+      } catch (err) {
+        showError(err);
+      }
+    },
+    [customFolders, showError],
+  );
+
+  const handleToggleThreadInFolder = useCallback(
+    async (targetFolder: ChatFolderDto, threadId: string) => {
+      const exists = targetFolder.thread_ids.includes(threadId);
+      const nextFolder: ChatFolderDto = {
+        ...targetFolder,
+        thread_ids: exists
+          ? targetFolder.thread_ids.filter((id) => id !== threadId)
+          : [...targetFolder.thread_ids, threadId],
+      };
+      try {
+        const list = await bridge.saveChatFolder(nextFolder);
+        setCustomFolders(list);
+      } catch (err) {
+        showError(err);
+      }
+    },
+    [showError],
+  );
+
+  const handleReplyMessage = useCallback((target: MessageDto) => {
+    setReplyTo(target);
+  }, []);
+
+  const handleJumpToMsgVoid = useCallback(
+    (msgId: string) => {
+      void jumpToMsg(msgId);
+    },
+    [jumpToMsg],
+  );
+
+  const handleOpenProfileModal = useCallback((uid: string) => {
+    setProfileUid(uid);
+  }, []);
+
+  const handleForwardSingle = useCallback((target: MessageDto) => {
+    setForwardMessages([target]);
+  }, []);
+
+  const handleHideTranslation = useCallback((msgId: string) => {
+    setTranslationsByMsg((prev) => {
+      const next = { ...prev };
+      delete next[msgId];
+      return next;
+    });
+  }, []);
 
   const sendTextInternal = useCallback(
     async (targetThreadId: string, text: string, quoteTarget: MessageDto | null): Promise<boolean> => {
@@ -1309,10 +1498,18 @@ export default function App() {
       if (!selectedId) return;
       void bridge
         .recallMessage(selectedId, target.msg_id)
-        .then((updated) => setMessages((list) => upsertMsg(list, updated)))
+        .then((updated) => {
+          setMessages((list) => upsertMsg(list, updated));
+          if (target.attachment_url) {
+            setDetailsRefreshTick((n) => n + 1);
+          }
+          if (pinnedMsgIdsRef.current.has(updated.msg_id)) {
+            void refreshPinnedMessages(selectedId);
+          }
+        })
         .catch(showError);
     },
-    [selectedId, showError],
+    [selectedId, showError, refreshPinnedMessages],
   );
 
   const handleDeleteLocalMessage = useCallback(
@@ -1320,10 +1517,15 @@ export default function App() {
       if (!selectedId) return;
       void bridge
         .deleteMessageLocal(selectedId, target.msg_id)
-        .then(() => setMessages((list) => list.filter((x) => x.msg_id !== target.msg_id)))
+        .then(() => {
+          setMessages((list) => list.filter((x) => x.msg_id !== target.msg_id));
+          if (pinnedMsgIdsRef.current.has(target.msg_id)) {
+            void refreshPinnedMessages(selectedId);
+          }
+        })
         .catch(showError);
     },
-    [selectedId, showError],
+    [selectedId, showError, refreshPinnedMessages],
   );
 
   const handleTogglePinMessage = useCallback(
@@ -1332,11 +1534,34 @@ export default function App() {
       if (!tid) return;
       void bridge
         .togglePinMessage(tid, target.msg_id, !target.is_pinned)
-        .then((updated) => setMessages((list) => upsertMsg(list, updated)))
+        .then((updated) => {
+          setMessages((list) => upsertMsg(list, updated));
+          void refreshPinnedMessages(tid);
+        })
         .catch(showError);
     },
-    [showError],
+    [showError, refreshPinnedMessages],
   );
+
+  const handleStartChatFromProfile = useCallback((profile: UserProfileDto) => {
+    setThreads((prev) => {
+      if (prev.some((t) => t.id === profile.uid)) return prev;
+      const created: ThreadDto = {
+        id: profile.uid,
+        title: profile.display_name || profile.uid,
+        avatar: profile.avatar,
+        kind: "direct",
+        last_preview: "",
+        last_ts: 0,
+        unread_count: 0,
+        is_pinned: false,
+        is_muted: false,
+      };
+      return [created, ...prev].sort(compareThreads);
+    });
+    setSelectedId(profile.uid);
+    setMobilePane("chat");
+  }, []);
 
   const handleSendSticker = useCallback(
     async (sticker: StickerItem) => {
@@ -1392,11 +1617,6 @@ export default function App() {
         ? threadDetails.members
         : [],
     [activeThread, threadDetails],
-  );
-
-  const pinnedMessages = useMemo(
-    () => messages.filter((m) => m.is_pinned && !m.is_recalled),
-    [messages],
   );
 
   const currentPinned =
@@ -1473,8 +1693,8 @@ export default function App() {
   const handleSendAttachment = async (
     att: PendingAttachment,
     caption: string,
-  ): Promise<MessageDto | null> => {
-    if (!selectedId) return null;
+  ): Promise<MessageDto | false> => {
+    if (!selectedId) return false;
     try {
       const msg =
         att.kind === "path"
@@ -1488,11 +1708,12 @@ export default function App() {
             );
       setMessages((prev) => upsertMsg(prev, msg));
       setThreads((prev) => bumpThreadList(prev, msg, false));
+      setDetailsRefreshTick((n) => n + 1);
       setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
       return msg;
     } catch (err) {
       showError(err);
-      return null;
+      return false;
     }
   };
 
@@ -1549,6 +1770,47 @@ export default function App() {
 
   const utilityModals = (
     <>
+      <FindUserModal
+        open={findUserOpen}
+        initialPhone={findUserInitialPhone}
+        onClose={() => {
+          setFindUserOpen(false);
+          setFindUserInitialPhone("");
+        }}
+        onOpenProfile={(profile) => {
+          setProfileInitial(profile);
+          setProfileUid(profile.uid);
+        }}
+        onStartChat={handleStartChatFromProfile}
+      />
+
+      <FolderEditorModal
+        open={folderModalOpen}
+        folders={customFolders}
+        threads={threads}
+        initialEditingFolder={editingFolder}
+        onClose={() => {
+          setFolderModalOpen(false);
+          setEditingFolder(null);
+        }}
+        onSaveFolder={async (targetFolder) => {
+          const updated = await bridge.saveChatFolder(targetFolder);
+          setCustomFolders(updated);
+        }}
+        onDeleteFolder={async (folderId) => {
+          const updated = await bridge.deleteChatFolder(folderId);
+          setCustomFolders(updated);
+          if (folder === `custom:${folderId}`) {
+            setFolder("all");
+          }
+        }}
+        onSyncRemoteLabels={async () => {
+          const updated = await bridge.syncRemoteLabelFolders();
+          setCustomFolders(updated);
+          return updated.length;
+        }}
+      />
+
       <SettingsModal
         open={settingsOpen}
         theme={theme}
@@ -1618,7 +1880,7 @@ export default function App() {
   if (authChecking) {
     return (
       <>
-        <TriforceEffects enabled={fxEnabled} />
+        <TriforceEffects enabled={fxEnabled} dustEnabled={fxEnabled && theme === "triforce"} />
         <div
           className="relative z-10 flex h-full w-full flex-col items-center justify-center gap-3 text-sm"
           style={{ background: "var(--bg-stage)", color: "var(--text-secondary)" }}
@@ -1633,7 +1895,7 @@ export default function App() {
   if (!authed) {
     return (
       <>
-        <TriforceEffects enabled={fxEnabled} />
+        <TriforceEffects enabled={fxEnabled} dustEnabled={fxEnabled && theme === "triforce"} />
         <div className="relative z-10 h-full w-full">
           <QrLoginModal
             qrSvg={qrSvg}
@@ -1655,31 +1917,98 @@ export default function App() {
 
   return (
     <div className={`relative flex h-full w-full overflow-hidden ${buzzShaking ? "buzz-shaking" : ""}`}>
-      <TriforceEffects enabled={fxEnabled} />
+      <TriforceEffects enabled={fxEnabled} dustEnabled={fxEnabled && theme === "triforce"} />
       {/* Column 1: Folder Rail */}
       <aside
-        className="relative z-10 flex w-[78px] shrink-0 flex-col items-center justify-between overflow-y-auto py-3"
+        className={`relative z-10 shrink-0 flex-col items-center justify-between overflow-y-auto py-3 ${
+          layout.mode === "single"
+            ? mobilePane === "chat"
+              ? "hidden"
+              : "flex w-[64px]"
+            : "flex w-[78px]"
+        }`}
         style={{ background: "var(--bg-rail)", borderRight: "1px solid var(--border-subtle)" }}
       >
-        <div className="flex w-full flex-col items-center gap-1.5 px-1.5">
+        <div className="flex w-full flex-col items-center gap-1 px-1.5">
           {FOLDERS.map((item) => {
             const Icon = item.icon;
             const active = folder === item.id;
+            const badge = item.id === "all" ? 0 : countFolderUnread(threads, item.id, customFolders);
             return (
               <button
                 key={item.id}
                 onClick={() => setFolder(item.id)}
-                className="hover-rail flex w-full flex-col items-center gap-1 rounded-xl py-2 text-xs font-medium transition"
+                className="hover-rail relative flex w-full flex-col items-center gap-1 rounded-xl py-2 text-xs font-medium transition"
                 style={{
                   background: active ? "var(--rail-active-bg)" : "transparent",
                   color: active ? "var(--rail-text-active)" : "var(--rail-text)",
                 }}
               >
                 <Icon className="h-5 w-5" />
-                <span className="truncate">{item.label}</span>
+                <span className="max-w-full truncate px-0.5">{item.label}</span>
+                {badge > 0 && (
+                  <span
+                    className="absolute right-1.5 top-1 min-w-[16px] rounded-full px-1 py-0.5 text-center text-[10px] font-bold leading-none"
+                    style={{ background: "var(--accent)", color: "var(--text-on-accent)" }}
+                  >
+                    {badge > 99 ? "99+" : badge}
+                  </span>
+                )}
               </button>
             );
           })}
+
+          {customFolders.length > 0 && (
+            <div className="my-1 h-px w-8" style={{ background: "var(--border-subtle)" }} />
+          )}
+
+          {customFolders.map((cf) => {
+            const sel = `custom:${cf.id}`;
+            const active = folder === sel;
+            const badge = countFolderUnread(threads, sel, customFolders);
+            return (
+              <button
+                key={cf.id}
+                type="button"
+                title={`${cf.name} (Chuột phải để tùy chỉnh)`}
+                onClick={() => setFolder(sel)}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setFolderMenu({ folder: cf, x: e.clientX, y: e.clientY });
+                }}
+                className="hover-rail relative flex w-full flex-col items-center gap-1 rounded-xl py-2 text-xs font-medium transition"
+                style={{
+                  background: active ? "var(--rail-active-bg)" : "transparent",
+                  color: active ? "var(--rail-text-active)" : "var(--rail-text)",
+                }}
+              >
+                {renderFolderIcon(cf.icon, "h-5 w-5")}
+                <span className="max-w-full truncate px-0.5">{cf.name}</span>
+                {badge > 0 && (
+                  <span
+                    className="absolute right-1.5 top-1 min-w-[16px] rounded-full px-1 py-0.5 text-center text-[10px] font-bold leading-none"
+                    style={{ background: "var(--accent)", color: "var(--text-on-accent)" }}
+                  >
+                    {badge > 99 ? "99+" : badge}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+
+          <button
+            type="button"
+            onClick={() => {
+              setEditingFolder(null);
+              setFolderModalOpen(true);
+            }}
+            title="Quản lý & tạo thư mục hội thoại"
+            className="hover-rail mt-0.5 flex w-full flex-col items-center gap-1 rounded-xl py-2 text-[11px] font-medium transition"
+            style={{ color: "var(--rail-text)" }}
+          >
+            <FolderPlus className="h-4 w-4" />
+            <span className="truncate">Thư mục</span>
+          </button>
         </div>
 
         <div className="flex flex-col items-center gap-2">
@@ -1720,8 +2049,8 @@ export default function App() {
             onClick={() => setSettingsOpen(true)}
             title={
               availableUpdate
-                ? `Cài đặt LiteChat (có bản cập nhật v${availableUpdate.version})`
-                : "Cài đặt LiteChat"
+                ? `Cài đặt Teza (có bản cập nhật v${availableUpdate.version})`
+                : "Cài đặt Teza"
             }
             className="hover-rail relative rounded-lg p-2 transition"
             style={{ color: availableUpdate ? "var(--accent)" : "var(--rail-text)" }}
@@ -1764,48 +2093,145 @@ export default function App() {
         </div>
       </aside>
 
-      {/* Column 2: Resizable Thread List */}
+      {/* Column 2: Resizable / Auto-Collapsing Thread List */}
       <section
-        className="relative z-10 flex shrink-0 flex-col"
+        className={`relative z-10 shrink-0 flex-col ${
+          layout.mode === "single"
+            ? mobilePane === "chat"
+              ? "hidden"
+              : "flex min-w-0 flex-1"
+            : "flex"
+        }`}
         style={{
-          width: `${sidebarWidth}px`,
+          width:
+            layout.mode === "single"
+              ? undefined
+              : layout.mode === "compact"
+                ? "72px"
+                : `${sidebarWidth}px`,
           background: "var(--bg-sidebar)",
-          borderRight: "1px solid var(--border-subtle)",
+          borderRight: layout.mode === "single" ? undefined : "1px solid var(--border-subtle)",
         }}
       >
-        <div className="flex items-center gap-1.5 p-3">
-          <div
-            className="flex flex-1 items-center gap-2 rounded-full px-3 py-1.5"
-            style={{ background: "var(--bg-surface)" }}
-          >
-            <Search className="h-4 w-4 shrink-0" style={{ color: "var(--text-secondary)" }} />
-            <input
-              value={filterText}
-              onChange={(e) => setFilterText(e.target.value)}
-              placeholder="Tìm hội thoại..."
-              className="w-full bg-transparent text-[15px] outline-none"
-            />
+        {layout.mode === "compact" ? (
+          <div className="flex flex-col items-center gap-1.5 px-2 py-2.5">
+            {windowWidth >= 900 && (
+              <button
+                type="button"
+                onClick={() => {
+                  setManualSidebarCompact(false);
+                  localStorage.setItem("litechat.sidebarCompact", "0");
+                }}
+                title="Mở rộng danh sách hội thoại"
+                className="hover-menu flex h-9 w-9 items-center justify-center rounded-xl transition"
+                style={{ background: "var(--bg-surface)", color: "var(--accent)" }}
+              >
+                <PanelLeftOpen className="h-4 w-4" />
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => setQuickSearchOpen(true)}
+              title="Tìm kiếm toàn cục (Ctrl+K)"
+              className="hover-menu flex h-9 w-9 items-center justify-center rounded-xl transition"
+              style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
+            >
+              <Search className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setFindUserInitialPhone("");
+                setFindUserOpen(true);
+              }}
+              title="Tìm bạn theo số điện thoại"
+              className="hover-menu flex h-9 w-9 items-center justify-center rounded-xl transition"
+              style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
+            >
+              <UserPlus className="h-4 w-4" />
+            </button>
           </div>
-          <button
-            onClick={() => void syncRemoteThreads()}
-            title="Đồng bộ lại danh bạ"
-            className="hover-menu rounded-lg p-2 transition"
-            style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
-          >
-            <RefreshCw className={`h-4 w-4 ${syncing ? "animate-spin" : ""}`} />
-          </button>
-          <button
-            onClick={() => setQuickSearchOpen(true)}
-            title="Tìm kiếm toàn cục (Ctrl+K)"
-            className="hover-menu rounded-lg px-2 py-1.5 text-xs font-medium transition"
-            style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
-          >
-            Ctrl+K
-          </button>
-        </div>
+        ) : (
+          <div className="p-3 pb-2">
+            <div className="flex items-center gap-1.5">
+              <div
+                className="flex min-w-0 flex-1 items-center gap-2 rounded-full px-3 py-1.5"
+                style={{ background: "var(--bg-surface)" }}
+              >
+                <Search className="h-4 w-4 shrink-0" style={{ color: "var(--text-secondary)" }} />
+                <input
+                  value={filterText}
+                  onChange={(e) => setFilterText(e.target.value)}
+                  placeholder="Tìm hội thoại hoặc SĐT..."
+                  className="w-full min-w-0 bg-transparent text-[15px] outline-none"
+                />
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setFindUserInitialPhone(looksLikePhoneQuery(filterText) ? filterText.trim() : "");
+                  setFindUserOpen(true);
+                }}
+                title="Tìm bạn mới theo số điện thoại"
+                className="hover-menu shrink-0 rounded-lg p-2 transition"
+                style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
+              >
+                <UserPlus className="h-4 w-4" />
+              </button>
+              <button
+                type="button"
+                onClick={() => void syncRemoteThreads()}
+                title="Đồng bộ lại danh bạ"
+                className="hover-menu shrink-0 rounded-lg p-2 transition"
+                style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
+              >
+                <RefreshCw className={`h-4 w-4 ${syncing ? "animate-spin" : ""}`} />
+              </button>
+              <button
+                type="button"
+                onClick={() => setQuickSearchOpen(true)}
+                title="Tìm kiếm toàn cục (Ctrl+K)"
+                className="hover-menu shrink-0 rounded-lg px-2 py-1.5 text-xs font-medium transition"
+                style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
+              >
+                Ctrl+K
+              </button>
+              {windowWidth >= 900 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setManualSidebarCompact(true);
+                    localStorage.setItem("litechat.sidebarCompact", "1");
+                  }}
+                  title="Thu gọn danh sách hội thoại"
+                  className="hover-menu shrink-0 rounded-lg p-2 transition"
+                  style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
+                >
+                  <PanelLeftClose className="h-4 w-4" />
+                </button>
+              )}
+            </div>
+            {looksLikePhoneQuery(filterText) && (
+              <button
+                type="button"
+                onClick={() => {
+                  setFindUserInitialPhone(filterText.trim());
+                  setFindUserOpen(true);
+                }}
+                className="hover-menu mt-2 flex w-full items-center gap-2 rounded-xl px-3 py-1.5 text-left text-xs font-medium transition"
+                style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
+              >
+                <UserPlus className="h-3.5 w-3.5 shrink-0" />
+                <span className="truncate">
+                  Tìm người dùng theo SĐT &ldquo;{filterText.trim()}&rdquo;
+                </span>
+              </button>
+            )}
+          </div>
+        )}
 
         <div
-          className="flex-1 overflow-y-auto px-2 pb-2"
+          className={`flex-1 overflow-y-auto pb-2 ${layout.mode === "compact" ? "px-1.5" : "px-2"}`}
           onScroll={(e) => {
             const el = e.currentTarget;
             if (
@@ -1818,11 +2244,13 @@ export default function App() {
         >
           {visibleThreads.length === 0 ? (
             <div className="px-4 py-12 text-center text-[13px]" style={{ color: "var(--text-secondary)" }}>
-              {filterText.trim()
-                ? "Không tìm thấy hội thoại phù hợp"
-                : folder === "unread"
-                  ? "Không có tin nhắn chưa đọc"
-                  : "Chưa có cuộc hội thoại nào"}
+              {layout.mode === "compact"
+                ? "Trống"
+                : filterText.trim()
+                  ? "Không tìm thấy hội thoại phù hợp"
+                  : folder === "unread"
+                    ? "Không có tin nhắn chưa đọc"
+                    : "Chưa có cuộc hội thoại nào"}
             </div>
           ) : (
             visibleThreads.slice(0, threadRenderLimit).map((t) => {
@@ -1835,16 +2263,70 @@ export default function App() {
                   : t.kind === "cloud"
                     ? "Lưu trữ cá nhân & ghi chú nhanh"
                     : "Nhấn để trò chuyện";
+              if (layout.mode === "compact") {
+                return (
+                  <button
+                    key={t.id}
+                    type="button"
+                    title={`${t.title}${t.last_preview ? ` — ${t.last_preview}` : ""}`}
+                    onClick={() => {
+                      setSelectedId(t.id);
+                      if (layout.mode === "single") setMobilePane("chat");
+                    }}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      setThreadMenu({ thread: t, x: e.clientX, y: e.clientY });
+                    }}
+                    className={`mb-1 flex w-full items-center justify-center rounded-xl py-2 transition ${
+                      active ? "" : "hover-surface"
+                    }`}
+                    style={{
+                      background: active ? "var(--bg-active)" : undefined,
+                      color: active ? "var(--text-on-active)" : "var(--text-primary)",
+                    }}
+                  >
+                    <div className="relative shrink-0">
+                      <ThreadAvatar avatar={t.avatar} title={t.title} kind={t.kind} size="md" />
+                      {unread && (
+                        <span
+                          className="absolute -right-1 -top-1 min-w-[18px] rounded-full px-1 py-0.5 text-center text-[10px] font-bold leading-none shadow"
+                          style={{
+                            background: t.is_muted ? "var(--chip-bg)" : "var(--accent)",
+                            color: t.is_muted ? "var(--text-secondary)" : "var(--text-on-accent)",
+                          }}
+                        >
+                          {t.unread_count > 99 ? "99+" : t.unread_count}
+                        </span>
+                      )}
+                      {t.is_pinned && (
+                        <span
+                          className="absolute -bottom-0.5 -right-0.5 flex h-3.5 w-3.5 items-center justify-center rounded-full shadow"
+                          style={{
+                            background: "var(--bg-sidebar)",
+                            color: "var(--accent)",
+                          }}
+                        >
+                          <Pin className="h-2.5 w-2.5" />
+                        </span>
+                      )}
+                    </div>
+                  </button>
+                );
+              }
               return (
                 <div
                   key={t.id}
                   role="button"
                   tabIndex={0}
-                  onClick={() => setSelectedId(t.id)}
+                  onClick={() => {
+                    setSelectedId(t.id);
+                    if (layout.mode === "single") setMobilePane("chat");
+                  }}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" || e.key === " ") {
                       e.preventDefault();
                       setSelectedId(t.id);
+                      if (layout.mode === "single") setMobilePane("chat");
                     }
                   }}
                   onContextMenu={(e) => {
@@ -1947,7 +2429,7 @@ export default function App() {
               );
             })
           )}
-          {visibleThreads.length > threadRenderLimit && (
+          {visibleThreads.length > threadRenderLimit && layout.mode !== "compact" && (
             <button
               type="button"
               onClick={() => setThreadRenderLimit((prev) => prev + 100)}
@@ -1959,38 +2441,55 @@ export default function App() {
           )}
         </div>
 
-        <div
-          role="separator"
-          aria-orientation="vertical"
-          title="Kéo để thay đổi độ rộng danh sách"
-          onPointerDown={(e) => {
-            e.preventDefault();
-            const startX = e.clientX;
-            const startW = sidebarWidth;
-            const onMove = (ev: PointerEvent) => {
-              const next = Math.min(440, Math.max(240, startW + (ev.clientX - startX)));
-              setSidebarWidth(next);
-            };
-            const onUp = (ev: PointerEvent) => {
-              const finalW = Math.min(440, Math.max(240, startW + (ev.clientX - startX)));
-              localStorage.setItem("litechat.sidebarWidth", String(finalW));
-              window.removeEventListener("pointermove", onMove);
-              window.removeEventListener("pointerup", onUp);
-            };
-            window.addEventListener("pointermove", onMove);
-            window.addEventListener("pointerup", onUp);
-          }}
-          className="absolute inset-y-0 -right-1 z-20 w-2 cursor-col-resize hover:bg-sky-500/30"
-        />
+        {layout.mode === "full" && (
+          <div
+            role="separator"
+            aria-orientation="vertical"
+            title="Kéo để thay đổi độ rộng (kéo hẹp < 160px để thu gọn)"
+            onPointerDown={(e) => {
+              e.preventDefault();
+              const startX = e.clientX;
+              const startW = sidebarWidth;
+              const onMove = (ev: PointerEvent) => {
+                const rawW = startW + (ev.clientX - startX);
+                if (rawW < 160) return;
+                const next = Math.min(440, Math.max(240, rawW));
+                setSidebarWidth(next);
+              };
+              const onUp = (ev: PointerEvent) => {
+                const rawW = startW + (ev.clientX - startX);
+                if (rawW < 160 && windowWidth >= 900) {
+                  setManualSidebarCompact(true);
+                  localStorage.setItem("litechat.sidebarCompact", "1");
+                } else {
+                  const finalW = Math.min(440, Math.max(240, rawW));
+                  setSidebarWidth(finalW);
+                  localStorage.setItem("litechat.sidebarCompact", "0");
+                  localStorage.setItem("litechat.sidebarWidth", String(finalW));
+                }
+                window.removeEventListener("pointermove", onMove);
+                window.removeEventListener("pointerup", onUp);
+              };
+              window.addEventListener("pointermove", onMove);
+              window.addEventListener("pointerup", onUp);
+            }}
+            className="absolute inset-y-0 -right-1 z-20 w-2 cursor-col-resize hover:bg-sky-500/30"
+          />
+        )}
       </section>
 
       {/* Column 3: Chat Stage */}
-      <main className="relative z-10 flex min-w-0 flex-1 flex-col">
+      <main
+        className={`relative z-10 min-w-0 flex-1 flex-col ${
+          layout.mode === "single" && mobilePane === "list" ? "hidden" : "flex"
+        }`}
+      >
         {buzzToast && (
           <button
             type="button"
             onClick={() => {
               setSelectedId(buzzToast.threadId);
+              setMobilePane("chat");
               setActiveThreadRootId(null);
               setBuzzToast(null);
             }}
@@ -2078,6 +2577,17 @@ export default function App() {
               }}
             >
               <div className="flex min-w-0 items-center gap-3">
+                {layout.mode === "single" && (
+                  <button
+                    type="button"
+                    onClick={() => setMobilePane("list")}
+                    title="Quay lại danh sách hội thoại"
+                    className="hover-menu -ml-1.5 rounded-lg p-1.5 transition"
+                    style={{ color: "var(--text-secondary)" }}
+                  >
+                    <ArrowLeft className="h-5 w-5" />
+                  </button>
+                )}
                 {activeThread.kind === "direct" ? (
                   <button
                     type="button"
@@ -2166,64 +2676,132 @@ export default function App() {
 
             {currentPinned && (
               <div
-                className="flex shrink-0 items-center justify-between gap-3 px-4 py-2 text-[13px]"
+                className="relative shrink-0 text-[13px]"
                 style={{
                   background: "var(--bg-surface)",
                   borderBottom: "1px solid var(--border-subtle)",
                 }}
               >
-                <button
-                  type="button"
-                  onClick={() => void jumpToMsg(currentPinned.msg_id)}
-                  className="flex min-w-0 flex-1 items-center gap-2.5 text-left transition hover:opacity-85"
-                >
-                  <Pin
-                    className="h-4 w-4 shrink-0 rotate-45"
-                    style={{ color: "var(--accent)" }}
-                  />
-                  <div
-                    className="min-w-0 flex-1 border-l-2 pl-2"
-                    style={{ borderColor: "var(--accent)" }}
+                <div className="flex items-center justify-between gap-3 px-4 py-2">
+                  <button
+                    type="button"
+                    onClick={() => void jumpToMsg(currentPinned.msg_id)}
+                    className="flex min-w-0 flex-1 items-center gap-2.5 text-left transition hover:opacity-85"
                   >
-                    <div
-                      className="flex items-center gap-1.5 text-xs font-semibold"
+                    <Pin
+                      className="h-4 w-4 shrink-0 rotate-45"
                       style={{ color: "var(--accent)" }}
+                    />
+                    <div
+                      className="min-w-0 flex-1 border-l-2 pl-2"
+                      style={{ borderColor: "var(--accent)" }}
                     >
-                      <span>Tin nhắn đã ghim</span>
-                      {pinnedMessages.length > 1 && (
-                        <span>
-                          ({(pinnedIdx % pinnedMessages.length) + 1}/{pinnedMessages.length})
-                        </span>
-                      )}
+                      <div
+                        className="flex items-center gap-1.5 text-xs font-semibold"
+                        style={{ color: "var(--accent)" }}
+                      >
+                        <span>Tin nhắn đã ghim</span>
+                        {pinnedMessages.length > 1 && (
+                          <span>
+                            ({(pinnedIdx % pinnedMessages.length) + 1}/{pinnedMessages.length})
+                          </span>
+                        )}
+                      </div>
+                      <div className="truncate" style={{ color: "var(--text-primary)" }}>
+                        {currentPinned.sender_name ? `${currentPinned.sender_name}: ` : ""}
+                        {currentPinned.text || currentPinned.attachment_name || "[Đính kèm]"}
+                      </div>
                     </div>
-                    <div className="truncate" style={{ color: "var(--text-primary)" }}>
-                      {currentPinned.sender_name}:{" "}
-                      {currentPinned.text || currentPinned.attachment_name || "[Đính kèm]"}
-                    </div>
-                  </div>
-                </button>
-                <div className="flex shrink-0 items-center gap-1">
-                  {pinnedMessages.length > 1 && (
+                  </button>
+                  <div className="flex shrink-0 items-center gap-1">
+                    {pinnedMessages.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={() => setPinnedIdx((i) => (i + 1) % pinnedMessages.length)}
+                        title="Xem tin ghim tiếp theo"
+                        className="hover-menu rounded-lg p-1.5"
+                        style={{ color: "var(--text-secondary)" }}
+                      >
+                        <ChevronDown className="h-4 w-4" />
+                      </button>
+                    )}
                     <button
                       type="button"
-                      onClick={() => setPinnedIdx((i) => (i + 1) % pinnedMessages.length)}
-                      title="Xem tin ghim tiếp theo"
+                      onClick={() => setPinnedListOpen((v) => !v)}
+                      title={
+                        pinnedListOpen
+                          ? "Thu gọn danh sách ghim"
+                          : `Xem tất cả ${pinnedMessages.length} tin ghim`
+                      }
+                      className="hover-menu rounded-lg px-2 py-1 text-xs font-medium"
+                      style={{ color: "var(--accent)" }}
+                    >
+                      {pinnedListOpen ? "Đóng" : `Tất cả (${pinnedMessages.length})`}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleTogglePinMessage(currentPinned)}
+                      title="Bỏ ghim tin nhắn này"
                       className="hover-menu rounded-lg p-1.5"
                       style={{ color: "var(--text-secondary)" }}
                     >
-                      <ChevronDown className="h-4 w-4" />
+                      <X className="h-4 w-4" />
                     </button>
-                  )}
-                  <button
-                    type="button"
-                    onClick={() => handleTogglePinMessage(currentPinned)}
-                    title="Bỏ ghim tin nhắn này"
-                    className="hover-menu rounded-lg p-1.5"
-                    style={{ color: "var(--text-secondary)" }}
-                  >
-                    <X className="h-4 w-4" />
-                  </button>
+                  </div>
                 </div>
+
+                {pinnedListOpen && (
+                  <div
+                    className="absolute inset-x-0 top-full z-30 max-h-64 overflow-y-auto px-3 py-2 shadow-2xl"
+                    style={{
+                      background: "var(--bg-sidebar)",
+                      borderBottom: "1px solid var(--border-subtle)",
+                    }}
+                  >
+                    <div
+                      className="mb-1.5 px-1 text-xs font-semibold uppercase tracking-wider"
+                      style={{ color: "var(--text-secondary)" }}
+                    >
+                      Danh sách tin nhắn đã ghim ({pinnedMessages.length})
+                    </div>
+                    <div className="space-y-1">
+                      {pinnedMessages.map((pm, idx) => (
+                        <div
+                          key={pm.msg_id}
+                          className="flex items-center justify-between gap-2 rounded-xl px-2.5 py-1.5"
+                          style={{ background: "var(--bg-surface)" }}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setPinnedIdx(idx);
+                              setPinnedListOpen(false);
+                              void jumpToMsg(pm.msg_id);
+                            }}
+                            className="min-w-0 flex-1 text-left transition hover:opacity-85"
+                          >
+                            <div className="truncate text-xs font-semibold" style={{ color: "var(--accent)" }}>
+                              {pm.sender_name || "Tin nhắn"} ·{" "}
+                              {pm.ts > 0 ? formatThreadTime(pm.ts) : ""}
+                            </div>
+                            <div className="truncate text-[13px]" style={{ color: "var(--text-primary)" }}>
+                              {pm.text || pm.attachment_name || "[Đính kèm]"}
+                            </div>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleTogglePinMessage(pm)}
+                            title="Bỏ ghim tin nhắn này"
+                            className="hover-menu shrink-0 rounded-lg p-1.5"
+                            style={{ color: "var(--text-secondary)" }}
+                          >
+                            <PinOff className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 
@@ -2413,7 +2991,7 @@ export default function App() {
                   m.ts - prev.ts < 120_000;
 
                 return (
-                  <div key={m.msg_id}>
+                  <div key={m.msg_id} className="msg-row-perf">
                     {showDate && (
                       <div className="my-4 flex justify-center">
                         <span
@@ -2451,22 +3029,16 @@ export default function App() {
                       onToggleSelect={handleToggleSelectMsg}
                       onStartSelect={handleStartSelect}
                       onTogglePin={handleTogglePinMessage}
-                      onReply={(target) => setReplyTo(target)}
+                      onReply={handleReplyMessage}
                       onReact={handleReactMessage}
                       onRecall={handleRecallMessage}
                       onDeleteLocal={handleDeleteLocalMessage}
-                      onJumpToMsg={(msgId) => void jumpToMsg(msgId)}
+                      onJumpToMsg={handleJumpToMsgVoid}
                       onOpenImage={openLightboxForUrl}
-                      onOpenProfile={(uid) => setProfileUid(uid)}
-                      onForward={(target) => setForwardMessages([target])}
+                      onOpenProfile={handleOpenProfileModal}
+                      onForward={handleForwardSingle}
                       onTranslate={handleTranslateSingle}
-                      onHideTranslation={(msgId) =>
-                        setTranslationsByMsg((prev) => {
-                          const next = { ...prev };
-                          delete next[msgId];
-                          return next;
-                        })
-                      }
+                      onHideTranslation={handleHideTranslation}
                       onOpenThread={handleOpenReplyThread}
                       onRetrySend={handleRetryFailedMessage}
                       onDiscardFailed={handleDiscardFailedMessage}
@@ -2567,9 +3139,10 @@ export default function App() {
               </footer>
             ) : (
               <Composer
+                threadKey={activeThread.id}
                 replyTo={replyTo}
                 draft={draftsByThread[activeThread.id] ?? ""}
-                onDraftChange={(val) => setDraftForThread(activeThread.id, val)}
+                onDraftChange={(val, tid) => setDraftForThread(tid ?? activeThread.id, val)}
                 pendingAttachment={pendingAttachment}
                 onPendingAttachmentChange={setPendingAttachment}
                 mentionMembers={activeMentionMembers}
@@ -2597,13 +3170,24 @@ export default function App() {
 
       {/* Right Info Drawer */}
       {drawerOpen && activeThread && (
-        <aside
-          className="fixed inset-y-0 right-0 z-30 flex w-80 shrink-0 flex-col overflow-hidden p-4 shadow-2xl lg:static lg:z-10 lg:shadow-none"
-          style={{
-            background: "var(--bg-sidebar)",
-            borderLeft: "1px solid var(--border-subtle)",
-          }}
-        >
+        <>
+          {layout.autoCompactDrawer && (
+            <div
+              className="fixed inset-0 z-20 bg-black/40"
+              onClick={() => setDrawerOpen(false)}
+            />
+          )}
+          <aside
+            className={
+              layout.autoCompactDrawer
+                ? "fixed inset-y-0 right-0 z-30 flex w-80 max-w-[90vw] shrink-0 flex-col overflow-hidden p-4 shadow-2xl"
+                : "static z-10 flex w-80 shrink-0 flex-col overflow-hidden p-4"
+            }
+            style={{
+              background: "var(--bg-sidebar)",
+              borderLeft: "1px solid var(--border-subtle)",
+            }}
+          >
           <div className="flex items-center justify-between">
             <h3
               className="text-[13px] font-semibold uppercase tracking-wider"
@@ -2695,12 +3279,28 @@ export default function App() {
             </button>
             <button
               type="button"
-              onClick={() => void handleMarkUnread(activeThread)}
+              onClick={() =>
+                void (activeThread.unread_count > 0
+                  ? handleMarkRead(activeThread)
+                  : handleMarkUnread(activeThread))
+              }
               className="flex flex-col items-center gap-1 rounded-xl py-2 transition hover:opacity-85"
-              style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
+              style={{
+                background: "var(--bg-surface)",
+                color: activeThread.unread_count > 0 ? "var(--accent)" : "var(--text-secondary)",
+              }}
             >
-              <MessageSquare className="h-4 w-4" />
-              <span>Chưa đọc</span>
+              {activeThread.unread_count > 0 ? (
+                <>
+                  <CheckCheck className="h-4 w-4" />
+                  <span>Đã đọc</span>
+                </>
+              ) : (
+                <>
+                  <MessageSquare className="h-4 w-4" />
+                  <span>Chưa đọc</span>
+                </>
+              )}
             </button>
           </div>
 
@@ -2748,19 +3348,19 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => setDetailsTab("media")}
-                  className="flex flex-1 items-center justify-center gap-1 rounded-lg py-1 text-[13px] font-medium transition"
+                  className="flex flex-1 items-center justify-center gap-1 rounded-lg py-1 text-[12px] font-medium transition"
                   style={{
                     background: detailsTab === "media" ? "var(--bg-hover)" : "transparent",
                     color: detailsTab === "media" ? "var(--accent)" : "var(--text-secondary)",
                   }}
                 >
                   <ImageIcon className="h-3.5 w-3.5" />
-                  Ảnh/Video ({threadDetails?.media_items.length ?? 0})
+                  Ảnh ({threadDetails?.media_items.length ?? 0})
                 </button>
                 <button
                   type="button"
                   onClick={() => setDetailsTab("files")}
-                  className="flex flex-1 items-center justify-center gap-1 rounded-lg py-1 text-[13px] font-medium transition"
+                  className="flex flex-1 items-center justify-center gap-1 rounded-lg py-1 text-[12px] font-medium transition"
                   style={{
                     background: detailsTab === "files" ? "var(--bg-hover)" : "transparent",
                     color: detailsTab === "files" ? "var(--accent)" : "var(--text-secondary)",
@@ -2769,86 +3369,160 @@ export default function App() {
                   <FileText className="h-3.5 w-3.5" />
                   Tệp ({threadDetails?.file_items.length ?? 0})
                 </button>
+                <button
+                  type="button"
+                  onClick={() => setDetailsTab("links")}
+                  className="flex flex-1 items-center justify-center gap-1 rounded-lg py-1 text-[12px] font-medium transition"
+                  style={{
+                    background: detailsTab === "links" ? "var(--bg-hover)" : "transparent",
+                    color: detailsTab === "links" ? "var(--accent)" : "var(--text-secondary)",
+                  }}
+                >
+                  <Link2 className="h-3.5 w-3.5" />
+                  Link ({threadDetails?.link_items?.length ?? 0})
+                </button>
               </div>
 
               {detailsTab === "media" ? (
                 threadDetails && threadDetails.media_items.length > 0 ? (
                   <div className="grid grid-cols-3 gap-1.5">
-                    {threadDetails.media_items.slice(0, 18).map((item) => (
-                      <button
-                        key={item.msg_id}
-                        type="button"
-                        onClick={() =>
-                          item.attachment_url &&
-                          openLightboxForUrl(
-                            item.attachment_url,
-                            item.attachment_name || "Hình ảnh",
-                          )
-                        }
-                        className="aspect-square overflow-hidden rounded-lg bg-black/25"
-                      >
-                        {item.attachment_url && (
-                          <RelayImage
-                            src={item.attachment_url}
-                            alt={item.attachment_name || "Media"}
-                            referrerPolicy="no-referrer"
-                            className="h-full w-full object-cover"
-                            loading="lazy"
-                          />
-                        )}
-                      </button>
-                    ))}
+                    {threadDetails.media_items.slice(0, 18).map((item) => {
+                      const tLower = item.msg_type.toLowerCase();
+                      const isVid =
+                        tLower.includes("video") ||
+                        tLower === "4" ||
+                        tLower === "44" ||
+                        /\.(mp4|mov|webm)(\?|$)/i.test(item.attachment_url || "");
+                      return (
+                        <button
+                          key={item.msg_id}
+                          type="button"
+                          onClick={() => {
+                            if (isVid) {
+                              void jumpToMsg(item.msg_id);
+                            } else if (item.attachment_url) {
+                              openLightboxForUrl(
+                                item.attachment_url,
+                                item.attachment_name || "Hình ảnh",
+                              );
+                            }
+                          }}
+                          title={isVid ? `Video: ${item.attachment_name || "Xem video"}` : item.attachment_name || "Hình ảnh"}
+                          className="relative aspect-square overflow-hidden rounded-lg bg-black/25"
+                        >
+                          {isVid ? (
+                            <div className="flex h-full w-full flex-col items-center justify-center gap-1 bg-slate-900/80 p-1 text-white">
+                              <span className="flex h-8 w-8 items-center justify-center rounded-full bg-white/20">
+                                <Play className="h-4 w-4 fill-white" />
+                              </span>
+                              <span className="max-w-full truncate text-[10px] opacity-80">
+                                {item.attachment_name || "Video"}
+                              </span>
+                            </div>
+                          ) : (
+                            item.attachment_url && (
+                              <RelayImage
+                                src={item.attachment_url}
+                                alt={item.attachment_name || "Media"}
+                                referrerPolicy="no-referrer"
+                                className="h-full w-full object-cover"
+                                loading="lazy"
+                              />
+                            )
+                          )}
+                        </button>
+                      );
+                    })}
                   </div>
                 ) : (
                   <div className="py-4 text-center text-xs opacity-60">Chưa có ảnh/video đã lưu</div>
                 )
-              ) : threadDetails && threadDetails.file_items.length > 0 ? (
+              ) : detailsTab === "files" ? (
+                threadDetails && threadDetails.file_items.length > 0 ? (
                 <div className="space-y-1.5">
                   {threadDetails.file_items.slice(0, 20).map((item) => (
-                    <a
+                    <button
                       key={item.msg_id}
-                      href={
-                        item.attachment_url && /^https:\/\//i.test(item.attachment_url)
-                          ? item.attachment_url
-                          : undefined
-                      }
-                      onClick={(e) => {
-                        if (
-                          relayCfg?.enabled &&
-                          item.attachment_url &&
-                          /^https:\/\//i.test(item.attachment_url)
-                        ) {
-                          e.preventDefault();
+                      type="button"
+                      onClick={() => {
+                        if (item.attachment_url && /^https?:\/\//i.test(item.attachment_url)) {
                           handleSaveRemoteFile(
                             item.attachment_url,
                             item.attachment_name || "attachment",
                           );
+                        } else {
+                          void jumpToMsg(item.msg_id);
                         }
                       }}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="hover-menu flex items-center gap-2 rounded-lg px-2 py-1.5 text-xs transition"
+                      title="Nhấn để tải tệp về máy"
+                      className="hover-menu flex w-full items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-left text-xs transition"
                       style={{ background: "var(--bg-surface)" }}
                     >
-                      <FileText className="h-4 w-4 shrink-0" style={{ color: "var(--accent)" }} />
-                      <span className="truncate">{item.attachment_name || item.text}</span>
-                    </a>
+                      <div className="flex min-w-0 flex-1 items-center gap-2">
+                        <FileText className="h-4 w-4 shrink-0" style={{ color: "var(--accent)" }} />
+                        <span className="truncate">{item.attachment_name || item.text}</span>
+                      </div>
+                      <Download className="h-3.5 w-3.5 shrink-0 opacity-75" style={{ color: "var(--accent)" }} />
+                    </button>
                   ))}
                 </div>
+                ) : (
+                  <div className="py-4 text-center text-xs opacity-60">Chưa có tệp đính kèm</div>
+                )
+              ) : threadDetails && (threadDetails.link_items?.length ?? 0) > 0 ? (
+                <div className="space-y-1.5">
+                  {threadDetails.link_items.slice(0, 25).map((item) => {
+                    const url = extractFirstUrl(item.text);
+                    return (
+                      <div
+                        key={item.msg_id}
+                        className="flex items-start justify-between gap-1.5 rounded-lg px-2 py-1.5 text-xs"
+                        style={{ background: "var(--bg-surface)" }}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => void jumpToMsg(item.msg_id)}
+                          title="Nhảy tới tin nhắn trong đoạn chat"
+                          className="min-w-0 flex-1 text-left transition hover:opacity-85"
+                        >
+                          <div className="truncate font-medium" style={{ color: "var(--accent)" }}>
+                            {url || item.text}
+                          </div>
+                          <div className="truncate text-[11px] opacity-75">
+                            {item.sender_name || "Tin nhắn"} · {formatThreadTime(item.ts)}
+                          </div>
+                        </button>
+                        {url && (
+                          <a
+                            href={url}
+                            target="_blank"
+                            rel="noreferrer"
+                            title="Mở liên kết"
+                            className="hover-menu shrink-0 rounded p-1"
+                            style={{ color: "var(--accent)" }}
+                          >
+                            <ExternalLink className="h-3.5 w-3.5" />
+                          </a>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
               ) : (
-                <div className="py-4 text-center text-xs opacity-60">Chưa có tệp đính kèm</div>
+                <div className="py-4 text-center text-xs opacity-60">Chưa có liên kết nào</div>
               )}
             </div>
           </div>
         </aside>
+        </>
       )}
 
       {threadMenu && (
         <div
-          className="fixed z-50 w-48 rounded-xl py-1 shadow-2xl"
+          className="fixed z-50 max-h-[75vh] w-56 overflow-y-auto rounded-xl py-1 shadow-2xl"
           style={{
-            left: Math.min(threadMenu.x, window.innerWidth - 200),
-            top: Math.min(threadMenu.y, window.innerHeight - 140),
+            left: Math.min(threadMenu.x, window.innerWidth - 232),
+            top: Math.min(threadMenu.y, window.innerHeight - 280),
             background: "var(--bg-sidebar)",
             border: "1px solid var(--border-subtle)",
           }}
@@ -2875,12 +3549,22 @@ export default function App() {
           <button
             type="button"
             onClick={() => {
-              void handleMarkUnread(threadMenu.thread);
+              void (threadMenu.thread.unread_count > 0
+                ? handleMarkRead(threadMenu.thread)
+                : handleMarkUnread(threadMenu.thread));
               setThreadMenu(null);
             }}
             className="hover-menu flex w-full items-center gap-2 px-3 py-2 text-left text-[13.5px]"
           >
-            <MessageSquare className="h-3.5 w-3.5" /> Đánh dấu chưa đọc
+            {threadMenu.thread.unread_count > 0 ? (
+              <>
+                <CheckCheck className="h-3.5 w-3.5" /> Đánh dấu đã đọc
+              </>
+            ) : (
+              <>
+                <MessageSquare className="h-3.5 w-3.5" /> Đánh dấu chưa đọc
+              </>
+            )}
           </button>
           <button
             type="button"
@@ -2900,6 +3584,88 @@ export default function App() {
               </>
             )}
           </button>
+          <div className="my-1 h-px" style={{ background: "var(--border-subtle)" }} />
+          {customFolders.map((cf) => {
+            const added = cf.thread_ids.includes(threadMenu.thread.id);
+            return (
+              <button
+                key={cf.id}
+                type="button"
+                onClick={() => {
+                  void handleToggleThreadInFolder(cf, threadMenu.thread.id);
+                  setThreadMenu(null);
+                }}
+                className="hover-menu flex w-full items-center justify-between gap-2 px-3 py-1.5 text-left text-[13px]"
+              >
+                <span className="flex min-w-0 items-center gap-2">
+                  {renderFolderIcon(cf.icon, "h-3.5 w-3.5 shrink-0")}
+                  <span className="truncate">{cf.name}</span>
+                </span>
+                {added && <Check className="h-3.5 w-3.5 shrink-0" style={{ color: "var(--accent)" }} />}
+              </button>
+            );
+          })}
+          <button
+            type="button"
+            onClick={() => {
+              setEditingFolder(null);
+              setFolderModalOpen(true);
+              setThreadMenu(null);
+            }}
+            className="hover-menu flex w-full items-center gap-2 px-3 py-2 text-left text-[13px]"
+            style={{ color: "var(--accent)" }}
+          >
+            <FolderPlus className="h-3.5 w-3.5" /> Quản lý thư mục...
+          </button>
+        </div>
+      )}
+
+      {folderMenu && (
+        <div
+          className="fixed z-50 w-52 rounded-xl py-1 shadow-2xl"
+          style={{
+            left: Math.min(folderMenu.x, window.innerWidth - 220),
+            top: Math.min(folderMenu.y, window.innerHeight - 150),
+            background: "var(--bg-sidebar)",
+            border: "1px solid var(--border-subtle)",
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            type="button"
+            onClick={() => {
+              void handleMarkFolderRead(`custom:${folderMenu.folder.id}`);
+              setFolderMenu(null);
+            }}
+            className="hover-menu flex w-full items-center gap-2 px-3 py-2 text-left text-[13.5px]"
+          >
+            <CheckCheck className="h-3.5 w-3.5" /> Đánh dấu tất cả đã đọc
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setEditingFolder(folderMenu.folder);
+              setFolderModalOpen(true);
+              setFolderMenu(null);
+            }}
+            className="hover-menu flex w-full items-center gap-2 px-3 py-2 text-left text-[13.5px]"
+          >
+            <FolderPlus className="h-3.5 w-3.5" /> Chỉnh sửa thư mục
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              const fid = folderMenu.folder.id;
+              setFolderMenu(null);
+              void bridge.deleteChatFolder(fid).then((list) => {
+                setCustomFolders(list);
+                if (folder === `custom:${fid}`) setFolder("all");
+              });
+            }}
+            className="hover-menu flex w-full items-center gap-2 px-3 py-2 text-left text-[13.5px] text-rose-500"
+          >
+            <Trash2 className="h-3.5 w-3.5" /> Xóa thư mục
+          </button>
         </div>
       )}
 
@@ -2910,6 +3676,10 @@ export default function App() {
         threads={threads}
         onClose={() => setQuickSearchOpen(false)}
         onSelectMessage={(hit) => void handleSelectSearchResult(hit)}
+        onFindPhone={(phone) => {
+          setFindUserInitialPhone(phone);
+          setFindUserOpen(true);
+        }}
       />
 
       <ForwardModal
@@ -2953,26 +3723,13 @@ export default function App() {
 
       <UserProfileModal
         userId={profileUid}
-        onClose={() => setProfileUid(null)}
-        onOpenImage={openLightboxForUrl}
-        onStartChat={(profile) => {
-          setThreads((prev) => {
-            if (prev.some((t) => t.id === profile.uid)) return prev;
-            const created: ThreadDto = {
-              id: profile.uid,
-              title: profile.display_name || profile.uid,
-              avatar: profile.avatar,
-              kind: "direct",
-              last_preview: "",
-              last_ts: 0,
-              unread_count: 0,
-              is_pinned: false,
-              is_muted: false,
-            };
-            return [created, ...prev].sort(compareThreads);
-          });
-          setSelectedId(profile.uid);
+        initialProfile={profileInitial}
+        onClose={() => {
+          setProfileUid(null);
+          setProfileInitial(null);
         }}
+        onOpenImage={openLightboxForUrl}
+        onStartChat={handleStartChatFromProfile}
       />
     </div>
   );

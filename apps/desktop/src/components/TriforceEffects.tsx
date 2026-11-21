@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 
 interface Props {
   enabled: boolean;
+  dustEnabled?: boolean;
 }
 
 const PRESS_SELECTOR = 'a[href], button, summary, [role="button"], .tf-row';
@@ -77,14 +78,16 @@ function createFairyWingBody(variant: 1 | 2, rgb: string): HTMLDivElement {
   return wrap;
 }
 
-export function TriforceEffects({ enabled }: Props) {
+export function TriforceEffects({ enabled, dustEnabled }: Props) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const activeDust = dustEnabled ?? enabled;
 
   useEffect(() => {
     const prefersReduced =
       typeof window !== "undefined" &&
       window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
     const active = enabled && !prefersReduced;
+    const runDust = active && activeDust;
     document.body.classList.toggle("fx-off", !active);
 
     if (!active) {
@@ -230,17 +233,17 @@ export function TriforceEffects({ enabled }: Props) {
     window.addEventListener("pointerdown", onPointerDown, { passive: true });
     document.documentElement.addEventListener("mouseleave", onMouseLeave);
 
-    // 2. Floating ambient gold dust on canvas
+    // 2. Floating ambient gold dust on canvas (paused briefly during active typing)
     const canvas = canvasRef.current;
-    const ctx = canvas?.getContext("2d");
+    const ctx = runDust ? canvas?.getContext("2d") ?? null : null;
     let w = 0;
     let h = 0;
-    let dpr = 1;
     let lastDust = 0;
     let visible = !document.hidden;
+    let typingUntil = 0;
     let dustRaf = 0;
 
-    const count = Math.max(24, Math.min(70, Math.round(window.innerWidth / 24)));
+    const count = Math.max(18, Math.min(36, Math.round(window.innerWidth / 40)));
     const particles = Array.from({ length: count }, () => ({
       x: Math.random(),
       y: Math.random(),
@@ -253,9 +256,8 @@ export function TriforceEffects({ enabled }: Props) {
 
     const fit = () => {
       if (!canvas) return;
-      dpr = Math.min(window.devicePixelRatio || 1, 2);
-      w = canvas.width = Math.round(window.innerWidth * dpr);
-      h = canvas.height = Math.round(window.innerHeight * dpr);
+      w = canvas.width = Math.max(1, Math.round(window.innerWidth));
+      h = canvas.height = Math.max(1, Math.round(window.innerHeight));
     };
     fit();
 
@@ -273,14 +275,24 @@ export function TriforceEffects({ enabled }: Props) {
       sCtx.fillRect(0, 0, 32, 32);
     }
 
-    const MIN_FRAME_MS = 40;
+    const onTypingKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === "TEXTAREA" || target.tagName === "INPUT")) {
+        typingUntil = performance.now() + 700;
+      }
+    };
+    if (runDust) {
+      window.addEventListener("keydown", onTypingKey, { passive: true });
+    }
+
+    const MIN_FRAME_MS = 45;
     const stepDust = (t: number) => {
       if (!ctx || !visible) return;
-      if (lastDust && t - lastDust < MIN_FRAME_MS) {
+      if (t < typingUntil || (lastDust && t - lastDust < MIN_FRAME_MS)) {
         dustRaf = requestAnimationFrame(stepDust);
         return;
       }
-      const dt = lastDust ? Math.min(80, t - lastDust) : 40;
+      const dt = lastDust ? Math.min(80, t - lastDust) : 45;
       lastDust = t;
       ctx.clearRect(0, 0, w, h);
       for (const p of particles) {
@@ -291,7 +303,7 @@ export function TriforceEffects({ enabled }: Props) {
         }
         const gx = (p.x + Math.sin(t * 0.00022 + p.s) * 0.012 * p.z) * w;
         const gy = p.y * h;
-        const rad = p.r * p.z * dpr * 1.4;
+        const rad = p.r * p.z * 1.4;
         const size = rad * 6.0;
         const alpha = p.a * (0.55 + 0.45 * Math.sin(t * 0.0011 + p.s * 3));
         ctx.globalAlpha = alpha;
@@ -313,6 +325,8 @@ export function TriforceEffects({ enabled }: Props) {
     document.addEventListener("visibilitychange", onVisibilityChange);
     if (ctx) {
       dustRaf = requestAnimationFrame(stepDust);
+    } else if (canvas) {
+      canvas.getContext("2d")?.clearRect(0, 0, canvas.width, canvas.height);
     }
 
     return () => {
@@ -321,6 +335,9 @@ export function TriforceEffects({ enabled }: Props) {
       cancelAnimationFrame(dustRaf);
       window.removeEventListener("pointermove", onPointerMove);
       window.removeEventListener("pointerdown", onPointerDown);
+      if (runDust) {
+        window.removeEventListener("keydown", onTypingKey);
+      }
       document.documentElement.removeEventListener("mouseleave", onMouseLeave);
       window.removeEventListener("resize", fit);
       document.removeEventListener("visibilitychange", onVisibilityChange);
@@ -330,12 +347,12 @@ export function TriforceEffects({ enabled }: Props) {
         ctx.clearRect(0, 0, canvas.width, canvas.height);
       }
     };
-  }, [enabled]);
+  }, [enabled, activeDust]);
 
   return (
     <>
-      <canvas ref={canvasRef} id="dust" aria-hidden="true" />
-      <div className="torch" aria-hidden="true" />
+      {activeDust && <canvas ref={canvasRef} id="dust" aria-hidden="true" />}
+      {activeDust && <div className="torch" aria-hidden="true" />}
     </>
   );
 }

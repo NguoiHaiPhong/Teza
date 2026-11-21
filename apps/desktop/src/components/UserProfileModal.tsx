@@ -8,12 +8,19 @@ import { ThreadAvatar } from "./ThreadAvatar";
 
 interface Props {
   userId: string | null;
+  initialProfile?: UserProfileDto | null;
   onClose: () => void;
   onStartChat: (profile: UserProfileDto) => void;
   onOpenImage: (url: string, title: string) => void;
 }
 
-export function UserProfileModal({ userId, onClose, onStartChat, onOpenImage }: Props) {
+export function UserProfileModal({
+  userId,
+  initialProfile = null,
+  onClose,
+  onStartChat,
+  onOpenImage,
+}: Props) {
   const [profile, setProfile] = useState<UserProfileDto | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -25,6 +32,21 @@ export function UserProfileModal({ userId, onClose, onStartChat, onOpenImage }: 
       setError(null);
       return;
     }
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+
+    if (initialProfile && initialProfile.uid === userId) {
+      setProfile(initialProfile);
+      setLoading(false);
+      setError(null);
+      setCopied(false);
+      return () => {
+        window.removeEventListener("keydown", onKeyDown);
+      };
+    }
+
     let cancelled = false;
     setLoading(true);
     setError(null);
@@ -41,15 +63,11 @@ export function UserProfileModal({ userId, onClose, onStartChat, onOpenImage }: 
         if (!cancelled) setLoading(false);
       });
 
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKeyDown);
     return () => {
       cancelled = true;
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [userId, onClose]);
+  }, [userId, initialProfile, onClose]);
 
   if (!userId) return null;
 

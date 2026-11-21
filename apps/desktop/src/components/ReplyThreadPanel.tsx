@@ -146,9 +146,19 @@ export function ReplyThreadPanel({
       ? translationsByMsg[rootMessage.msg_id]?.text
       : rootMessage.text || rootMessage.attachment_name;
 
+  const rootTypeLower = rootMessage.msg_type.toLowerCase();
+  const rootIsSticker =
+    rootTypeLower.includes("sticker") ||
+    rootTypeLower === "5" ||
+    rootTypeLower === "35" ||
+    rootTypeLower === "36";
   const isRootImage =
     !!rootMessage.attachment_url &&
-    /\.(png|jpe?g|webp|gif|bmp)(\?|$)/i.test(rootMessage.attachment_url);
+    !rootIsSticker &&
+    (rootTypeLower.includes("photo") ||
+      rootTypeLower === "2" ||
+      rootMessage.attachment_url.startsWith("data:image/") ||
+      /\.(png|jpe?g|webp|gif|bmp)(\?|$)/i.test(rootMessage.attachment_url));
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">

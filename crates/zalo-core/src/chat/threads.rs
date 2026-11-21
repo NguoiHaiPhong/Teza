@@ -10,7 +10,9 @@ use crate::chat::parser::{
     is_raw_numeric_id, normalize_avatar_url, normalize_media_url, normalize_ts_ms,
     parse_chat_message, parse_friend_thread, pick_str,
 };
-use crate::chat::{MessageDto, ThreadDto, ThreadKind, ThreadMemberDto, UserProfileDto};
+use crate::chat::{
+    ChatFolderDto, MessageDto, ThreadDto, ThreadKind, ThreadMemberDto, UserProfileDto,
+};
 use crate::session::{is_session_expired_code, Session, SessionError};
 
 fn ensure_not_expired(resp: &Value) -> Result<()> {
@@ -613,7 +615,7 @@ async fn fetch_alias_map(session: &Session) -> Result<HashMap<String, String>> {
 }
 
 /// Synchronize friends, groups, Cloud thread, pinned state, aliases, and latest conversation previews.
-pub async fn sync_threads(session: &Session) -> Result<Vec<ThreadDto>> {
+pub async fn sync_threads_full(session: &Session) -> Result<SyncedThreads> {
     let mut threads = match get_friends(session).await {
         Ok(list) => list,
         Err(e) if is_expired_err(&e) => return Err(e),
@@ -641,18 +643,6 @@ pub async fn sync_threads(session: &Session) -> Result<Vec<ThreadDto>> {
                 }
             }
         }
-    }
-
-    match fetch_pinned_thread_ids(session).await {
-        Ok(pinned_ids) => {
-            for t in &mut threads {
-                if pinned_ids.contains(clean_group_id(&t.id)) || pinned_ids.contains(&t.id) {
-                    t.is_pinned = true;
-                }
-            }
-        }
-        Err(e) if is_expired_err(&e) => return Err(e),
-        Err(_) => {}
     }
 
     let mut extra_profiles: Map<String, Value> = Map::new();
@@ -715,8 +705,6 @@ pub async fn sync_threads(session: &Session) -> Result<Vec<ThreadDto>> {
             &session.profile.send2me_id,
             &name_map,
         );
-    } else {
-        sort_threads_by_recent(&mut threads);
     }
 
     for t in &mut threads {
@@ -738,17 +726,378 @@ pub async fn sync_threads(session: &Session) -> Result<Vec<ThreadDto>> {
         }
     }
 
-    Ok(threads)
+    let mut pinned_synced = false;
+    match fetch_pinned_thread_ids(session).await {
+        Ok(pinned_ids) => {
+            pinned_synced = true;
+            for t in &mut threads {
+                if pinned_ids.contains(clean_group_id(&t.id)) || pinned_ids.contains(&t.id) {
+                    t.is_pinned = true;
+                }
+            }
+        }
+        Err(e) if is_expired_err(&e) => return Err(e),
+        Err(_) => {}
+    }
+
+    sort_threads_by_recent(&mut threads);
+
+    let mut friend_names = name_map;
+    for t in &threads {
+        if t.kind == ThreadKind::Direct && !t.title.is_empty() && t.title != t.id {
+            friend_names
+                .entry(t.id.clone())
+                .or_insert_with(|| t.title.clone());
+        }
+    }
+
+    Ok(SyncedThreads {
+        threads,
+        friend_names,
+        pinned_synced,
+    })
+}
+
+pub async fn sync_threads(session: &Session) -> Result<Vec<ThreadDto>> {
+    Ok(sync_threads_full(session).await?.threads)
 }
 
 pub fn sort_threads_by_recent(threads: &mut [ThreadDto]) {
     threads.sort_by(|a, b| {
-        (b.unread_count > 0)
-            .cmp(&(a.unread_count > 0))
-            .then_with(|| b.is_pinned.cmp(&a.is_pinned))
+        b.is_pinned
+            .cmp(&a.is_pinned)
             .then_with(|| b.last_ts.cmp(&a.last_ts))
             .then_with(|| a.id.cmp(&b.id))
     });
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncedThreads {
+    pub threads: Vec<ThreadDto>,
+    pub friend_names: HashMap<String, String>,
+    pub pinned_synced: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteHistoryPage {
+    pub messages: Vec<MessageDto>,
+    pub has_more: bool,
+    pub error_code: i64,
+}
+
+fn value_as_i64(v: &Value) -> Option<i64> {
+    v.as_i64()
+        .or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok()))
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+}
+
+fn value_as_bool(v: &Value) -> Option<bool> {
+    v.as_bool()
+        .or_else(|| value_as_i64(v).map(|n| n != 0))
+        .or_else(|| match v.as_str().map(str::trim) {
+            Some("true") | Some("1") => Some(true),
+            Some("false") | Some("0") => Some(false),
+            _ => None,
+        })
+}
+
+fn unwrap_history_data_node(resp: &Value) -> Option<Value> {
+    match resp.get("data") {
+        Some(Value::String(s)) => serde_json::from_str::<Value>(s).ok(),
+        Some(v) => Some(v.clone()),
+        None => None,
+    }
+}
+
+pub fn extract_history_items(resp: &Value) -> Result<Vec<Value>> {
+    let err_code = resp
+        .get("error_code")
+        .and_then(value_as_i64)
+        .unwrap_or(0);
+    if err_code == -69 {
+        return Ok(Vec::new());
+    }
+    ensure_not_expired(resp)?;
+    if err_code != 0 {
+        let msg = resp
+            .get("error_message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Không thể tải lịch sử tin nhắn");
+        return Err(anyhow::anyhow!("{msg} (code {err_code})"));
+    }
+    let Some(data_node) = unwrap_history_data_node(resp) else {
+        return Ok(Vec::new());
+    };
+    if let Some(arr) = data_node.as_array() {
+        return Ok(arr.clone());
+    }
+    for key in ["msgs", "groupMsgs", "list", "items"] {
+        if let Some(arr) = data_node.get(key).and_then(|v| v.as_array()) {
+            return Ok(arr.clone());
+        }
+    }
+    Ok(Vec::new())
+}
+
+pub fn extract_history_has_more(resp: &Value, item_count: usize) -> bool {
+    let err_code = resp
+        .get("error_code")
+        .and_then(value_as_i64)
+        .unwrap_or(0);
+    if err_code == -69 {
+        return false;
+    }
+    let Some(data_node) = unwrap_history_data_node(resp) else {
+        return item_count > 0;
+    };
+    if let Some(filtered) = data_node
+        .get("isFiltered")
+        .or_else(|| data_node.get("is_filtered"))
+        .and_then(value_as_bool)
+    {
+        if filtered {
+            return true;
+        }
+    }
+    for key in ["hasMore", "has_more", "more"] {
+        if let Some(has_more) = data_node.get(key).and_then(value_as_bool) {
+            return has_more;
+        }
+    }
+    item_count > 0
+}
+
+pub fn normalize_vn_phone(raw: &str) -> Result<String> {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '-' | '.' | '(' | ')' | '\t'))
+        .collect();
+    let stripped = cleaned.strip_prefix('+').unwrap_or(&cleaned);
+    if stripped.is_empty() || !stripped.chars().all(|c| c.is_ascii_digit()) {
+        return Err(anyhow::anyhow!("Số điện thoại không hợp lệ"));
+    }
+    let normalized = if let Some(rest) = stripped.strip_prefix("840") {
+        format!("84{rest}")
+    } else if let Some(rest) = stripped.strip_prefix('0') {
+        format!("84{rest}")
+    } else if stripped.starts_with("84") {
+        stripped.to_string()
+    } else if stripped.len() == 9 {
+        format!("84{stripped}")
+    } else {
+        stripped.to_string()
+    };
+    if !(10..=15).contains(&normalized.len()) {
+        return Err(anyhow::anyhow!("Số điện thoại phải gồm 10-11 chữ số"));
+    }
+    Ok(normalized)
+}
+
+pub fn parse_phone_profile_response(
+    resp: &Value,
+    fallback_phone: &str,
+    self_uid: &str,
+) -> Result<UserProfileDto> {
+    ensure_not_expired(resp)?;
+    let err_code = resp
+        .get("error_code")
+        .and_then(value_as_i64)
+        .unwrap_or(0);
+    if err_code == 216 || err_code == 212 {
+        return Err(anyhow::anyhow!(
+            "Không tìm thấy tài khoản nào với số điện thoại này"
+        ));
+    }
+    if err_code == 221 {
+        return Err(anyhow::anyhow!(
+            "Bạn đã tìm kiếm quá nhanh, vui lòng thử lại sau ít phút"
+        ));
+    }
+    if err_code != 0 {
+        let msg = resp
+            .get("error_message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Không tìm thấy người dùng");
+        return Err(anyhow::anyhow!("{msg}"));
+    }
+    let Some(data_node) = unwrap_history_data_node(resp) else {
+        return Err(anyhow::anyhow!(
+            "Không tìm thấy tài khoản nào với số điện thoại này"
+        ));
+    };
+    let uid = pick_str(&data_node, &["uid", "userId", "id"]).ok_or_else(|| {
+        anyhow::anyhow!("Không tìm thấy tài khoản nào với số điện thoại này")
+    })?;
+    let display_name = pick_str(&data_node, &["displayName", "zaloName", "name", "display_name"])
+        .unwrap_or_else(|| fallback_phone.to_string());
+    let zalo_name = pick_str(&data_node, &["zaloName", "displayName", "name"])
+        .unwrap_or_else(|| display_name.clone());
+    let avatar = pick_str(&data_node, &["avatar", "avt", "profile_avatar"])
+        .map(|a| normalize_avatar_url(&a))
+        .unwrap_or_default();
+    let cover = pick_str(&data_node, &["cover", "bgavatar", "bgurl"])
+        .map(|c| normalize_media_url(&c))
+        .filter(|u| !u.is_empty() && !u.trim_end_matches('/').ends_with("/default"))
+        .unwrap_or_default();
+    let status = pick_str(&data_node, &["status", "bio"]).unwrap_or_default();
+    let sdob = pick_str(&data_node, &["sdob", "dobStr", "dob"]).unwrap_or_default();
+    let gender = data_node
+        .get("gender")
+        .and_then(value_as_i64)
+        .and_then(|g| u8::try_from(g).ok());
+    let phone_number = pick_str(&data_node, &["phoneNumber", "phone"])
+        .unwrap_or_else(|| fallback_phone.to_string());
+    let is_friend = data_node
+        .get("isFr")
+        .or_else(|| data_node.get("isFriend"))
+        .and_then(value_as_bool);
+    let is_self = !self_uid.is_empty() && uid == self_uid;
+    Ok(UserProfileDto {
+        uid,
+        display_name,
+        zalo_name,
+        avatar,
+        cover,
+        status,
+        gender,
+        sdob,
+        phone_number,
+        is_friend,
+        is_self,
+    })
+}
+
+pub fn parse_pinned_board_response(
+    resp: &Value,
+    thread_id: &str,
+    self_uid: &str,
+    send2me: &str,
+    is_group: bool,
+    friend_names: &HashMap<String, String>,
+) -> Vec<MessageDto> {
+    let Some(data_node) = unwrap_history_data_node(resp) else {
+        return Vec::new();
+    };
+    let mut raw_items: Vec<Value> = Vec::new();
+    if let Some(arr) = data_node.as_array() {
+        raw_items.extend(arr.iter().cloned());
+    } else {
+        for key in ["items", "list", "msgs", "boardItems", "topics", "topic"] {
+            if let Some(node) = data_node.get(key) {
+                if let Some(arr) = node.as_array() {
+                    raw_items.extend(arr.iter().cloned());
+                } else if node.is_object() {
+                    raw_items.push(node.clone());
+                }
+            }
+        }
+    }
+    let mut out: Vec<MessageDto> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for item in raw_items {
+        let mut parsed_msg: Option<MessageDto> = None;
+        if let Some(inner) = item.get("msg").or_else(|| item.get("message")).filter(|v| v.is_object()) {
+            parsed_msg = parse_chat_message(inner, Some(thread_id), self_uid, send2me, is_group);
+        }
+        if parsed_msg.is_none()
+            && item.get("content").is_some()
+            && (item.get("msgId").is_some() || item.get("cliMsgId").is_some())
+        {
+            parsed_msg = parse_chat_message(&item, Some(thread_id), self_uid, send2me, is_group);
+        }
+        let mut dto = if let Some(mut m) = parsed_msg {
+            m.is_pinned = true;
+            m
+        } else {
+            let params_obj = match item.get("params") {
+                Some(Value::String(s)) => serde_json::from_str::<Value>(s).unwrap_or(Value::Null),
+                Some(v) if v.is_object() => v.clone(),
+                _ => Value::Null,
+            };
+            let msg_id = pick_str(
+                &params_obj,
+                &["msgId", "globalMsgId", "cliMsgId", "clientMsgId", "id"],
+            )
+            .or_else(|| pick_str(&item, &["msgId", "globalMsgId", "cliMsgId", "id", "topicId"]))
+            .unwrap_or_default();
+            if msg_id.is_empty() {
+                continue;
+            }
+            let sender_id = pick_str(&params_obj, &["senderUid", "uidFrom", "creatorId"])
+                .or_else(|| pick_str(&item, &["creatorId", "uidFrom", "senderId", "senderUid"]))
+                .unwrap_or_default();
+            let mut sender_name = pick_str(&params_obj, &["senderName", "dName"])
+                .or_else(|| pick_str(&item, &["creatorName", "dName", "senderName"]))
+                .unwrap_or_default();
+            if sender_name.is_empty() && !sender_id.is_empty() {
+                if sender_id == self_uid {
+                    sender_name = "Bạn".to_string();
+                } else if let Some(name) = friend_names.get(&sender_id) {
+                    sender_name = name.clone();
+                }
+            }
+            let text = pick_str(
+                &params_obj,
+                &["title", "message", "msg", "text", "content", "description"],
+            )
+            .or_else(|| pick_str(&item, &["title", "content", "text", "message", "description"]))
+            .unwrap_or_default();
+            let attachment_url = pick_str(&params_obj, &["href", "url", "thumb"])
+                .or_else(|| pick_str(&item, &["href", "url", "thumb"]))
+                .map(|u| normalize_media_url(&u));
+            let attachment_name = pick_str(&params_obj, &["fileName", "title"])
+                .filter(|_| attachment_url.is_some());
+            if text.is_empty() && attachment_url.is_none() {
+                continue;
+            }
+            let raw_ts = params_obj
+                .get("ts")
+                .or_else(|| params_obj.get("createTime"))
+                .or_else(|| item.get("createTime"))
+                .or_else(|| item.get("editTime"))
+                .or_else(|| item.get("ts"))
+                .or_else(|| item.get("time"))
+                .and_then(value_as_i64)
+                .unwrap_or(0);
+            let ts = normalize_ts_ms(raw_ts);
+            let msg_type = pick_str(&params_obj, &["msgType", "msg_type"])
+                .or_else(|| pick_str(&item, &["msgType", "msg_type"]))
+                .unwrap_or_else(|| "chat.text".to_string());
+            let is_outgoing = !self_uid.is_empty() && sender_id == self_uid;
+            MessageDto {
+                msg_id,
+                thread_id: thread_id.to_string(),
+                sender_id,
+                sender_name,
+                text,
+                msg_type,
+                ts,
+                is_outgoing,
+                is_recalled: false,
+                is_pinned: true,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url,
+                attachment_name,
+            }
+        };
+        if !self_uid.is_empty() && dto.sender_id == self_uid {
+            dto.is_outgoing = true;
+            if dto.sender_name.is_empty() {
+                dto.sender_name = "Bạn".to_string();
+            }
+        } else if dto.sender_name.is_empty() {
+            if let Some(name) = friend_names.get(&dto.sender_id) {
+                dto.sender_name = name.clone();
+            }
+        }
+        if seen.insert(dto.msg_id.clone()) {
+            out.push(dto);
+        }
+    }
+    out.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.msg_id.cmp(&b.msg_id)));
+    out
 }
 
 pub fn apply_last_msgs_to_threads(
@@ -949,14 +1298,50 @@ pub fn apply_last_msgs_to_threads_with_names(
     sort_threads_by_recent(threads);
 }
 
-pub async fn fetch_thread_history(
+fn parse_remote_history_page(
+    resp: &Value,
+    thread_id: &str,
+    my_uid: &str,
+    send2me: &str,
+    is_group: bool,
+    exclude_msg_id: Option<&str>,
+) -> Result<RemoteHistoryPage> {
+    let error_code = resp
+        .get("error_code")
+        .and_then(value_as_i64)
+        .unwrap_or(0);
+    let items = extract_history_items(resp)?;
+    let raw_count = items.len();
+    let has_more = extract_history_has_more(resp, raw_count);
+    let mut msgs: Vec<MessageDto> = items
+        .iter()
+        .filter_map(|item| parse_chat_message(item, Some(thread_id), my_uid, send2me, is_group))
+        .filter(|msg| {
+            exclude_msg_id
+                .map(|ex| msg.msg_id != ex)
+                .unwrap_or(true)
+        })
+        .collect();
+    msgs.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.msg_id.cmp(&b.msg_id)));
+    Ok(RemoteHistoryPage {
+        messages: msgs,
+        has_more,
+        error_code,
+    })
+}
+
+pub async fn fetch_thread_history_page(
     session: &Session,
     thread_id: &str,
     kind: ThreadKind,
     count: u32,
-) -> Result<Vec<MessageDto>> {
+) -> Result<RemoteHistoryPage> {
     if !session.is_authenticated() {
-        return Ok(Vec::new());
+        return Ok(RemoteHistoryPage {
+            messages: Vec::new(),
+            has_more: false,
+            error_code: 0,
+        });
     }
     let clean = clean_group_id(thread_id);
     let my_uid = session.profile.uid.as_str();
@@ -984,51 +1369,38 @@ pub async fn fetch_thread_history(
     );
     let raw = session.get_json(&url).await?;
     let resp = unwrap_data_str(session.maybe_decrypt(raw, session.session_key_bytes()));
+    parse_remote_history_page(&resp, thread_id, my_uid, send2me, kind == ThreadKind::Group, None)
+}
 
-    ensure_not_expired(&resp)?;
-    let data_node = resp.get("data").unwrap_or(&resp);
-    let items: Vec<&Value> = if let Some(arr) = data_node.as_array() {
-        arr.iter().collect()
-    } else if let Some(arr) = data_node
-        .get("msgs")
-        .or_else(|| data_node.get("list"))
-        .and_then(Value::as_array)
-    {
-        arr.iter().collect()
-    } else {
-        Vec::new()
-    };
-
-    let mut msgs: Vec<MessageDto> = items
-        .into_iter()
-        .filter_map(|item| {
-            parse_chat_message(
-                item,
-                Some(thread_id),
-                my_uid,
-                send2me,
-                kind == ThreadKind::Group,
-            )
-        })
-        .collect();
-    msgs.sort_by_key(|m| m.ts);
-    Ok(msgs)
+pub async fn fetch_thread_history(
+    session: &Session,
+    thread_id: &str,
+    kind: ThreadKind,
+    count: u32,
+) -> Result<Vec<MessageDto>> {
+    Ok(fetch_thread_history_page(session, thread_id, kind, count)
+        .await?
+        .messages)
 }
 
 /// Fetch older messages strictly before `before_msg_id` via `/api/cm/getoldv2`.
-pub async fn fetch_older_thread_history(
+pub async fn fetch_older_thread_history_page(
     session: &Session,
     thread_id: &str,
     kind: ThreadKind,
     before_msg_id: &str,
     count: u32,
-) -> Result<Vec<MessageDto>> {
+) -> Result<RemoteHistoryPage> {
     if !session.is_authenticated()
         || before_msg_id.is_empty()
         || before_msg_id.starts_with("local-")
         || before_msg_id.starts_with("out_")
     {
-        return Ok(Vec::new());
+        return Ok(RemoteHistoryPage {
+            messages: Vec::new(),
+            has_more: false,
+            error_code: 0,
+        });
     }
     let clean = clean_group_id(thread_id);
     let my_uid = session.profile.uid.as_str();
@@ -1057,36 +1429,28 @@ pub async fn fetch_older_thread_history(
     );
     let raw = session.get_json(&url).await?;
     let resp = unwrap_data_str(session.maybe_decrypt(raw, session.session_key_bytes()));
-    ensure_not_expired(&resp)?;
+    parse_remote_history_page(
+        &resp,
+        thread_id,
+        my_uid,
+        send2me,
+        kind == ThreadKind::Group,
+        Some(before_msg_id),
+    )
+}
 
-    let data_node = resp.get("data").unwrap_or(&resp);
-    let items: Vec<&Value> = if let Some(arr) = data_node.as_array() {
-        arr.iter().collect()
-    } else if let Some(arr) = data_node
-        .get("msgs")
-        .or_else(|| data_node.get("list"))
-        .and_then(Value::as_array)
-    {
-        arr.iter().collect()
-    } else {
-        Vec::new()
-    };
-
-    let mut msgs: Vec<MessageDto> = items
-        .into_iter()
-        .filter_map(|item| {
-            parse_chat_message(
-                item,
-                Some(thread_id),
-                my_uid,
-                send2me,
-                kind == ThreadKind::Group,
-            )
-        })
-        .filter(|msg| msg.msg_id != before_msg_id)
-        .collect();
-    msgs.sort_by_key(|m| m.ts);
-    Ok(msgs)
+pub async fn fetch_older_thread_history(
+    session: &Session,
+    thread_id: &str,
+    kind: ThreadKind,
+    before_msg_id: &str,
+    count: u32,
+) -> Result<Vec<MessageDto>> {
+    Ok(
+        fetch_older_thread_history_page(session, thread_id, kind, before_msg_id, count)
+            .await?
+            .messages,
+    )
 }
 
 pub async fn fetch_group_details(
@@ -1323,6 +1687,278 @@ pub async fn fetch_user_profile(
     })
 }
 
+pub async fn find_user_by_phone(session: &Session, raw_phone: &str) -> Result<UserProfileDto> {
+    if !session.is_authenticated() {
+        anyhow::bail!("Chưa đăng nhập");
+    }
+    let phone = normalize_vn_phone(raw_phone)?;
+    let body = obj(&[
+        ("phone", json!(phone)),
+        ("avatar_size", json!(240)),
+        ("language", json!("vi")),
+        ("imei", json!(session.imei)),
+        ("reqSrc", json!(40)),
+    ]);
+    let params = session.encoded_params(&body)?;
+    let mut hosts = session.domains.candidates("friend");
+    for extra in [
+        "https://friend-wpa.chat.zalo.me",
+        "https://tt-friend-wpa.chat.zalo.me",
+    ] {
+        if !hosts.iter().any(|h| h == extra) {
+            hosts.push(extra.to_string());
+        }
+    }
+    let mut last_err: Option<anyhow::Error> = None;
+    for host in &hosts {
+        let url = format!(
+            "{}/api/friend/profile/get?{}&params={params}",
+            host.trim_end_matches('/'),
+            session.common_params()
+        );
+        match session.get_json(&url).await {
+            Ok(raw) => {
+                let resp = unwrap_data_str(session.maybe_decrypt(raw, session.session_key_bytes()));
+                return parse_phone_profile_response(&resp, &phone, &session.profile.uid);
+            }
+            Err(e) => {
+                if is_expired_err(&e) {
+                    return Err(e);
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Không tìm thấy người dùng với số điện thoại này")))
+}
+
+pub async fn fetch_pinned_messages(
+    session: &Session,
+    thread_id: &str,
+    kind: ThreadKind,
+    friend_names: &HashMap<String, String>,
+) -> Result<Vec<MessageDto>> {
+    if !session.is_authenticated() {
+        return Ok(Vec::new());
+    }
+    let my_uid = session.profile.uid.as_str();
+    let send2me = session.profile.send2me_id.as_str();
+    let clean = clean_group_id(thread_id);
+
+    if kind == ThreadKind::Group {
+        let mut hosts = session.domains.candidates("groupboard");
+        for extra in [crate::endpoints::GROUP_BOARD, crate::endpoints::BOARD] {
+            if !hosts.iter().any(|h| h == extra) {
+                hosts.push(extra.to_string());
+            }
+        }
+        let body = obj(&[
+            ("group_id", json!(clean)),
+            ("board_type", json!(0)),
+            ("page", json!(1)),
+            ("count", json!(20)),
+            ("last_id", json!(0)),
+            ("status", json!(0)),
+            ("imei", json!(session.imei)),
+        ]);
+        if let Ok(params) = session.encoded_params(&body) {
+            for host in &hosts {
+                let url = format!(
+                    "{}/api/board/list?{}&params={params}",
+                    host.trim_end_matches('/'),
+                    session.common_params()
+                );
+                if let Ok(raw) = session.get_json(&url).await {
+                    let resp =
+                        unwrap_data_str(session.maybe_decrypt(raw, session.session_key_bytes()));
+                    ensure_not_expired(&resp)?;
+                    let parsed = parse_pinned_board_response(
+                        &resp,
+                        thread_id,
+                        my_uid,
+                        send2me,
+                        true,
+                        friend_names,
+                    );
+                    if !parsed.is_empty() {
+                        return Ok(parsed);
+                    }
+                    if resp.get("error_code").and_then(value_as_i64) == Some(0) {
+                        break;
+                    }
+                }
+            }
+        }
+        if let Ok((info_map, _)) = fetch_group_profiles(session, &[clean.to_string()]).await {
+            if let Some(info) = info_map.get(clean).or_else(|| info_map.get(thread_id)) {
+                let wrapped = json!({ "data": info });
+                let parsed = parse_pinned_board_response(
+                    &wrapped,
+                    thread_id,
+                    my_uid,
+                    send2me,
+                    true,
+                    friend_names,
+                );
+                if !parsed.is_empty() {
+                    return Ok(parsed);
+                }
+            }
+        }
+        return Ok(Vec::new());
+    }
+
+    let conv_id = if kind == ThreadKind::Cloud || thread_id == send2me {
+        send2me
+    } else {
+        thread_id
+    };
+    if conv_id.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut hosts = session.domains.candidates("friendboard");
+    if !hosts.iter().any(|h| h == crate::endpoints::FRIEND_BOARD) {
+        hosts.push(crate::endpoints::FRIEND_BOARD.to_string());
+    }
+    let body = obj(&[
+        ("conversationId", json!(conv_id)),
+        ("version", json!(0)),
+        ("imei", json!(session.imei)),
+    ]);
+    if let Ok(params) = session.encoded_params(&body) {
+        for host in &hosts {
+            let url = format!(
+                "{}/api/friendboard/list?{}&params={params}",
+                host.trim_end_matches('/'),
+                session.common_params()
+            );
+            if let Ok(raw) = session.get_json(&url).await {
+                let resp =
+                    unwrap_data_str(session.maybe_decrypt(raw, session.session_key_bytes()));
+                ensure_not_expired(&resp)?;
+                let parsed = parse_pinned_board_response(
+                    &resp,
+                    thread_id,
+                    my_uid,
+                    send2me,
+                    false,
+                    friend_names,
+                );
+                if !parsed.is_empty() || resp.get("error_code").and_then(value_as_i64) == Some(0) {
+                    return Ok(parsed);
+                }
+            }
+        }
+    }
+    Ok(Vec::new())
+}
+
+pub fn parse_remote_labels_response(resp: &Value) -> Vec<ChatFolderDto> {
+    let Some(data_node) = unwrap_history_data_node(resp) else {
+        return Vec::new();
+    };
+    let mut raw_labels: Vec<Value> = Vec::new();
+    if let Some(arr) = data_node.as_array() {
+        raw_labels.extend(arr.iter().cloned());
+    } else {
+        if let Some(ld) = data_node.get("labelData") {
+            match ld {
+                Value::String(s) => {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(s.trim()) {
+                        if let Some(arr) = parsed.as_array() {
+                            raw_labels.extend(arr.iter().cloned());
+                        }
+                    }
+                }
+                Value::Array(arr) => raw_labels.extend(arr.iter().cloned()),
+                _ => {}
+            }
+        }
+        if raw_labels.is_empty() {
+            for key in ["labels", "items", "list"] {
+                if let Some(arr) = data_node.get(key).and_then(Value::as_array) {
+                    raw_labels.extend(arr.iter().cloned());
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut seen_ids = HashSet::new();
+    for (idx, item) in raw_labels.into_iter().enumerate() {
+        let Some(raw_id) = pick_str(&item, &["id", "labelId"]).or_else(|| {
+            item.get("id")
+                .or_else(|| item.get("labelId"))
+                .and_then(value_as_i64)
+                .map(|n| n.to_string())
+        }) else {
+            continue;
+        };
+        let Some(name) = pick_str(&item, &["text", "name", "labelName", "title"]) else {
+            continue;
+        };
+        if !seen_ids.insert(raw_id.clone()) {
+            continue;
+        }
+        let color = pick_str(&item, &["color"]).unwrap_or_default();
+        let mut thread_ids = Vec::new();
+        let mut seen_tids = HashSet::new();
+        for key in ["conversations", "conversationIds", "threadIds", "convs"] {
+            if let Some(node) = item.get(key) {
+                let parsed_arr: Option<Vec<Value>> = match node {
+                    Value::Array(arr) => Some(arr.clone()),
+                    Value::String(s) if s.trim().starts_with('[') => {
+                        serde_json::from_str::<Vec<Value>>(s.trim()).ok()
+                    }
+                    _ => None,
+                };
+                if let Some(arr) = parsed_arr {
+                    for entry in arr {
+                        let tid_raw = entry
+                            .as_str()
+                            .map(str::to_string)
+                            .or_else(|| value_as_i64(&entry).map(|n| n.to_string()));
+                        if let Some(raw_tid) = tid_raw {
+                            let clean = clean_group_id(raw_tid.trim()).to_string();
+                            if !clean.is_empty() && seen_tids.insert(clean.clone()) {
+                                thread_ids.push(clean);
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        out.push(ChatFolderDto {
+            id: format!("label-{raw_id}"),
+            name,
+            icon: "tag".to_string(),
+            color,
+            thread_ids,
+            include_kinds: Vec::new(),
+            only_unread: false,
+            exclude_muted: false,
+            position: 100 + idx as i64,
+            remote_label_id: Some(raw_id),
+        });
+    }
+    out
+}
+
+pub async fn fetch_remote_labels(session: &Session) -> Result<Vec<ChatFolderDto>> {
+    if !session.is_authenticated() {
+        return Ok(Vec::new());
+    }
+    let body = obj(&[("imei", json!(session.imei))]);
+    let params = session.encoded_params(&body)?;
+    let path_and_query = format!("/api/label/get?{}&params={params}", session.common_params());
+    let raw = session.get_endpoint("label", &path_and_query).await?;
+    let resp = unwrap_data_str(session.maybe_decrypt(raw, session.session_key_bytes()));
+    ensure_not_expired(&resp)?;
+    Ok(parse_remote_labels_response(&resp))
+}
+
 pub async fn sync_pin_thread(
     session: &Session,
     thread_id: &str,
@@ -1509,11 +2145,12 @@ mod tests {
         assert_eq!(threads[3].last_preview, "An: Tin nhom cu hon");
         assert!(!threads.iter().any(|t| t.id == "me-999"));
 
-        // Unread thread moves above pinned and read threads
+        // Unread thread keeps timestamp position (does not jump above pinned or newer threads)
         threads[3].unread_count = 2;
         sort_threads_by_recent(&mut threads);
         let ids_after_unread: Vec<&str> = threads.iter().map(|t| t.id.as_str()).collect();
-        assert_eq!(ids_after_unread, vec!["888111", "cloud-1", "friend-a", "stranger-b"]);
+        // Zalo sort order: pinned threads first, then newest timestamp regardless of unread badge
+        assert_eq!(ids_after_unread, vec!["cloud-1", "friend-a", "stranger-b", "888111"]);
     }
 
     #[test]
@@ -1573,5 +2210,115 @@ mod tests {
 
         let grp = threads.iter().find(|t| t.id == "999888777").unwrap();
         assert_eq!(grp.last_preview, "Minh Anh: Da xong phan API");
+    }
+
+    #[test]
+    fn extract_history_helpers_support_group_msgs_and_filtered_flag() {
+        let resp = json!({
+            "error_code": 0,
+            "data": {
+                "groupMsgs": [
+                    { "msgId": "g1", "uidFrom": "u1", "idTo": "grp1", "content": "Hello", "ts": 1_700_000_001_000_i64 }
+                ],
+                "isFiltered": 1,
+                "hasMore": false
+            }
+        });
+        let items = extract_history_items(&resp).unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(extract_history_has_more(&resp, items.len()));
+
+        let end_resp = json!({
+            "error_code": -69,
+            "error_message": "End of history",
+            "data": { "msgs": [] }
+        });
+        assert!(!extract_history_has_more(&end_resp, 0));
+    }
+
+    #[test]
+    fn normalize_vn_phone_and_parse_profile_work() {
+        assert_eq!(normalize_vn_phone("0912 345 678").unwrap(), "84912345678");
+        assert_eq!(normalize_vn_phone("+84-912-345-678").unwrap(), "84912345678");
+        assert_eq!(normalize_vn_phone("912345678").unwrap(), "84912345678");
+        assert!(normalize_vn_phone("abc123").is_err());
+        assert!(normalize_vn_phone("0123").is_err());
+
+        let resp = json!({
+            "error_code": 0,
+            "data": {
+                "userId": "778899",
+                "displayName": "Le Thi Hoa",
+                "zaloName": "Hoa Le",
+                "avatar": "//ava.zdn.vn/hoa.jpg",
+                "sdob": "01/05/1995",
+                "gender": 1,
+                "isFr": 0
+            }
+        });
+    let prof = parse_phone_profile_response(&resp, "84912345678", "999").unwrap();
+    assert_eq!(prof.uid, "778899");
+    assert_eq!(prof.display_name, "Le Thi Hoa");
+    assert_eq!(prof.phone_number, "84912345678");
+    assert_eq!(prof.sdob, "01/05/1995");
+    assert_eq!(prof.gender, Some(1));
+    assert_eq!(prof.is_friend, Some(false));
+    assert!(!prof.is_self);
+
+    let not_found = json!({ "error_code": 216, "error_message": "Not found" });
+    assert!(parse_phone_profile_response(&not_found, "84912345678", "999").is_err());
+    }
+
+    #[test]
+    fn parse_pinned_board_response_extracts_embedded_params_and_messages() {
+        let mut names = HashMap::new();
+        names.insert("1001".to_string(), "Minh".to_string());
+        let resp = json!({
+            "error_code": 0,
+            "data": {
+                "items": [
+                    {
+                        "id": "board-1",
+                        "creatorId": "1001",
+                        "createTime": 1_700_000_050_000_i64,
+                        "params": "{\"clientMsgId\":\"m-pin-1\",\"msgId\":\"m-pin-1\",\"senderUid\":\"1001\",\"title\":\"Hop luc 14h\"}"
+                    },
+                    {
+                        "msgId": "m-pin-2",
+                        "uidFrom": "1002",
+                        "dName": "Lan",
+                        "content": "Ban doc moi",
+                        "msgType": "chat.text",
+                        "ts": 1_700_000_060_000_i64
+                    }
+                ]
+            }
+        });
+        let pins = parse_pinned_board_response(&resp, "grp-9", "9999", "", true, &names);
+        assert_eq!(pins.len(), 2);
+        assert_eq!(pins[0].msg_id, "m-pin-1");
+        assert_eq!(pins[0].sender_name, "Minh");
+        assert_eq!(pins[0].text, "Hop luc 14h");
+        assert!(pins[0].is_pinned);
+        assert_eq!(pins[1].msg_id, "m-pin-2");
+        assert_eq!(pins[1].sender_name, "Lan");
+    }
+
+    #[test]
+    fn parse_remote_labels_response_parses_stringified_label_data() {
+        let resp = json!({
+            "error_code": 0,
+            "data": {
+                "labelData": "[{\"id\":1,\"text\":\"Khach hang\",\"color\":\"#CFA13A\",\"conversations\":[\"12345\",\"g998877\",\"12345\"]},{\"labelId\":\"work\",\"labelName\":\"Cong viec\",\"conversations\":\"[\\\"555\\\"]\"}]"
+            }
+        });
+        let folders = parse_remote_labels_response(&resp);
+        assert_eq!(folders.len(), 2);
+        assert_eq!(folders[0].id, "label-1");
+        assert_eq!(folders[0].name, "Khach hang");
+        assert_eq!(folders[0].thread_ids, vec!["12345", "998877"]);
+        assert_eq!(folders[0].remote_label_id.as_deref(), Some("1"));
+        assert_eq!(folders[1].id, "label-work");
+        assert_eq!(folders[1].thread_ids, vec!["555"]);
     }
 }

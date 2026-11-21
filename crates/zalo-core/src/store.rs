@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 
 use crate::chat::parser::normalize_ts_ms;
 use crate::chat::{
-    strip_vi_accents, FolderFilter, MessageDto, QuoteRef, ReactionSummary, ThreadDto, ThreadKind,
+    strip_vi_accents, ChatFolderDto, FolderFilter, MessageDto, QuoteRef, ReactionSummary,
+    ThreadDto, ThreadKind,
 };
 use crate::{data_dir, dpapi};
 
@@ -133,6 +134,10 @@ fn msg_aad(thread_id: &str, msg_id: &str) -> Vec<u8> {
     format!("msg:{thread_id}:{msg_id}").into_bytes()
 }
 
+fn folder_aad(folder_id: &str) -> Vec<u8> {
+    format!("folder:{folder_id}").into_bytes()
+}
+
 pub struct MessageStore {
     conn: Connection,
     fts_conn: Connection,
@@ -195,7 +200,15 @@ impl MessageStore {
             );
             DROP INDEX IF EXISTS idx_threads_sort;
             CREATE INDEX IF NOT EXISTS idx_threads_sort
-                ON threads((unread_count > 0) DESC, is_pinned DESC, last_ts DESC);
+                ON threads(is_pinned DESC, last_ts DESC);
+
+            CREATE TABLE IF NOT EXISTS chat_folders (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                icon TEXT NOT NULL DEFAULT 'folder',
+                config_json TEXT NOT NULL,
+                position INTEGER NOT NULL DEFAULT 0
+            );
 
             CREATE TABLE IF NOT EXISTS messages (
                 msg_id TEXT NOT NULL,
@@ -448,6 +461,14 @@ impl MessageStore {
     }
 
     pub fn upsert_thread(&self, t: &ThreadDto) -> Result<()> {
+        self.upsert_thread_inner(t, false)
+    }
+
+    pub fn upsert_thread_synced(&self, t: &ThreadDto) -> Result<()> {
+        self.upsert_thread_inner(t, true)
+    }
+
+    fn upsert_thread_inner(&self, t: &ThreadDto, overwrite_pinned: bool) -> Result<()> {
         let kind_str = match t.kind {
             ThreadKind::Direct => "direct",
             ThreadKind::Group => "group",
@@ -477,7 +498,10 @@ impl MessageStore {
                     WHEN ?13 = 1 AND excluded.last_ts >= threads.last_ts THEN 0
                     ELSE MAX(excluded.unread_count, threads.unread_count)
                 END,
-                is_pinned = MAX(excluded.is_pinned, threads.is_pinned),
+                is_pinned = CASE
+                    WHEN ?14 = 1 THEN excluded.is_pinned
+                    ELSE MAX(excluded.is_pinned, threads.is_pinned)
+                END,
                 is_muted = MAX(excluded.is_muted, threads.is_muted)
             "#,
             params![
@@ -494,6 +518,7 @@ impl MessageStore {
                 avatar_empty,
                 title_fallback,
                 clear_unread,
+                overwrite_pinned as i64,
             ],
         )?;
         Ok(())
@@ -509,7 +534,7 @@ impl MessageStore {
         };
         let sql = format!(
             "SELECT id, title, avatar, kind, last_preview, last_ts, unread_count, is_pinned, is_muted
-             FROM threads {where_clause} ORDER BY (unread_count > 0) DESC, is_pinned DESC, last_ts DESC"
+             FROM threads {where_clause} ORDER BY is_pinned DESC, last_ts DESC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], |row| {
@@ -971,18 +996,26 @@ impl MessageStore {
         thread_id: &str,
         limit: usize,
     ) -> Result<(Vec<MessageDto>, Vec<MessageDto>)> {
+        let scan_limit = limit.saturating_mul(6).max(300) as i64;
         let rows = self.query_messages(
             "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name
              FROM messages
-             WHERE thread_id = ?1 AND is_recalled = 0 AND attachment_url IS NOT NULL
-             ORDER BY ts DESC
+             WHERE thread_id = ?1
+               AND is_recalled = 0
+               AND attachment_url IS NOT NULL
+               AND attachment_url != ''
+               AND LOWER(msg_type) NOT IN ('chat.sticker', 'sticker', '35', '36')
+             ORDER BY ts DESC, msg_id DESC
              LIMIT ?2",
-            params![thread_id, limit as i64],
+            params![thread_id, scan_limit],
         )?;
         let mut media = Vec::new();
         let mut files = Vec::new();
         for m in rows {
-            if m.msg_type.contains("sticker") || m.msg_type == "5" {
+            if media.len() >= limit && files.len() >= limit {
+                break;
+            }
+            if m.msg_type.contains("sticker") || m.msg_type == "5" || m.msg_type == "35" || m.msg_type == "36" {
                 continue;
             }
             let url_lower = m
@@ -994,13 +1027,16 @@ impl MessageStore {
                 || m.msg_type == "2"
                 || m.msg_type.contains("video")
                 || m.msg_type == "4"
+                || m.msg_type == "44"
                 || m.msg_type.contains("gif")
-                || [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"]
+                || [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".mp4", ".mov", ".webm"]
                     .iter()
                     .any(|ext| url_lower.contains(ext));
             if is_img_or_video {
-                media.push(m);
-            } else {
+                if media.len() < limit {
+                    media.push(m);
+                }
+            } else if files.len() < limit {
                 files.push(m);
             }
         }
@@ -1022,21 +1058,142 @@ impl MessageStore {
         }))
     }
 
+    pub fn list_thread_links(&self, thread_id: &str, limit: usize) -> Result<Vec<MessageDto>> {
+        let scan_limit = limit.saturating_mul(10).max(400) as i64;
+        let rows = self.query_messages(
+            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name
+             FROM messages
+             WHERE thread_id = ?1 AND is_recalled = 0
+             ORDER BY ts DESC, msg_id DESC
+             LIMIT ?2",
+            params![thread_id, scan_limit],
+        )?;
+        let mut links = Vec::new();
+        for m in rows {
+            if links.len() >= limit {
+                break;
+            }
+            let lower = m.text.to_ascii_lowercase();
+            if lower.contains("http://") || lower.contains("https://") {
+                links.push(m);
+            }
+        }
+        Ok(links)
+    }
+
+    pub fn list_chat_folders(&self) -> Result<Vec<ChatFolderDto>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, config_json FROM chat_folders ORDER BY position ASC, id ASC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let enc_json: String = row.get(1)?;
+            let raw_json = self.cipher.decrypt_str(&folder_aad(&id), &enc_json)?;
+            if let Ok(mut dto) = serde_json::from_str::<ChatFolderDto>(&raw_json) {
+                if dto.id.is_empty() {
+                    dto.id = id;
+                }
+                out.push(dto);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn save_chat_folder(&self, folder: &ChatFolderDto) -> Result<()> {
+        let aad = folder_aad(&folder.id);
+        let enc_name = self.cipher.encrypt_str(&aad, &folder.name)?;
+        let raw_json = serde_json::to_string(folder)?;
+        let enc_json = self.cipher.encrypt_str(&aad, &raw_json)?;
+        self.conn.execute(
+            "INSERT INTO chat_folders (id, name, icon, config_json, position)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+                 name = excluded.name,
+                 icon = excluded.icon,
+                 config_json = excluded.config_json,
+                 position = excluded.position",
+            params![folder.id, enc_name, folder.icon, enc_json, folder.position],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_chat_folder(&self, folder_id: &str) -> Result<bool> {
+        let affected = self.conn.execute(
+            "DELETE FROM chat_folders WHERE id = ?1",
+            params![folder_id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    pub fn list_pinned_messages(&self, thread_id: &str, limit: usize) -> Result<Vec<MessageDto>> {
+        let mut msgs = self.query_messages(
+            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name
+             FROM messages
+             WHERE thread_id = ?1 AND is_pinned = 1 AND is_recalled = 0
+             ORDER BY ts DESC, msg_id DESC
+             LIMIT ?2",
+            params![thread_id, limit as i64],
+        )?;
+        msgs.reverse();
+        Ok(msgs)
+    }
+
+    pub fn load_messages_before(
+        &self,
+        thread_id: &str,
+        before_ts: Option<i64>,
+        before_msg_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MessageDto>> {
+        let cutoff_ts = before_ts.unwrap_or(i64::MAX);
+        let mut msgs = match before_msg_id.filter(|s| !s.trim().is_empty()) {
+            Some(cutoff_id) if before_ts.is_some() => self.query_messages(
+                "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name
+                 FROM messages
+                 WHERE thread_id = ?1 AND (ts < ?2 OR (ts = ?2 AND msg_id < ?3))
+                 ORDER BY ts DESC, msg_id DESC
+                 LIMIT ?4",
+                params![thread_id, cutoff_ts, cutoff_id, limit as i64],
+            )?,
+            _ => self.query_messages(
+                "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name
+                 FROM messages
+                 WHERE thread_id = ?1 AND ts < ?2
+                 ORDER BY ts DESC, msg_id DESC
+                 LIMIT ?3",
+                params![thread_id, cutoff_ts, limit as i64],
+            )?,
+        };
+        msgs.reverse();
+        Ok(msgs)
+    }
+
     pub fn load_messages(
         &self,
         thread_id: &str,
         before_ts: Option<i64>,
         limit: usize,
     ) -> Result<Vec<MessageDto>> {
-        let cutoff = before_ts.unwrap_or(i64::MAX);
-        let mut msgs = self.query_messages(
-            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name
-             FROM messages WHERE thread_id = ?1 AND ts < ?2
-             ORDER BY ts DESC LIMIT ?3",
-            params![thread_id, cutoff, limit as i64],
+        self.load_messages_before(thread_id, before_ts, None, limit)
+    }
+
+    pub fn oldest_server_msg_id(&self, thread_id: &str) -> Result<Option<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ts, msg_id FROM messages
+             WHERE thread_id = ?1
+               AND msg_id NOT LIKE 'local-%'
+               AND msg_id NOT LIKE 'out_%'
+             ORDER BY ts ASC, msg_id ASC
+             LIMIT 1",
         )?;
-        msgs.reverse();
-        Ok(msgs)
+        let mut rows = stmt.query(params![thread_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some((row.get(0)?, row.get(1)?)))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Load messages starting from a historical timestamp (with `context_before` earlier messages
@@ -1437,25 +1594,25 @@ mod tests {
 
         let threads = store.list_threads(FolderFilter::All).unwrap();
         let ids: Vec<&str> = threads.iter().map(|t| t.id.as_str()).collect();
-        assert_eq!(ids, vec!["stranger-new", "pinned-old", "direct-sec"]);
+        // Pinned stays first even when another thread is newer or unread
+        assert_eq!(ids, vec!["pinned-old", "stranger-new", "direct-sec"]);
         assert_eq!(threads[2].last_ts, 1_700_000_050_000);
-        assert_eq!(threads[0].unread_count, 1);
+        assert_eq!(threads[1].unread_count, 1);
 
-        // Read newest thread vs older unread thread: unread stays on top until read
-        store.mark_thread_read("stranger-new").unwrap();
+        // Among unpinned threads, newer message beats older unread message
         store
-            .update_thread_preview("pinned-old", "Chua doc", 1_700_000_060_000, true)
+            .update_thread_preview("direct-sec", "Tin read moi hon", 1_700_000_085_000, false)
             .unwrap();
         let threads_after = store.list_threads(FolderFilter::All).unwrap();
         let ids_after: Vec<&str> = threads_after.iter().map(|t| t.id.as_str()).collect();
-        assert_eq!(ids_after, vec!["pinned-old", "stranger-new", "direct-sec"]);
+        assert_eq!(ids_after, vec!["pinned-old", "direct-sec", "stranger-new"]);
 
-        // After marking read and unpinning, newest timestamp wins over older
-        store.mark_thread_read("pinned-old").unwrap();
+        // After unpinning, pure last_ts DESC applies across all threads
+        store.mark_thread_read("stranger-new").unwrap();
         store.set_thread_pinned("pinned-old", false).unwrap();
         let threads_unpinned = store.list_threads(FolderFilter::All).unwrap();
         let ids_unpinned: Vec<&str> = threads_unpinned.iter().map(|t| t.id.as_str()).collect();
-        assert_eq!(ids_unpinned, vec!["stranger-new", "pinned-old", "direct-sec"]);
+        assert_eq!(ids_unpinned, vec!["direct-sec", "stranger-new", "pinned-old"]);
 
         // An existing unread count is cleared when the newest synced/updated message is outgoing
         store.set_thread_unread("stranger-new", 2).unwrap();
@@ -1582,6 +1739,290 @@ mod tests {
         assert!(reloaded.is_recalled);
         assert!(reloaded.attachment_url.is_none());
         assert!(reloaded.attachment_name.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upsert_thread_synced_updates_remote_unpin_while_preserves_on_non_synced() {
+        let dir = std::env::temp_dir().join(format!("litechat-store-sync-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("sync_pin.db");
+        let store = MessageStore::open(&db_path).unwrap();
+
+        let t = ThreadDto {
+            id: "t1".into(),
+            title: "Alice".into(),
+            avatar: String::new(),
+            kind: ThreadKind::Direct,
+            last_preview: "hi".into(),
+            last_ts: 1_700_000_010_000,
+            unread_count: 0,
+            is_pinned: true,
+            is_muted: false,
+        };
+        store.upsert_thread(&t).unwrap();
+        assert!(store.list_threads(FolderFilter::All).unwrap()[0].is_pinned);
+
+        // Non-synced upsert preserves existing pin
+        let unpinned = ThreadDto { is_pinned: false, ..t.clone() };
+        store.upsert_thread(&unpinned).unwrap();
+        assert!(store.list_threads(FolderFilter::All).unwrap()[0].is_pinned);
+
+        // Synced upsert applies authoritative remote unpin
+        store.upsert_thread_synced(&unpinned).unwrap();
+        assert!(!store.list_threads(FolderFilter::All).unwrap()[0].is_pinned);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_pinned_messages_returns_all_pinned_beyond_first_page() {
+        let dir = std::env::temp_dir().join(format!("litechat-store-list-pins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("list_pins.db");
+        let mut store = MessageStore::open(&db_path).unwrap();
+
+        for i in 0..70i64 {
+            store
+                .upsert_message(&MessageDto {
+                    msg_id: format!("m{i:03}"),
+                    thread_id: "t1".into(),
+                    sender_id: "u1".into(),
+                    sender_name: "An".into(),
+                    text: format!("Msg {i}"),
+                    msg_type: "chat.text".into(),
+                    ts: 1_700_000_000_000 + i * 1_000,
+                    is_outgoing: false,
+                    is_recalled: false,
+                    is_pinned: i == 5 || i == 65,
+                    quote: None,
+                    reactions: Vec::new(),
+                    attachment_url: None,
+                    attachment_name: None,
+                })
+                .unwrap();
+        }
+        let pins = store.list_pinned_messages("t1", 50).unwrap();
+        let ids: Vec<&str> = pins.iter().map(|m| m.msg_id.as_str()).collect();
+        assert_eq!(ids, vec!["m005", "m065"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_thread_media_collects_files_even_after_many_photos_and_excludes_stickers() {
+        let dir = std::env::temp_dir().join(format!("litechat-store-media-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("media_files.db");
+        let mut store = MessageStore::open(&db_path).unwrap();
+
+        // Older file message
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "file-old".into(),
+                thread_id: "t1".into(),
+                sender_id: "u1".into(),
+                sender_name: "An".into(),
+                text: "[Tập tin] spec.pdf".into(),
+                msg_type: "share.file".into(),
+                ts: 1_700_000_001_000,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: Some("https://f.zdn.vn/spec.pdf".into()),
+                attachment_name: Some("spec.pdf".into()),
+            })
+            .unwrap();
+
+        // 15 newer photos and 5 stickers
+        for i in 1..=15i64 {
+            store
+                .upsert_message(&MessageDto {
+                    msg_id: format!("pic-{i:02}"),
+                    thread_id: "t1".into(),
+                    sender_id: "u1".into(),
+                    sender_name: "An".into(),
+                    text: "[Hình ảnh]".into(),
+                    msg_type: "chat.photo".into(),
+                    ts: 1_700_000_010_000 + i * 1_000,
+                    is_outgoing: false,
+                    is_recalled: false,
+                    is_pinned: false,
+                    quote: None,
+                    reactions: Vec::new(),
+                    attachment_url: Some(format!("https://f.zdn.vn/pic-{i}.jpg")),
+                    attachment_name: None,
+                })
+                .unwrap();
+        }
+        for i in 1..=5i64 {
+            store
+                .upsert_message(&MessageDto {
+                    msg_id: format!("stk-{i}"),
+                    thread_id: "t1".into(),
+                    sender_id: "u1".into(),
+                    sender_name: "An".into(),
+                    text: "[Nhãn dán]".into(),
+                    msg_type: "chat.sticker".into(),
+                    ts: 1_700_000_050_000 + i * 1_000,
+                    is_outgoing: false,
+                    is_recalled: false,
+                    is_pinned: false,
+                    quote: None,
+                    reactions: Vec::new(),
+                    attachment_url: Some(format!("https://f.zdn.vn/stk-{i}.webp")),
+                    attachment_name: None,
+                })
+                .unwrap();
+        }
+
+        let (media, files) = store.list_thread_media("t1", 10).unwrap();
+        assert_eq!(media.len(), 10);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].msg_id, "file-old");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_messages_before_handles_same_timestamp_tie_breaker_and_oldest_server_msg_id() {
+        let dir = std::env::temp_dir().join(format!("litechat-store-cursor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("cursor.db");
+        let mut store = MessageStore::open(&db_path).unwrap();
+
+        for (id, ts) in [
+            ("local-opt-1", 1_700_000_000_500),
+            ("m1", 1_700_000_001_000),
+            ("m2", 1_700_000_001_000),
+            ("m3", 1_700_000_002_000),
+        ] {
+            store
+                .upsert_message(&MessageDto {
+                    msg_id: id.into(),
+                    thread_id: "t1".into(),
+                    sender_id: "u1".into(),
+                    sender_name: "An".into(),
+                    text: id.into(),
+                    msg_type: "chat.text".into(),
+                    ts,
+                    is_outgoing: false,
+                    is_recalled: false,
+                    is_pinned: false,
+                    quote: None,
+                    reactions: Vec::new(),
+                    attachment_url: None,
+                    attachment_name: None,
+                })
+                .unwrap();
+        }
+
+        let page1 = store
+            .load_messages_before("t1", Some(1_700_000_002_000), Some("m3"), 1)
+            .unwrap();
+        assert_eq!(page1.len(), 1);
+        assert_eq!(page1[0].msg_id, "m2");
+
+        let page2 = store
+            .load_messages_before("t1", Some(1_700_000_001_000), Some("m2"), 1)
+            .unwrap();
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].msg_id, "m1");
+
+        let oldest_srv = store.oldest_server_msg_id("t1").unwrap().unwrap();
+        assert_eq!(oldest_srv, (1_700_000_001_000, "m1".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chat_folders_crud_and_ordering() {
+        let dir = std::env::temp_dir().join(format!("teza-folders-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = MessageStore::open(&dir.join("folders.db")).unwrap();
+
+        let f2 = ChatFolderDto {
+            id: "f-work".into(),
+            name: "Công việc".into(),
+            icon: "briefcase".into(),
+            color: "#CFA13A".into(),
+            thread_ids: vec!["t1".into(), "t2".into()],
+            include_kinds: vec![ThreadKind::Group],
+            only_unread: false,
+            exclude_muted: true,
+            position: 2,
+            remote_label_id: None,
+        };
+        let f1 = ChatFolderDto {
+            id: "f-vip".into(),
+            name: "Khách hàng".into(),
+            icon: "star".into(),
+            color: String::new(),
+            thread_ids: vec!["t9".into()],
+            include_kinds: Vec::new(),
+            only_unread: true,
+            exclude_muted: false,
+            position: 1,
+            remote_label_id: Some("lbl-1".into()),
+        };
+
+        store.save_chat_folder(&f2).unwrap();
+        store.save_chat_folder(&f1).unwrap();
+        let list = store.list_chat_folders().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0], f1);
+        assert_eq!(list[1], f2);
+
+        let mut f1_updated = f1.clone();
+        f1_updated.name = "Khách VIP".into();
+        store.save_chat_folder(&f1_updated).unwrap();
+        assert_eq!(store.list_chat_folders().unwrap()[0].name, "Khách VIP");
+
+        assert!(store.delete_chat_folder("f-vip").unwrap());
+        assert!(!store.delete_chat_folder("f-missing").unwrap());
+        assert_eq!(store.list_chat_folders().unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_thread_links_extracts_http_and_https_messages() {
+        let dir = std::env::temp_dir().join(format!("teza-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = MessageStore::open(&dir.join("links.db")).unwrap();
+
+        for (id, text, ts, recalled) in [
+            ("m1", "Khong co link", 1_700_000_001_000, false),
+            ("m2", "Trang cu http://intranet.local/doc", 1_700_000_002_000, false),
+            ("m3", "Da thu hoi https://secret.example", 1_700_000_003_000, true),
+            ("m4", "Xem tai https://teza.app/release", 1_700_000_004_000, false),
+        ] {
+            store
+                .upsert_message(&MessageDto {
+                    msg_id: id.into(),
+                    thread_id: "t1".into(),
+                    sender_id: "u1".into(),
+                    sender_name: "An".into(),
+                    text: text.into(),
+                    msg_type: "chat.text".into(),
+                    ts,
+                    is_outgoing: false,
+                    is_recalled: recalled,
+                    is_pinned: false,
+                    quote: None,
+                    reactions: Vec::new(),
+                    attachment_url: None,
+                    attachment_name: None,
+                })
+                .unwrap();
+        }
+
+        let links = store.list_thread_links("t1", 20).unwrap();
+        let ids: Vec<&str> = links.iter().map(|m| m.msg_id.as_str()).collect();
+        assert_eq!(ids, vec!["m4", "m2"]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

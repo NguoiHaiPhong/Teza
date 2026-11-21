@@ -90,7 +90,7 @@ export function MediaLightbox({
     if (!canExport || saving) return;
     setSaving(true);
     try {
-      await bridge.saveRemoteFile(current.url, current.title || "litechat-image.png");
+      await bridge.saveRemoteFile(current.url, current.title || "teza-image.png");
     } catch (err) {
       onNotify?.(String(err));
     } finally {

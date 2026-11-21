@@ -1,4 +1,4 @@
-name: Release litechat
+name: Release Teza
 
 on:
   push:
@@ -48,8 +48,8 @@ jobs:
         with:
           projectPath: apps/desktop
           tagName: v__VERSION__
-          releaseName: "litechat v__VERSION__"
-          releaseBody: "Bản phát hành cài đặt Windows & gói Auto-Update cho litechat v__VERSION__."
+          releaseName: "Teza v__VERSION__"
+          releaseBody: "Bản phát hành cài đặt Windows & gói Auto-Update cho Teza v__VERSION__."
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}

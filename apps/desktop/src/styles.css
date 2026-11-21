@@ -575,6 +575,11 @@ body.fx-off .fay-trail {
   animation: litechat-buzz-shake 0.38s cubic-bezier(0.36, 0.07, 0.19, 0.97) 3 both;
 }
 
+.msg-row-perf {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 76px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .buzz-shaking {
     animation: none !important;

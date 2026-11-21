@@ -23,7 +23,8 @@ use zalo_core::chat::parser::{
 };
 use zalo_core::chat::threads;
 use zalo_core::chat::{
-    FolderFilter, MessageDto, ThreadDetailsDto, ThreadDto, ThreadKind, UserProfileDto,
+    ChatFolderDto, FolderFilter, MessageDto, ThreadDetailsDto, ThreadDto, ThreadKind,
+    UserProfileDto,
 };
 use zalo_core::data_dir::StoragePaths;
 use zalo_core::qr::{self, QrTicket};
@@ -75,6 +76,7 @@ pub struct MessagesPageDto {
 pub struct ThreadMessagesSyncedPayload {
     pub thread_id: String,
     pub messages: Vec<MessageDto>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -551,8 +553,8 @@ async fn threads_sync(
         }
         sess.clone_shallow()
     };
-    let remote = match threads::sync_threads(&sess_snapshot).await {
-        Ok(list) => list,
+    let remote = match threads::sync_threads_full(&sess_snapshot).await {
+        Ok(res) => res,
         Err(e) => {
             if let Some(code) = expired_code(&e) {
                 let reason = format!("Phiên đăng nhập đã hết hạn (mã {code}). Vui lòng quét lại mã QR.");
@@ -563,8 +565,12 @@ async fn threads_sync(
         }
     };
     let store = state.store.lock().await;
-    for t in &remote {
-        let _ = store.upsert_thread(t);
+    for t in &remote.threads {
+        if remote.pinned_synced {
+            let _ = store.upsert_thread_synced(t);
+        } else {
+            let _ = store.upsert_thread(t);
+        }
     }
     store.list_threads(folder).map_err(|e| e.to_string())
 }
@@ -723,7 +729,7 @@ async fn thread_get_details(
     state: State<'_, AppState>,
     thread_id: String,
 ) -> Result<ThreadDetailsDto, String> {
-    let (kind, media_items, file_items, known_profiles) = {
+    let (kind, media_items, file_items, link_items, known_profiles) = {
         let store = state.store.lock().await;
         let kind = store
             .get_thread_kind(&thread_id)
@@ -733,12 +739,15 @@ async fn thread_get_details(
         let (media, files) = store
             .list_thread_media(&thread_id, 60)
             .unwrap_or_default();
+        let links = store
+            .list_thread_links(&thread_id, 60)
+            .unwrap_or_default();
         let known = if kind == ThreadKind::Group {
             store.resolve_known_profiles().unwrap_or_default()
         } else {
             Default::default()
         };
-        (kind, media, files, known)
+        (kind, media, files, links, known)
     };
 
     let mut total_members = None;
@@ -764,7 +773,99 @@ async fn thread_get_details(
         members,
         media_items,
         file_items,
+        link_items,
     })
+}
+
+#[tauri::command]
+async fn folders_list(state: State<'_, AppState>) -> Result<Vec<ChatFolderDto>, String> {
+    let store = state.store.lock().await;
+    store.list_chat_folders().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn folder_save(
+    state: State<'_, AppState>,
+    mut folder: ChatFolderDto,
+) -> Result<Vec<ChatFolderDto>, String> {
+    folder.id = folder.id.trim().to_string();
+    folder.name = folder.name.trim().to_string();
+    if folder.id.is_empty() {
+        return Err("Mã thư mục không hợp lệ".into());
+    }
+    if folder.name.is_empty() {
+        return Err("Tên thư mục không được để trống".into());
+    }
+    if folder.icon.trim().is_empty() {
+        folder.icon = "folder".to_string();
+    }
+    let store = state.store.lock().await;
+    store.save_chat_folder(&folder).map_err(|e| e.to_string())?;
+    store.list_chat_folders().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn folder_delete(
+    state: State<'_, AppState>,
+    folder_id: String,
+) -> Result<Vec<ChatFolderDto>, String> {
+    let store = state.store.lock().await;
+    store
+        .delete_chat_folder(&folder_id)
+        .map_err(|e| e.to_string())?;
+    store.list_chat_folders().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn folders_sync_remote_labels(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<ChatFolderDto>, String> {
+    let sess_snapshot = {
+        let sess = state.session.lock().await;
+        if !sess.is_authenticated() {
+            return Err("Chưa đăng nhập".into());
+        }
+        sess.clone_shallow()
+    };
+    let remote = match threads::fetch_remote_labels(&sess_snapshot).await {
+        Ok(list) => list,
+        Err(e) => {
+            if let Some(code) = expired_code(&e) {
+                let reason = format!(
+                    "Phiên đăng nhập đã hết hạn (mã {code}). Vui lòng quét lại mã QR."
+                );
+                clear_expired_session(
+                    &app,
+                    &state.session,
+                    Some(&state.ws_task),
+                    &state.paths,
+                    reason.clone(),
+                    true,
+                )
+                .await;
+                return Err(reason);
+            }
+            return Err(format!("Không đồng bộ được thẻ phân loại: {e}"));
+        }
+    };
+    let store = state.store.lock().await;
+    let existing = store.list_chat_folders().unwrap_or_default();
+    for mut rf in remote {
+        if let Some(old) = existing
+            .iter()
+            .find(|f| f.remote_label_id.is_some() && f.remote_label_id == rf.remote_label_id)
+        {
+            rf.id = old.id.clone();
+            rf.icon = old.icon.clone();
+            rf.include_kinds = old.include_kinds.clone();
+            rf.only_unread = old.only_unread;
+            rf.exclude_muted = old.exclude_muted;
+            rf.position = old.position;
+        }
+        let _ = store.save_chat_folder(&rf);
+    }
+    store.list_chat_folders().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -783,6 +884,20 @@ async fn user_get_profile(
     threads::fetch_user_profile(&sess_snapshot, &user_id, &known_profiles)
         .await
         .map_err(|e| format!("Không tra được thông tin tài khoản: {e}"))
+}
+
+#[tauri::command]
+async fn user_find_by_phone(
+    state: State<'_, AppState>,
+    phone: String,
+) -> Result<UserProfileDto, String> {
+    let sess_snapshot = {
+        let sess = state.session.lock().await;
+        sess.clone_shallow()
+    };
+    threads::find_user_by_phone(&sess_snapshot, &phone)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 struct RemoteThreadSyncCtx {
@@ -809,80 +924,111 @@ fn message_sync_sig(m: &MessageDto) -> (String, i64, bool, bool, usize, String, 
     )
 }
 
-async fn sync_remote_thread_history(ctx: &RemoteThreadSyncCtx) -> bool {
-    match threads::fetch_thread_history(&ctx.sess, &ctx.thread_id, ctx.kind, ctx.limit as u32).await
-    {
-        Ok(mut remote_msgs) if !remote_msgs.is_empty() => {
-            let mut known_titles = {
-                let store = ctx.store.lock().await;
-                store.resolve_known_titles().unwrap_or_default()
-            };
-            let unresolved_senders: Vec<String> = remote_msgs
-                .iter()
-                .filter(|m| {
-                    !m.is_outgoing
-                        && !m.sender_id.is_empty()
-                        && (m.sender_name == m.sender_id || is_raw_numeric_id(&m.sender_name))
-                        && !known_titles.contains_key(&m.sender_id)
-                })
-                .map(|m| m.sender_id.clone())
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .take(50)
-                .collect();
-            if !unresolved_senders.is_empty() {
-                if let Ok(mp) = threads::get_mini_profiles(&ctx.sess, &unresolved_senders).await {
-                    for (uid, p) in mp {
-                        if let Some(name) =
-                            pick_str(&p, &["displayName", "zaloName", "name", "display_name"])
-                        {
-                            known_titles.insert(uid, name);
-                        }
-                    }
-                }
-            }
+fn is_server_msg_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.starts_with("local-")
+        && !id.starts_with("out_")
+        && !id.starts_with("opt-")
+}
 
-            let mut store = ctx.store.lock().await;
-            for m in &mut remote_msgs {
-                if !m.is_outgoing
-                    && (m.sender_name == m.sender_id || is_raw_numeric_id(&m.sender_name))
+async fn resolve_and_upsert_remote_messages(
+    app: &AppHandle,
+    store_arc: &Arc<Mutex<MessageStore>>,
+    sess: &Session,
+    thread_id: &str,
+    kind: ThreadKind,
+    remote_msgs: &mut [MessageDto],
+    update_preview: bool,
+) {
+    let mut known_titles = {
+        let store = store_arc.lock().await;
+        store.resolve_known_titles().unwrap_or_default()
+    };
+    let unresolved_senders: Vec<String> = remote_msgs
+        .iter()
+        .filter(|m| {
+            !m.is_outgoing
+                && !m.sender_id.is_empty()
+                && (m.sender_name == m.sender_id || is_raw_numeric_id(&m.sender_name))
+                && !known_titles.contains_key(&m.sender_id)
+        })
+        .map(|m| m.sender_id.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .take(50)
+        .collect();
+    if !unresolved_senders.is_empty() {
+        if let Ok(mp) = threads::get_mini_profiles(sess, &unresolved_senders).await {
+            for (uid, p) in mp {
+                if let Some(name) =
+                    pick_str(&p, &["displayName", "zaloName", "name", "display_name"])
                 {
-                    if let Some(name) = known_titles.get(&m.sender_id) {
-                        m.sender_name = name.clone();
-                    }
+                    known_titles.insert(uid, name);
                 }
-                let _ = store.upsert_message(m);
             }
-            if let Some(newest) = remote_msgs.iter().max_by_key(|m| m.ts) {
-                let raw_text = if newest.text.is_empty() {
-                    newest
-                        .attachment_name
-                        .as_deref()
-                        .map(|n| format!("[Tệp: {n}]"))
-                        .unwrap_or_else(|| format!("[{}]", newest.msg_type))
-                } else {
-                    newest.text.clone()
-                };
-                let preview = format_thread_preview(
-                    &raw_text,
+        }
+    }
+
+    let mut store = store_arc.lock().await;
+    for m in remote_msgs.iter_mut() {
+        if !m.is_outgoing && (m.sender_name == m.sender_id || is_raw_numeric_id(&m.sender_name)) {
+            if let Some(name) = known_titles.get(&m.sender_id) {
+                m.sender_name = name.clone();
+            }
+        }
+        let _ = store.upsert_message(m);
+    }
+    if update_preview {
+        if let Some(newest) = remote_msgs.iter().max_by_key(|m| m.ts) {
+            let raw_text = if newest.text.is_empty() {
+                newest
+                    .attachment_name
+                    .as_deref()
+                    .map(|n| format!("[Tệp: {n}]"))
+                    .unwrap_or_else(|| format!("[{}]", newest.msg_type))
+            } else {
+                newest.text.clone()
+            };
+            let preview = format_thread_preview(
+                &raw_text,
+                newest.is_outgoing,
+                &newest.sender_name,
+                kind == ThreadKind::Group,
+            );
+            let created = store
+                .update_thread_preview_returning_created(
+                    thread_id,
+                    &preview,
+                    newest.ts,
+                    false,
                     newest.is_outgoing,
-                    &newest.sender_name,
-                    ctx.kind == ThreadKind::Group,
-                );
-                let created = store
-                    .update_thread_preview_returning_created(
-                        &ctx.thread_id,
-                        &preview,
-                        newest.ts,
-                        false,
-                        newest.is_outgoing,
-                    )
-                    .unwrap_or(false);
-                if created {
-                    let _ = ctx.app.emit("core://threads-updated", ());
-                }
+                )
+                .unwrap_or(false);
+            if created {
+                let _ = app.emit("core://threads-updated", ());
             }
-            true
+        }
+    }
+}
+
+async fn sync_remote_thread_history(ctx: &RemoteThreadSyncCtx) -> Option<bool> {
+    match threads::fetch_thread_history_page(&ctx.sess, &ctx.thread_id, ctx.kind, ctx.limit as u32)
+        .await
+    {
+        Ok(mut page) => {
+            if !page.messages.is_empty() {
+                resolve_and_upsert_remote_messages(
+                    &ctx.app,
+                    &ctx.store,
+                    &ctx.sess,
+                    &ctx.thread_id,
+                    ctx.kind,
+                    &mut page.messages,
+                    true,
+                )
+                .await;
+            }
+            Some(page.has_more)
         }
         Err(e) => {
             if let Some(code) = expired_code(&e) {
@@ -899,9 +1045,8 @@ async fn sync_remote_thread_history(ctx: &RemoteThreadSyncCtx) -> bool {
                 )
                 .await;
             }
-            false
+            None
         }
-        _ => false,
     }
 }
 
@@ -919,7 +1064,7 @@ async fn messages_load(
     let mut cached = {
         let store = state.store.lock().await;
         store
-            .load_messages(&thread_id, before_ts, limit + 1)
+            .load_messages_before(&thread_id, before_ts, before_msg_id.as_deref(), limit + 1)
             .map_err(|e| e.to_string())?
     };
 
@@ -931,6 +1076,8 @@ async fn messages_load(
             None
         }
     };
+    let is_authed = sess_snapshot.is_some();
+    let mut remote_has_more: Option<bool> = None;
 
     if let Some(sess) = sess_snapshot {
         let kind = {
@@ -954,13 +1101,15 @@ async fn messages_load(
                 kind,
                 limit,
             };
-            if sync_remote_thread_history(&ctx).await {
+            remote_has_more = sync_remote_thread_history(&ctx).await;
+            if remote_has_more.is_some() {
                 let store = state.store.lock().await;
                 cached = store
-                    .load_messages(&thread_id, None, limit + 1)
+                    .load_messages_before(&thread_id, None, None, limit + 1)
                     .map_err(|e| e.to_string())?;
             }
         } else if before_ts.is_none() && sync_remote == Some(true) {
+            let prev_has_more = cached.len() > limit || (is_authed && !cached.is_empty());
             let mut snapshot = cached.clone();
             if snapshot.len() > limit {
                 let excess = snapshot.len() - limit;
@@ -979,44 +1128,96 @@ async fn messages_load(
                 limit,
             };
             tokio::spawn(async move {
-                if sync_remote_thread_history(&ctx).await {
+                if let Some(rm_has_more) = sync_remote_thread_history(&ctx).await {
                     let latest = {
                         let store = ctx.store.lock().await;
-                        store.load_messages(&ctx.thread_id, None, ctx.limit).ok()
+                        store
+                            .load_messages_before(&ctx.thread_id, None, None, ctx.limit + 1)
+                            .ok()
                     };
-                    if let Some(msgs) = latest {
+                    if let Some(mut msgs) = latest {
+                        let synced_has_more = msgs.len() > ctx.limit || rm_has_more;
+                        if msgs.len() > ctx.limit {
+                            let excess = msgs.len() - ctx.limit;
+                            msgs.drain(0..excess);
+                        }
                         let next_sigs: Vec<_> = msgs.iter().map(message_sync_sig).collect();
-                        if next_sigs != prev_sigs {
+                        if next_sigs != prev_sigs || synced_has_more != prev_has_more {
                             let _ = ctx.app.emit(
                                 "core://thread-messages-synced",
                                 ThreadMessagesSyncedPayload {
                                     thread_id: ctx.thread_id.clone(),
                                     messages: msgs,
+                                    has_more: synced_has_more,
                                 },
                             );
                         }
                     }
                 }
             });
-        } else if before_ts.is_some() && cached.len() < limit {
-            if let Some(cursor_id) = before_msg_id.as_deref().filter(|s| !s.is_empty()) {
-                match threads::fetch_older_thread_history(
+        } else if before_ts.is_some() && cached.len() <= limit {
+            let cursor_id = cached
+                .iter()
+                .find(|m| is_server_msg_id(&m.msg_id))
+                .map(|m| m.msg_id.clone())
+                .or_else(|| {
+                    before_msg_id
+                        .as_deref()
+                        .filter(|s| is_server_msg_id(s))
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    // Fallback when oldest visible bubble in UI has a local synthetic ID
+                    let store = state.store.try_lock().ok()?;
+                    store
+                        .oldest_server_msg_id(&thread_id)
+                        .ok()
+                        .flatten()
+                        .map(|(_, id)| id)
+                });
+            let cursor_id = if cursor_id.is_some() {
+                cursor_id
+            } else {
+                let store = state.store.lock().await;
+                store
+                    .oldest_server_msg_id(&thread_id)
+                    .ok()
+                    .flatten()
+                    .map(|(_, id)| id)
+            };
+            if let Some(cursor_id) = cursor_id {
+                match threads::fetch_older_thread_history_page(
                     &sess,
                     &thread_id,
                     kind,
-                    cursor_id,
+                    &cursor_id,
                     limit as u32,
                 )
                 .await
                 {
-                    Ok(remote_older) if !remote_older.is_empty() => {
-                        let mut store = state.store.lock().await;
-                        for m in &remote_older {
-                            let _ = store.upsert_message(m);
+                    Ok(mut page) => {
+                        remote_has_more = Some(page.has_more);
+                        if !page.messages.is_empty() {
+                            resolve_and_upsert_remote_messages(
+                                &app,
+                                &state.store,
+                                &sess,
+                                &thread_id,
+                                kind,
+                                &mut page.messages,
+                                false,
+                            )
+                            .await;
+                            let store = state.store.lock().await;
+                            cached = store
+                                .load_messages_before(
+                                    &thread_id,
+                                    before_ts,
+                                    before_msg_id.as_deref(),
+                                    limit + 1,
+                                )
+                                .map_err(|e| e.to_string())?;
                         }
-                        cached = store
-                            .load_messages(&thread_id, before_ts, limit + 1)
-                            .map_err(|e| e.to_string())?;
                     }
                     Err(e) => {
                         if let Some(code) = expired_code(&e) {
@@ -1034,17 +1235,23 @@ async fn messages_load(
                             .await;
                         }
                     }
-                    _ => {}
                 }
             }
         }
     }
 
-    let has_more = cached.len() > limit;
-    if has_more {
+    let local_has_more = cached.len() > limit;
+    if local_has_more {
         let excess = cached.len() - limit;
         cached.drain(0..excess);
     }
+    let has_more = if local_has_more {
+        true
+    } else if before_ts.is_some() {
+        remote_has_more.unwrap_or(false)
+    } else {
+        remote_has_more.unwrap_or(is_authed && !cached.is_empty())
+    };
     Ok(MessagesPageDto {
         messages: cached,
         has_more,
@@ -1073,6 +1280,52 @@ async fn messages_load_around(
         messages: msgs,
         has_more,
     })
+}
+
+#[tauri::command]
+async fn messages_list_pinned(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> Result<Vec<MessageDto>, String> {
+    let (kind, known_titles) = {
+        let store = state.store.lock().await;
+        let kind = store
+            .get_thread_kind(&thread_id)
+            .ok()
+            .flatten()
+            .unwrap_or(ThreadKind::Direct);
+        let titles = store.resolve_known_titles().unwrap_or_default();
+        (kind, titles)
+    };
+    let sess_snapshot = {
+        let sess = state.session.lock().await;
+        if sess.is_authenticated() {
+            Some(sess.clone_shallow())
+        } else {
+            None
+        }
+    };
+    if let Some(sess) = sess_snapshot {
+        if let Ok(remote_pins) =
+            threads::fetch_pinned_messages(&sess, &thread_id, kind, &known_titles).await
+        {
+            if !remote_pins.is_empty() {
+                let mut store = state.store.lock().await;
+                for mut pm in remote_pins {
+                    if store.get_message(&thread_id, &pm.msg_id).ok().flatten().is_some() {
+                        let _ = store.set_message_pinned(&thread_id, &pm.msg_id, true);
+                    } else if !pm.text.is_empty() || pm.attachment_url.is_some() {
+                        pm.is_pinned = true;
+                        let _ = store.upsert_message(&pm);
+                    }
+                }
+            }
+        }
+    }
+    let store = state.store.lock().await;
+    store
+        .list_pinned_messages(&thread_id, 50)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1598,7 +1851,11 @@ async fn fetch_image_data_url(
     state: State<'_, AppState>,
     url: String,
 ) -> Result<String, String> {
-    if url.trim_start().starts_with("data:image/") {
+    let trimmed = url.trim_start();
+    if trimmed.starts_with("data:image/")
+        || trimmed.starts_with("data:audio/")
+        || trimmed.starts_with("data:video/")
+    {
         return Ok(url);
     }
     let sess_snapshot = {
@@ -1606,7 +1863,7 @@ async fn fetch_image_data_url(
         sess.clone_shallow()
     };
     sess_snapshot
-        .download_media_data_url(&url, 15 * 1024 * 1024)
+        .download_media_data_url(&url, 25 * 1024 * 1024)
         .await
         .map_err(|e| e.to_string())
 }
@@ -2046,9 +2303,15 @@ pub fn run() {
             thread_toggle_pin,
             thread_toggle_mute,
             thread_get_details,
+            folders_list,
+            folder_save,
+            folder_delete,
+            folders_sync_remote_labels,
             user_get_profile,
+            user_find_by_phone,
             messages_load,
             messages_load_around,
+            messages_list_pinned,
             message_get_by_id,
             message_send_text,
             message_send_quote,
@@ -2079,12 +2342,12 @@ pub fn run() {
         ])
         .setup(move |app| {
             let _ = app.get_webview_window("main");
-            let open_item = MenuItem::with_id(app, "open", "Mở litechat", true, None::<&str>)?;
-            let quit_item = MenuItem::with_id(app, "quit", "Thoát litechat", true, None::<&str>)?;
+            let open_item = MenuItem::with_id(app, "open", "Mở Teza", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Thoát Teza", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open_item, &quit_item])?;
             let exit_flag = allow_exit.clone();
             let mut tray = TrayIconBuilder::new()
-                .tooltip("litechat")
+                .tooltip("Teza")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(move |app_handle, event| {
@@ -2131,5 +2394,5 @@ pub fn run() {
             }
         })
         .run(tauri::generate_context!())
-        .expect("error while running litechat");
+        .expect("error while running Teza");
 }

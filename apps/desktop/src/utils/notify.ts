@@ -48,7 +48,7 @@ export function playMessageSound(): void {
 }
 
 export async function showDesktopNotification(title: string, body: string): Promise<void> {
-  const safeTitle = title.trim() || "litechat";
+  const safeTitle = title.trim() || "Teza";
   const safeBody = body.trim().slice(0, 200);
   if (!safeBody) return;
 

@@ -1053,13 +1053,60 @@ impl Session {
 
     pub async fn download_media_data_url(&self, url: &str, max_bytes: usize) -> Result<String> {
         let (bytes, mime) = self.download_media_bytes(url, max_bytes).await?;
-        let final_mime = if mime.starts_with("image/") {
-            mime
-        } else {
-            "image/png".to_string()
-        };
+        let final_mime = infer_media_data_url_mime(url, &mime);
         Ok(format!("data:{final_mime};base64,{}", B64.encode(&bytes)))
     }
+}
+
+pub fn infer_media_data_url_mime(url: &str, content_type: &str) -> String {
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if ct.starts_with("image/") || ct.starts_with("audio/") || ct.starts_with("video/") {
+        return ct;
+    }
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if path.ends_with(".mp4") || path.ends_with(".m4v") {
+        return "video/mp4".to_string();
+    }
+    if path.ends_with(".webm") {
+        return "video/webm".to_string();
+    }
+    if path.ends_with(".mov") {
+        return "video/quicktime".to_string();
+    }
+    if path.ends_with(".mp3") {
+        return "audio/mpeg".to_string();
+    }
+    if path.ends_with(".aac") {
+        return "audio/aac".to_string();
+    }
+    if path.ends_with(".m4a") {
+        return "audio/mp4".to_string();
+    }
+    if path.ends_with(".ogg") || path.ends_with(".opus") {
+        return "audio/ogg".to_string();
+    }
+    if path.ends_with(".wav") {
+        return "audio/wav".to_string();
+    }
+    if path.ends_with(".jpg") || path.ends_with(".jpeg") {
+        return "image/jpeg".to_string();
+    }
+    if path.ends_with(".webp") {
+        return "image/webp".to_string();
+    }
+    if path.ends_with(".gif") {
+        return "image/gif".to_string();
+    }
+    "image/png".to_string()
 }
 
 fn value_as_nonempty_str(v: Option<&Value>) -> Option<String> {
@@ -1349,5 +1396,29 @@ mod tests {
         let cloned = sess.clone_shallow();
         assert!(cloned.relay.enabled);
         assert_eq!(cloned.relay.host, "10.7.12.233");
+    }
+
+    #[test]
+    fn infer_media_data_url_mime_detects_audio_video_and_falls_back_cleanly() {
+        assert_eq!(
+            infer_media_data_url_mime("https://f.zdn.vn/clip.mp4?t=1", "application/octet-stream"),
+            "video/mp4"
+        );
+        assert_eq!(
+            infer_media_data_url_mime("https://f.zdn.vn/voice.aac", ""),
+            "audio/aac"
+        );
+        assert_eq!(
+            infer_media_data_url_mime("https://f.zdn.vn/blob", "audio/mpeg; charset=utf-8"),
+            "audio/mpeg"
+        );
+        assert_eq!(
+            infer_media_data_url_mime("https://f.zdn.vn/blob", "video/webm"),
+            "video/webm"
+        );
+        assert_eq!(
+            infer_media_data_url_mime("https://f.zdn.vn/blob", "application/octet-stream"),
+            "image/png"
+        );
     }
 }

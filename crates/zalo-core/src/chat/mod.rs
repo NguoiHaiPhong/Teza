@@ -52,6 +52,34 @@ pub struct ThreadDetailsDto {
     pub members: Vec<ThreadMemberDto>,
     pub media_items: Vec<MessageDto>,
     pub file_items: Vec<MessageDto>,
+    #[serde(default)]
+    pub link_items: Vec<MessageDto>,
+}
+
+fn default_folder_icon() -> String {
+    "folder".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatFolderDto {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_folder_icon")]
+    pub icon: String,
+    #[serde(default)]
+    pub color: String,
+    #[serde(default)]
+    pub thread_ids: Vec<String>,
+    #[serde(default)]
+    pub include_kinds: Vec<ThreadKind>,
+    #[serde(default)]
+    pub only_unread: bool,
+    #[serde(default)]
+    pub exclude_muted: bool,
+    #[serde(default)]
+    pub position: i64,
+    #[serde(default)]
+    pub remote_label_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

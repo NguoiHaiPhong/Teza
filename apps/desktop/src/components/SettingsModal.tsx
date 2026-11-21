@@ -233,7 +233,7 @@ export function SettingsModal({
         >
           <div className="flex items-center gap-2">
             <Palette className="h-5 w-5" style={{ color: "var(--accent)" }} />
-            <h3 className="text-[16px] font-semibold">Cài đặt LiteChat</h3>
+            <h3 className="text-[16px] font-semibold">Cài đặt Teza</h3>
           </div>
           <button
             type="button"
@@ -485,7 +485,7 @@ export function SettingsModal({
                     <input
                       value={relayUser}
                       onChange={(e) => setRelayUser(e.target.value)}
-                      placeholder="litechat"
+                      placeholder="teza"
                       className="w-full rounded-lg px-2.5 py-1.5 text-[13.5px] outline-none"
                       style={{
                         background: "var(--bg-sidebar)",

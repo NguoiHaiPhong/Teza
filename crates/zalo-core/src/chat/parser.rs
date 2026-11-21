@@ -281,17 +281,13 @@ fn extract_attachment(v: &Value, msg_type: &str) -> (Option<String>, Option<Stri
         .get("params")
         .and_then(Value::as_str)
         .and_then(|s| serde_json::from_str::<Value>(s.trim()).ok());
-    let href = pick_str(
-        &o,
-        &["href", "oriUrl", "hdUrl", "normalUrl", "thumb", "stickerUrl"],
-    )
-    .or_else(|| {
-        params_val
-            .as_ref()
-            .and_then(|p| pick_str(p, &["href", "oriUrl", "hdUrl", "normalUrl", "thumb"]))
-    })
-    .map(|u| normalize_media_url(&u))
-    .filter(|u| !u.is_empty());
+    const URL_PRIORITY: &[&str] = &["oriUrl", "hdUrl", "href", "normalUrl", "thumb", "stickerUrl"];
+    let href = URL_PRIORITY.iter().find_map(|key| {
+        pick_str(&o, &[*key])
+            .or_else(|| params_val.as_ref().and_then(|p| pick_str(p, &[*key])))
+            .map(|u| normalize_media_url(&u))
+            .filter(|u| !u.is_empty())
+    });
 
     let mut title = pick_str(&o, &["fileName", "name", "title"]);
     if title.is_none() {
@@ -484,10 +480,29 @@ pub fn parse_chat_message(
         }
     }
 
+    let is_file_type = matches!(msg_type.as_str(), "chat.file" | "file" | "19" | "share.file");
     let mut text = if is_undo {
         "[Tin nhắn đã thu hồi]".to_string()
     } else if sticker_meta.is_some() {
         "[Nhãn dán]".to_string()
+    } else if is_file_type {
+        raw_content
+            .and_then(|c| {
+                let caption = ["description", "caption", "desc"]
+                    .iter()
+                    .find_map(|k| c.get(*k).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()))
+                    .map(str::to_string)
+                    .or_else(|| extract_content_text(c));
+                caption.filter(|s| {
+                    let trimmed = s.trim();
+                    !trimmed.is_empty()
+                        && attachment_name
+                            .as_deref()
+                            .map(|name| !trimmed.eq_ignore_ascii_case(name.trim()))
+                            .unwrap_or(true)
+                })
+            })
+            .unwrap_or_default()
     } else {
         raw_content.and_then(extract_content_text).unwrap_or_default()
     };
@@ -916,5 +931,80 @@ mod tests {
         let q = msg.quote.unwrap();
         assert_eq!(q.msg_id, "cm0");
         assert_eq!(q.snippet, "Tin goc");
+    }
+
+    #[test]
+    fn parses_file_message_without_duplicating_filename_and_preserves_caption() {
+        let no_caption = json!({
+            "msgId": "f1",
+            "uidFrom": "123",
+            "idTo": "456",
+            "msgType": "chat.file",
+            "content": {
+                "title": "bao_cao.pdf",
+                "href": "https://f10-zpc.zdn.vn/bao_cao.pdf",
+                "params": "{\"checksum\":\"abc\"}"
+            },
+            "ts": 1_700_000_015_000_i64
+        });
+        let m1 = parse_chat_message(&no_caption, None, "999", "cloud-1", false).unwrap();
+        assert_eq!(m1.attachment_name.as_deref(), Some("bao_cao.pdf"));
+        assert_eq!(m1.text, "[Tập tin] bao_cao.pdf");
+
+        let with_caption = json!({
+            "msgId": "f2",
+            "uidFrom": "123",
+            "idTo": "456",
+            "msgType": "chat.file",
+            "content": {
+                "title": "bao_cao.pdf",
+                "description": "Ban cap nhat moi nhat",
+                "href": "https://f10-zpc.zdn.vn/bao_cao.pdf"
+            },
+            "ts": 1_700_000_016_000_i64
+        });
+        let m2 = parse_chat_message(&with_caption, None, "999", "cloud-1", false).unwrap();
+        assert_eq!(m2.attachment_name.as_deref(), Some("bao_cao.pdf"));
+        assert_eq!(m2.text, "Ban cap nhat moi nhat");
+    }
+
+    #[test]
+    fn extracts_hd_photo_url_from_params_instead_of_root_thumb() {
+        let photo = json!({
+            "msgId": "img-hd-1",
+            "uidFrom": "123",
+            "idTo": "456",
+            "msgType": "chat.photo",
+            "content": {
+                "thumb": "https://f.zdn.vn/small_thumb.jpg",
+                "href": "https://f.zdn.vn/normal_compressed.jpg",
+                "params": "{\"oriUrl\":\"https://f.zdn.vn/original_hd.jpg\",\"hdUrl\":\"https://f.zdn.vn/hd.jpg\"}"
+            },
+            "ts": 1_700_000_018_000_i64
+        });
+        let parsed = parse_chat_message(&photo, None, "999", "cloud-1", false).unwrap();
+        assert_eq!(
+            parsed.attachment_url.as_deref(),
+            Some("https://f.zdn.vn/original_hd.jpg")
+        );
+
+        let only_root_thumb_and_params_hd = json!({
+            "msgId": "img-hd-2",
+            "uidFrom": "123",
+            "idTo": "456",
+            "msgType": "chat.photo",
+            "content": {
+                "thumb": "https://f.zdn.vn/small_thumb.jpg",
+                "params": "{\"hdUrl\":\"https://f.zdn.vn/hd_from_params.jpg\"}"
+            },
+            "ts": 1_700_000_019_000_i64
+        });
+        let parsed2 =
+            parse_chat_message(&only_root_thumb_and_params_hd, None, "999", "cloud-1", false)
+                .unwrap();
+        assert_eq!(
+            parsed2.attachment_url.as_deref(),
+            Some("https://f.zdn.vn/hd_from_params.jpg")
+        );
     }
 }
