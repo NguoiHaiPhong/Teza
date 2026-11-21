@@ -95,6 +95,7 @@ import { QrLoginModal } from "./components/QrLoginModal";
 import { QuickSearchModal } from "./components/QuickSearchModal";
 import { RelayImage } from "./components/RelayImage";
 import { ReplyThreadPanel } from "./components/ReplyThreadPanel";
+import { ScreenshotEditorModal } from "./components/ScreenshotEditorModal";
 import {
   SettingsModal,
   type DensityMode,
@@ -133,6 +134,7 @@ import type {
   ConnectionStatus,
   FolderFilter,
   MessageDto,
+  MonitorInfoDto,
   NotificationPrefs,
   NotifyToastPayload,
   PasscodeConfig,
@@ -220,6 +222,18 @@ export default function App() {
   const [addMembersOpen, setAddMembersOpen] = useState(false);
   const [createReminderOpen, setCreateReminderOpen] = useState(false);
   const [createPollOpen, setCreatePollOpen] = useState(false);
+  const [capturingScreen, setCapturingScreen] = useState(false);
+  const [hideWindowOnCapture, setHideWindowOnCapture] = useState(
+    () => localStorage.getItem("teza.screenshotHideWindow") !== "0",
+  );
+  const [screenshotEditor, setScreenshotEditor] = useState<{
+    sourceUrl: string;
+    revokeUrl?: string;
+    initialMode: "crop" | "annotate";
+    monitors: MonitorInfoDto[];
+    activeMonitorIndex: number | null;
+    canRecapture: boolean;
+  } | null>(null);
   const [forwardMessages, setForwardMessages] = useState<MessageDto[]>([]);
   const [selectMode, setSelectMode] = useState(false);
   const [selectedMsgIds, setSelectedMsgIds] = useState<Set<string>>(() => new Set());
@@ -349,6 +363,10 @@ export default function App() {
   const customFoldersRef = useRef<ChatFolderDto[]>(customFolders);
   const hiddenBuiltInFoldersRef = useRef<BuiltInRailFolderId[]>(hiddenBuiltInFolders);
   const lastActivityAtRef = useRef<number>(Date.now());
+  const authedRef = useRef<boolean>(authed);
+  const capturingScreenRef = useRef<boolean>(capturingScreen);
+  const screenshotEditorRef = useRef(screenshotEditor);
+  const handleCaptureScreenRef = useRef<() => void>(() => {});
   const progressiveEscStateRef = useRef({
     hasOverlay: false,
     hasMenu: false,
@@ -370,6 +388,9 @@ export default function App() {
   passcodeEnabledRef.current = passcodeCfg.enabled;
   customFoldersRef.current = customFolders;
   hiddenBuiltInFoldersRef.current = hiddenBuiltInFolders;
+  authedRef.current = authed;
+  capturingScreenRef.current = capturingScreen;
+  screenshotEditorRef.current = screenshotEditor;
   progressiveEscStateRef.current = {
     hasOverlay: Boolean(
       settingsOpen ||
@@ -380,6 +401,7 @@ export default function App() {
         addMembersOpen ||
         createReminderOpen ||
         createPollOpen ||
+        screenshotEditor ||
         profileUid ||
         lightboxState ||
         forwardMessages.length > 0 ||
@@ -550,6 +572,23 @@ export default function App() {
         if (passcodeEnabledRef.current) {
           e.preventDefault();
           setIsLocked(true);
+        }
+        return;
+      }
+      if (
+        (e.ctrlKey || e.metaKey) &&
+        e.shiftKey &&
+        !e.altKey &&
+        e.key.toLowerCase() === "s"
+      ) {
+        if (
+          authedRef.current &&
+          selectedIdRef.current &&
+          !capturingScreenRef.current &&
+          !screenshotEditorRef.current
+        ) {
+          e.preventDefault();
+          handleCaptureScreenRef.current();
         }
         return;
       }
@@ -2304,6 +2343,86 @@ export default function App() {
       return false;
     }
   };
+
+  const closeScreenshotEditor = useCallback(() => {
+    setScreenshotEditor((prev) => {
+      if (prev?.revokeUrl) {
+        URL.revokeObjectURL(prev.revokeUrl);
+      }
+      return null;
+    });
+  }, []);
+
+  const handleCaptureScreen = async (opts?: {
+    hideWindow?: boolean;
+    monitorIndex?: number | null;
+    captureAll?: boolean;
+  }) => {
+    if (!authedRef.current || !selectedIdRef.current || capturingScreenRef.current) {
+      return;
+    }
+    capturingScreenRef.current = true;
+    setCapturingScreen(true);
+    try {
+      const cap = await bridge.captureScreen({
+        hideWindow: opts?.hideWindow ?? hideWindowOnCapture,
+        monitorIndex: opts?.monitorIndex ?? null,
+        captureAll: opts?.captureAll ?? false,
+      });
+      setScreenshotEditor((prev) => {
+        if (prev?.revokeUrl) {
+          URL.revokeObjectURL(prev.revokeUrl);
+        }
+        return {
+          sourceUrl: cap.data_url,
+          initialMode: "crop",
+          monitors: cap.monitors,
+          activeMonitorIndex: opts?.captureAll ? null : cap.active_monitor_index,
+          canRecapture: true,
+        };
+      });
+    } catch (err) {
+      showError(t("screenshotCaptureError", { err: String(err) }));
+    } finally {
+      capturingScreenRef.current = false;
+      setCapturingScreen(false);
+    }
+  };
+
+  const handleEditPendingImage = () => {
+    if (!pendingAttachment || pendingAttachment.kind !== "raw" || !pendingAttachment.isImage) {
+      return;
+    }
+    const existingPreview = pendingAttachment.previewUrl;
+    const objectUrl = existingPreview ? undefined : URL.createObjectURL(pendingAttachment.file);
+    const sourceUrl = existingPreview ?? objectUrl ?? "";
+    if (!sourceUrl) return;
+    setScreenshotEditor((prev) => {
+      if (prev?.revokeUrl) {
+        URL.revokeObjectURL(prev.revokeUrl);
+      }
+      return {
+        sourceUrl,
+        revokeUrl: objectUrl,
+        initialMode: "annotate",
+        monitors: [],
+        activeMonitorIndex: null,
+        canRecapture: false,
+      };
+    });
+  };
+
+  handleCaptureScreenRef.current = () => {
+    void handleCaptureScreen();
+  };
+
+  useEffect(() => {
+    return () => {
+      if (screenshotEditorRef.current?.revokeUrl) {
+        URL.revokeObjectURL(screenshotEditorRef.current.revokeUrl);
+      }
+    };
+  }, []);
 
   const handleSendThreadAttachment = async (
     att: PendingAttachment,
@@ -4150,6 +4269,13 @@ export default function App() {
                 buzzCooldownSec={buzzCooldownSec}
                 sendOnEnter={sendOnEnter}
                 globalPasteFallback={!activeThreadRootId}
+                onCaptureScreen={() => void handleCaptureScreen()}
+                capturingScreen={capturingScreen}
+                onEditPendingImage={
+                  pendingAttachment?.kind === "raw" && pendingAttachment.isImage
+                    ? handleEditPendingImage
+                    : undefined
+                }
                 onError={showError}
               />
             )}
@@ -4962,6 +5088,46 @@ export default function App() {
           setMobilePane("chat");
         }}
         onStartChat={handleStartChatFromProfile}
+      />
+
+      <ScreenshotEditorModal
+        open={Boolean(screenshotEditor)}
+        sourceUrl={screenshotEditor?.sourceUrl ?? ""}
+        initialMode={screenshotEditor?.initialMode ?? "crop"}
+        monitors={screenshotEditor?.monitors ?? []}
+        activeMonitorIndex={screenshotEditor?.activeMonitorIndex ?? null}
+        hideWindowOnCapture={hideWindowOnCapture}
+        capturing={capturingScreen}
+        canRecapture={screenshotEditor?.canRecapture ?? false}
+        onToggleHideWindow={(val) => {
+          setHideWindowOnCapture(val);
+          try {
+            localStorage.setItem("teza.screenshotHideWindow", val ? "1" : "0");
+          } catch {
+            // Ignore storage quota errors
+          }
+        }}
+        onRecapture={(opts) => {
+          void handleCaptureScreen({
+            monitorIndex: opts.monitorIndex,
+            captureAll: opts.captureAll,
+          });
+        }}
+        onClose={closeScreenshotEditor}
+        onAttach={(att, cap) => {
+          setPendingAttachment(att);
+          if (selectedId && cap) {
+            setDraftForThread(selectedId, cap);
+          }
+        }}
+        onSend={async (att, cap) => {
+          const sent = await handleSendAttachment(att, cap);
+          if (sent && screenshotEditor?.initialMode === "annotate") {
+            setPendingAttachment(null);
+          }
+          return sent;
+        }}
+        onError={showError}
       />
 
       {webNotifyToast && !isLocked && (

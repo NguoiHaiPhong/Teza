@@ -286,3 +286,21 @@ export type PendingAttachment =
       isImage: boolean;
       previewUrl: string | null;
     };
+
+export interface MonitorInfoDto {
+  index: number;
+  label: string;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  is_primary: boolean;
+}
+
+export interface ScreenCaptureDto {
+  data_url: string;
+  width: number;
+  height: number;
+  monitors: MonitorInfoDto[];
+  active_monitor_index: number | null;
+}

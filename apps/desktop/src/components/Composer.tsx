@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { BarChart3, CalendarClock, CornerUpLeft, FileText, Image as ImageIcon, Loader2, Paperclip, Search, Send, Smile, X, Zap } from "lucide-react";
+import { BarChart3, CalendarClock, CornerUpLeft, FileText, Image as ImageIcon, Loader2, Paperclip, Pencil, Scissors, Search, Send, Smile, X, Zap } from "lucide-react";
 import { bridge, isTauri, MAX_ATTACHMENT_BYTES } from "../bridge";
 import { useI18n, type TranslationKey } from "../i18n";
 import type { MessageDto, PendingAttachment, StickerItem, ThreadMemberDto } from "../types";
@@ -64,6 +64,9 @@ interface Props {
   onBuzz?: () => Promise<void>;
   onOpenReminder?: () => void;
   onOpenPoll?: () => void;
+  onCaptureScreen?: () => void;
+  capturingScreen?: boolean;
+  onEditPendingImage?: () => void;
   buzzCooldownSec?: number;
   placeholder?: string;
   sendOnEnter?: boolean;
@@ -92,6 +95,9 @@ export function Composer({
   onBuzz,
   onOpenReminder,
   onOpenPoll,
+  onCaptureScreen,
+  capturingScreen = false,
+  onEditPendingImage,
   buzzCooldownSec = 0,
   placeholder,
   sendOnEnter = true,
@@ -567,12 +573,26 @@ export function Composer({
               </div>
             </div>
           </div>
-          <button
-            onClick={() => onPendingAttachmentChange?.(null)}
-            className="rounded-lg p-1 hover:opacity-80"
-          >
-            <X className="h-4 w-4" />
-          </button>
+          <div className="flex items-center gap-1">
+            {pendingAttachment.isImage && onEditPendingImage && (
+              <button
+                type="button"
+                onClick={onEditPendingImage}
+                title={t("editImageBtn")}
+                className="hover-surface rounded-lg p-1.5 transition"
+                style={{ color: "var(--accent)" }}
+              >
+                <Pencil className="h-4 w-4" />
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => onPendingAttachmentChange?.(null)}
+              className="rounded-lg p-1 hover:opacity-80"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
         </div>
       )}
 
@@ -934,6 +954,26 @@ export function Composer({
             style={{ color: "var(--text-secondary)" }}
           >
             <Paperclip className="h-5 w-5" />
+          </button>
+        )}
+
+        {onCaptureScreen && (
+          <button
+            type="button"
+            disabled={capturingScreen || sending}
+            onClick={() => {
+              setEmojiOpen(false);
+              onCaptureScreen();
+            }}
+            title={t("composerScreenshotTitle")}
+            className="hover-surface rounded-lg p-2 transition disabled:opacity-50"
+            style={{ color: "var(--text-secondary)" }}
+          >
+            {capturingScreen ? (
+              <Loader2 className="h-5 w-5 animate-spin" />
+            ) : (
+              <Scissors className="h-5 w-5" />
+            )}
           </button>
         )}
 

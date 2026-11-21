@@ -1897,6 +1897,7 @@ export function SettingsModal({
                     {[
                       { key: "Ctrl + K", desc: t("shortcutGlobalSearch") },
                       { key: "Ctrl + F", desc: t("shortcutInChatSearch") },
+                      { key: "Ctrl + Shift + S", desc: t("shortcutScreenshot") },
                       { key: "Ctrl + 1..9", desc: t("shortcutSwitchFolder") },
                       { key: "Ctrl + L", desc: t("shortcutLockApp") },
                       {

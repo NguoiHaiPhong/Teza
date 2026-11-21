@@ -2264,6 +2264,8 @@ name = "litechat-desktop"
 version = "0.4.1"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "png",
  "serde",
  "serde_json",
  "tauri",

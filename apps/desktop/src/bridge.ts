@@ -12,6 +12,7 @@ import type {
   RelayConfigSummary,
   RelayConfigUpdate,
   RelayTestResult,
+  ScreenCaptureDto,
   StickerItem,
   ThreadDetailsDto,
   ThreadDto,
@@ -1036,6 +1037,20 @@ export const bridge = {
       optionIds,
       threadId: threadId ?? null,
       msgId: msgId ?? null,
+    });
+  },
+  async captureScreen(opts?: {
+    hideWindow?: boolean;
+    monitorIndex?: number | null;
+    captureAll?: boolean;
+  }): Promise<ScreenCaptureDto> {
+    if (!isTauri()) {
+      throw new Error("Chức năng chụp ảnh màn hình chỉ khả dụng trên ứng dụng desktop");
+    }
+    return invoke<ScreenCaptureDto>("capture_screen", {
+      hideWindow: opts?.hideWindow ?? true,
+      monitorIndex: opts?.monitorIndex ?? null,
+      captureAll: opts?.captureAll ?? false,
     });
   },
 };

@@ -2,6 +2,7 @@
 
 mod clipboard;
 mod file_dialog;
+mod screenshot;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -2531,10 +2532,7 @@ async fn message_send_raw_attachment(
         .unwrap_or_else(|| "clipboard.png".to_string());
     let caption = header_value_utf8(request.headers(), "x-caption").unwrap_or_default();
 
-    let bytes = match request.body() {
-        InvokeBody::Raw(raw) => raw.as_slice(),
-        InvokeBody::Json(_) => return Err("Dữ liệu đính kèm phải truyền dạng nhị phân raw".into()),
-    };
+    let bytes = extract_invoke_body_bytes(request.body(), messaging::MAX_ATTACHMENT_BYTES as usize)?;
     messaging::validate_attachment_size(bytes.len() as u64).map_err(|e| e.to_string())?;
 
     let kind = {
@@ -2556,7 +2554,7 @@ async fn message_send_raw_attachment(
             &thread_id,
             kind,
             &file_name,
-            bytes,
+            &bytes,
             &caption,
         )
         .await
@@ -2796,6 +2794,35 @@ async fn clipboard_copy_text(text: String) -> Result<(), String> {
         .map_err(|e| format!("Lỗi tác vụ clipboard: {e}"))?
 }
 
+fn extract_invoke_body_bytes<'a>(
+    body: &'a InvokeBody,
+    max_bytes: usize,
+) -> Result<std::borrow::Cow<'a, [u8]>, String> {
+    match body {
+        InvokeBody::Raw(raw) => {
+            if raw.len() > max_bytes {
+                return Err("Dữ liệu vượt quá giới hạn kích thước cho phép".into());
+            }
+            Ok(std::borrow::Cow::Borrowed(raw.as_slice()))
+        }
+        InvokeBody::Json(serde_json::Value::Array(arr)) => {
+            if arr.len() > max_bytes {
+                return Err("Dữ liệu vượt quá giới hạn kích thước cho phép".into());
+            }
+            let mut bytes = Vec::with_capacity(arr.len());
+            for elem in arr {
+                let b = elem
+                    .as_u64()
+                    .and_then(|n| u8::try_from(n).ok())
+                    .ok_or_else(|| "Dữ liệu nhị phân IPC không hợp lệ".to_string())?;
+                bytes.push(b);
+            }
+            Ok(std::borrow::Cow::Owned(bytes))
+        }
+        InvokeBody::Json(_) => Err("Dữ liệu nhị phân IPC không hợp lệ".into()),
+    }
+}
+
 #[tauri::command]
 async fn clipboard_copy_rgba_image(request: tauri::ipc::Request<'_>) -> Result<(), String> {
     let width = request
@@ -2810,15 +2837,56 @@ async fn clipboard_copy_rgba_image(request: tauri::ipc::Request<'_>) -> Result<(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u32>().ok())
         .ok_or_else(|| "Thiếu chiều cao ảnh để sao chép".to_string())?;
-    let bytes = match request.body() {
-        tauri::ipc::InvokeBody::Raw(raw) => raw.clone(),
-        tauri::ipc::InvokeBody::Json(_) => {
-            return Err("Định dạng dữ liệu ảnh clipboard không hợp lệ".into());
-        }
-    };
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|px| px.checked_mul(4))
+        .filter(|&n| n <= 128 * 1024 * 1024)
+        .ok_or_else(|| "Kích thước ảnh vượt giới hạn".to_string())?;
+    let bytes = extract_invoke_body_bytes(request.body(), expected)?.into_owned();
     tokio::task::spawn_blocking(move || clipboard::copy_rgba_image_native(width, height, &bytes))
         .await
         .map_err(|e| format!("Lỗi tác vụ clipboard ảnh: {e}"))?
+}
+
+#[tauri::command]
+async fn capture_screen(
+    app: AppHandle,
+    hide_window: Option<bool>,
+    monitor_index: Option<usize>,
+    capture_all: Option<bool>,
+) -> Result<screenshot::ScreenCaptureDto, String> {
+    let owner_hwnd = main_window_hwnd(&app);
+    let main_win = app.get_webview_window("main");
+    let mut hid_window = false;
+
+    if hide_window.unwrap_or(true) {
+        if let Some(ref win) = main_win {
+            if win.is_visible().unwrap_or(false) {
+                hide_all_webapp_children(&app);
+                if win.hide().is_ok() {
+                    hid_window = true;
+                    tokio::time::sleep(std::time::Duration::from_millis(240)).await;
+                }
+            }
+        }
+    }
+
+    let res = tokio::task::spawn_blocking(move || {
+        screenshot::capture_screen(owner_hwnd, monitor_index, capture_all.unwrap_or(false))
+    })
+    .await
+    .map_err(|e| format!("Lỗi tác vụ chụp màn hình: {e}"))
+    .and_then(|inner| inner);
+
+    if hid_window {
+        if let Some(ref win) = main_win {
+            let _ = win.show();
+            let _ = win.unminimize();
+            let _ = win.set_focus();
+        }
+    }
+
+    res
 }
 
 const WEBAPP_LABEL_PREFIX: &str = "teza-webapp-";
@@ -3148,6 +3216,7 @@ pub fn run() {
             app_set_close_to_tray,
             clipboard_copy_text,
             clipboard_copy_rgba_image,
+            capture_screen,
             webapp_open,
             webapp_set_bounds,
             webapp_hide_all,
@@ -3261,5 +3330,36 @@ mod tests {
         assert!(super::validate_web_url("javascript:alert(1)").is_err());
         assert!(super::validate_web_url("file:///C:/Windows/win.ini").is_err());
         assert!(super::validate_web_url("data:text/html,hi").is_err());
+    }
+
+    #[test]
+    fn extract_invoke_body_bytes_handles_raw_and_json_fallback() {
+        use tauri::ipc::InvokeBody;
+
+        let raw = InvokeBody::Raw(vec![137, 80, 78, 71]);
+        assert_eq!(
+            super::extract_invoke_body_bytes(&raw, 16).unwrap().as_ref(),
+            &[137, 80, 78, 71]
+        );
+        assert!(super::extract_invoke_body_bytes(&raw, 3).is_err());
+
+        let arr = InvokeBody::Json(serde_json::json!([137, 80, 78, 71]));
+        assert_eq!(
+            super::extract_invoke_body_bytes(&arr, 16).unwrap().as_ref(),
+            &[137, 80, 78, 71]
+        );
+        assert!(super::extract_invoke_body_bytes(&arr, 3).is_err());
+
+        let out_of_range = InvokeBody::Json(serde_json::json!([1, 256]));
+        assert!(super::extract_invoke_body_bytes(&out_of_range, 16).is_err());
+
+        let negative = InvokeBody::Json(serde_json::json!([-1]));
+        assert!(super::extract_invoke_body_bytes(&negative, 16).is_err());
+
+        let obj = InvokeBody::Json(serde_json::json!({ "bytes": [1, 2] }));
+        assert!(super::extract_invoke_body_bytes(&obj, 16).is_err());
+
+        let text = InvokeBody::Json(serde_json::json!("abc"));
+        assert!(super::extract_invoke_body_bytes(&text, 16).is_err());
     }
 }
