@@ -129,6 +129,7 @@ export const en: Record<TranslationKey, string> = {
   composerEmojiTitle: "Insert emoji & stickers",
   composerBuzzTitle: "Send BUZZ! alert (5s cooldown)",
   composerBuzzCooldown: "Wait {secs}s before sending BUZZ again",
+  buzzSentByUser: "{name} just sent a BUZZ!",
   composerReminderTitle: "Create reminder",
   composerPollTitle: "Create group poll",
   composerSendTitle: "Send message",
@@ -160,6 +161,7 @@ export const en: Record<TranslationKey, string> = {
   viewTranslation: "Show translation",
   hideTranslation: "Hide",
   translatingBody: "Translating message...",
+  alreadyInTargetLang: "Message is already in {lang} — no translation needed",
   pinnedBadgeTitle: "Pinned message",
   reactTitle: "React",
   replyTitle: "Reply",
@@ -443,6 +445,16 @@ export const en: Record<TranslationKey, string> = {
   azureKeyPlaceholder: "Enter Azure Cognitive Services Translator Key",
   azureRegionLabel: "Azure Region",
   translateSavedNotice: "Translation configuration saved securely.",
+  translateDetectModeLabel: "Language detection mode",
+  translateModeApiCacheTitle: "API-first + SQLite cache (Recommended)",
+  translateModeApiCacheDesc: "Skips only non-text items locally. API detects each message accurately and caches encrypted results permanently in SQLite — each message uses API once.",
+  translateModeLocalSkipTitle: "Local smart skip + SQLite cache",
+  translateModeLocalSkipDesc: "Pre-skips obvious same-language messages locally to save first-time API calls; remaining messages are cached permanently in SQLite.",
+  translateClearCacheBtn: "Clear translation cache",
+  translateCacheClearedNotice: "Cleared {count} cached translations from SQLite.",
+  translateModeBadgeApi: "API + SQLite",
+  translateModeBadgeLocal: "Local skip + SQLite",
+  viewMemberProfileTitle: "View member profile",
   saveSettingsBtn: "Save settings",
 
   // Other Modals
@@ -605,4 +617,12 @@ export const en: Record<TranslationKey, string> = {
   screenshotCaptureError: "Failed to capture screen: {err}",
   screenshotDesktopOnly: "Screen capture is only available in the desktop app",
   shortcutScreenshot: "Capture & edit screenshot",
+
+  // Retro emoticons & emoji style
+  emojiStyleHeading: "Emoji style",
+  emojiStyleRetro: "Retro (Animated classic)",
+  emojiStyleSystem: "System (Default)",
+  emojiStyleDesc: "Convert classic shortcuts like :)) =)) :(( ;) >:) :-* and render animated emoticons",
+  emojiCatRetro: "Retro Classic",
+  retroShortcutHint: "Shortcuts :), :D, :)), =)), :((, ;), >:), :-*, B-)...",
 };

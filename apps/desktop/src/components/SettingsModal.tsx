@@ -32,6 +32,8 @@ import {
 } from "lucide-react";
 import { bridge } from "../bridge";
 import { UI_LANGUAGE_OPTIONS, useI18n, type TranslationKey } from "../i18n";
+import { useEmojiStyle } from "../utils/emojiStyleContext";
+import { RetroEmoticon } from "./RetroEmoticon";
 import type {
   AccountProfile,
   AppUpdateInfo,
@@ -229,6 +231,7 @@ export function SettingsModal({
   onClose,
 }: Props) {
   const { lang, setLang, translateCode, t } = useI18n();
+  const { emojiStyle, setEmojiStyle } = useEmojiStyle();
   const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab);
   const [relayEnabled, setRelayEnabled] = useState(false);
   const [relayMode, setRelayMode] = useState<RelayMode>("socks5");
@@ -861,6 +864,62 @@ export function SettingsModal({
                       className="border-t px-2 pt-2.5"
                       style={{ borderColor: "var(--border-subtle)" }}
                     >
+                      <div className="mb-1 flex items-center justify-between gap-2 text-xs font-medium">
+                        <span>{t("emojiStyleHeading")}</span>
+                        <div className="flex items-center gap-1">
+                          {(["smile", "rofl", "wink", "love", "devil", "cry"] as const).map(
+                            (emoId) => (
+                              <RetroEmoticon key={emoId} id={emoId} size={17} />
+                            ),
+                          )}
+                        </div>
+                      </div>
+                      <div
+                        className="mb-2 text-[11.5px]"
+                        style={{ color: "var(--text-secondary)" }}
+                      >
+                        {t("emojiStyleDesc")}
+                      </div>
+                      <div
+                        className="grid grid-cols-2 gap-1 rounded-xl p-1"
+                        style={{ background: "var(--bg-sidebar)" }}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => setEmojiStyle("retro")}
+                          className="rounded-lg px-2 py-1.5 text-xs font-medium transition"
+                          style={{
+                            background:
+                              emojiStyle === "retro" ? "var(--accent)" : "transparent",
+                            color:
+                              emojiStyle === "retro"
+                                ? "var(--text-on-accent)"
+                                : "var(--text-secondary)",
+                          }}
+                        >
+                          {t("emojiStyleRetro")}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setEmojiStyle("system")}
+                          className="rounded-lg px-2 py-1.5 text-xs font-medium transition"
+                          style={{
+                            background:
+                              emojiStyle === "system" ? "var(--accent)" : "transparent",
+                            color:
+                              emojiStyle === "system"
+                                ? "var(--text-on-accent)"
+                                : "var(--text-secondary)",
+                          }}
+                        >
+                          {t("emojiStyleSystem")}
+                        </button>
+                      </div>
+                    </div>
+                    <div
+                      className="border-t px-2 pt-2.5"
+                      style={{ borderColor: "var(--border-subtle)" }}
+                    >
                       <div className="mb-1.5 flex items-center gap-2 text-xs font-medium">
                         <Send className="h-3.5 w-3.5" style={{ color: "var(--accent)" }} />
                         <span>Phím gửi tin nhắn</span>
@@ -1277,6 +1336,11 @@ export function SettingsModal({
                           lang: translateCfg?.target_lang || "VI",
                           uiLang: translateCode,
                         })}
+                      </div>
+                      <div className="mt-1.5 inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>
+                        {translateCfg?.detect_mode === "local_smart_skip"
+                          ? t("translateModeBadgeLocal")
+                          : t("translateModeBadgeApi")}
                       </div>
                     </div>
                   </div>

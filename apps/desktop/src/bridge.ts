@@ -261,6 +261,10 @@ export const bridge = {
     if (!isTauri()) return;
     return invoke("notify_click", { threadId });
   },
+  async buzzShakeScreen(): Promise<void> {
+    if (!isTauri()) return;
+    return invoke("buzz_shake_screen");
+  },
   async getThreadDetails(threadId: string): Promise<ThreadDetailsDto> {
     if (!isTauri()) {
       const msgs = DEMO_MESSAGES[threadId] ?? [];
@@ -621,6 +625,7 @@ export const bridge = {
     if (!isTauri()) {
       return {
         provider: "deepl",
+        detect_mode: "api_cache",
         target_lang: "VI",
         gemini_model: "gemini-2.0-flash",
         azure_region: "eastasia",
@@ -638,6 +643,7 @@ export const bridge = {
     if (!isTauri()) {
       return {
         provider: update.provider,
+        detect_mode: update.detect_mode ?? "api_cache",
         target_lang: update.target_lang,
         gemini_model: update.gemini_model || "gemini-2.0-flash",
         azure_region: update.azure_region || "eastasia",
@@ -655,6 +661,7 @@ export const bridge = {
     items: { msg_id: string; text: string }[],
     targetLang?: string,
     provider?: TranslateProvider,
+    forceRefresh = false,
   ): Promise<TranslationResult[]> {
     if (!isTauri()) {
       return items.map((it) => ({
@@ -667,6 +674,14 @@ export const bridge = {
       items,
       targetLang: targetLang ?? null,
       provider: provider ?? null,
+      forceRefresh,
+    });
+  },
+  async clearTranslateCache(msgIds?: string[], targetLang?: string): Promise<number> {
+    if (!isTauri()) return 0;
+    return invoke<number>("translate_clear_cache", {
+      msgIds: msgIds ?? null,
+      targetLang: targetLang ?? null,
     });
   },
   async saveRemoteFile(url: string, suggestedName: string): Promise<string | null> {

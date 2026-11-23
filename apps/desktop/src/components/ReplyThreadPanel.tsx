@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, Info, LocateFixed, MessagesSquare } from "lucide-react";
 import { useI18n } from "../i18n";
 import type { MessageDto, PendingAttachment, StickerItem, ThreadKind, ThreadMemberDto } from "../types";
+import type { MentionCandidate } from "../utils/mentions";
 import { formatDayLabel } from "../utils/threadState";
 import { Composer } from "./Composer";
 import { MessageBubble, type MessageTranslationState } from "./MessageBubble";
@@ -43,6 +44,7 @@ interface Props {
   onTranslate: (msg: MessageDto) => void;
   onHideTranslation: (msgId: string) => void;
   mentionMembers?: ThreadMemberDto[];
+  displayMentionMembers?: MentionCandidate[];
   onSendSticker?: (sticker: StickerItem) => Promise<void>;
   onTogglePin?: (msg: MessageDto) => void;
   onError: (err: unknown) => void;
@@ -79,6 +81,7 @@ export function ReplyThreadPanel({
   onTranslate,
   onHideTranslation,
   mentionMembers,
+  displayMentionMembers,
   onSendSticker,
   onTogglePin,
   onError,
@@ -135,9 +138,10 @@ export function ReplyThreadPanel({
     return ids.size;
   }, [rootMessage, replies]);
 
+  const rootTr = translationsByMsg[rootMessage.msg_id];
   const rootText =
-    replaceWithTranslation && translationsByMsg[rootMessage.msg_id]?.text
-      ? translationsByMsg[rootMessage.msg_id]?.text
+    replaceWithTranslation && rootTr?.text && !rootTr.skipped
+      ? rootTr.text
       : rootMessage.text || rootMessage.attachment_name;
 
   const rootTypeLower = rootMessage.msg_type.toLowerCase();
@@ -323,6 +327,7 @@ export function ReplyThreadPanel({
                   onJumpToMsg={handleJumpSmart}
                   onOpenImage={onOpenImage}
                   onOpenProfile={onOpenProfile}
+                  mentionMembers={displayMentionMembers ?? mentionMembers}
                   onForward={onForward}
                   onTranslate={onTranslate}
                   onHideTranslation={onHideTranslation}

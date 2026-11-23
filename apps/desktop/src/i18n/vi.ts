@@ -132,6 +132,7 @@ export const vi = {
   composerEmojiTitle: "Chèn biểu cảm & nhãn dán",
   composerBuzzTitle: "Gửi BUZZ! gây chú ý (giới hạn 5s/lần)",
   composerBuzzCooldown: "Chờ {secs}s để gửi BUZZ tiếp",
+  buzzSentByUser: "{name} vừa gửi BUZZ!",
   composerReminderTitle: "Tạo nhắc hẹn",
   composerPollTitle: "Tạo bình chọn nhóm",
   composerSendTitle: "Gửi tin nhắn",
@@ -164,6 +165,7 @@ export const vi = {
   viewTranslation: "Xem bản dịch",
   hideTranslation: "Ẩn",
   translatingBody: "Đang xử lý bản dịch...",
+  alreadyInTargetLang: "Tin nhắn đã là {lang} — không cần dịch",
   pinnedBadgeTitle: "Tin nhắn đã ghim",
   reactTitle: "Thả cảm xúc",
   replyTitle: "Trả lời",
@@ -453,6 +455,16 @@ export const vi = {
   azureKeyPlaceholder: "Nhập Azure Cognitive Services Translator Key",
   azureRegionLabel: "Azure Region",
   translateSavedNotice: "Đã lưu cấu hình dịch thuật an toàn.",
+  translateDetectModeLabel: "Chế độ nhận diện ngôn ngữ",
+  translateModeApiCacheTitle: "Ưu tiên API + Lưu SQLite (Khuyên dùng)",
+  translateModeApiCacheDesc: "Chỉ bỏ qua ảnh/tệp/link/mã. API nhận diện chính xác từng tin và lưu cố định đã mã hóa vào SQLite — mỗi tin chỉ tốn API 1 lần.",
+  translateModeLocalSkipTitle: "Lọc nhanh cục bộ + Lưu SQLite",
+  translateModeLocalSkipDesc: "Tự bỏ qua trước các tin trùng ngôn ngữ đích rõ ràng để tiết kiệm lượt gọi đầu; các tin còn lại vẫn lưu cố định vào SQLite.",
+  translateClearCacheBtn: "Xóa bộ nhớ đệm dịch",
+  translateCacheClearedNotice: "Đã xóa {count} bản dịch đã lưu trong SQLite.",
+  translateModeBadgeApi: "API + SQLite",
+  translateModeBadgeLocal: "Lọc cục bộ + SQLite",
+  viewMemberProfileTitle: "Xem thông tin tài khoản",
   saveSettingsBtn: "Lưu cài đặt",
 
   // Other Modals
@@ -615,6 +627,14 @@ export const vi = {
   screenshotCaptureError: "Không thể chụp ảnh màn hình: {err}",
   screenshotDesktopOnly: "Chức năng chụp ảnh màn hình chỉ khả dụng trên ứng dụng desktop",
   shortcutScreenshot: "Chụp & chỉnh sửa ảnh màn hình",
+
+  // Retro emoticons & emoji style
+  emojiStyleHeading: "Phong cách Emoji",
+  emojiStyleRetro: "Retro (Cổ điển động)",
+  emojiStyleSystem: "Hệ thống (Mặc định)",
+  emojiStyleDesc: "Tự chuyển mã gõ tắt quen thuộc như :)) =)) :(( ;) >:) :-* và hiển thị emoticon động",
+  emojiCatRetro: "Retro Cổ điển",
+  retroShortcutHint: "Gõ tắt :), :D, :)), =)), :((, ;), >:), :-*, B-)...",
 } as const;
 
 export type TranslationKey = keyof typeof vi;

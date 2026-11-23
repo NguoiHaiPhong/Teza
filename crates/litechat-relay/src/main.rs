@@ -41,6 +41,11 @@ const DEFAULT_ALLOWED_SUFFIXES: &[&str] = &[
     "zapps.me",
     "zaloplatforms.com",
     "zing.vn",
+    "dlfl.vn",
+    "dlfl.me",
+    "flchat.vn",
+    "dlmd.me",
+    "mdchat.me",
     // Translation & updater endpoints
     "api-free.deepl.com",
     "api.deepl.com",
@@ -1219,6 +1224,11 @@ mod tests {
             "assets.zapps.me",
             "stc.zaloplatforms.com",
             "mp3.zing.vn",
+            "file-stal-9.dlfl.vn",
+            "file-stal-1.dlfl.me",
+            "file-stal-9-te-vnso-pt-25.flchat.vn",
+            "video-stal-20.dlmd.me",
+            "video-stal-20-te-vnno-cm-1.mdchat.me",
         ] {
             assert!(is_allowed_target(host, 443, &cfg), "expected 443 allowed: {host}");
             assert!(!is_allowed_target(host, 80, &cfg), "expected 80 blocked: {host}");

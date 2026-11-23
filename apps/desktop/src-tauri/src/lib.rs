@@ -2,6 +2,7 @@
 
 mod clipboard;
 mod file_dialog;
+mod screen_shake;
 mod screenshot;
 
 use std::path::PathBuf;
@@ -13,8 +14,8 @@ use tauri::ipc::InvokeBody;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{
-    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, State,
-    WebviewBuilder, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize,
+    State, WebviewBuilder, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::Mutex;
@@ -37,8 +38,10 @@ use zalo_core::session::{AccountProfile, Session, SessionError, SessionStatus};
 use zalo_core::socket::{self, WsSignal};
 use zalo_core::store::MessageStore;
 use zalo_core::translate::{
-    translate_batch_with_relay, TranslateConfig, TranslateConfigSummary, TranslateConfigUpdate,
-    TranslateInputItem, TranslateProvider, TranslationResult,
+    classify_skip_reason, classify_skip_reason_for_mode, is_static_non_translatable,
+    normalize_lang_base_code, provider_name, translate_api_only_with_relay, TranslateConfig,
+    TranslateConfigSummary, TranslateConfigUpdate, TranslateDetectMode, TranslateInputItem,
+    TranslateProvider, TranslationResult,
 };
 
 pub struct AppState {
@@ -67,12 +70,74 @@ pub struct NotifyToastPayload {
     pub theme: String,
     pub position: String,
     pub duration_ms: u64,
+    #[serde(default)]
+    pub is_buzz: bool,
+    #[serde(default)]
+    pub buzz_streak: u32,
 }
 
-const TOAST_LOGICAL_W: f64 = 356.0;
-const TOAST_LOGICAL_H: f64 = 96.0;
+fn compute_notify_shake_offsets(scale: f64) -> Vec<(i32, i32)> {
+    let max_amp = (10.0 * scale.max(0.5)).round() as i32;
+    let frames = 26usize;
+    let mut out = Vec::with_capacity(frames);
+    for i in 0..(frames - 1) {
+        let t = i as f64 / (frames - 1) as f64;
+        let decay = 1.0 - t;
+        let step_x = if i % 2 == 0 { 1.0 } else { -1.0 };
+        let step_y = if i % 4 < 2 { 1.0 } else { -1.0 };
+        let dx = (step_x * max_amp as f64 * decay).round() as i32;
+        let dy = (step_y * (max_amp as f64 * 0.45) * decay).round() as i32;
+        out.push((dx, dy));
+    }
+    out.push((0, 0));
+    out
+}
+
+const TOAST_LOGICAL_W: f64 = 320.0;
+const TOAST_LOGICAL_H_COMPACT: f64 = 72.0;
+const TOAST_LOGICAL_H_TALL: f64 = 86.0;
 const TOAST_MARGIN: f64 = 16.0;
 
+fn compute_toast_logical_size(body: &str) -> (f64, f64) {
+    let trimmed = body.trim();
+    if trimmed.contains('\n') || trimmed.chars().count() > 38 {
+        (TOAST_LOGICAL_W, TOAST_LOGICAL_H_TALL)
+    } else {
+        (TOAST_LOGICAL_W, TOAST_LOGICAL_H_COMPACT)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_notify_position_for_size(
+    work_x: i32,
+    work_y: i32,
+    work_w: u32,
+    work_h: u32,
+    win_w: u32,
+    win_h: u32,
+    scale: f64,
+    position: &str,
+) -> (i32, i32) {
+    let pm = (TOAST_MARGIN * scale).round().max(0.0) as i32;
+    let ww = work_w as i32;
+    let wh = work_h as i32;
+    let pw = (win_w as i32).min(ww.max(1));
+    let ph = (win_h as i32).min(wh.max(1));
+    let max_x = work_x + (ww - pw).max(0);
+    let max_y = work_y + (wh - ph).max(0);
+    let left_x = (work_x + pm).clamp(work_x, max_x);
+    let right_x = (work_x + ww - pw - pm).clamp(work_x, max_x);
+    let top_y = (work_y + pm).clamp(work_y, max_y);
+    let bottom_y = (work_y + wh - ph - pm).clamp(work_y, max_y);
+    match position {
+        "top-left" => (left_x, top_y),
+        "top-right" => (right_x, top_y),
+        "bottom-left" => (left_x, bottom_y),
+        _ => (right_x, bottom_y),
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn compute_notify_position(
     work_x: i32,
     work_y: i32,
@@ -81,19 +146,9 @@ fn compute_notify_position(
     scale: f64,
     position: &str,
 ) -> (i32, i32) {
-    let pw = (TOAST_LOGICAL_W * scale).round() as i32;
-    let ph = (TOAST_LOGICAL_H * scale).round() as i32;
-    let pm = (TOAST_MARGIN * scale).round() as i32;
-    let left_x = work_x + pm;
-    let right_x = (work_x + work_w as i32 - pw - pm).max(left_x);
-    let top_y = work_y + pm;
-    let bottom_y = (work_y + work_h as i32 - ph - pm).max(top_y);
-    match position {
-        "top-left" => (left_x, top_y),
-        "top-right" => (right_x, top_y),
-        "bottom-left" => (left_x, bottom_y),
-        _ => (right_x, bottom_y),
-    }
+    let pw = (TOAST_LOGICAL_W * scale).round() as u32;
+    let ph = (TOAST_LOGICAL_H_COMPACT * scale).round() as u32;
+    compute_notify_position_for_size(work_x, work_y, work_w, work_h, pw, ph, scale, position)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -830,22 +885,38 @@ async fn notify_show_popup(
 ) -> Result<(), String> {
     *state.pending_notify.lock().await = Some(payload.clone());
 
-    let (px, py) = app
-        .primary_monitor()
-        .ok()
-        .flatten()
+    let target_mon = app
+        .get_webview_window("main")
+        .filter(|m| m.is_visible().unwrap_or(false) && !m.is_minimized().unwrap_or(false))
+        .and_then(|m| m.current_monitor().ok().flatten())
+        .or_else(|| app.primary_monitor().ok().flatten());
+
+    let (work_x, work_y, work_w, work_h, scale) = target_mon
         .map(|mon| {
             let work = mon.work_area();
-            compute_notify_position(
+            (
                 work.position.x,
                 work.position.y,
                 work.size.width,
                 work.size.height,
-                mon.scale_factor(),
-                &payload.position,
+                mon.scale_factor().max(0.5),
             )
         })
-        .unwrap_or((16, 16));
+        .unwrap_or((0, 0, 1920, 1040, 1.0));
+
+    let (logical_w, logical_h) = compute_toast_logical_size(&payload.body);
+    let pw = ((logical_w * scale).round() as u32).clamp(1, work_w.max(1));
+    let ph = ((logical_h * scale).round() as u32).clamp(1, work_h.max(1));
+    let (est_x, est_y) = compute_notify_position_for_size(
+        work_x,
+        work_y,
+        work_w,
+        work_h,
+        pw,
+        ph,
+        scale,
+        &payload.position,
+    );
 
     let win = if let Some(existing) = app.get_webview_window("teza-notify") {
         existing
@@ -856,9 +927,11 @@ async fn notify_show_popup(
             WebviewUrl::App("index.html?view=notify".into()),
         )
         .title("Teza Notification")
-        .inner_size(TOAST_LOGICAL_W, TOAST_LOGICAL_H)
+        .inner_size(logical_w, logical_h)
+        .position(est_x as f64 / scale, est_y as f64 / scale)
         .resizable(false)
         .decorations(false)
+        .shadow(false)
         .always_on_top(true)
         .skip_taskbar(true)
         .focused(false)
@@ -867,11 +940,57 @@ async fn notify_show_popup(
         .map_err(|e| e.to_string())?
     };
 
-    let _ = win.set_position(PhysicalPosition::new(px, py));
-    let _ = win.show();
-    let _ = app.emit_to("teza-notify", "core://notify-payload", &payload);
-
     let gen = state.notify_hide_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let _ = win.set_shadow(false);
+    // Move to the target monitor first so DPI and outer_size reflect the destination monitor.
+    let _ = win.set_position(PhysicalPosition::new(est_x, est_y));
+    let _ = win.set_size(PhysicalSize::new(pw, ph));
+    let (actual_w, actual_h) = win
+        .outer_size()
+        .ok()
+        .filter(|s| s.width > 0 && s.height > 0)
+        .map(|s| (s.width, s.height))
+        .unwrap_or((pw, ph));
+    let (px, py) = compute_notify_position_for_size(
+        work_x,
+        work_y,
+        work_w,
+        work_h,
+        actual_w,
+        actual_h,
+        scale,
+        &payload.position,
+    );
+    let _ = win.set_position(PhysicalPosition::new(px, py));
+    let _ = app.emit_to("teza-notify", "core://notify-payload", &payload);
+    let _ = win.show();
+
+    if payload.is_buzz && payload.buzz_streak < 3 {
+        let gen_shake = state.notify_hide_gen.clone();
+        let app_shake = app.clone();
+        let max_x = work_x + (work_w as i32 - actual_w as i32).max(0);
+        let max_y = work_y + (work_h as i32 - actual_h as i32).max(0);
+        let offsets = compute_notify_shake_offsets(scale);
+        tokio::spawn(async move {
+            for (dx, dy) in offsets {
+                if gen_shake.load(Ordering::SeqCst) != gen {
+                    return;
+                }
+                if let Some(w) = app_shake.get_webview_window("teza-notify") {
+                    let sx = (px + dx).clamp(work_x, max_x);
+                    let sy = (py + dy).clamp(work_y, max_y);
+                    let _ = w.set_position(PhysicalPosition::new(sx, sy));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(28)).await;
+            }
+            if gen_shake.load(Ordering::SeqCst) == gen {
+                if let Some(w) = app_shake.get_webview_window("teza-notify") {
+                    let _ = w.set_position(PhysicalPosition::new(px, py));
+                }
+            }
+        });
+    }
+
     let gen_arc = state.notify_hide_gen.clone();
     let app_hide = app.clone();
     let ms = payload.duration_ms.clamp(2500, 15000);
@@ -885,6 +1004,11 @@ async fn notify_show_popup(
     });
 
     Ok(())
+}
+
+#[tauri::command]
+async fn buzz_shake_screen() -> Result<(), String> {
+    screen_shake::trigger_screen_shake()
 }
 
 #[tauri::command]
@@ -1536,6 +1660,11 @@ async fn resolve_and_upsert_remote_messages(
             }
         }
         let _ = store.upsert_message(m);
+    }
+    if let Some(max_out_ts) = remote_msgs.iter().filter(|m| m.is_outgoing).map(|m| m.ts).max() {
+        if max_out_ts > 0 {
+            let _ = store.advance_last_read_in_ts(thread_id, max_out_ts);
+        }
     }
     if update_preview {
         if let Some(newest) = remote_msgs.iter().max_by_key(|m| m.ts) {
@@ -2405,27 +2534,43 @@ async fn save_remote_file(
     suggested_name: String,
 ) -> Result<Option<String>, String> {
     let trimmed = url.trim_start();
-    let bytes = if trimmed.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("data:")) {
-        let (data, _) = zalo_core::session::decode_data_url_bytes(trimmed, 25 * 1024 * 1024)
+    let is_data_url = trimmed.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("data:"));
+    let (bytes, mime, final_url, cd_name) = if is_data_url {
+        let (data, mime) = zalo_core::session::decode_data_url_bytes(trimmed, 25 * 1024 * 1024)
             .map_err(|e| e.to_string())?;
-        data
+        (data, mime, String::new(), None)
     } else {
         let sess_snapshot = {
             let sess = state.session.lock().await;
             sess.clone_shallow()
         };
-        let (data, _) = sess_snapshot
-            .download_media_bytes(&url, 100 * 1024 * 1024)
+        let downloaded = sess_snapshot
+            .download_media_with_meta(&url, 100 * 1024 * 1024)
             .await
             .map_err(|e| e.to_string())?;
-        data
+        (
+            downloaded.bytes,
+            downloaded.mime,
+            downloaded.final_url,
+            downloaded.content_disposition_filename,
+        )
     };
 
+    let source_url = if is_data_url { "" } else { url.as_str() };
+    let (resolved_name, resolved_ext) = file_dialog::resolve_download_filename_and_ext(
+        &suggested_name,
+        cd_name.as_deref(),
+        source_url,
+        &final_url,
+        &mime,
+        &bytes,
+    );
     let owner_hwnd = main_window_hwnd(&app);
-    let suggested = suggested_name;
-    let target = tokio::task::spawn_blocking(move || file_dialog::pick_save_file(owner_hwnd, &suggested))
-        .await
-        .map_err(|e| format!("Lỗi hộp thoại lưu tệp: {e}"))??;
+    let target = tokio::task::spawn_blocking(move || {
+        file_dialog::pick_save_file(owner_hwnd, &resolved_name, resolved_ext.as_deref())
+    })
+    .await
+    .map_err(|e| format!("Lỗi hộp thoại lưu tệp: {e}"))??;
     let Some(path) = target else {
         return Ok(None);
     };
@@ -2622,11 +2767,144 @@ async fn translate_messages(
     items: Vec<TranslateInputItem>,
     target_lang: Option<String>,
     provider: Option<TranslateProvider>,
+    force_refresh: Option<bool>,
 ) -> Result<Vec<TranslationResult>, String> {
     let cfg = state.translate_cfg.lock().await.clone();
     let relay = state.relay_cfg.lock().await.clone();
-    translate_batch_with_relay(&cfg, &relay, &items, target_lang.as_deref(), provider)
-        .await
+    let eff_provider = provider.unwrap_or(cfg.provider);
+    let eff_target = target_lang
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(cfg.target_lang.as_str())
+        .to_ascii_uppercase();
+    let target_base = normalize_lang_base_code(&eff_target);
+    let force = force_refresh.unwrap_or(false);
+
+    let mut results: Vec<TranslationResult> = Vec::with_capacity(items.len());
+    let mut check_cache: Vec<TranslateInputItem> = Vec::new();
+    for it in items {
+        let skip = if force {
+            is_static_non_translatable(&it.text)
+        } else {
+            classify_skip_reason_for_mode(&it.text, &eff_target, TranslateDetectMode::ApiCache)
+                == Some("non_linguistic")
+        };
+        if skip {
+            results.push(TranslationResult {
+                msg_id: it.msg_id,
+                translated_text: it.text,
+                detected_source_lang: None,
+                skipped: true,
+            });
+        } else {
+            check_cache.push(it);
+        }
+    }
+
+    if check_cache.is_empty() {
+        return Ok(results);
+    }
+
+    let after_cache: Vec<TranslateInputItem> = if !force {
+        let pairs: Vec<(String, String)> = check_cache
+            .iter()
+            .map(|it| (it.msg_id.clone(), it.text.clone()))
+            .collect();
+        let cached = {
+            let store = state.store.lock().await;
+            store
+                .get_cached_translations(&pairs, &eff_target)
+                .unwrap_or_default()
+        };
+        let mut misses = Vec::new();
+        for it in check_cache {
+            if let Some(hit) = cached.get(&it.msg_id) {
+                results.push(hit.clone());
+            } else {
+                misses.push(it);
+            }
+        }
+        misses
+    } else {
+        check_cache
+    };
+
+    if after_cache.is_empty() {
+        return Ok(results);
+    }
+
+    let api_items: Vec<TranslateInputItem> =
+        if !force && cfg.detect_mode == TranslateDetectMode::LocalSmartSkip {
+            let mut rest = Vec::new();
+            for it in after_cache {
+                if classify_skip_reason(&it.text, &eff_target) == Some("same_language") {
+                    results.push(TranslationResult {
+                        msg_id: it.msg_id,
+                        translated_text: it.text,
+                        detected_source_lang: Some(target_base.clone()),
+                        skipped: true,
+                    });
+                } else {
+                    rest.push(it);
+                }
+            }
+            rest
+        } else {
+            after_cache
+        };
+
+    if api_items.is_empty() {
+        return Ok(results);
+    }
+
+    let orig_by_id: std::collections::HashMap<String, String> = api_items
+        .iter()
+        .map(|it| (it.msg_id.clone(), it.text.clone()))
+        .collect();
+    let api_res = translate_api_only_with_relay(
+        &cfg,
+        &relay,
+        &api_items,
+        Some(&eff_target),
+        Some(eff_provider),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let to_persist: Vec<(String, String, TranslationResult)> = api_res
+        .iter()
+        .filter_map(|tr| {
+            if tr.translated_text.trim().is_empty() && !tr.skipped {
+                return None;
+            }
+            orig_by_id
+                .get(&tr.msg_id)
+                .map(|orig| (tr.msg_id.clone(), orig.clone(), tr.clone()))
+        })
+        .collect();
+    if !to_persist.is_empty() {
+        let mut store = state.store.lock().await;
+        let _ = store.upsert_cached_translations(
+            &to_persist,
+            &eff_target,
+            provider_name(eff_provider),
+        );
+    }
+
+    results.extend(api_res);
+    Ok(results)
+}
+
+#[tauri::command]
+async fn translate_clear_cache(
+    state: State<'_, AppState>,
+    msg_ids: Option<Vec<String>>,
+    target_lang: Option<String>,
+) -> Result<usize, String> {
+    let store = state.store.lock().await;
+    store
+        .clear_cached_translations(msg_ids.as_deref(), target_lang.as_deref())
         .map_err(|e| e.to_string())
 }
 
@@ -3204,6 +3482,7 @@ pub fn run() {
             translate_get_config,
             translate_save_config,
             translate_messages,
+            translate_clear_cache,
             relay_get_config,
             relay_save_config,
             relay_test_connection,
@@ -3211,6 +3490,7 @@ pub fn run() {
             notify_get_current,
             notify_dismiss,
             notify_click,
+            buzz_shake_screen,
             app_check_update,
             app_install_update,
             app_set_close_to_tray,
@@ -3286,37 +3566,89 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::compute_notify_position;
+    use super::{
+        compute_notify_position, compute_notify_position_for_size, compute_notify_shake_offsets,
+        compute_toast_logical_size,
+    };
 
     #[test]
     fn compute_notify_position_places_all_four_corners_with_dpi_scaling() {
-        // 1920x1040 work area starting at (0, 0), scale 1.0 -> pw=356, ph=96, margin=16
+        // 1920x1040 work area starting at (0, 0), scale 1.0 -> pw=320, ph=72, margin=16
         assert_eq!(
             compute_notify_position(0, 0, 1920, 1040, 1.0, "top-left"),
             (16, 16)
         );
         assert_eq!(
             compute_notify_position(0, 0, 1920, 1040, 1.0, "top-right"),
-            (1548, 16)
+            (1584, 16)
         );
         assert_eq!(
             compute_notify_position(0, 0, 1920, 1040, 1.0, "bottom-left"),
-            (16, 928)
+            (16, 952)
         );
         assert_eq!(
             compute_notify_position(0, 0, 1920, 1040, 1.0, "bottom-right"),
-            (1548, 928)
+            (1584, 952)
         );
 
-        // Scale 1.5 with non-zero work area origin (taskbar top/left): pw=534, ph=144, margin=24
+        // Scale 1.25 on 1920x1042 work area -> pw=400, ph=90, margin=20
+        assert_eq!(
+            compute_notify_position(0, 0, 1920, 1042, 1.25, "bottom-right"),
+            (1500, 932)
+        );
+
+        // Scale 1.5 with non-zero work area origin (taskbar top/left): pw=480, ph=108, margin=24
         assert_eq!(
             compute_notify_position(100, 40, 1920, 1080, 1.5, "top-left"),
             (124, 64)
         );
         assert_eq!(
             compute_notify_position(100, 40, 1920, 1080, 1.5, "bottom-right"),
-            (1462, 952)
+            (1516, 988)
         );
+    }
+
+    #[test]
+    fn compute_notify_position_for_size_stays_within_work_area_and_handles_secondary_monitors() {
+        // Negative X monitor on the left
+        let (nx, ny) =
+            compute_notify_position_for_size(-1920, 0, 1920, 1040, 340, 96, 1.0, "bottom-right");
+        assert_eq!((nx, ny), (-356, 928));
+        assert!(nx >= -1920 && nx + 340 <= 0);
+        assert!(ny >= 0 && ny + 96 <= 1040);
+
+        // Constrained work area where margins must clamp inside [work_x..work_x+work_w]
+        let (tx, ty) =
+            compute_notify_position_for_size(50, 20, 350, 100, 340, 95, 1.0, "top-left");
+        assert_eq!((tx, ty), (60, 25));
+        assert!(tx >= 50 && tx + 340 <= 400);
+        assert!(ty >= 20 && ty + 95 <= 120);
+
+        let (bx, by) =
+            compute_notify_position_for_size(50, 20, 350, 100, 340, 95, 1.0, "bottom-right");
+        assert_eq!((bx, by), (50, 20));
+    }
+
+    #[test]
+    fn compute_toast_logical_size_adapts_height_for_multiline_and_long_text() {
+        assert_eq!(compute_toast_logical_size("Xin chào"), (320.0, 72.0));
+        assert_eq!(compute_toast_logical_size("Dòng 1\nDòng 2"), (320.0, 86.0));
+        assert_eq!(
+            compute_toast_logical_size("Đây là một tin nhắn khá dài hơn ba mươi tám ký tự"),
+            (320.0, 86.0)
+        );
+    }
+
+    #[test]
+    fn compute_notify_shake_offsets_is_bounded_and_returns_to_origin() {
+        let offsets = compute_notify_shake_offsets(1.25);
+        assert_eq!(offsets.len(), 26);
+        assert_eq!(offsets.last().copied(), Some((0, 0)));
+        let bound = (10.0 * 1.25f64).round() as i32;
+        assert!(offsets.iter().any(|&(dx, _)| dx != 0));
+        assert!(offsets
+            .iter()
+            .all(|&(dx, dy)| dx.abs() <= bound && dy.abs() <= bound));
     }
 
     #[test]

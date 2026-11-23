@@ -5,7 +5,14 @@ import { useI18n, type TranslationKey } from "../i18n";
 import type { MessageDto, PendingAttachment, StickerItem, ThreadMemberDto } from "../types";
 import { extFromMime, extractAttachmentFromClipboard } from "../utils/clipboardParse";
 import { EMOJI_CATEGORIES, searchEmojis } from "../utils/emojiCatalog";
+import { useEmojiStyle } from "../utils/emojiStyleContext";
+import {
+  convertRetroShortcutsToEmoji,
+  RETRO_EMOTICONS,
+  searchRetroEmoticons,
+} from "../utils/retroEmoticons";
 import { RelayImage } from "./RelayImage";
+import { EmojiGlyph, RetroEmoticon } from "./RetroEmoticon";
 import { ThreadAvatar } from "./ThreadAvatar";
 
 const RECENT_EMOJIS_KEY = "teza.recentEmojis";
@@ -171,13 +178,28 @@ export function Composer({
     }, 350);
   };
   const { t } = useI18n();
+  const { emojiStyle } = useEmojiStyle();
   const [sending, setSending] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [pickerMode, setPickerMode] = useState<"emoji" | "sticker">("emoji");
   const [recentEmojis, setRecentEmojis] = useState<string[]>(() => readRecentEmojis());
-  const [emojiTab, setEmojiTab] = useState<string>(() =>
-    readRecentEmojis().length > 0 ? "recent" : (EMOJI_CATEGORIES[0]?.id ?? "smileys"),
-  );
+  const [emojiTab, setEmojiTab] = useState<string>(() => {
+    if (emojiStyle === "retro") return "retro";
+    return readRecentEmojis().length > 0 ? "recent" : (EMOJI_CATEGORIES[0]?.id ?? "smileys");
+  });
+  useEffect(() => {
+    if (emojiStyle === "retro") {
+      setEmojiTab("retro");
+    } else {
+      setEmojiTab((cur) =>
+        cur === "retro"
+          ? readRecentEmojis().length > 0
+            ? "recent"
+            : (EMOJI_CATEGORIES[0]?.id ?? "smileys")
+          : cur,
+      );
+    }
+  }, [emojiStyle]);
   const [emojiQuery, setEmojiQuery] = useState("");
   const [stickers, setStickers] = useState<StickerItem[] | null>(null);
   const [stickersLoading, setStickersLoading] = useState(false);
@@ -260,9 +282,18 @@ export function Composer({
     [emojiTab],
   );
 
+  const visibleRetroEmoticons = useMemo(() => {
+    const trimmed = emojiQuery.trim();
+    if (trimmed) {
+      return searchRetroEmoticons(trimmed);
+    }
+    return emojiTab === "retro" ? [...RETRO_EMOTICONS] : [];
+  }, [emojiQuery, emojiTab]);
+
   const visibleEmojis = useMemo(() => {
     const trimmed = emojiQuery.trim();
     if (trimmed) return searchEmojis(trimmed);
+    if (emojiTab === "retro") return [];
     if (emojiTab === "recent") return recentEmojis;
     return activeEmojiCategory ? activeEmojiCategory.items.map((item) => item.emoji) : [];
   }, [emojiQuery, emojiTab, recentEmojis, activeEmojiCategory]);
@@ -474,7 +505,8 @@ export function Composer({
     if (pendingAttachment && onSendAttachment) {
       setSending(true);
       const att = pendingAttachment;
-      const cap = draft;
+      const rawCap = draft;
+      const cap = emojiStyle === "retro" ? convertRetroShortcutsToEmoji(rawCap) : rawCap;
       try {
         const ok = await onSendAttachment(att, cap);
         if (ok !== false && ok !== null) {
@@ -491,15 +523,16 @@ export function Composer({
 
     if (!draft.trim()) return;
     setSending(true);
-    const text = draft;
+    const rawText = draft;
+    const text = emojiStyle === "retro" ? convertRetroShortcutsToEmoji(rawText) : rawText;
     setDraft("");
     try {
       const ok = await onSendText(text);
       if (ok === false) {
-        setDraft((cur) => (cur ? cur : text));
+        setDraft((cur) => (cur ? cur : rawText));
       }
     } catch {
-      setDraft((cur) => (cur ? cur : text));
+      setDraft((cur) => (cur ? cur : rawText));
     } finally {
       setSending(false);
     }
@@ -715,6 +748,21 @@ export function Composer({
                 <div className="mb-1.5 flex items-center gap-1 overflow-x-auto pb-1">
                   <button
                     type="button"
+                    title={t("emojiCatRetro")}
+                    onClick={() => {
+                      setEmojiQuery("");
+                      setEmojiTab("retro");
+                    }}
+                    className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg transition"
+                    style={{
+                      background: !emojiQuery.trim() && emojiTab === "retro" ? "var(--accent-soft)" : "transparent",
+                      color: !emojiQuery.trim() && emojiTab === "retro" ? "var(--accent)" : "var(--text-secondary)",
+                    }}
+                  >
+                    <RetroEmoticon id="smile" size={18} animated={false} />
+                  </button>
+                  <button
+                    type="button"
                     title={t("recentUsedLabel")}
                     onClick={() => {
                       setEmojiQuery("");
@@ -746,49 +794,97 @@ export function Composer({
                           color: active ? "var(--accent)" : "var(--text-secondary)",
                         }}
                       >
-                        {cat.icon}
+                        <EmojiGlyph emoji={cat.icon} size={17} animated={false} />
                       </button>
                     );
                   })}
                 </div>
 
-                <div className="mb-1.5 flex items-center justify-between text-[11px] font-medium" style={{ color: "var(--text-muted)" }}>
-                  <span>
-                    {emojiQuery.trim()
-                      ? t("searchResultsCount", { count: visibleEmojis.length })
-                      : emojiTab === "recent"
-                        ? t("recentUsedLabel")
-                        : activeEmojiCategory
-                          ? (EMOJI_CAT_LABEL_KEYS[activeEmojiCategory.id]
-                              ? t(EMOJI_CAT_LABEL_KEYS[activeEmojiCategory.id])
-                              : activeEmojiCategory.label)
-                          : ""}
-                  </span>
-                </div>
+                {(() => {
+                  const searching = Boolean(emojiQuery.trim());
+                  const showRetroInSearch = searching && emojiStyle === "retro";
+                  const retroGlyphSet = showRetroInSearch
+                    ? new Set(visibleRetroEmoticons.map((r) => r.emoji))
+                    : null;
+                  const filteredUnicode = retroGlyphSet
+                    ? visibleEmojis.filter((e) => !retroGlyphSet.has(e))
+                    : visibleEmojis;
+                  const showingRetroOnly = !searching && emojiTab === "retro";
+                  const totalCount = showingRetroOnly
+                    ? visibleRetroEmoticons.length
+                    : (showRetroInSearch ? visibleRetroEmoticons.length : 0) + filteredUnicode.length;
 
-                {visibleEmojis.length === 0 ? (
-                  <div
-                    className="flex h-44 items-center justify-center text-center text-xs"
-                    style={{ color: "var(--text-secondary)" }}
-                  >
-                    {emojiQuery.trim()
-                      ? t("noEmojiFound")
-                      : t("noRecentEmoji")}
-                  </div>
-                ) : (
-                  <div className="grid max-h-56 grid-cols-8 gap-1 overflow-y-auto pr-1">
-                    {visibleEmojis.map((emoji) => (
-                      <button
-                        key={emoji}
-                        type="button"
-                        onClick={() => insertEmojiAtCaret(emoji)}
-                        className="hover-menu flex h-8 w-8 items-center justify-center rounded-lg text-base transition hover:scale-110"
+                  return (
+                    <>
+                      <div
+                        className="mb-1.5 flex items-center justify-between text-[11px] font-medium"
+                        style={{ color: "var(--text-muted)" }}
                       >
-                        {emoji}
-                      </button>
-                    ))}
-                  </div>
-                )}
+                        <span>
+                          {searching
+                            ? t("searchResultsCount", { count: totalCount })
+                            : emojiTab === "retro"
+                              ? t("emojiCatRetro")
+                              : emojiTab === "recent"
+                                ? t("recentUsedLabel")
+                                : activeEmojiCategory
+                                  ? EMOJI_CAT_LABEL_KEYS[activeEmojiCategory.id]
+                                    ? t(EMOJI_CAT_LABEL_KEYS[activeEmojiCategory.id])
+                                    : activeEmojiCategory.label
+                                  : ""}
+                        </span>
+                      </div>
+
+                      {totalCount === 0 ? (
+                        <div
+                          className="flex h-44 items-center justify-center text-center text-xs"
+                          style={{ color: "var(--text-secondary)" }}
+                        >
+                          {searching ? t("noEmojiFound") : t("noRecentEmoji")}
+                        </div>
+                      ) : (
+                        <>
+                          <div className="grid max-h-56 grid-cols-8 gap-1 overflow-y-auto pr-1">
+                            {(showingRetroOnly || showRetroInSearch) &&
+                              visibleRetroEmoticons.map((item) => (
+                                <button
+                                  key={`retro-${item.id}`}
+                                  type="button"
+                                  title={`${item.label} (${item.primaryShortcut})`}
+                                  onClick={() => insertEmojiAtCaret(item.emoji)}
+                                  className="hover-menu flex h-8 w-8 items-center justify-center rounded-lg transition hover:scale-110"
+                                >
+                                  <RetroEmoticon id={item.id} size={23} />
+                                </button>
+                              ))}
+                            {!showingRetroOnly &&
+                              filteredUnicode.map((emoji) => (
+                                <button
+                                  key={emoji}
+                                  type="button"
+                                  onClick={() => insertEmojiAtCaret(emoji)}
+                                  className="hover-menu flex h-8 w-8 items-center justify-center rounded-lg text-base transition hover:scale-110"
+                                >
+                                  <EmojiGlyph emoji={emoji} size={21} animated={false} />
+                                </button>
+                              ))}
+                          </div>
+                          {(showingRetroOnly || showRetroInSearch) && (
+                            <div
+                              className="mt-1.5 truncate border-t pt-1 text-[10.5px]"
+                              style={{
+                                borderColor: "var(--border-subtle)",
+                                color: "var(--text-muted)",
+                              }}
+                            >
+                              {t("retroShortcutHint")}
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </>
+                  );
+                })()}
               </>
             ) : (
               <>

@@ -2,8 +2,11 @@ export type ThemeMode = "triforce" | "night-blue" | "dark" | "light";
 
 export type TranslateProvider = "deepl" | "gemini" | "azure";
 
+export type TranslateDetectMode = "api_cache" | "local_smart_skip";
+
 export interface TranslateConfigSummary {
   provider: TranslateProvider;
+  detect_mode: TranslateDetectMode;
   target_lang: string;
   gemini_model: string;
   azure_region: string;
@@ -18,6 +21,7 @@ export interface TranslateConfigSummary {
 export interface TranslateConfigUpdate {
   provider: TranslateProvider;
   target_lang: string;
+  detect_mode?: TranslateDetectMode;
   deepl_key?: string;
   gemini_key?: string;
   gemini_model?: string;
@@ -29,6 +33,7 @@ export interface TranslationResult {
   msg_id: string;
   translated_text: string;
   detected_source_lang: string | null;
+  skipped?: boolean;
 }
 
 export type FolderFilter = "all" | "unread" | "direct" | "group" | "cloud";
@@ -118,6 +123,8 @@ export interface NotifyToastPayload {
   theme: string;
   position: NotifyPosition;
   duration_ms: number;
+  is_buzz?: boolean;
+  buzz_streak?: number;
 }
 
 export interface ThreadMemberDto {

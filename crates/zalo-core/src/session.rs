@@ -63,6 +63,11 @@ pub const ALLOWED_MEDIA_HOST_SUFFIXES: &[&str] = &[
     "zapps.me",
     "zaloplatforms.com",
     "zing.vn",
+    "dlfl.vn",
+    "dlfl.me",
+    "flchat.vn",
+    "dlmd.me",
+    "mdchat.me",
 ];
 
 fn host_matches_suffix(normalized_host: &str, suffix: &str) -> bool {
@@ -1103,6 +1108,15 @@ impl Session {
     }
 
     pub async fn download_media_bytes(&self, url: &str, max_bytes: usize) -> Result<(Vec<u8>, String)> {
+        let media = self.download_media_with_meta(url, max_bytes).await?;
+        Ok((media.bytes, media.mime))
+    }
+
+    pub async fn download_media_with_meta(
+        &self,
+        url: &str,
+        max_bytes: usize,
+    ) -> Result<DownloadedMedia> {
         let mut current_url = match normalize_allowed_media_url(url) {
             Ok(u) => u,
             Err(origin) => {
@@ -1174,6 +1188,13 @@ impl Session {
             }
         }
 
+        let final_url = resp.url().to_string();
+        let content_disposition_filename = resp
+            .headers()
+            .get(reqwest::header::CONTENT_DISPOSITION)
+            .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
+            .and_then(parse_content_disposition_filename);
+
         let mime = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -1195,7 +1216,12 @@ impl Session {
             }
             buf.extend_from_slice(&chunk);
         }
-        Ok((buf, mime))
+        Ok(DownloadedMedia {
+            bytes: buf,
+            mime,
+            final_url,
+            content_disposition_filename,
+        })
     }
 
     pub async fn download_media_data_url(&self, url: &str, max_bytes: usize) -> Result<String> {
@@ -1203,6 +1229,119 @@ impl Session {
         let final_mime = infer_media_data_url_mime(url, &mime);
         Ok(format!("data:{final_mime};base64,{}", B64.encode(&bytes)))
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct DownloadedMedia {
+    pub bytes: Vec<u8>,
+    pub mime: String,
+    pub final_url: String,
+    pub content_disposition_filename: Option<String>,
+}
+
+fn percent_decode_utf8(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let h1 = (bytes[i + 1] as char).to_digit(16);
+            let h2 = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (h1, h2) {
+                out.push(((hi << 4) | lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn clean_disposition_basename(raw: &str) -> Option<String> {
+    let base = raw
+        .trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    if base.is_empty() || base == "." || base == ".." {
+        None
+    } else {
+        Some(base.to_string())
+    }
+}
+
+fn split_header_params_respecting_quotes(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut start = 0usize;
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (idx, &b) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_quotes && b == b'\\' {
+            escaped = true;
+            continue;
+        }
+        if b == b'"' {
+            in_quotes = !in_quotes;
+            continue;
+        }
+        if b == b';' && !in_quotes {
+            out.push(&s[start..idx]);
+            start = idx + 1;
+        }
+    }
+    if start <= s.len() {
+        out.push(&s[start..]);
+    }
+    out
+}
+
+pub fn parse_content_disposition_filename(header_val: &str) -> Option<String> {
+    let mut ext_star: Option<String> = None;
+    let mut plain: Option<String> = None;
+    for part in split_header_params_respecting_quotes(header_val)
+        .into_iter()
+        .skip(1)
+    {
+        let Some((raw_key, raw_val)) = part.split_once('=') else {
+            continue;
+        };
+        let key = raw_key.trim().to_ascii_lowercase();
+        let val = raw_val.trim();
+        if key == "filename*" {
+            let unquoted = val.trim_matches('"').trim();
+            let encoded = if let Some((_charset, after_first)) = unquoted.split_once('\'') {
+                if let Some((_lang, value)) = after_first.split_once('\'') {
+                    value
+                } else {
+                    unquoted
+                }
+            } else {
+                unquoted
+            };
+            let decoded = percent_decode_utf8(encoded);
+            if let Some(clean) = clean_disposition_basename(&decoded) {
+                ext_star = Some(clean);
+            }
+        } else if key == "filename" && plain.is_none() {
+            let unquoted = if val.starts_with('"') && val.ends_with('"') && val.len() >= 2 {
+                val[1..val.len() - 1].replace("\\\"", "\"")
+            } else {
+                val.trim_matches('"').to_string()
+            };
+            if let Some(clean) = clean_disposition_basename(&unquoted) {
+                plain = Some(clean);
+            }
+        }
+    }
+    ext_star.or(plain)
 }
 
 pub fn infer_media_data_url_mime(url: &str, content_type: &str) -> String {
@@ -1585,6 +1724,13 @@ mod tests {
             "assets.zapps.me",
             "stc.zaloplatforms.com",
             "mp3.zing.vn",
+            "file-stal-9.dlfl.vn",
+            "fg41.dlfl.vn",
+            "file-stal-1.dlfl.me",
+            "file-stal-9.flchat.vn",
+            "file-stal-9-te-vnso-pt-25.flchat.vn",
+            "video-stal-20.dlmd.me",
+            "video-stal-20-te-vnno-cm-1.mdchat.me",
             "FILES.ZALO.CLOUD.",
         ] {
             assert!(is_allowed_media_host(host), "expected allowed: {host}");
@@ -1598,6 +1744,10 @@ mod tests {
             "cdn.vcdn.com.vn",
             "evilzalo.cloud",
             "zalo.cloud.evil.com",
+            "evildlfl.vn",
+            "dlfl.vn.evil.com",
+            "evilflchat.vn",
+            "mdchat.me.evil.com",
             ".zdn.vn",
             "",
         ] {
@@ -1639,6 +1789,18 @@ mod tests {
                 .unwrap()
                 .as_str(),
             "https://s160-ava-talk.zadn.vn/14/ava.jpg"
+        );
+        assert_eq!(
+            normalize_allowed_media_url("http://file-stal-9.dlfl.vn/gr/test.xlsx")
+                .unwrap()
+                .as_str(),
+            "https://file-stal-9.dlfl.vn/gr/test.xlsx"
+        );
+        assert_eq!(
+            normalize_allowed_media_url("https://video-stal-20.dlmd.me/v.mp4")
+                .unwrap()
+                .as_str(),
+            "https://video-stal-20.dlmd.me/v.mp4"
         );
 
         // Non-standard ports rejected with origin-only diagnostic (no path/query leak)
@@ -1713,5 +1875,44 @@ mod tests {
             "avatar": "https://s160-ava-talk.zadn.vn/default"
         }));
         assert_eq!(s.profile.avatar, "");
+    }
+
+    #[test]
+    fn parse_content_disposition_filename_handles_plain_rfc5987_and_traversal() {
+        assert_eq!(
+            parse_content_disposition_filename(
+                r#"attachment; filename="Check NAD Change PN.xlsx""#
+            ),
+            Some("Check NAD Change PN.xlsx".to_string())
+        );
+        assert_eq!(
+            parse_content_disposition_filename(
+                r#"attachment; filename="fallback.pdf"; filename*=UTF-8''B%C3%A1o%20c%C3%A1o.pdf"#
+            ),
+            Some("Báo cáo.pdf".to_string())
+        );
+        assert_eq!(
+            parse_content_disposition_filename(
+                r#"attachment; filename*=UTF-8'en'annual%20report.pdf; filename="fallback.pdf""#
+            ),
+            Some("annual report.pdf".to_string())
+        );
+        assert_eq!(
+            parse_content_disposition_filename(r#"attachment; filename="Q1; summary.xlsx"; size=42"#),
+            Some("Q1; summary.xlsx".to_string())
+        );
+        assert_eq!(
+            parse_content_disposition_filename(r#"attachment; filename="Báo cáo.xlsx""#),
+            Some("Báo cáo.xlsx".to_string())
+        );
+        assert_eq!(
+            parse_content_disposition_filename(r#"attachment; filename="../../evil/report.docx""#),
+            Some("report.docx".to_string())
+        );
+        assert_eq!(
+            parse_content_disposition_filename(r#"inline; filename=archive.7z"#),
+            Some("archive.7z".to_string())
+        );
+        assert_eq!(parse_content_disposition_filename("attachment"), None);
     }
 }

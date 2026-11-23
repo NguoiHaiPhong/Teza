@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
-import { Check, KeyRound, Languages, Loader2, X } from "lucide-react";
+import { Check, KeyRound, Languages, Loader2, Trash2, X } from "lucide-react";
 import { bridge } from "../bridge";
 import { useI18n } from "../i18n";
 import type {
   TranslateConfigSummary,
   TranslateConfigUpdate,
+  TranslateDetectMode,
   TranslateProvider,
 } from "../types";
 
@@ -26,6 +27,7 @@ interface Props {
   config: TranslateConfigSummary | null;
   onClose: () => void;
   onSaved: (cfg: TranslateConfigSummary) => void;
+  onCacheCleared?: () => void;
 }
 
 export function TranslateSettingsModal({
@@ -33,9 +35,11 @@ export function TranslateSettingsModal({
   config,
   onClose,
   onSaved,
+  onCacheCleared,
 }: Props) {
   const { t } = useI18n();
   const [provider, setProvider] = useState<TranslateProvider>("deepl");
+  const [detectMode, setDetectMode] = useState<TranslateDetectMode>("api_cache");
   const [targetLang, setTargetLang] = useState("VI");
   const [deeplKey, setDeeplKey] = useState("");
   const [geminiKey, setGeminiKey] = useState("");
@@ -43,12 +47,15 @@ export function TranslateSettingsModal({
   const [azureKey, setAzureKey] = useState("");
   const [azureRegion, setAzureRegion] = useState("southeastasia");
   const [saving, setSaving] = useState(false);
+  const [clearingCache, setClearingCache] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [savedNotice, setSavedNotice] = useState(false);
+  const [cacheNotice, setCacheNotice] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open || !config) return;
     setProvider(config.provider);
+    setDetectMode(config.detect_mode || "api_cache");
     setTargetLang(config.target_lang || "VI");
     setGeminiModel(config.gemini_model || "gemini-2.0-flash");
     setAzureRegion(config.azure_region || "southeastasia");
@@ -57,6 +64,7 @@ export function TranslateSettingsModal({
     setAzureKey("");
     setError(null);
     setSavedNotice(false);
+    setCacheNotice(null);
   }, [open, config]);
 
   if (!open) return null;
@@ -66,9 +74,11 @@ export function TranslateSettingsModal({
     setSaving(true);
     setError(null);
     setSavedNotice(false);
+    setCacheNotice(null);
     try {
       const payload: TranslateConfigUpdate = {
         provider,
+        detect_mode: detectMode,
         target_lang: targetLang,
         gemini_model: geminiModel.trim() || "gemini-2.0-flash",
         azure_region: azureRegion.trim() || "southeastasia",
@@ -90,13 +100,29 @@ export function TranslateSettingsModal({
     }
   };
 
+  const handleClearCache = async () => {
+    setClearingCache(true);
+    setError(null);
+    setSavedNotice(false);
+    setCacheNotice(null);
+    try {
+      const count = await bridge.clearTranslateCache();
+      onCacheCleared?.();
+      setCacheNotice(t("translateCacheClearedNotice", { count }));
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setClearingCache(false);
+    }
+  };
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4"
       onClick={onClose}
     >
       <div
-        className="w-full max-w-lg rounded-2xl shadow-2xl overflow-hidden"
+        className="flex max-h-[90vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl shadow-2xl"
         style={{
           background: "var(--bg-sidebar)",
           border: "1px solid var(--border)",
@@ -105,7 +131,7 @@ export function TranslateSettingsModal({
         onClick={(e) => e.stopPropagation()}
       >
         <div
-          className="flex items-center justify-between px-5 py-3.5"
+          className="flex shrink-0 items-center justify-between px-5 py-3.5"
           style={{ borderBottom: "1px solid var(--border)" }}
         >
           <div className="flex items-center gap-2.5">
@@ -124,7 +150,7 @@ export function TranslateSettingsModal({
           </button>
         </div>
 
-        <form onSubmit={handleSave} className="space-y-4 p-5">
+        <form onSubmit={handleSave} className="space-y-4 overflow-y-auto p-5">
           <div>
             <label
               className="mb-1.5 block text-[13px] font-medium"
@@ -192,6 +218,66 @@ export function TranslateSettingsModal({
                 </option>
               ))}
             </select>
+          </div>
+
+          <div>
+            <label
+              className="mb-1.5 block text-[13px] font-medium"
+              style={{ color: "var(--text-secondary)" }}
+            >
+              {t("translateDetectModeLabel")}
+            </label>
+            <div className="space-y-2">
+              {(
+                [
+                  {
+                    id: "api_cache" as const,
+                    title: t("translateModeApiCacheTitle"),
+                    desc: t("translateModeApiCacheDesc"),
+                  },
+                  {
+                    id: "local_smart_skip" as const,
+                    title: t("translateModeLocalSkipTitle"),
+                    desc: t("translateModeLocalSkipDesc"),
+                  },
+                ]
+              ).map((opt) => {
+                const active = detectMode === opt.id;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => setDetectMode(opt.id)}
+                    className="flex w-full items-start gap-2.5 rounded-xl px-3 py-2.5 text-left transition"
+                    style={{
+                      background: active ? "var(--accent-soft)" : "var(--bg-surface)",
+                      border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
+                    }}
+                  >
+                    <span
+                      className="mt-1 h-2.5 w-2.5 shrink-0 rounded-full"
+                      style={{
+                        background: active ? "var(--accent)" : "var(--border)",
+                      }}
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div
+                        className="text-[13.5px] font-semibold"
+                        style={{ color: active ? "var(--accent)" : "var(--text-primary)" }}
+                      >
+                        {opt.title}
+                      </div>
+                      <div
+                        className="mt-0.5 text-[12px] leading-snug"
+                        style={{ color: "var(--text-secondary)" }}
+                      >
+                        {opt.desc}
+                      </div>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
           </div>
 
           {provider === "deepl" && (
@@ -376,27 +462,60 @@ export function TranslateSettingsModal({
             </div>
           )}
 
-          <div className="flex justify-end gap-2 pt-1">
+          {cacheNotice && (
+            <div
+              className="flex items-center gap-1.5 rounded-xl px-3 py-2 text-[13px]"
+              style={{
+                background: "var(--accent-soft)",
+                color: "var(--accent)",
+              }}
+            >
+              <Check className="h-4 w-4" />
+              {cacheNotice}
+            </div>
+          )}
+
+          <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
             <button
               type="button"
-              onClick={onClose}
-              className="rounded-xl px-4 py-2 text-[14px] font-medium"
+              disabled={clearingCache || saving}
+              onClick={() => void handleClearCache()}
+              className="hover-menu flex items-center gap-1.5 rounded-xl px-3 py-2 text-[13px] font-medium transition disabled:opacity-60"
               style={{
                 background: "var(--bg-surface)",
                 border: "1px solid var(--border)",
+                color: "var(--text-secondary)",
               }}
             >
-              {t("close")}
+              {clearingCache ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Trash2 className="h-3.5 w-3.5" />
+              )}
+              {t("translateClearCacheBtn")}
             </button>
-            <button
-              type="submit"
-              disabled={saving}
-              className="tf-btn flex items-center gap-1.5 rounded-xl px-4 py-2 text-[14px] font-medium text-white disabled:opacity-60"
-              style={{ background: "var(--accent)" }}
-            >
-              {saving && <Loader2 className="h-4 w-4 animate-spin" />}
-              {t("saveSettingsBtn")}
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={onClose}
+                className="rounded-xl px-4 py-2 text-[14px] font-medium"
+                style={{
+                  background: "var(--bg-surface)",
+                  border: "1px solid var(--border)",
+                }}
+              >
+                {t("close")}
+              </button>
+              <button
+                type="submit"
+                disabled={saving}
+                className="tf-btn flex items-center gap-1.5 rounded-xl px-4 py-2 text-[14px] font-medium text-white disabled:opacity-60"
+                style={{ background: "var(--accent)" }}
+              >
+                {saving && <Loader2 className="h-4 w-4 animate-spin" />}
+                {t("saveSettingsBtn")}
+              </button>
+            </div>
           </div>
         </form>
       </div>

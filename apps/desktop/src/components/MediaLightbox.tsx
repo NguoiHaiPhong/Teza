@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Check,
   ChevronLeft,
@@ -13,6 +13,13 @@ import {
 import { bridge } from "../bridge";
 import { useI18n } from "../i18n";
 import { copyImageReliable } from "../utils/clipboard";
+import {
+  clampLightboxPan,
+  clampLightboxZoom,
+  LIGHTBOX_MAX_ZOOM,
+  LIGHTBOX_MIN_ZOOM,
+  zoomAroundPoint,
+} from "../utils/lightboxPan";
 import {
   isBlobUrl,
   isDataImageUrl,
@@ -86,14 +93,79 @@ export function MediaLightbox({
 }: Props) {
   const { t } = useI18n();
   const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
   const [rotation, setRotation] = useState(0);
   const [copied, setCopied] = useState(false);
   const [saving, setSaving] = useState(false);
+
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const zoomRef = useRef(zoom);
+  const panRef = useRef(pan);
+  const rotationRef = useRef(rotation);
+  const suppressClickRef = useRef(false);
+  const dragRef = useRef({
+    active: false,
+    pointerId: -1,
+    startX: 0,
+    startY: 0,
+    startPanX: 0,
+    startPanY: 0,
+    moved: false,
+  });
+
+  zoomRef.current = zoom;
+  panRef.current = pan;
+  rotationRef.current = rotation;
 
   const valid = activeIndex !== null && activeIndex >= 0 && activeIndex < items.length;
   const current = valid ? items[activeIndex] : null;
   const hasPrev = valid && activeIndex > 0;
   const hasNext = valid && activeIndex < items.length - 1;
+
+  const getMetrics = useCallback(() => {
+    const stage = stageRef.current;
+    const img = stage?.querySelector("img") ?? null;
+    return {
+      stageW: stage?.clientWidth ?? 0,
+      stageH: stage?.clientHeight ?? 0,
+      imgW: img?.offsetWidth ?? 0,
+      imgH: img?.offsetHeight ?? 0,
+    };
+  }, []);
+
+  const applyZoom = useCallback(
+    (targetZoom: number, clientX?: number, clientY?: number) => {
+      const oldZoom = zoomRef.current;
+      const nextZoom = clampLightboxZoom(targetZoom);
+      if (nextZoom <= 1) {
+        setZoom(nextZoom);
+        setPan({ x: 0, y: 0 });
+        return;
+      }
+      const { stageW, stageH, imgW, imgH } = getMetrics();
+      let anchorPan = panRef.current;
+      if (typeof clientX === "number" && typeof clientY === "number" && stageRef.current) {
+        const rect = stageRef.current.getBoundingClientRect();
+        const cursorOffsetX = clientX - (rect.left + rect.width / 2);
+        const cursorOffsetY = clientY - (rect.top + rect.height / 2);
+        anchorPan = zoomAroundPoint(panRef.current, oldZoom, nextZoom, cursorOffsetX, cursorOffsetY);
+      }
+      const clamped = clampLightboxPan(
+        anchorPan.x,
+        anchorPan.y,
+        nextZoom,
+        stageW,
+        stageH,
+        imgW,
+        imgH,
+        rotationRef.current,
+      );
+      setZoom(nextZoom);
+      setPan(clamped);
+    },
+    [getMetrics],
+  );
 
   const goPrev = useCallback(() => {
     if (hasPrev && activeIndex !== null) onIndexChange(activeIndex - 1);
@@ -105,9 +177,73 @@ export function MediaLightbox({
 
   useEffect(() => {
     setZoom(1);
+    setPan({ x: 0, y: 0 });
+    setDragging(false);
+    dragRef.current.active = false;
+    suppressClickRef.current = false;
     setRotation(0);
     setCopied(false);
   }, [activeIndex, current?.url]);
+
+  useEffect(() => {
+    if (zoomRef.current <= 1) return;
+    const { stageW, stageH, imgW, imgH } = getMetrics();
+    setPan((prev) =>
+      clampLightboxPan(prev.x, prev.y, zoomRef.current, stageW, stageH, imgW, imgH, rotation),
+    );
+  }, [rotation, getMetrics]);
+
+  useEffect(() => {
+    if (!dragging) return;
+    const onPointerMove = (e: PointerEvent) => {
+      const drag = dragRef.current;
+      if (!drag.active || e.pointerId !== drag.pointerId) return;
+      const dx = e.clientX - drag.startX;
+      const dy = e.clientY - drag.startY;
+      if (!drag.moved && Math.hypot(dx, dy) > 4) {
+        drag.moved = true;
+      }
+      const { stageW, stageH, imgW, imgH } = getMetrics();
+      setPan(
+        clampLightboxPan(
+          drag.startPanX + dx,
+          drag.startPanY + dy,
+          zoomRef.current,
+          stageW,
+          stageH,
+          imgW,
+          imgH,
+          rotationRef.current,
+        ),
+      );
+    };
+    const finishDrag = (pointerId?: number) => {
+      const drag = dragRef.current;
+      if (!drag.active) return;
+      if (typeof pointerId === "number" && pointerId !== drag.pointerId) return;
+      if (drag.moved) {
+        suppressClickRef.current = true;
+        window.setTimeout(() => {
+          suppressClickRef.current = false;
+        }, 50);
+      }
+      drag.active = false;
+      setDragging(false);
+    };
+    const onPointerUp = (e: PointerEvent) => finishDrag(e.pointerId);
+    const onBlur = () => finishDrag();
+
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("pointercancel", onPointerUp);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+      window.removeEventListener("pointercancel", onPointerUp);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, [dragging, getMetrics]);
 
   useEffect(() => {
     if (!valid) return;
@@ -115,12 +251,13 @@ export function MediaLightbox({
       if (e.key === "Escape") onClose();
       else if (e.key === "ArrowLeft") goPrev();
       else if (e.key === "ArrowRight") goNext();
-      else if (e.key === "+" || e.key === "=") setZoom((z) => Math.min(3, +(z + 0.25).toFixed(2)));
-      else if (e.key === "-") setZoom((z) => Math.max(0.5, +(z - 0.25).toFixed(2)));
+      else if (e.key === "+" || e.key === "=") applyZoom(zoomRef.current + 0.25);
+      else if (e.key === "-") applyZoom(zoomRef.current - 0.25);
+      else if (e.key === "0") applyZoom(1);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [valid, onClose, goPrev, goNext]);
+  }, [valid, onClose, goPrev, goNext, applyZoom]);
 
   if (!current) return null;
 
@@ -148,7 +285,7 @@ export function MediaLightbox({
       const targetUrl = isBlobUrl(normalizedUrl)
         ? await blobUrlToDataUrl(normalizedUrl)
         : normalizedUrl;
-      await bridge.saveRemoteFile(targetUrl, current.title || "teza-image.png");
+      await bridge.saveRemoteFile(targetUrl, current.title || "teza-image");
     } catch (err) {
       onNotify?.(String(err));
     } finally {
@@ -159,7 +296,13 @@ export function MediaLightbox({
   return (
     <div
       className="fixed inset-0 z-50 flex flex-col bg-black/90 backdrop-blur-sm"
-      onClick={onClose}
+      onClick={() => {
+        if (suppressClickRef.current) {
+          suppressClickRef.current = false;
+          return;
+        }
+        onClose();
+      }}
     >
       <div
         className="flex h-14 shrink-0 items-center justify-between gap-3 px-5 text-white"
@@ -177,20 +320,27 @@ export function MediaLightbox({
         <div className="flex shrink-0 items-center gap-1.5">
           <button
             type="button"
-            onClick={() => setZoom((z) => Math.max(0.5, +(z - 0.25).toFixed(2)))}
+            disabled={zoom <= LIGHTBOX_MIN_ZOOM}
+            onClick={() => applyZoom(zoom - 0.25)}
             title={t("zoomOutTitle")}
-            className="rounded-lg p-2 hover:bg-white/10"
+            className="rounded-lg p-2 hover:bg-white/10 disabled:opacity-40"
           >
             <ZoomOut className="h-5 w-5" />
           </button>
-          <span className="w-11 text-center text-xs font-mono text-white/75">
-            {Math.round(zoom * 100)}%
-          </span>
           <button
             type="button"
-            onClick={() => setZoom((z) => Math.min(3, +(z + 0.25).toFixed(2)))}
+            onClick={() => applyZoom(1)}
+            title="100%"
+            className="w-12 rounded-md py-1 text-center text-xs font-mono text-white/75 hover:bg-white/10"
+          >
+            {Math.round(zoom * 100)}%
+          </button>
+          <button
+            type="button"
+            disabled={zoom >= LIGHTBOX_MAX_ZOOM}
+            onClick={() => applyZoom(zoom + 0.25)}
             title={t("zoomInTitle")}
-            className="rounded-lg p-2 hover:bg-white/10"
+            className="rounded-lg p-2 hover:bg-white/10 disabled:opacity-40"
           >
             <ZoomIn className="h-5 w-5" />
           </button>
@@ -234,14 +384,27 @@ export function MediaLightbox({
       </div>
 
       <div
-        className="relative flex flex-1 items-center justify-center overflow-hidden p-6"
+        ref={stageRef}
+        className="relative flex flex-1 items-center justify-center overflow-hidden p-6 select-none"
         onWheel={(e) => {
           e.stopPropagation();
-          setZoom((z) =>
-            e.deltaY < 0
-              ? Math.min(3, +(z + 0.15).toFixed(2))
-              : Math.max(0.5, +(z - 0.15).toFixed(2)),
-          );
+          applyZoom(e.deltaY < 0 ? zoom + 0.2 : zoom - 0.2, e.clientX, e.clientY);
+        }}
+        onPointerDown={(e) => {
+          if (zoom <= 1 || e.button !== 0) return;
+          if ((e.target as HTMLElement | null)?.closest("button")) return;
+          e.preventDefault();
+          suppressClickRef.current = false;
+          dragRef.current = {
+            active: true,
+            pointerId: e.pointerId,
+            startX: e.clientX,
+            startY: e.clientY,
+            startPanX: panRef.current.x,
+            startPanY: panRef.current.y,
+            moved: false,
+          };
+          setDragging(true);
         }}
       >
         {hasPrev && (
@@ -262,16 +425,25 @@ export function MediaLightbox({
           src={normalizedUrl}
           alt={current.title}
           referrerPolicy="no-referrer"
+          draggable={false}
           onClick={(e) => {
             e.stopPropagation();
-            setZoom((z) => (z > 1 ? 1 : 1.75));
+            if (suppressClickRef.current) {
+              suppressClickRef.current = false;
+              return;
+            }
+            if (zoom > 1) {
+              applyZoom(1);
+            } else {
+              applyZoom(2, e.clientX, e.clientY);
+            }
           }}
           style={{
-            transform: `scale(${zoom}) rotate(${rotation}deg)`,
+            transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${zoom}) rotate(${rotation}deg)`,
           }}
-          className={`max-h-full max-w-full rounded-lg shadow-2xl transition-transform duration-150 ${
-            zoom > 1 ? "cursor-zoom-out" : "cursor-zoom-in"
-          }`}
+          className={`max-h-full max-w-full rounded-lg shadow-2xl select-none ${
+            dragging ? "" : "transition-transform duration-150"
+          } ${zoom > 1 ? (dragging ? "cursor-grabbing" : "cursor-grab") : "cursor-zoom-in"}`}
         />
 
         {hasNext && (

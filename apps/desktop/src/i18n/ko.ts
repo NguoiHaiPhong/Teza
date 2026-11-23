@@ -129,6 +129,7 @@ export const ko: Record<TranslationKey, string> = {
   composerEmojiTitle: "이모지 및 스티커 삽입",
   composerBuzzTitle: "BUZZ! 알림 보내기 (5초 쿨타임)",
   composerBuzzCooldown: "BUZZ 재전송까지 {secs}초 대기",
+  buzzSentByUser: "{name}님이 BUZZ!를 보냈습니다",
   composerReminderTitle: "일정 알림 만들기",
   composerPollTitle: "그룹 투표 만들기",
   composerSendTitle: "메시지 보내기",
@@ -160,6 +161,7 @@ export const ko: Record<TranslationKey, string> = {
   viewTranslation: "번역 보기",
   hideTranslation: "숨기기",
   translatingBody: "메시지 번역 중...",
+  alreadyInTargetLang: "이미 {lang} 메시지입니다 — 번역이 필요하지 않습니다",
   pinnedBadgeTitle: "고정된 메시지",
   reactTitle: "반응 남기기",
   replyTitle: "답장",
@@ -443,6 +445,16 @@ export const ko: Record<TranslationKey, string> = {
   azureKeyPlaceholder: "Azure Cognitive Services Translator 키 입력",
   azureRegionLabel: "Azure 리전",
   translateSavedNotice: "번역 설정이 안전하게 저장되었습니다.",
+  translateDetectModeLabel: "언어 감지 모드",
+  translateModeApiCacheTitle: "API 우선 + SQLite 캐시 (권장)",
+  translateModeApiCacheDesc: "이미지·파일·링크·코드만 로컬 제외하고 API가 정확히 감지한 뒤 암호화된 SQLite에 영구 저장합니다(메시지당 1회 호출).",
+  translateModeLocalSkipTitle: "로컬 스마트 건너뛰기 + SQLite 캐시",
+  translateModeLocalSkipDesc: "명백히 같은 언어인 메시지는 먼저 로컬에서 건너뛰어 첫 호출을 절약하고 나머지는 SQLite에 영구 저장합니다.",
+  translateClearCacheBtn: "번역 캐시 삭제",
+  translateCacheClearedNotice: "SQLite에서 저장된 번역 {count}개를 삭제했습니다.",
+  translateModeBadgeApi: "API + SQLite",
+  translateModeBadgeLocal: "로컬 필터 + SQLite",
+  viewMemberProfileTitle: "계정 정보 보기",
   saveSettingsBtn: "설정 저장",
 
   // Other Modals
@@ -605,4 +617,12 @@ export const ko: Record<TranslationKey, string> = {
   screenshotCaptureError: "화면 캡처 실패: {err}",
   screenshotDesktopOnly: "화면 캡처는 데스크톱 앱에서만 사용할 수 있습니다",
   shortcutScreenshot: "화면 캡처 및 편집",
+
+  // Retro emoticons & emoji style
+  emojiStyleHeading: "이모지 스타일",
+  emojiStyleRetro: "레트로 (클래식 애니메이션)",
+  emojiStyleSystem: "시스템 (기본값)",
+  emojiStyleDesc: ":)) =)) :(( ;) >:) :-* 같은 단축 입력을 변환하고 움직이는 레트로 이모티콘으로 표시",
+  emojiCatRetro: "레트로 클래식",
+  retroShortcutHint: "단축키 :), :D, :)), =)), :((, ;), >:), :-*, B-)...",
 };

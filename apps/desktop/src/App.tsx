@@ -48,8 +48,11 @@ import { bridge, isTauri } from "./bridge";
 import {
   BUZZ_COOLDOWN_MS,
   BUZZ_TEXT,
+  type BuzzStreakMap,
   isBuzzMessage,
   playBuzzSound,
+  recordIncomingBuzz,
+  resetBuzzStreak,
 } from "./utils/buzz";
 import {
   classifyDrawerFileAction,
@@ -77,9 +80,16 @@ import {
   findFirstUnreadMsgId,
   formatDayLabel,
   formatThreadTime,
+  getDisplayBodyText,
   looksLikePhoneQuery,
   upsertMsg,
 } from "./utils/threadState";
+import {
+  classifySkipTranslation,
+  isEffectivelySameText,
+  isSameLangCode,
+  normalizeLangBase,
+} from "./utils/translateFilter";
 import { AddGroupMembersModal } from "./components/AddGroupMembersModal";
 import { Composer } from "./components/Composer";
 import { CreatePollModal } from "./components/CreatePollModal";
@@ -321,6 +331,8 @@ export default function App() {
     threadId: string;
     threadTitle: string;
     senderName: string;
+    streak: number;
+    nonce: number;
   } | null>(null);
   const [buzzCooldownUntil, setBuzzCooldownUntil] = useState<Record<string, number>>({});
   const [buzzNow, setBuzzNow] = useState(() => Date.now());
@@ -343,16 +355,26 @@ export default function App() {
   const visibleThreadsRef = useRef<ThreadDto[]>([]);
   const notifyPrefsRef = useRef<NotificationPrefs>(notifyPrefs);
   const themeRef = useRef<ThemeMode>(theme);
+  const tRef = useRef(t);
   const myProfileRef = useRef<AccountProfile | null>(myProfile);
   const webToastTimerRef = useRef<number | null>(null);
   const toastErrorTimerRef = useRef<number | null>(null);
+  const buzzStreaksRef = useRef<BuzzStreakMap>(new Map());
+  const buzzShakeTimerRef = useRef<number | null>(null);
+  const buzzToastTimerRef = useRef<number | null>(null);
   const activeThreadRootIdRef = useRef<string | null>(activeThreadRootId);
   const inChatSearchInputRef = useRef<HTMLInputElement | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const messagesContentRef = useRef<HTMLDivElement | null>(null);
+  const stickToBottomRef = useRef<boolean>(false);
+  const initialScrollReadyRef = useRef<boolean>(true);
+  const lastProgrammaticScrollAtRef = useRef<number>(0);
   const pendingJumpRef = useRef<{ threadId: string; msgId: string; ts: number } | null>(null);
   const bootedRef = useRef(false);
   const translationsRef = useRef(translationsByMsg);
+  const translateCfgRef = useRef<TranslateConfigSummary | null>(translateCfg);
+  const translationCacheRef = useRef<Map<string, MessageTranslationState>>(new Map());
   const inFlightTranslateRef = useRef<Set<string>>(new Set());
   const prevConnStatusRef = useRef<ConnectionStatus>(connStatus);
   const lastOlderCursorRef = useRef<string | null>(null);
@@ -380,9 +402,11 @@ export default function App() {
   threadsRef.current = threads;
   notifyPrefsRef.current = notifyPrefs;
   themeRef.current = theme;
+  tRef.current = t;
   myProfileRef.current = myProfile;
   activeThreadRootIdRef.current = activeThreadRootId;
   translationsRef.current = translationsByMsg;
+  translateCfgRef.current = translateCfg;
   pinnedMsgIdsRef.current = new Set(pinnedMessages.map((p) => p.msg_id));
   isLockedRef.current = isLocked;
   passcodeEnabledRef.current = passcodeCfg.enabled;
@@ -711,6 +735,13 @@ export default function App() {
     }, 5000);
   }, []);
 
+  const snapScrollToBottom = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    lastProgrammaticScrollAtRef.current = performance.now();
+    el.scrollTop = el.scrollHeight;
+  }, []);
+
   useEffect(() => {
     return () => {
       if (toastErrorTimerRef.current !== null) {
@@ -742,6 +773,8 @@ export default function App() {
     setPinnedIdx(0);
     setThreadRenderLimit(100);
     setTranslationsByMsg({});
+    translationCacheRef.current.clear();
+    stickToBottomRef.current = false;
     setThreadAutoTranslate({});
     setThreads([]);
     setCustomFolders([]);
@@ -771,40 +804,94 @@ export default function App() {
 
   const isTranslatableText = useCallback((m: MessageDto) => {
     if (m.is_recalled) return false;
-    const t = m.text.trim();
-    if (!t) return false;
-    const exactSkip = [
-      "[Nhãn dán]",
-      "[Hình ảnh]",
-      "[Video]",
-      "[Tin nhắn thoại]",
-      "[Tệp đính kèm]",
-      "[Tin nhắn đã thu hồi]",
-      "[Thiệp/Danh thiếp]",
-      "[Vị trí]",
-      "[Cuộc gọi]",
-    ];
-    return !exactSkip.includes(t);
+    return getDisplayBodyText(m).trim().length > 0;
   }, []);
 
   const translateBatchMessages = useCallback(
-    async (targetMsgs: MessageDto[], targetLang: string, singleMode = false) => {
-      const pending = targetMsgs.filter((m) => {
+    async (
+      targetMsgs: MessageDto[],
+      targetLang: string,
+      singleMode = false,
+      forceRefresh = false,
+    ) => {
+      const candidates = targetMsgs.filter((m) => {
         if (!isTranslatableText(m)) return false;
-        const cur = translationsRef.current[m.msg_id];
-        if (!singleMode && cur && cur.targetLang === targetLang && (cur.text || cur.loading)) {
-          return false;
+        if (!forceRefresh) {
+          const cur = translationsRef.current[m.msg_id];
+          if (
+            !singleMode &&
+            cur &&
+            cur.targetLang === targetLang &&
+            (cur.text || cur.loading || cur.skipped)
+          ) {
+            return false;
+          }
         }
         return !inFlightTranslateRef.current.has(`${m.msg_id}:${targetLang}`);
       });
-      if (pending.length === 0) return;
+      if (candidates.length === 0) return;
 
-      for (const m of pending) {
+      const detectMode = translateCfgRef.current?.detect_mode ?? "api_cache";
+      const immediateUpdates: Record<string, MessageTranslationState> = {};
+      const toFetch: { msg: MessageDto; text: string }[] = [];
+
+      for (const m of candidates) {
+        const text = getDisplayBodyText(m);
+        const cacheKey = `${m.msg_id}:${targetLang}`;
+        if (!forceRefresh) {
+          const cached = translationCacheRef.current.get(cacheKey);
+          if (cached) {
+            immediateUpdates[m.msg_id] =
+              singleMode && cached.skipped && cached.src
+                ? { ...cached, note: t("alreadyInTargetLang", { lang: targetLang }) }
+                : cached;
+            continue;
+          }
+        }
+
+        const skipReason = classifySkipTranslation(text, targetLang);
+        if (!forceRefresh && skipReason === "non_linguistic") {
+          const baseEntry: MessageTranslationState = {
+            targetLang,
+            loading: false,
+            skipped: true,
+          };
+          translationCacheRef.current.set(cacheKey, baseEntry);
+          immediateUpdates[m.msg_id] = baseEntry;
+          continue;
+        }
+        if (
+          !forceRefresh &&
+          skipReason === "same_language" &&
+          detectMode === "local_smart_skip"
+        ) {
+          const baseEntry: MessageTranslationState = {
+            targetLang,
+            loading: false,
+            skipped: true,
+            src: normalizeLangBase(targetLang),
+          };
+          translationCacheRef.current.set(cacheKey, baseEntry);
+          immediateUpdates[m.msg_id] = singleMode
+            ? { ...baseEntry, note: t("alreadyInTargetLang", { lang: targetLang }) }
+            : baseEntry;
+          continue;
+        }
+
+        toFetch.push({ msg: m, text });
+      }
+
+      if (Object.keys(immediateUpdates).length > 0) {
+        setTranslationsByMsg((prev) => ({ ...prev, ...immediateUpdates }));
+      }
+      if (toFetch.length === 0) return;
+
+      for (const { msg: m } of toFetch) {
         inFlightTranslateRef.current.add(`${m.msg_id}:${targetLang}`);
       }
       setTranslationsByMsg((prev) => {
         const next = { ...prev };
-        for (const m of pending) {
+        for (const { msg: m } of toFetch) {
           next[m.msg_id] = { targetLang, loading: true };
         }
         return next;
@@ -813,24 +900,51 @@ export default function App() {
 
       try {
         const results = await bridge.translateMessages(
-          pending.map((m) => ({ msg_id: m.msg_id, text: m.text })),
+          toFetch.map(({ msg: m, text }) => ({ msg_id: m.msg_id, text })),
           targetLang,
+          undefined,
+          forceRefresh,
         );
         const byId = new Map(results.map((r) => [r.msg_id, r]));
+        const fetchedEntries: Record<string, MessageTranslationState> = {};
+        const missingIds: string[] = [];
+        for (const { msg: m, text } of toFetch) {
+          const hit = byId.get(m.msg_id);
+          const cacheKey = `${m.msg_id}:${targetLang}`;
+          if (!hit) {
+            missingIds.push(m.msg_id);
+            continue;
+          }
+          const isSkipped =
+            Boolean(hit.skipped) ||
+            isSameLangCode(hit.detected_source_lang, targetLang) ||
+            isEffectivelySameText(text, hit.translated_text);
+          if (isSkipped) {
+            const baseEntry: MessageTranslationState = {
+              targetLang,
+              loading: false,
+              skipped: true,
+              src: hit.detected_source_lang,
+            };
+            translationCacheRef.current.set(cacheKey, baseEntry);
+            fetchedEntries[m.msg_id] = singleMode
+              ? { ...baseEntry, note: t("alreadyInTargetLang", { lang: targetLang }) }
+              : baseEntry;
+          } else {
+            const entry: MessageTranslationState = {
+              text: hit.translated_text,
+              src: hit.detected_source_lang,
+              targetLang,
+              loading: false,
+            };
+            translationCacheRef.current.set(cacheKey, entry);
+            fetchedEntries[m.msg_id] = entry;
+          }
+        }
         setTranslationsByMsg((prev) => {
-          const next = { ...prev };
-          for (const m of pending) {
-            const hit = byId.get(m.msg_id);
-            if (hit) {
-              next[m.msg_id] = {
-                text: hit.translated_text,
-                src: hit.detected_source_lang,
-                targetLang,
-                loading: false,
-              };
-            } else {
-              delete next[m.msg_id];
-            }
+          const next = { ...prev, ...fetchedEntries };
+          for (const mid of missingIds) {
+            delete next[mid];
           }
           return next;
         });
@@ -838,7 +952,7 @@ export default function App() {
         const msg = String(err);
         setTranslationsByMsg((prev) => {
           const next = { ...prev };
-          for (const m of pending) {
+          for (const { msg: m } of toFetch) {
             if (singleMode) {
               next[m.msg_id] = { targetLang, loading: false, error: msg };
             } else {
@@ -849,13 +963,13 @@ export default function App() {
         });
         showError(msg);
       } finally {
-        for (const m of pending) {
+        for (const { msg: m } of toFetch) {
           inFlightTranslateRef.current.delete(`${m.msg_id}:${targetLang}`);
         }
         if (!singleMode) setThreadTranslating(false);
       }
     },
-    [isTranslatableText, showError],
+    [isTranslatableText, showError, t],
   );
 
   const handleTranslateSingle = useCallback(
@@ -1039,7 +1153,10 @@ export default function App() {
           const isActiveThread = msg.thread_id === selectedIdRef.current;
           const el = isActiveThread ? scrollContainerRef.current : null;
           const nearBottom =
-            isActiveThread && (!el || el.scrollHeight - el.scrollTop - el.clientHeight < 140);
+            isActiveThread &&
+            (stickToBottomRef.current ||
+              !el ||
+              el.scrollHeight - el.scrollTop - el.clientHeight < 140);
           const readingLive =
             !msg.is_outgoing &&
             nearBottom &&
@@ -1061,6 +1178,9 @@ export default function App() {
             if (!msg.is_outgoing && readingLive) {
               completeMarkReadForThread(msg.thread_id);
             }
+            if (msg.is_outgoing) {
+              stickToBottomRef.current = true;
+            }
             if ((nearBottom && pendingMarkReadRef.current !== msg.thread_id) || msg.is_outgoing) {
               setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
             } else if (!msg.is_outgoing) {
@@ -1072,23 +1192,79 @@ export default function App() {
           const isRecent = Math.abs(Date.now() - msg.ts) < 90_000;
           const prefs = notifyPrefsRef.current;
           const threadMuted = isThreadCurrentlyMuted(matchedThread);
+          if (!isBuzzMessage(msg)) {
+            resetBuzzStreak(buzzStreaksRef.current, msg.thread_id);
+          }
           if (!msg.is_outgoing && isBuzzMessage(msg) && prefs.buzz) {
             if (!threadMuted && isRecent) {
-              playBuzzSound();
-              if (!isLockedRef.current) {
-                setBuzzShaking(true);
-                setTimeout(() => setBuzzShaking(false), 1200);
-                setBuzzToast({
-                  threadId: msg.thread_id,
-                  threadTitle: matchedThread?.title || msg.sender_name || msg.thread_id,
-                  senderName: msg.sender_name || matchedThread?.title || "Liên hệ",
-                });
-                setTimeout(() => setBuzzToast(null), 5000);
-              }
-              if (isTauri()) {
-                void getCurrentWindow()
-                  .requestUserAttention(2)
-                  .catch(() => undefined);
+              const streak = recordIncomingBuzz(
+                buzzStreaksRef.current,
+                msg.thread_id,
+                msg.msg_id,
+                Date.now(),
+              );
+              if (!streak.isDuplicate) {
+                const fullScreenBuzz = streak.shouldShakeScreen;
+                playBuzzSound(fullScreenBuzz);
+                const senderName = msg.sender_name || matchedThread?.title || "Liên hệ";
+                const locked = isLockedRef.current;
+                if (prefs.enabled) {
+                  triggerNotifyPopup({
+                    thread_id: msg.thread_id,
+                    title: locked ? "Teza" : matchedThread?.title || msg.sender_name || "Teza",
+                    body: locked
+                      ? streak.count >= 2
+                        ? `⚡ BUZZ! (×${streak.count})`
+                        : "⚡ BUZZ!"
+                      : `${tRef.current("buzzSentByUser", { name: senderName })}${
+                          streak.count >= 2 ? ` (×${streak.count})` : ""
+                        }`,
+                    avatar: locked ? "" : matchedThread?.avatar || "",
+                    theme: themeRef.current,
+                    position: prefs.position,
+                    duration_ms: prefs.durationSec * 1000,
+                    is_buzz: true,
+                    buzz_streak: streak.count,
+                  });
+                }
+                if (!locked) {
+                  setBuzzToast({
+                    threadId: msg.thread_id,
+                    threadTitle: matchedThread?.title || msg.sender_name || msg.thread_id,
+                    senderName,
+                    streak: streak.count,
+                    nonce: Date.now(),
+                  });
+                  if (buzzToastTimerRef.current !== null) {
+                    window.clearTimeout(buzzToastTimerRef.current);
+                  }
+                  buzzToastTimerRef.current = window.setTimeout(() => {
+                    buzzToastTimerRef.current = null;
+                    setBuzzToast(null);
+                  }, 5000);
+                }
+                if (buzzShakeTimerRef.current !== null) {
+                  window.clearTimeout(buzzShakeTimerRef.current);
+                  buzzShakeTimerRef.current = null;
+                }
+                if (fullScreenBuzz && isTauri()) {
+                  setBuzzShaking(false);
+                  window.setTimeout(() => {
+                    void bridge.buzzShakeScreen().catch(() => undefined);
+                  }, 60);
+                } else {
+                  setBuzzShaking(false);
+                  window.requestAnimationFrame(() => setBuzzShaking(true));
+                  buzzShakeTimerRef.current = window.setTimeout(() => {
+                    buzzShakeTimerRef.current = null;
+                    setBuzzShaking(false);
+                  }, 1200);
+                }
+                if (isTauri()) {
+                  void getCurrentWindow()
+                    .requestUserAttention(2)
+                    .catch(() => undefined);
+                }
               }
             }
           } else if (isRecent) {
@@ -1158,7 +1334,13 @@ export default function App() {
           (ev) => {
             if (ev.payload.thread_id !== selectedIdRef.current) return;
             const el = scrollContainerRef.current;
-            const nearBottom = !el || el.scrollHeight - el.scrollTop - el.clientHeight < 180;
+            const shouldStick =
+              stickToBottomRef.current ||
+              !el ||
+              el.scrollHeight - el.scrollTop - el.clientHeight < 180;
+            if (shouldStick) {
+              stickToBottomRef.current = true;
+            }
             setMessages((prev) => {
               let next = prev;
               for (const m of ev.payload.messages) {
@@ -1176,8 +1358,15 @@ export default function App() {
             if (newest) {
               setThreads((prev) => bumpThreadList(prev, newest, false));
             }
-            if (nearBottom) {
-              setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
+            if (shouldStick) {
+              window.requestAnimationFrame(() => {
+                if (stickToBottomRef.current && selectedIdRef.current === ev.payload.thread_id) {
+                  snapScrollToBottom();
+                }
+              });
+              if (pendingMarkReadRef.current !== ev.payload.thread_id) {
+                completeMarkReadForThread(ev.payload.thread_id);
+              }
             }
           },
         ),
@@ -1211,6 +1400,7 @@ export default function App() {
     completeMarkReadForThread,
     openThreadById,
     triggerNotifyPopup,
+    snapScrollToBottom,
   ]);
 
   useEffect(() => {
@@ -1364,6 +1554,13 @@ export default function App() {
   useEffect(() => {
     if (!authed || !selectedId) return;
     let cancelled = false;
+    initialScrollReadyRef.current = false;
+    stickToBottomRef.current = false;
+    let raf1 = 0;
+    let raf2 = 0;
+    const timers: number[] = [];
+    let detachUserWatch: (() => void) | null = null;
+
     const current = threadsRef.current.find((t) => t.id === selectedId);
     const initUnread = current?.unread_count ?? 0;
     const initWatermark = current?.last_read_in_ts ?? 0;
@@ -1402,6 +1599,7 @@ export default function App() {
         const pending = pendingJumpRef.current;
         if (pending && pending.threadId === selectedId) {
           pendingJumpRef.current = null;
+          stickToBottomRef.current = false;
           if (!page.messages.some((m) => m.msg_id === pending.msgId)) {
             const around = await bridge.loadMessagesAround(selectedId, pending.ts);
             if (cancelled) return;
@@ -1411,36 +1609,87 @@ export default function App() {
             setMessages(page.messages);
             setHasMoreHistory(page.has_more);
           }
-          setTimeout(() => void jumpToMsg(pending.msgId), 60);
+          timers.push(
+            window.setTimeout(() => {
+              if (cancelled) return;
+              void jumpToMsg(pending.msgId);
+              initialScrollReadyRef.current = true;
+            }, 60),
+          );
         } else {
           setMessages(page.messages);
           setHasMoreHistory(page.has_more);
           const targetUnreadId = findFirstUnreadMsgId(page.messages, initWatermark, initUnread);
           if (targetUnreadId) {
-            setTimeout(() => {
+            stickToBottomRef.current = false;
+            raf1 = window.requestAnimationFrame(() => {
               if (cancelled) return;
-              document
-                .getElementById("unread-divider")
-                ?.scrollIntoView({ block: "start" });
-              requestAnimationFrame(() => {
+              raf2 = window.requestAnimationFrame(() => {
                 if (cancelled) return;
+                lastProgrammaticScrollAtRef.current = performance.now();
+                document
+                  .getElementById("unread-divider")
+                  ?.scrollIntoView({ block: "start" });
                 const el = scrollContainerRef.current;
                 if (!el || el.scrollHeight - el.scrollTop - el.clientHeight < 90) {
                   completeMarkReadForThread(selectedId);
+                  stickToBottomRef.current = true;
                 } else {
                   setShowScrollDown(true);
                   setUnreadBelow(initUnread);
                 }
+                initialScrollReadyRef.current = true;
+
+                let userInteracted = false;
+                const markUserInteracted = () => {
+                  userInteracted = true;
+                };
+                if (el) {
+                  el.addEventListener("wheel", markUserInteracted, { passive: true });
+                  el.addEventListener("pointerdown", markUserInteracted, { passive: true });
+                  detachUserWatch = () => {
+                    el.removeEventListener("wheel", markUserInteracted);
+                    el.removeEventListener("pointerdown", markUserInteracted);
+                  };
+                }
+                timers.push(
+                  window.setTimeout(() => {
+                    detachUserWatch?.();
+                    detachUserWatch = null;
+                    if (cancelled || userInteracted || stickToBottomRef.current) return;
+                    const divider = document.getElementById("unread-divider");
+                    if (divider) {
+                      lastProgrammaticScrollAtRef.current = performance.now();
+                      divider.scrollIntoView({ block: "start" });
+                    }
+                  }, 150),
+                );
               });
-            }, 50);
+            });
           } else {
-            setTimeout(() => {
+            stickToBottomRef.current = true;
+            raf1 = window.requestAnimationFrame(() => {
               if (cancelled) return;
-              bottomRef.current?.scrollIntoView();
-              if (pendingMarkReadRef.current === selectedId) {
-                completeMarkReadForThread(selectedId);
-              }
-            }, 40);
+              raf2 = window.requestAnimationFrame(() => {
+                if (cancelled) return;
+                if (stickToBottomRef.current) {
+                  snapScrollToBottom();
+                }
+                initialScrollReadyRef.current = true;
+                if (pendingMarkReadRef.current === selectedId) {
+                  completeMarkReadForThread(selectedId);
+                }
+              });
+            });
+            timers.push(
+              window.setTimeout(() => {
+                if (cancelled) return;
+                initialScrollReadyRef.current = true;
+                if (stickToBottomRef.current) {
+                  snapScrollToBottom();
+                }
+              }, 120),
+            );
           }
         }
       })
@@ -1449,8 +1698,13 @@ export default function App() {
       });
     return () => {
       cancelled = true;
+      if (raf1) window.cancelAnimationFrame(raf1);
+      if (raf2) window.cancelAnimationFrame(raf2);
+      for (const id of timers) window.clearTimeout(id);
+      detachUserWatch?.();
+      detachUserWatch = null;
     };
-  }, [authed, selectedId, jumpToMsg, refreshPinnedMessages, completeMarkReadForThread]);
+  }, [authed, selectedId, jumpToMsg, refreshPinnedMessages, completeMarkReadForThread, snapScrollToBottom]);
 
   const activeThreadLang = selectedId ? threadAutoTranslate[selectedId] : undefined;
   const prevTranslateCodeRef = useRef(translateCode);
@@ -1489,6 +1743,7 @@ export default function App() {
 
   const loadOlderMessages = useCallback(async () => {
     if (!selectedId || loadingOlder || !hasMoreHistory || messages.length === 0) return;
+    stickToBottomRef.current = false;
     const oldest = messages[0];
     const container = scrollContainerRef.current;
     const prevScrollHeight = container?.scrollHeight ?? 0;
@@ -1510,6 +1765,7 @@ export default function App() {
         });
         requestAnimationFrame(() => {
           if (container) {
+            lastProgrammaticScrollAtRef.current = performance.now();
             const delta = container.scrollHeight - prevScrollHeight;
             container.scrollTop = prevScrollTop + delta;
           }
@@ -1561,6 +1817,20 @@ export default function App() {
     () => threads.find((t) => t.id === selectedId) ?? null,
     [threads, selectedId],
   );
+  const hasActiveThread = Boolean(activeThread);
+
+  useEffect(() => {
+    if (!authed || !selectedId || !hasActiveThread) return;
+    const contentEl = messagesContentRef.current;
+    if (!contentEl || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (stickToBottomRef.current) {
+        snapScrollToBottom();
+      }
+    });
+    observer.observe(contentEl);
+    return () => observer.disconnect();
+  }, [authed, selectedId, hasActiveThread, snapScrollToBottom]);
 
   const inChatMatches = useMemo(() => {
     const q = inChatSearchQuery.trim().toLowerCase();
@@ -2243,6 +2513,32 @@ export default function App() {
     [activeThread, threadDetails],
   );
 
+  const messageMentionCandidates = useMemo(() => {
+    const byId = new Map<string, { id: string; name: string }>();
+    const add = (id: string | undefined, name: string | undefined) => {
+      const uid = (id || "").trim();
+      const nm = (name || "").trim();
+      if (!uid || !nm || nm === "Bạn" || /^\d{6,}$/.test(nm)) return;
+      const existing = byId.get(uid);
+      if (!existing || nm.length > existing.name.length) {
+        byId.set(uid, { id: uid, name: nm });
+      }
+    };
+    for (const m of activeMentionMembers) {
+      add(m.id, m.name);
+    }
+    for (const msg of messages) {
+      add(msg.sender_id, msg.sender_name);
+    }
+    if (myProfile) {
+      add(myProfile.uid, myProfile.display_name);
+    }
+    if (activeThread && activeThread.kind === "direct") {
+      add(activeThread.id, activeThread.title);
+    }
+    return Array.from(byId.values());
+  }, [activeMentionMembers, messages, myProfile, activeThread]);
+
   const currentPinned =
     pinnedMessages.length > 0 ? pinnedMessages[pinnedIdx % pinnedMessages.length] : null;
 
@@ -2643,13 +2939,34 @@ export default function App() {
         config={translateCfg}
         onClose={() => setTranslateModalOpen(false)}
         onSaved={(cfg) => {
+          const prevCfg = translateCfgRef.current;
           setTranslateCfg(cfg);
-          setTranslationsByMsg({});
+          translateCfgRef.current = cfg;
+          const providerChanged = Boolean(prevCfg && prevCfg.provider !== cfg.provider);
+          const modeChanged = Boolean(prevCfg && prevCfg.detect_mode !== cfg.detect_mode);
+          const langChanged = Boolean(prevCfg && prevCfg.target_lang !== cfg.target_lang);
+          if (providerChanged || modeChanged || langChanged) {
+            translationCacheRef.current.clear();
+            translationsRef.current = {};
+            setTranslationsByMsg({});
+          }
           if (selectedId && threadAutoTranslate[selectedId]) {
+            const nextLang = cfg.target_lang || translateCode;
             setThreadAutoTranslate((prev) => ({
               ...prev,
-              [selectedId]: cfg.target_lang || translateCode,
+              [selectedId]: nextLang,
             }));
+            if ((providerChanged || modeChanged) && !langChanged) {
+              void translateBatchMessages(messages, nextLang, false, providerChanged);
+            }
+          }
+        }}
+        onCacheCleared={() => {
+          translationCacheRef.current.clear();
+          translationsRef.current = {};
+          setTranslationsByMsg({});
+          if (selectedId && threadAutoTranslate[selectedId]) {
+            void translateBatchMessages(messages, threadAutoTranslate[selectedId], false, false);
           }
         }}
       />
@@ -3569,21 +3886,25 @@ export default function App() {
         }`}
       >
         {buzzToast && (
-          <button
-            type="button"
-            onClick={() => {
-              setSelectedId(buzzToast.threadId);
-              setMobilePane("chat");
-              setActiveThreadRootId(null);
-              setBuzzToast(null);
-            }}
-            className="absolute left-1/2 top-16 z-40 flex -translate-x-1/2 items-center gap-2 rounded-full bg-amber-500 px-4 py-2 text-[13px] font-bold text-slate-950 shadow-2xl transition hover:scale-105"
-          >
-            <Zap className="h-4 w-4 fill-slate-950" />
-            <span>
-              {buzzToast.senderName} vừa gửi BUZZ! ({buzzToast.threadTitle})
-            </span>
-          </button>
+          <div className="absolute left-1/2 top-16 z-40 -translate-x-1/2">
+            <button
+              key={buzzToast.nonce}
+              type="button"
+              onClick={() => {
+                setSelectedId(buzzToast.threadId);
+                setMobilePane("chat");
+                setActiveThreadRootId(null);
+                setBuzzToast(null);
+              }}
+              className="buzz-shaking flex items-center gap-2 rounded-full bg-amber-500 px-4 py-2 text-[13px] font-bold text-slate-950 shadow-2xl transition hover:scale-105"
+            >
+              <Zap className="h-4 w-4 fill-slate-950" />
+              <span>
+                {t("buzzSentByUser", { name: buzzToast.senderName })}
+                {buzzToast.streak >= 2 ? ` (×${buzzToast.streak})` : ""} ({buzzToast.threadTitle})
+              </span>
+            </button>
+          </div>
         )}
 
         {dragHover && activeThread && (
@@ -3643,6 +3964,7 @@ export default function App() {
                 })
               }
               mentionMembers={activeMentionMembers}
+              displayMentionMembers={messageMentionCandidates}
               onSendSticker={handleSendSticker}
               onTogglePin={handleTogglePinMessage}
               onError={showError}
@@ -4003,6 +4325,19 @@ export default function App() {
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
+                    disabled={threadTranslating || messages.length === 0}
+                    onClick={() => {
+                      if (!activeThreadLang) return;
+                      void translateBatchMessages(messages, activeThreadLang, false, true);
+                    }}
+                    className="hover-menu flex items-center gap-1 rounded-lg px-2 py-1 text-xs font-medium transition disabled:opacity-50"
+                    style={{ color: "var(--text-secondary)" }}
+                  >
+                    <RefreshCw className={`h-3.5 w-3.5 ${threadTranslating ? "animate-spin" : ""}`} />
+                    {t("retranslateAll")}
+                  </button>
+                  <button
+                    type="button"
                     onClick={() => setTranslateModalOpen(true)}
                     className="hover-menu flex items-center gap-1 rounded-lg px-2 py-1 text-xs font-medium transition"
                     style={{ color: "var(--text-secondary)" }}
@@ -4024,12 +4359,27 @@ export default function App() {
 
             <div
               ref={scrollContainerRef}
+              onWheel={(e) => {
+                if (e.deltaY < 0) stickToBottomRef.current = false;
+              }}
+              onPointerDown={(e) => {
+                if (e.target === e.currentTarget) {
+                  stickToBottomRef.current = false;
+                }
+              }}
               onScroll={(e) => {
                 const el = e.currentTarget;
-                if (el.scrollTop < 120 && hasMoreHistory && !loadingOlder) {
+                if (initialScrollReadyRef.current && el.scrollTop < 120 && hasMoreHistory && !loadingOlder) {
                   void loadOlderMessages();
                 }
                 const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+                if (performance.now() - lastProgrammaticScrollAtRef.current > 120) {
+                  if (distFromBottom > 120) {
+                    stickToBottomRef.current = false;
+                  } else if (distFromBottom < 40) {
+                    stickToBottomRef.current = true;
+                  }
+                }
                 const farUp = distFromBottom > 220;
                 setShowScrollDown(farUp);
                 if (!farUp) setUnreadBelow(0);
@@ -4068,105 +4418,112 @@ export default function App() {
                   </button>
                 </div>
               )}
-              {messages.map((m, idx) => {
-                const prev = idx > 0 ? messages[idx - 1] : null;
-                const next = idx < messages.length - 1 ? messages[idx + 1] : null;
-                const showDate = !prev || dayKey(prev.ts) !== dayKey(m.ts);
-                const showUnread = firstUnreadMsgId === m.msg_id && unreadDividerCount > 0;
-                const groupedWithPrev =
-                  !!prev &&
-                  !showDate &&
-                  !showUnread &&
-                  prev.sender_id === m.sender_id &&
-                  prev.is_outgoing === m.is_outgoing &&
-                  m.ts - prev.ts < 300_000;
-                const nextShowDate = !next || dayKey(m.ts) !== dayKey(next.ts);
-                const nextShowUnread = Boolean(
-                  next && firstUnreadMsgId === next.msg_id && unreadDividerCount > 0,
-                );
-                const groupedWithNext =
-                  !!next &&
-                  !nextShowDate &&
-                  !nextShowUnread &&
-                  next.sender_id === m.sender_id &&
-                  next.is_outgoing === m.is_outgoing &&
-                  next.ts - m.ts < 300_000;
+              <div ref={messagesContentRef}>
+                {messages.map((m, idx) => {
+                  const prev = idx > 0 ? messages[idx - 1] : null;
+                  const next = idx < messages.length - 1 ? messages[idx + 1] : null;
+                  const showDate = !prev || dayKey(prev.ts) !== dayKey(m.ts);
+                  const showUnread = firstUnreadMsgId === m.msg_id && unreadDividerCount > 0;
+                  const groupedWithPrev =
+                    !!prev &&
+                    !showDate &&
+                    !showUnread &&
+                    prev.sender_id === m.sender_id &&
+                    prev.is_outgoing === m.is_outgoing &&
+                    m.ts - prev.ts < 300_000;
+                  const nextShowDate = !next || dayKey(m.ts) !== dayKey(next.ts);
+                  const nextShowUnread = Boolean(
+                    next && firstUnreadMsgId === next.msg_id && unreadDividerCount > 0,
+                  );
+                  const groupedWithNext =
+                    !!next &&
+                    !nextShowDate &&
+                    !nextShowUnread &&
+                    next.sender_id === m.sender_id &&
+                    next.is_outgoing === m.is_outgoing &&
+                    next.ts - m.ts < 300_000;
 
-                return (
-                  <div key={m.msg_id} className="msg-row-perf">
-                    {showDate && (
-                      <div className="my-2.5 flex justify-center">
-                        <span
-                          className="rounded-full px-3 py-0.5 text-xs font-medium shadow-xs"
-                          style={{ background: "var(--pill-bg)", color: "var(--pill-text)" }}
-                        >
-                          {formatDayLabel(m.ts, lang)}
-                        </span>
-                      </div>
-                    )}
-                    {showUnread && (
-                      <div id="unread-divider" className="my-2 flex items-center gap-3">
-                        <div className="h-px flex-1" style={{ background: "var(--accent)", opacity: 0.35 }} />
-                        <span
-                          className="rounded-full px-3 py-0.5 text-xs font-semibold"
-                          style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
-                        >
-                          {t("unreadDivider", { count: unreadDividerCount })}
-                        </span>
-                        <div className="h-px flex-1" style={{ background: "var(--accent)", opacity: 0.35 }} />
-                      </div>
-                    )}
-                    <MessageBubble
-                      msg={m}
-                      threadKind={activeThread.kind}
-                      groupedWithPrev={groupedWithPrev}
-                      groupedWithNext={groupedWithNext}
-                      highlighted={highlightedId === m.msg_id || inChatActiveMatchId === m.msg_id}
-                      isSeen={
-                        m.is_outgoing &&
-                        !m.is_recalled &&
-                        !m.send_status &&
-                        (activeThread.kind === "cloud" || (activeThread.peer_read_ts ?? 0) >= m.ts)
-                      }
-                      senderAvatar={avatarByUserId.get(m.sender_id)}
-                      translation={translationsByMsg[m.msg_id]}
-                      replaceWithTranslation={Boolean(activeThreadLang)}
-                      replyCount={replyGraph.repliesByRoot[m.msg_id]?.length ?? 0}
-                      highlightQuery={inChatSearchOpen ? inChatSearchQuery : ""}
-                      selectMode={selectMode}
-                      selected={selectedMsgIds.has(m.msg_id)}
-                      onToggleSelect={handleToggleSelectMsg}
-                      onStartSelect={handleStartSelect}
-                      onTogglePin={handleTogglePinMessage}
-                      onReply={handleReplyMessage}
-                      onReact={handleReactMessage}
-                      onRecall={handleRecallMessage}
-                      onDeleteLocal={handleDeleteLocalMessage}
-                      onJumpToMsg={handleJumpToMsgVoid}
-                      onOpenImage={openLightboxForUrl}
-                      onOpenProfile={handleOpenProfileModal}
-                      onForward={handleForwardSingle}
-                      onTranslate={handleTranslateSingle}
-                      onHideTranslation={handleHideTranslation}
-                      onOpenThread={handleOpenReplyThread}
-                      onRetrySend={handleRetryFailedMessage}
-                      onDiscardFailed={handleDiscardFailedMessage}
-                      onSaveFile={handleSaveRemoteFile}
-                      onOpenExternal={handleOpenExternalUrl}
-                      onCopyError={showError}
-                      onVotePoll={handleVotePoll}
-                      onRefreshPoll={handleRefreshPoll}
-                    />
-                  </div>
-                );
-              })}
-              <div ref={bottomRef} />
+                  return (
+                    <div
+                      key={m.msg_id}
+                      className={idx < messages.length - 20 ? "msg-row-perf" : undefined}
+                    >
+                      {showDate && (
+                        <div className="my-2.5 flex justify-center">
+                          <span
+                            className="rounded-full px-3 py-0.5 text-xs font-medium shadow-xs"
+                            style={{ background: "var(--pill-bg)", color: "var(--pill-text)" }}
+                          >
+                            {formatDayLabel(m.ts, lang)}
+                          </span>
+                        </div>
+                      )}
+                      {showUnread && (
+                        <div id="unread-divider" className="my-2 flex items-center gap-3">
+                          <div className="h-px flex-1" style={{ background: "var(--accent)", opacity: 0.35 }} />
+                          <span
+                            className="rounded-full px-3 py-0.5 text-xs font-semibold"
+                            style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
+                          >
+                            {t("unreadDivider", { count: unreadDividerCount })}
+                          </span>
+                          <div className="h-px flex-1" style={{ background: "var(--accent)", opacity: 0.35 }} />
+                        </div>
+                      )}
+                      <MessageBubble
+                        msg={m}
+                        threadKind={activeThread.kind}
+                        groupedWithPrev={groupedWithPrev}
+                        groupedWithNext={groupedWithNext}
+                        highlighted={highlightedId === m.msg_id || inChatActiveMatchId === m.msg_id}
+                        isSeen={
+                          m.is_outgoing &&
+                          !m.is_recalled &&
+                          !m.send_status &&
+                          (activeThread.kind === "cloud" || (activeThread.peer_read_ts ?? 0) >= m.ts)
+                        }
+                        senderAvatar={avatarByUserId.get(m.sender_id)}
+                        translation={translationsByMsg[m.msg_id]}
+                        replaceWithTranslation={Boolean(activeThreadLang)}
+                        replyCount={replyGraph.repliesByRoot[m.msg_id]?.length ?? 0}
+                        highlightQuery={inChatSearchOpen ? inChatSearchQuery : ""}
+                        selectMode={selectMode}
+                        selected={selectedMsgIds.has(m.msg_id)}
+                        onToggleSelect={handleToggleSelectMsg}
+                        onStartSelect={handleStartSelect}
+                        onTogglePin={handleTogglePinMessage}
+                        onReply={handleReplyMessage}
+                        onReact={handleReactMessage}
+                        onRecall={handleRecallMessage}
+                        onDeleteLocal={handleDeleteLocalMessage}
+                        onJumpToMsg={handleJumpToMsgVoid}
+                        onOpenImage={openLightboxForUrl}
+                        onOpenProfile={handleOpenProfileModal}
+                        mentionMembers={messageMentionCandidates}
+                        onForward={handleForwardSingle}
+                        onTranslate={handleTranslateSingle}
+                        onHideTranslation={handleHideTranslation}
+                        onOpenThread={handleOpenReplyThread}
+                        onRetrySend={handleRetryFailedMessage}
+                        onDiscardFailed={handleDiscardFailedMessage}
+                        onSaveFile={handleSaveRemoteFile}
+                        onOpenExternal={handleOpenExternalUrl}
+                        onCopyError={showError}
+                        onVotePoll={handleVotePoll}
+                        onRefreshPoll={handleRefreshPoll}
+                      />
+                    </div>
+                  );
+                })}
+                <div ref={bottomRef} />
+              </div>
             </div>
 
             {showScrollDown && (
               <button
                 type="button"
                 onClick={() => {
+                  stickToBottomRef.current = true;
                   bottomRef.current?.scrollIntoView({ behavior: "smooth" });
                   setUnreadBelow(0);
                   setShowScrollDown(false);
@@ -5147,7 +5504,9 @@ export default function App() {
               openThreadById(targetId);
             }
           }}
-          className={`fixed z-[75] flex w-[340px] max-w-[calc(100vw-2rem)] cursor-pointer items-center gap-3 overflow-hidden rounded-2xl p-3 shadow-2xl transition hover:brightness-105 ${
+          className={`fixed z-[75] flex w-[320px] max-w-[calc(100vw-2rem)] cursor-pointer items-center gap-2.5 overflow-hidden rounded-xl px-3 py-2 shadow-2xl transition hover:brightness-105 ${
+            webNotifyToast.is_buzz ? "notify-buzz-shaking" : ""
+          } ${
             webNotifyToast.position === "top-left"
               ? "left-4 top-4"
               : webNotifyToast.position === "top-right"
@@ -5158,47 +5517,56 @@ export default function App() {
           }`}
           style={{
             background: "var(--bg-sidebar)",
-            border: "1px solid var(--border-subtle)",
+            border: webNotifyToast.is_buzz
+              ? "1px solid rgba(245, 158, 11, 0.55)"
+              : "1px solid var(--border-subtle)",
             color: "var(--text-primary)",
           }}
         >
           <span
             aria-hidden="true"
             className="absolute inset-y-0 left-0 w-[3px]"
-            style={{ background: "var(--accent)" }}
+            style={{ background: webNotifyToast.is_buzz ? "#f59e0b" : "var(--accent)" }}
           />
-          <div className="pl-1">
+          <div className="shrink-0 pl-0.5">
             <ThreadAvatar
               avatar={webNotifyToast.avatar}
               title={webNotifyToast.title}
               kind="direct"
-              size="md"
+              size="sm"
             />
           </div>
-          <div className="min-w-0 flex-1 pr-5">
-            <div className="truncate text-[13.5px] font-semibold">{webNotifyToast.title}</div>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center justify-between gap-1.5">
+              <div className="min-w-0 truncate text-[13px] font-semibold leading-tight">
+                {webNotifyToast.title}
+              </div>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setWebNotifyToast(null);
+                }}
+                className="hover-menu -mr-1 shrink-0 rounded-md p-0.5 transition"
+                style={{ color: "var(--text-secondary)" }}
+                title={t("notifyCloseTitle")}
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
             <div
-              className="mt-0.5 line-clamp-2 text-[12px] leading-snug"
+              className="mt-0.5 line-clamp-2 break-words text-[12px] leading-[1.35]"
               style={{ color: "var(--text-secondary)" }}
             >
               {webNotifyToast.body}
             </div>
-            <div className="mt-0.5 text-[10.5px] font-medium" style={{ color: "var(--accent)" }}>
-              Teza · Bấm để mở hội thoại
+            <div
+              className="mt-0.5 truncate text-[10.5px] font-medium leading-tight"
+              style={{ color: "var(--accent)" }}
+            >
+              {t("notifyClickHint")}
             </div>
           </div>
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              setWebNotifyToast(null);
-            }}
-            className="hover-menu absolute right-2 top-2 rounded-lg p-1"
-            style={{ color: "var(--text-secondary)" }}
-            title="Đóng thông báo"
-          >
-            <X className="h-3.5 w-3.5" />
-          </button>
         </div>
       )}
 

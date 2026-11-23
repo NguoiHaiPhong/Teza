@@ -29,6 +29,13 @@ import type { MessageDto, ThreadKind } from "../types";
 import { useI18n } from "../i18n";
 import { isBuzzMessage } from "../utils/buzz";
 import { copyImageReliable, copyTextReliable } from "../utils/clipboard";
+import { useEmojiStyle } from "../utils/emojiStyleContext";
+import {
+  isPureRetroEmoticonMessage,
+  tokenizeRetroEmoticons,
+  type EmojiStyle,
+} from "../utils/retroEmoticons";
+import { EmojiGlyph, RetroEmoticon } from "./RetroEmoticon";
 import {
   classifyNonMediaAttachment,
   extractLinkHost,
@@ -43,6 +50,7 @@ import {
   parsePollPayload,
   parseReminderPayload,
 } from "../utils/richMessage";
+import { tokenizeMentions, type MentionCandidate } from "../utils/mentions";
 import { getDisplayBodyText, splitTextLinks } from "../utils/threadState";
 import { RelayAudio, RelayImage, RelayVideo } from "./RelayImage";
 import { ThreadAvatar } from "./ThreadAvatar";
@@ -53,6 +61,8 @@ export interface MessageTranslationState {
   targetLang?: string;
   loading?: boolean;
   error?: string;
+  skipped?: boolean;
+  note?: string;
 }
 
 const QUICK_EMOJIS = ["👍", "❤️", "😆", "😮", "😢", "😠"];
@@ -82,6 +92,7 @@ interface Props {
   onJumpToMsg: (msgId: string) => void;
   onOpenImage: (url: string, title: string) => void;
   onOpenProfile?: (userId: string) => void;
+  mentionMembers?: MentionCandidate[];
   onForward?: (msg: MessageDto) => void;
   onTranslate?: (msg: MessageDto) => void;
   onHideTranslation?: (msgId: string) => void;
@@ -144,28 +155,93 @@ function renderHighlightedPlain(text: string, query?: string) {
   );
 }
 
-function renderMentionsAndSearch(text: string, isOutgoing: boolean, highlightQuery?: string) {
-  const parts = text.split(/((?:^|\s)@[^\s@<>]+)/g);
-  return parts.map((part, idx) => {
-    const m = part.match(/^(\s*)(@[^\s@<>]+)$/);
-    if (m) {
-      return (
-        <span key={idx}>
-          {m[1]}
-          <span
-            className="font-semibold"
-            style={{ color: isOutgoing ? "var(--link-out)" : "var(--accent)" }}
+function renderPlainWithEmoticons(
+  text: string,
+  emojiStyle: EmojiStyle,
+  highlightQuery?: string,
+  largeEmoticons = false,
+) {
+  if (emojiStyle !== "retro") {
+    return renderHighlightedPlain(text, highlightQuery);
+  }
+  const tokens = tokenizeRetroEmoticons(text);
+  if (!tokens.some((tok) => tok.kind === "emoticon")) {
+    return renderHighlightedPlain(text, highlightQuery);
+  }
+  const px = largeEmoticons ? 36 : 22;
+  return tokens.map((tok, i) =>
+    tok.kind === "emoticon" ? (
+      <RetroEmoticon
+        key={i}
+        id={tok.emoticon.id}
+        size={px}
+        className="mx-[1px]"
+        title={`${tok.emoticon.label} (${tok.emoticon.primaryShortcut})`}
+      />
+    ) : (
+      <span key={i}>{renderHighlightedPlain(tok.text, highlightQuery)}</span>
+    ),
+  );
+}
+
+function renderMentionsAndSearch(
+  text: string,
+  isOutgoing: boolean,
+  emojiStyle: EmojiStyle,
+  mentionMembers: MentionCandidate[],
+  onOpenProfile: ((userId: string) => void) | undefined,
+  selectMode: boolean,
+  viewProfileTitle: string,
+  highlightQuery?: string,
+  largeEmoticons = false,
+) {
+  const tokens = tokenizeMentions(text, mentionMembers);
+  return tokens.map((tok, idx) => {
+    if (tok.kind === "mention") {
+      const color = isOutgoing ? "var(--link-out)" : "var(--accent)";
+      if (tok.userId && onOpenProfile && !selectMode) {
+        const targetUid = tok.userId;
+        return (
+          <button
+            key={idx}
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpenProfile(targetUid);
+            }}
+            title={tok.displayName ? `${tok.displayName} — ${viewProfileTitle}` : viewProfileTitle}
+            className="inline cursor-pointer font-semibold hover:underline focus:outline-none"
+            style={{ color }}
           >
-            {renderHighlightedPlain(m[2], highlightQuery)}
-          </span>
+            {renderHighlightedPlain(tok.text, highlightQuery)}
+          </button>
+        );
+      }
+      return (
+        <span key={idx} className="font-semibold" style={{ color }}>
+          {renderHighlightedPlain(tok.text, highlightQuery)}
         </span>
       );
     }
-    return <span key={idx}>{renderHighlightedPlain(part, highlightQuery)}</span>;
+    return (
+      <span key={idx}>
+        {renderPlainWithEmoticons(tok.text, emojiStyle, highlightQuery, largeEmoticons)}
+      </span>
+    );
   });
 }
 
-function renderLinkedText(text: string, isOutgoing: boolean, highlightQuery?: string) {
+function renderLinkedText(
+  text: string,
+  isOutgoing: boolean,
+  emojiStyle: EmojiStyle,
+  mentionMembers: MentionCandidate[],
+  onOpenProfile: ((userId: string) => void) | undefined,
+  selectMode: boolean,
+  viewProfileTitle: string,
+  highlightQuery?: string,
+  largeEmoticons = false,
+) {
   const parts = splitTextLinks(text);
   return parts.map((part, idx) =>
     part.url ? (
@@ -180,7 +256,19 @@ function renderLinkedText(text: string, isOutgoing: boolean, highlightQuery?: st
         {part.text}
       </a>
     ) : (
-      <span key={idx}>{renderMentionsAndSearch(part.text, isOutgoing, highlightQuery)}</span>
+      <span key={idx}>
+        {renderMentionsAndSearch(
+          part.text,
+          isOutgoing,
+          emojiStyle,
+          mentionMembers,
+          onOpenProfile,
+          selectMode,
+          viewProfileTitle,
+          highlightQuery,
+          largeEmoticons,
+        )}
+      </span>
     ),
   );
 }
@@ -228,6 +316,7 @@ export const MessageBubble = memo(function MessageBubble({
   onJumpToMsg,
   onOpenImage,
   onOpenProfile,
+  mentionMembers = [],
   onForward,
   onTranslate,
   onHideTranslation,
@@ -241,6 +330,7 @@ export const MessageBubble = memo(function MessageBubble({
   onRefreshPoll,
 }: Props) {
   const { lang, locale, t } = useI18n();
+  const { emojiStyle } = useEmojiStyle();
   const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
   const [pickerPos, setPickerPos] = useState<{ left: number; top: number } | null>(null);
   const [mediaError, setMediaError] = useState(false);
@@ -253,7 +343,8 @@ export const MessageBubble = memo(function MessageBubble({
     setMediaRetryKey(0);
   }, [msg.attachment_url, msg.msg_type]);
   const normalizedAttachmentUrl = normalizeMediaRequestUrl(msg.attachment_url);
-  const isReplaced = Boolean(replaceWithTranslation && translation?.text && !showOriginal);
+  const hasVisibleTranslation = Boolean(translation?.text && !translation?.skipped);
+  const isReplaced = Boolean(replaceWithTranslation && hasVisibleTranslation && !showOriginal);
   const reminderData = !msg.is_recalled ? parseReminderPayload(msg) : null;
   const pollData = !msg.is_recalled && !reminderData ? parsePollPayload(msg) : null;
   const isRichCard = Boolean(reminderData || pollData);
@@ -289,6 +380,12 @@ export const MessageBubble = memo(function MessageBubble({
     : isReplaced && translation?.text
       ? translation.text
       : getDisplayBodyText(msg);
+  const isPureEmoticon =
+    emojiStyle === "retro" &&
+    !msg.is_recalled &&
+    !isRichCard &&
+    !isBuzz &&
+    Boolean(displayText && isPureRetroEmoticonMessage(displayText));
   const isPlainSticker =
     isSticker &&
     !msg.quote &&
@@ -296,6 +393,7 @@ export const MessageBubble = memo(function MessageBubble({
     !displayText &&
     !isBuzz &&
     !(threadKind === "group" && !msg.is_outgoing && !groupedWithPrev);
+  const hasTranslatableBody = Boolean(!msg.is_recalled && getDisplayBodyText(msg).trim());
   const safeDownloadUrl =
     nonMediaAction === "save_file" &&
     (isRemoteMediaUrl(normalizedAttachmentUrl) || isDataUrl(normalizedAttachmentUrl))
@@ -365,11 +463,18 @@ export const MessageBubble = memo(function MessageBubble({
           : "rounded-2xl rounded-bl-[4px]";
 
   const hasTranslationPanel = Boolean(
-    translation && !isReplaced && (!replaceWithTranslation || showOriginal || translation.error),
+    translation &&
+      !isReplaced &&
+      (!translation.skipped || Boolean(translation.note)) &&
+      (!replaceWithTranslation ||
+        showOriginal ||
+        Boolean(translation.error) ||
+        Boolean(translation.note)),
   );
   const useInlineMeta = Boolean(
     displayText &&
       !isBuzz &&
+      !isPureEmoticon &&
       !isRichCard &&
       !isPlainSticker &&
       !hasTranslationPanel &&
@@ -500,16 +605,16 @@ export const MessageBubble = memo(function MessageBubble({
               <MessagesSquare className="h-3.5 w-3.5" />
             </button>
           )}
-          {onTranslate && msg.text.trim() && !(isSticker && msg.text === "[Nhãn dán]") && (
+          {onTranslate && hasTranslatableBody && (
             <button
               onClick={() =>
-                translation?.text ? onHideTranslation?.(msg.msg_id) : onTranslate(msg)
+                hasVisibleTranslation ? onHideTranslation?.(msg.msg_id) : onTranslate(msg)
               }
-              title={translation?.text ? t("hideTranslation") : t("translateMessage")}
+              title={hasVisibleTranslation ? t("hideTranslation") : t("translateMessage")}
               className="hover-surface rounded-full p-1.5 transition"
               style={{
                 background: "var(--bg-surface)",
-                color: translation?.text ? "var(--accent)" : "var(--text-secondary)",
+                color: hasVisibleTranslation ? "var(--accent)" : "var(--text-secondary)",
               }}
             >
               <Languages className="h-3.5 w-3.5" />
@@ -582,7 +687,7 @@ export const MessageBubble = memo(function MessageBubble({
                     setPickerPos(null);
                   }}
                   title={active ? t("reactToggleRemoveTitle") : t("reactWithTitle", { emoji })}
-                  className="rounded-full p-1 text-sm transition hover:scale-125"
+                  className="inline-flex items-center justify-center rounded-full p-1 text-sm transition hover:scale-125"
                   style={
                     active
                       ? {
@@ -592,7 +697,7 @@ export const MessageBubble = memo(function MessageBubble({
                       : undefined
                   }
                 >
-                  {emoji}
+                  <EmojiGlyph emoji={emoji} size={18} />
                 </button>
               );
             })}
@@ -1063,11 +1168,23 @@ export const MessageBubble = memo(function MessageBubble({
         ) : (
           displayText && (
             <div
-              className={`msg-body-text whitespace-pre-wrap wrap-anywhere leading-[1.38] ${
+              className={`msg-body-text whitespace-pre-wrap wrap-anywhere ${
+                isPureEmoticon ? "py-0.5 leading-none" : "leading-[1.38]"
+              } ${
                 msg.is_recalled ? "italic opacity-65" : ""
               } ${replaceWithTranslation && translation?.loading ? "opacity-75" : ""}`}
             >
-              {renderLinkedText(displayText, msg.is_outgoing, highlightQuery)}
+              {renderLinkedText(
+                displayText,
+                msg.is_outgoing,
+                emojiStyle,
+                mentionMembers,
+                onOpenProfile,
+                selectMode,
+                t("viewMemberProfileTitle"),
+                highlightQuery,
+                isPureEmoticon,
+              )}
               {useInlineMeta && (
                 <span
                   aria-hidden="true"
@@ -1079,7 +1196,7 @@ export const MessageBubble = memo(function MessageBubble({
           )
         )}
 
-        {translation && !isReplaced && (!replaceWithTranslation || showOriginal || translation.error) && (
+        {hasTranslationPanel && translation && (
           <div
             className="mt-2 border-t pt-1.5"
             style={{
@@ -1095,11 +1212,13 @@ export const MessageBubble = memo(function MessageBubble({
                   ? t("translatingDots")
                   : translation.error
                     ? t("translateError")
-                    : `${t("translateHeader")}${translation.src ? ` · ${translation.src}` : ""}${
-                        translation.targetLang ? ` → ${translation.targetLang}` : ""
-                      }`}
+                    : translation.note
+                      ? t("translateHeader")
+                      : `${t("translateHeader")}${translation.src ? ` · ${translation.src}` : ""}${
+                          translation.targetLang ? ` → ${translation.targetLang}` : ""
+                        }`}
               </span>
-              {replaceWithTranslation && translation.text ? (
+              {replaceWithTranslation && hasVisibleTranslation ? (
                 <button
                   type="button"
                   onClick={() => setShowOriginal(false)}
@@ -1132,6 +1251,15 @@ export const MessageBubble = memo(function MessageBubble({
               >
                 {translation.error}
               </div>
+            ) : translation.note ? (
+              <div
+                className="text-[13px] opacity-85"
+                style={{
+                  color: msg.is_outgoing ? "rgba(255,255,255,0.86)" : "var(--text-secondary)",
+                }}
+              >
+                {translation.note}
+              </div>
             ) : (
               <div className="whitespace-pre-wrap wrap-anywhere text-[15px] leading-[1.5] opacity-95">
                 {translation.text}
@@ -1155,13 +1283,14 @@ export const MessageBubble = memo(function MessageBubble({
                   <button
                     key={r.emoji}
                     onClick={() => onReact(msg, r.emoji)}
-                    className="rounded-full px-2 py-0.5 text-[13px] transition hover:opacity-85"
+                    className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[13px] transition hover:opacity-85"
                     style={{
                       background: r.me ? "var(--accent-soft)" : "var(--chip-bg)",
                       border: r.me ? "1px solid var(--accent)" : "1px solid var(--chip-border)",
                     }}
                   >
-                    {r.emoji} {r.count}
+                    <EmojiGlyph emoji={r.emoji} size={16} animated={false} />
+                    <span>{r.count}</span>
                   </button>
                 ))}
               </div>
@@ -1276,13 +1405,12 @@ export const MessageBubble = memo(function MessageBubble({
             {!msg.is_recalled &&
               !msg.send_status &&
               onTranslate &&
-              msg.text.trim() &&
-              !(isSticker && msg.text === "[Nhãn dán]") && (
+              hasTranslatableBody && (
                 <button
                   onClick={() => {
-                    if (replaceWithTranslation && translation?.text) {
+                    if (replaceWithTranslation && hasVisibleTranslation) {
                       setShowOriginal((v) => !v);
-                    } else if (translation?.text) {
+                    } else if (hasVisibleTranslation) {
                       onHideTranslation?.(msg.msg_id);
                     } else {
                       onTranslate(msg);
@@ -1292,11 +1420,11 @@ export const MessageBubble = memo(function MessageBubble({
                   className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
                 >
                   <Languages className="h-3.5 w-3.5" />{" "}
-                  {replaceWithTranslation && translation?.text
+                  {replaceWithTranslation && hasVisibleTranslation
                     ? showOriginal
                       ? t("showTranslationOnly")
                       : t("viewOriginalTextMenu")
-                    : translation?.text
+                    : hasVisibleTranslation
                       ? t("hideTranslation")
                       : t("translateMessage")}
                 </button>

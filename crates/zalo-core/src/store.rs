@@ -4,7 +4,9 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use md5::{Digest, Md5};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::chat::parser::normalize_ts_ms;
@@ -12,6 +14,7 @@ use crate::chat::{
     strip_vi_accents, ChatFolderDto, FolderFilter, MessageDto, QuoteRef, ReactionSummary,
     ThreadDto, ThreadKind,
 };
+use crate::translate::TranslationResult;
 use crate::{data_dir, dpapi};
 
 const ENC_PREFIX: &str = "enc:v1:";
@@ -19,12 +22,14 @@ const KEY_CHECK_VALUE: &str = "litechat-db-v1";
 
 struct DbCipher {
     cipher: Aes256Gcm,
+    mac_key: [u8; 32],
 }
 
 impl DbCipher {
     fn from_raw_key(key: &[u8; 32]) -> Self {
         Self {
             cipher: Aes256Gcm::new_from_slice(key).expect("32-byte AES-256 key"),
+            mac_key: *key,
         }
     }
 
@@ -124,6 +129,33 @@ impl DbCipher {
             self.encrypt_str(aad, value)
         }
     }
+
+    fn keyed_translation_mac(&self, msg_id: &str, text: &str) -> String {
+        let mut ipad = [0x36u8; 64];
+        let mut opad = [0x5cu8; 64];
+        for (i, &kb) in self.mac_key.iter().enumerate() {
+            ipad[i] ^= kb;
+            opad[i] ^= kb;
+        }
+
+        let mut inner = Md5::new();
+        inner.update(ipad);
+        inner.update(b"tr-v2:");
+        inner.update(msg_id.as_bytes());
+        inner.update(b"\0");
+        inner.update(text.trim().as_bytes());
+        let inner_digest = inner.finalize();
+
+        let mut outer = Md5::new();
+        outer.update(opad);
+        outer.update(inner_digest);
+        let out = outer.finalize();
+        out.iter().fold(String::with_capacity(32), |mut acc, b| {
+            use std::fmt::Write;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        })
+    }
 }
 
 fn thread_aad(thread_id: &str) -> Vec<u8> {
@@ -136,6 +168,10 @@ fn msg_aad(thread_id: &str, msg_id: &str) -> Vec<u8> {
 
 fn folder_aad(folder_id: &str) -> Vec<u8> {
     format!("folder:{folder_id}").into_bytes()
+}
+
+fn translation_aad(msg_id: &str, target_lang: &str) -> Vec<u8> {
+    format!("tr:{msg_id}:{target_lang}").into_bytes()
 }
 
 pub struct MessageStore {
@@ -230,6 +266,20 @@ impl MessageStore {
             );
             CREATE INDEX IF NOT EXISTS idx_messages_thread_ts
                 ON messages(thread_id, ts DESC);
+
+            CREATE TABLE IF NOT EXISTS message_translations (
+                msg_id TEXT NOT NULL,
+                target_lang TEXT NOT NULL,
+                text_hash TEXT NOT NULL,
+                provider TEXT NOT NULL DEFAULT '',
+                translated_text TEXT NOT NULL,
+                detected_source_lang TEXT,
+                skipped INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (msg_id, target_lang)
+            );
+            CREATE INDEX IF NOT EXISTS idx_msg_translations_msg
+                ON message_translations(msg_id);
             "#,
         )?;
         self.ensure_column("messages", "quote_json", "TEXT")?;
@@ -512,6 +562,11 @@ impl MessageStore {
         let title_fallback = (t.title == t.id) as i64;
         let clear_unread = (t.unread_count == 0 && t.last_preview.starts_with("Bạn:")) as i64;
         let last_ts = normalize_ts_ms(t.last_ts);
+        let read_in_ts = if clear_unread == 1 {
+            last_ts.max(normalize_ts_ms(t.last_read_in_ts))
+        } else {
+            normalize_ts_ms(t.last_read_in_ts)
+        };
         self.conn.execute(
             r#"
             INSERT INTO threads (id, title, title_norm, avatar, kind, last_preview, last_ts, unread_count, is_pinned, is_muted, last_read_in_ts, peer_read_ts, muted_until_ts, is_archived)
@@ -532,7 +587,11 @@ impl MessageStore {
                     ELSE MAX(excluded.is_pinned, threads.is_pinned)
                 END,
                 is_muted = MAX(excluded.is_muted, threads.is_muted),
-                last_read_in_ts = MAX(threads.last_read_in_ts, excluded.last_read_in_ts),
+                last_read_in_ts = CASE
+                    WHEN ?13 = 1 AND excluded.last_ts >= threads.last_ts
+                    THEN MAX(threads.last_read_in_ts, excluded.last_read_in_ts, excluded.last_ts)
+                    ELSE MAX(threads.last_read_in_ts, excluded.last_read_in_ts)
+                END,
                 peer_read_ts = MAX(threads.peer_read_ts, excluded.peer_read_ts),
                 muted_until_ts = MAX(threads.muted_until_ts, excluded.muted_until_ts),
                 is_archived = MAX(threads.is_archived, excluded.is_archived)
@@ -552,7 +611,7 @@ impl MessageStore {
                 title_fallback,
                 clear_unread,
                 overwrite_pinned as i64,
-                normalize_ts_ms(t.last_read_in_ts),
+                read_in_ts,
                 normalize_ts_ms(t.peer_read_ts),
                 normalize_ts_ms(t.muted_until_ts),
                 t.is_archived as i64,
@@ -710,6 +769,12 @@ impl MessageStore {
                 params![m.thread_id, ts],
             )?;
         }
+        if m.is_recalled {
+            tx.execute(
+                "DELETE FROM message_translations WHERE msg_id = ?1",
+                params![m.msg_id],
+            )?;
+        }
         tx.commit()?;
 
         let fts_tx = self.fts_conn.transaction()?;
@@ -809,6 +874,10 @@ impl MessageStore {
             "DELETE FROM messages WHERE thread_id = ?1 AND msg_id = ?2",
             params![thread_id, msg_id],
         )?;
+        tx.execute(
+            "DELETE FROM message_translations WHERE msg_id = ?1",
+            params![msg_id],
+        )?;
         tx.commit()?;
 
         self.fts_conn.execute(
@@ -816,6 +885,139 @@ impl MessageStore {
             params![thread_id, msg_id],
         )?;
         Ok(affected > 0)
+    }
+
+    pub fn get_cached_translations(
+        &self,
+        items: &[(String, String)],
+        target_lang: &str,
+    ) -> Result<HashMap<String, TranslationResult>> {
+        let lang = target_lang.trim().to_ascii_uppercase();
+        let mut out = HashMap::new();
+        if lang.is_empty() || items.is_empty() {
+            return Ok(out);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT text_hash, translated_text, detected_source_lang, skipped
+             FROM message_translations
+             WHERE msg_id = ?1 AND target_lang = ?2
+             LIMIT 1",
+        )?;
+        for (msg_id, text) in items {
+            let expected_hash = self.cipher.keyed_translation_mac(msg_id, text);
+            let row: Option<(String, String, Option<String>, i64)> = stmt
+                .query_row(params![msg_id, &lang], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+                .optional()?;
+            if let Some((stored_hash, enc_text, det_lang, skipped_i64)) = row {
+                if stored_hash != expected_hash {
+                    continue;
+                }
+                let Ok(plain) = self
+                    .cipher
+                    .decrypt_str(&translation_aad(msg_id, &lang), &enc_text)
+                else {
+                    continue;
+                };
+                out.insert(
+                    msg_id.clone(),
+                    TranslationResult {
+                        msg_id: msg_id.clone(),
+                        translated_text: plain,
+                        detected_source_lang: det_lang,
+                        skipped: skipped_i64 != 0,
+                    },
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn upsert_cached_translations(
+        &mut self,
+        entries: &[(String, String, TranslationResult)],
+        target_lang: &str,
+        provider: &str,
+    ) -> Result<()> {
+        let lang = target_lang.trim().to_ascii_uppercase();
+        if lang.is_empty() || entries.is_empty() {
+            return Ok(());
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO message_translations
+                 (msg_id, target_lang, text_hash, provider, translated_text, detected_source_lang, skipped, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for (msg_id, orig_text, tr) in entries {
+                let text_hash = self.cipher.keyed_translation_mac(msg_id, orig_text);
+                let enc_text = self
+                    .cipher
+                    .encrypt_str(&translation_aad(msg_id, &lang), &tr.translated_text)?;
+                stmt.execute(params![
+                    msg_id,
+                    &lang,
+                    text_hash,
+                    provider,
+                    enc_text,
+                    tr.detected_source_lang.as_deref(),
+                    tr.skipped as i64,
+                    now,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn clear_cached_translations(
+        &self,
+        msg_ids: Option<&[String]>,
+        target_lang: Option<&str>,
+    ) -> Result<usize> {
+        let lang = target_lang
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_ascii_uppercase);
+        let affected = match (msg_ids, lang.as_deref()) {
+            (Some([]), _) => return Ok(0),
+            (None, None) => self.conn.execute("DELETE FROM message_translations", [])?,
+            (None, Some(l)) => self.conn.execute(
+                "DELETE FROM message_translations WHERE target_lang = ?1",
+                params![l],
+            )?,
+            (Some(ids), None) => {
+                let tx = self.conn.unchecked_transaction()?;
+                let mut total = 0usize;
+                {
+                    let mut stmt =
+                        tx.prepare("DELETE FROM message_translations WHERE msg_id = ?1")?;
+                    for id in ids {
+                        total += stmt.execute(params![id])?;
+                    }
+                }
+                tx.commit()?;
+                total
+            }
+            (Some(ids), Some(l)) => {
+                let tx = self.conn.unchecked_transaction()?;
+                let mut total = 0usize;
+                {
+                    let mut stmt = tx.prepare(
+                        "DELETE FROM message_translations WHERE msg_id = ?1 AND target_lang = ?2",
+                    )?;
+                    for id in ids {
+                        total += stmt.execute(params![id, l])?;
+                    }
+                }
+                tx.commit()?;
+                total
+            }
+        };
+        Ok(affected)
     }
 
     pub fn set_message_pinned(
@@ -1017,10 +1219,23 @@ impl MessageStore {
              SET unread_count = 0,
                  last_read_in_ts = MAX(
                      last_read_in_ts,
-                     COALESCE((SELECT MAX(ts) FROM messages WHERE thread_id = ?1 AND is_outgoing = 0), last_ts)
+                     last_ts,
+                     COALESCE((SELECT MAX(ts) FROM messages WHERE thread_id = ?1 AND is_outgoing = 0), 0)
                  )
              WHERE id = ?1",
             params![thread_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn advance_last_read_in_ts(&self, thread_id: &str, ts: i64) -> Result<()> {
+        let ts = normalize_ts_ms(ts);
+        if ts <= 0 {
+            return Ok(());
+        }
+        self.conn.execute(
+            "UPDATE threads SET last_read_in_ts = MAX(last_read_in_ts, ?2) WHERE id = ?1",
+            params![thread_id, ts],
         )?;
         Ok(())
     }
@@ -2763,13 +2978,55 @@ mod tests {
                 attachment_name: Some("report.pdf".into()),
             })
             .unwrap();
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "dlfl-file".into(),
+                thread_id: "t1".into(),
+                sender_id: "u1".into(),
+                sender_name: "An".into(),
+                text: "[Tập tin] Check.xlsx".into(),
+                msg_type: "share.file".into(),
+                ts: 1_700_000_004_000,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: Some("https://file-stal-9.dlfl.vn/gr/test/Check.xlsx".into()),
+                attachment_name: Some("Check.xlsx".into()),
+            })
+            .unwrap();
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "dlmd-video".into(),
+                thread_id: "t1".into(),
+                sender_id: "u1".into(),
+                sender_name: "An".into(),
+                text: "[Video]".into(),
+                msg_type: "chat.video.msg".into(),
+                ts: 1_700_000_005_000,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: Some("https://video-stal-20.dlmd.me/v/clip.mp4".into()),
+                attachment_name: Some("clip.mp4".into()),
+            })
+            .unwrap();
 
         let (media, files) = store.list_thread_media("t1", 20).unwrap();
-        assert!(media.is_empty());
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].msg_id, "legacy-http-file");
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].msg_id, "dlmd-video");
         assert_eq!(
-            files[0].attachment_url.as_deref(),
+            media[0].attachment_url.as_deref(),
+            Some("https://video-stal-20.dlmd.me/v/clip.mp4")
+        );
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].msg_id, "dlfl-file");
+        assert_eq!(files[1].msg_id, "legacy-http-file");
+        assert_eq!(
+            files[1].attachment_url.as_deref(),
             Some("https://files.zalo.cloud/report.pdf")
         );
 
@@ -2840,6 +3097,285 @@ mod tests {
         let reloaded_rec = store.get_message("t1", "stale-rec").unwrap().unwrap();
         assert!(reloaded_rec.attachment_url.is_none());
         assert!(reloaded_rec.attachment_name.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mark_thread_read_and_clear_unread_upsert_advance_watermark_past_stale_messages() {
+        let dir = std::env::temp_dir().join(format!("teza-watermark-sync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = MessageStore::open(&dir.join("watermarks_sync.db")).unwrap();
+
+        let yesterday = 1_700_000_000_000;
+        let today = yesterday + 86_400_000;
+
+        store
+            .upsert_thread(&ThreadDto {
+                id: "dm-stale".into(),
+                title: "Lan".into(),
+                avatar: String::new(),
+                kind: ThreadKind::Direct,
+                last_preview: "Hôm qua".into(),
+                last_ts: today,
+                unread_count: 1,
+                is_pinned: false,
+                is_muted: false,
+                last_read_in_ts: yesterday,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
+            })
+            .unwrap();
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "old-in".into(),
+                thread_id: "dm-stale".into(),
+                sender_id: "dm-stale".into(),
+                sender_name: "Lan".into(),
+                text: "Tin cũ hôm qua".into(),
+                msg_type: "chat.text".into(),
+                ts: yesterday,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+
+        // mark_thread_read must advance last_read_in_ts to threads.last_ts (`today`), not stay on `yesterday`
+        store.mark_thread_read("dm-stale").unwrap();
+        let after_read = store.list_threads(FolderFilter::All).unwrap();
+        assert_eq!(after_read[0].unread_count, 0);
+        assert_eq!(after_read[0].last_read_in_ts, today);
+
+        // Upsert with clear_unread (`unread_count == 0` and `"Bạn: ..."`) on both INSERT and ON CONFLICT UPDATE must pull `last_read_in_ts`
+        let tomorrow = today + 86_400_000;
+        let next_day = tomorrow + 86_400_000;
+        store
+            .upsert_thread(&ThreadDto {
+                id: "dm-phone-insert".into(),
+                title: "Lan 2".into(),
+                avatar: String::new(),
+                kind: ThreadKind::Direct,
+                last_preview: "Bạn: Ok nha".into(),
+                last_ts: tomorrow,
+                unread_count: 0,
+                is_pinned: false,
+                is_muted: false,
+                last_read_in_ts: 0,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
+            })
+            .unwrap();
+        store
+            .upsert_thread(&ThreadDto {
+                id: "dm-phone".into(),
+                title: "Hung".into(),
+                avatar: String::new(),
+                kind: ThreadKind::Direct,
+                last_preview: "Hôm qua".into(),
+                last_ts: yesterday,
+                unread_count: 1,
+                is_pinned: false,
+                is_muted: false,
+                last_read_in_ts: yesterday,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
+            })
+            .unwrap();
+        store
+            .upsert_thread(&ThreadDto {
+                id: "dm-phone".into(),
+                title: "Hung".into(),
+                avatar: String::new(),
+                kind: ThreadKind::Direct,
+                last_preview: "Bạn: Ok nha".into(),
+                last_ts: tomorrow,
+                unread_count: 0,
+                is_pinned: false,
+                is_muted: false,
+                last_read_in_ts: 0,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
+            })
+            .unwrap();
+        let listed = store.list_threads(FolderFilter::All).unwrap();
+        let phone_insert = listed.iter().find(|t| t.id == "dm-phone-insert").unwrap();
+        assert_eq!(phone_insert.last_read_in_ts, tomorrow);
+        let phone = listed.iter().find(|t| t.id == "dm-phone").unwrap();
+        assert_eq!(phone.unread_count, 0);
+        assert_eq!(phone.last_read_in_ts, tomorrow);
+
+        // advance_last_read_in_ts updates monotonically
+        let later = next_day + 5_000;
+        store.advance_last_read_in_ts("dm-phone", later).unwrap();
+        store.advance_last_read_in_ts("dm-phone", yesterday).unwrap();
+        let listed2 = store.list_threads(FolderFilter::All).unwrap();
+        let phone2 = listed2.iter().find(|t| t.id == "dm-phone").unwrap();
+        assert_eq!(phone2.last_read_in_ts, later);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cached_translations_encrypt_at_rest_invalidate_on_text_change_and_cleanup_on_delete() {
+        let dir = std::env::temp_dir().join(format!("teza-tr-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("tr_cache.db");
+        let mut store = MessageStore::open(&db_path).unwrap();
+
+        let translated = TranslationResult {
+            msg_id: "tr-1".into(),
+            translated_text: "Cuộc họp bắt đầu lúc 9 giờ".into(),
+            detected_source_lang: Some("EN".into()),
+            skipped: false,
+        };
+        let skipped = TranslationResult {
+            msg_id: "tr-2".into(),
+            translated_text: "Xin chào mọi người".into(),
+            detected_source_lang: Some("VI".into()),
+            skipped: true,
+        };
+        let same_text_other_id = TranslationResult {
+            msg_id: "tr-same".into(),
+            translated_text: "Cuộc họp lúc 9h".into(),
+            detected_source_lang: Some("EN".into()),
+            skipped: false,
+        };
+        store
+            .upsert_cached_translations(
+                &[
+                    ("tr-1".into(), "The meeting starts at 9am".into(), translated),
+                    ("tr-2".into(), "Xin chào mọi người".into(), skipped),
+                    ("tr-same".into(), "The meeting starts at 9am".into(), same_text_other_id),
+                ],
+                "VI",
+                "deepl",
+            )
+            .unwrap();
+
+        // Raw SQLite column must store ciphertext and keyed per-message MAC (never raw unkeyed MD5)
+        let raw_conn = Connection::open(&db_path).unwrap();
+        let (raw_text, hash1): (String, String) = raw_conn
+            .query_row(
+                "SELECT translated_text, text_hash FROM message_translations WHERE msg_id = 'tr-1' AND target_lang = 'VI'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let hash_same: String = raw_conn
+            .query_row(
+                "SELECT text_hash FROM message_translations WHERE msg_id = 'tr-same' AND target_lang = 'VI'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut raw_md5 = Md5::new();
+        raw_md5.update(b"The meeting starts at 9am");
+        let unkeyed_hex = raw_md5.finalize().iter().fold(String::with_capacity(32), |mut acc, b| {
+            use std::fmt::Write;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
+        assert!(raw_text.starts_with(ENC_PREFIX));
+        assert!(!raw_text.contains("Cuộc họp"));
+        assert_eq!(hash1.len(), 32);
+        assert_ne!(hash1, unkeyed_hex);
+        assert_ne!(hash1, hash_same);
+        drop(raw_conn);
+
+        // Lookup hits matching keyed MAC and recovers both translated and skipped entries
+        let hits = store
+            .get_cached_translations(
+                &[
+                    ("tr-1".into(), "The meeting starts at 9am".into()),
+                    ("tr-2".into(), "Xin chào mọi người".into()),
+                ],
+                "vi",
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits["tr-1"].translated_text, "Cuộc họp bắt đầu lúc 9 giờ");
+        assert!(!hits["tr-1"].skipped);
+        assert!(hits["tr-2"].skipped);
+        assert_eq!(hits["tr-2"].detected_source_lang.as_deref(), Some("VI"));
+
+        // Changed source text misses cache cleanly
+        let changed = store
+            .get_cached_translations(
+                &[("tr-1".into(), "The meeting starts at 10am".into())],
+                "VI",
+            )
+            .unwrap();
+        assert!(changed.is_empty());
+
+        // delete_message removes its cached translations too
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "tr-1".into(),
+                thread_id: "t-cache".into(),
+                sender_id: "u1".into(),
+                sender_name: "An".into(),
+                text: "The meeting starts at 9am".into(),
+                msg_type: "chat.text".into(),
+                ts: 1_700_000_000_000,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+        assert!(store.delete_message("t-cache", "tr-1").unwrap());
+        let after_del = store
+            .get_cached_translations(&[("tr-1".into(), "The meeting starts at 9am".into())], "VI")
+            .unwrap();
+        assert!(after_del.is_empty());
+
+        // clear_cached_translations(Some(&[]), ...) must be a no-op returning 0
+        assert_eq!(store.clear_cached_translations(Some(&[]), None).unwrap(), 0);
+        let still_there = store
+            .get_cached_translations(&[("tr-2".into(), "Xin chào mọi người".into())], "VI")
+            .unwrap();
+        assert_eq!(still_there.len(), 1);
+
+        // Recalling a message deletes its cached translations from disk
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "tr-2".into(),
+                thread_id: "t-cache".into(),
+                sender_id: "u1".into(),
+                sender_name: "An".into(),
+                text: "Xin chào mọi người".into(),
+                msg_type: "chat.text".into(),
+                ts: 1_700_000_001_000,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+        assert!(store.mark_recalled("t-cache", "tr-2").unwrap().is_some());
+        let after_recall = store
+            .get_cached_translations(&[("tr-2".into(), "Xin chào mọi người".into())], "VI")
+            .unwrap();
+        assert!(after_recall.is_empty());
+
+        // clear_cached_translations removes remaining entries (tr-same)
+        let cleared = store.clear_cached_translations(None, None).unwrap();
+        assert_eq!(cleared, 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -89,7 +89,7 @@ export function getDisplayBodyText(
   if (hasAtt && isVideo && raw === "[Video]") return "";
   if (hasAtt && isVoice && raw === "[Tin nhắn thoại]") return "";
 
-  if (isFile || hasAtt) {
+  if (!isPhoto && !isVideo && !isVoice && !isSticker && (isFile || hasAtt)) {
     if (raw === "[Tập tin]") return "";
     const fileName = (msg.attachment_name || "").trim();
     const rawLower = raw.toLowerCase();
@@ -296,16 +296,32 @@ export function findFirstUnreadMsgId(
   fallbackUnreadCount: number,
 ): string | null {
   if (fallbackUnreadCount <= 0 || messages.length === 0) return null;
-  if (lastReadInTs > 0) {
-    const firstNew = messages.find((m) => !m.is_outgoing && m.ts > lastReadInTs);
-    if (firstNew) return firstNew.msg_id;
-  }
-  let rem = fallbackUnreadCount;
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    if (!messages[i].is_outgoing) {
-      rem -= 1;
-      if (rem <= 0) return messages[i].msg_id;
+  let lastOutgoingTs = 0;
+  for (const m of messages) {
+    if (m.is_outgoing && m.ts > lastOutgoingTs) {
+      lastOutgoingTs = m.ts;
     }
   }
-  return messages.find((m) => !m.is_outgoing)?.msg_id ?? null;
+  const effectiveWatermark = Math.max(lastReadInTs, lastOutgoingTs);
+  const incomingAfter =
+    effectiveWatermark > 0
+      ? messages.filter((m) => !m.is_outgoing && m.ts > effectiveWatermark)
+      : messages.filter((m) => !m.is_outgoing);
+  if (incomingAfter.length === 0) return null;
+
+  if (lastReadInTs > 0) {
+    const firstNew = incomingAfter[0];
+    const latestTs = messages[messages.length - 1].ts;
+    const firstIdx = messages.indexOf(firstNew);
+    const staleByCount =
+      incomingAfter.length > Math.max(fallbackUnreadCount + 5, fallbackUnreadCount * 2);
+    const staleByAgeOrTop =
+      latestTs - firstNew.ts > 6 * 3_600_000 || (messages.length >= 25 && firstIdx < 3);
+    if (staleByCount && staleByAgeOrTop) {
+      return incomingAfter[Math.max(0, incomingAfter.length - fallbackUnreadCount)].msg_id;
+    }
+    return firstNew.msg_id;
+  }
+
+  return incomingAfter[Math.max(0, incomingAfter.length - fallbackUnreadCount)].msg_id;
 }

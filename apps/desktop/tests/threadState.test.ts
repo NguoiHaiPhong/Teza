@@ -206,6 +206,17 @@ test("getDisplayBodyText suppresses redundant file/media text and preserves capt
     ),
     "",
   );
+  assert.equal(
+    getDisplayBodyText(
+      makeMsg({
+        msg_type: "chat.photo",
+        text: "@All e gửi todolist nhé",
+        attachment_url: "https://f.zdn.vn/a.jpg",
+        attachment_name: "@All e gửi todolist nhé",
+      }),
+    ),
+    "@All e gửi todolist nhé",
+  );
 });
 
 test("splitTextLinks parses http/https URLs and trims trailing punctuation cleanly", () => {
@@ -328,6 +339,36 @@ test("findFirstUnreadMsgId uses last_read_in_ts watermark with count fallback an
   );
   assert.equal(afterReadIn[0].peer_read_ts, 4000);
   assert.equal(afterReadIn[0].last_read_in_ts, 4000);
+
+  // Stale watermark from yesterday + outgoing message sent on phone today jumps only after outgoing reply
+  const dayMs = 86_400_000;
+  const phoneSyncedMsgs = [
+    makeMsg({ msg_id: "y1", ts: 1000, is_outgoing: false }),
+    makeMsg({ msg_id: "y2", ts: 2000, is_outgoing: false }),
+    makeMsg({ msg_id: "today-out", ts: dayMs + 1000, is_outgoing: true }),
+    makeMsg({ msg_id: "today-in", ts: dayMs + 2000, is_outgoing: false }),
+  ];
+  assert.equal(findFirstUnreadMsgId(phoneSyncedMsgs, 500, 1), "today-in");
+
+  // If newest message after stale watermark is our own outgoing reply, nothing is unread
+  const endingWithOutgoing = [
+    makeMsg({ msg_id: "y1", ts: 1000, is_outgoing: false }),
+    makeMsg({ msg_id: "today-out", ts: dayMs + 1000, is_outgoing: true }),
+  ];
+  assert.equal(findFirstUnreadMsgId(endingWithOutgoing, 500, 1), null);
+
+  // Stale multi-device watermark (30 incoming messages spanning > 6h while unread_count = 1)
+  const manyStaleMsgs = Array.from({ length: 30 }, (_, idx) =>
+    makeMsg({
+      msg_id: `m-${idx}`,
+      ts: 1_000_000 + idx * 1_000_000,
+      is_outgoing: false,
+    }),
+  );
+  assert.equal(findFirstUnreadMsgId(manyStaleMsgs, 500_000, 1), "m-29");
+
+  // Genuine busy group chat with 25 actual unread messages keeps the 1st of all 25
+  assert.equal(findFirstUnreadMsgId(manyStaleMsgs, 5_000_000, 25), "m-5");
 });
 
 test("filterThreadsByFolder handles excluded_thread_ids, archived view, and moveArrayItem", () => {
