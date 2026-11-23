@@ -12,6 +12,7 @@ import type {
   RelayConfigSummary,
   RelayConfigUpdate,
   RelayTestResult,
+  SavedFileResultDto,
   ScreenCaptureDto,
   StickerItem,
   ThreadDetailsDto,
@@ -684,7 +685,11 @@ export const bridge = {
       targetLang: targetLang ?? null,
     });
   },
-  async saveRemoteFile(url: string, suggestedName: string): Promise<string | null> {
+  async saveRemoteFile(
+    url: string,
+    suggestedName: string,
+    downloadId?: string,
+  ): Promise<SavedFileResultDto | null> {
     const trimmed = url.trim();
     const targetUrl =
       /^data:/i.test(trimmed) || /^blob:/i.test(trimmed)
@@ -701,7 +706,19 @@ export const bridge = {
       a.remove();
       return null;
     }
-    return invoke<string | null>("save_remote_file", { url: targetUrl, suggestedName });
+    return invoke<SavedFileResultDto | null>("save_remote_file", {
+      url: targetUrl,
+      suggestedName,
+      downloadId: downloadId ?? null,
+    });
+  },
+  async openSavedFile(path: string): Promise<void> {
+    if (!isTauri()) return;
+    return invoke("open_saved_file", { path });
+  },
+  async revealSavedFile(path: string): Promise<void> {
+    if (!isTauri()) return;
+    return invoke("reveal_saved_file", { path });
   },
   async fetchImageDataUrl(url: string): Promise<string> {
     const trimmed = url.trim();

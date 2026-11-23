@@ -1,7 +1,7 @@
 //! Native OS open/save file dialogs using Win32 `comdlg32` and safe filename/extension resolution.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn pick_single_file(owner_hwnd: Option<usize>) -> Result<Option<PathBuf>, String> {
     #[cfg(target_os = "windows")]
@@ -565,6 +565,143 @@ pub fn ensure_save_path_extension(path: PathBuf, expected_ext: Option<&str>) -> 
     PathBuf::from(raw)
 }
 
+pub fn is_dangerous_executable_ext(path: &Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    let lower = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "exe"
+            | "bat"
+            | "cmd"
+            | "com"
+            | "msi"
+            | "msp"
+            | "msix"
+            | "ps1"
+            | "psm1"
+            | "psd1"
+            | "vbs"
+            | "vbe"
+            | "js"
+            | "jse"
+            | "wsf"
+            | "wsh"
+            | "scr"
+            | "pif"
+            | "hta"
+            | "cpl"
+            | "jar"
+            | "lnk"
+            | "reg"
+            | "inf"
+            | "dll"
+            | "sys"
+            | "drv"
+            | "sh"
+            | "app"
+            | "dmg"
+            | "pkg"
+            | "command"
+    )
+}
+
+pub fn normalize_os_display_path(path: &Path) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(s) = path.to_str() {
+            if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+                return PathBuf::from(format!(r"\\{unc}"));
+            }
+            if let Some(local) = s.strip_prefix(r"\\?\") {
+                return PathBuf::from(local);
+            }
+        }
+        path.to_path_buf()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        path.to_path_buf()
+    }
+}
+
+pub fn open_local_file(path: &Path) -> Result<(), String> {
+    if is_dangerous_executable_ext(path) {
+        return Err(
+            "Vì lý do an toàn, không mở trực tiếp tệp thực thi. Hãy mở thư mục chứa tệp để kiểm tra."
+                .into(),
+        );
+    }
+    if !path.is_file() {
+        return Err("Không tìm thấy tệp trên máy".into());
+    }
+    let clean = normalize_os_display_path(path);
+    #[cfg(target_os = "windows")]
+    {
+        win32::shell_open_file(&clean)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&clean)
+            .spawn()
+            .map_err(|e| format!("Không thể mở tệp: {e}"))?;
+        Ok(())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&clean)
+            .spawn()
+            .map_err(|e| format!("Không thể mở tệp: {e}"))?;
+        Ok(())
+    }
+}
+
+pub fn reveal_local_file(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Err("Không tìm thấy tệp hoặc thư mục trên máy".into());
+    }
+    let clean = normalize_os_display_path(path);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+
+        let path_str = clean
+            .to_str()
+            .ok_or_else(|| "Đường dẫn tệp chứa ký tự không hợp lệ".to_string())?;
+        if path_str.contains('"') || path_str.contains('\0') {
+            return Err("Đường dẫn tệp không hợp lệ".into());
+        }
+        std::process::Command::new("explorer.exe")
+            .raw_arg(format!("/select,\"{path_str}\""))
+            .spawn()
+            .map_err(|e| format!("Không thể mở thư mục chứa tệp: {e}"))?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(&clean)
+            .spawn()
+            .map_err(|e| format!("Không thể mở thư mục chứa tệp: {e}"))?;
+        Ok(())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let parent = clean
+            .parent()
+            .ok_or_else(|| "Không xác định được thư mục chứa tệp".to_string())?;
+        std::process::Command::new("xdg-open")
+            .arg(parent)
+            .spawn()
+            .map_err(|e| format!("Không thể mở thư mục chứa tệp: {e}"))?;
+        Ok(())
+    }
+}
+
 #[cfg(target_os = "windows")]
 mod win32 {
     use std::ffi::c_void;
@@ -625,6 +762,65 @@ mod win32 {
             lp_caption: *const u16,
             u_type: u32,
         ) -> i32;
+    }
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut c_void,
+            lp_operation: *const u16,
+            lp_file: *const u16,
+            lp_parameters: *const u16,
+            lp_directory: *const u16,
+            n_show_cmd: i32,
+        ) -> *mut c_void;
+    }
+
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoInitializeEx(pv_reserved: *mut c_void, dw_co_init: u32) -> i32;
+        fn CoUninitialize();
+    }
+
+    const COINIT_APARTMENTTHREADED: u32 = 0x2;
+    const COINIT_DISABLE_OLE1DDE: u32 = 0x4;
+    const SW_SHOWNORMAL: i32 = 1;
+
+    pub fn shell_open_file(path: &std::path::Path) -> Result<(), String> {
+        let Some(path_str) = path.to_str() else {
+            return Err("Đường dẫn tệp chứa ký tự không hợp lệ".into());
+        };
+        if path_str.contains('\0') {
+            return Err("Đường dẫn tệp không hợp lệ".into());
+        }
+        let verb: Vec<u16> = "open\0".encode_utf16().collect();
+        let file: Vec<u16> = format!("{path_str}\0").encode_utf16().collect();
+        let hr = unsafe {
+            CoInitializeEx(
+                null_mut(),
+                COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
+            )
+        };
+        let ret = unsafe {
+            ShellExecuteW(
+                null_mut(),
+                verb.as_ptr(),
+                file.as_ptr(),
+                null(),
+                null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if hr >= 0 {
+            unsafe {
+                CoUninitialize();
+            }
+        }
+        let code = ret as isize;
+        if code <= 32 {
+            return Err(format!("Không thể mở tệp bằng ứng dụng mặc định (mã {code})"));
+        }
+        Ok(())
     }
 
     const MB_YESNO: u32 = 0x0000_0004;
@@ -980,5 +1176,36 @@ mod tests {
         let mut legacy_xls = vec![0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
         legacy_xls.extend_from_slice(b"W\0o\0r\0k\0b\0o\0o\0k\0\0");
         assert_eq!(sniff_extension_from_bytes(&legacy_xls), Some("xls"));
+    }
+
+    #[test]
+    fn dangerous_executable_extensions_are_blocked_from_direct_open() {
+        for safe in [
+            "report.xlsx",
+            "doc.pdf",
+            "image.png",
+            "notes.docx",
+            "archive.zip",
+            "noext",
+        ] {
+            assert!(
+                !is_dangerous_executable_ext(Path::new(safe)),
+                "expected safe: {safe}"
+            );
+        }
+        for dangerous in [
+            "setup.exe",
+            "run.BAT",
+            "script.ps1",
+            "shortcut.lnk",
+            "installer.msi",
+            "macro.vbs",
+            "payload.cmd",
+        ] {
+            assert!(
+                is_dangerous_executable_ext(Path::new(dangerous)),
+                "expected blocked: {dangerous}"
+            );
+        }
     }
 }

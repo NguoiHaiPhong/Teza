@@ -4,6 +4,7 @@ import { bridge, isTauri, MAX_ATTACHMENT_BYTES } from "../bridge";
 import { useI18n, type TranslationKey } from "../i18n";
 import type { MessageDto, PendingAttachment, StickerItem, ThreadMemberDto } from "../types";
 import { extFromMime, extractAttachmentFromClipboard } from "../utils/clipboardParse";
+import { shouldFocusComposerOnReply } from "../utils/downloadState";
 import { EMOJI_CATEGORIES, searchEmojis } from "../utils/emojiCatalog";
 import { useEmojiStyle } from "../utils/emojiStyleContext";
 import {
@@ -59,6 +60,7 @@ function saveRecentEmoji(emoji: string): string[] {
 interface Props {
   threadKey?: string;
   replyTo: MessageDto | null;
+  focusSignal?: number;
   draft?: string;
   onDraftChange?: (val: string, threadKey?: string) => void;
   pendingAttachment?: PendingAttachment | null;
@@ -90,6 +92,7 @@ function formatBytes(bytes: number): string {
 export function Composer({
   threadKey,
   replyTo,
+  focusSignal = 0,
   draft: controlledDraft,
   onDraftChange,
   pendingAttachment = null,
@@ -213,6 +216,29 @@ export function Composer({
   const isComposingRef = useRef(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const prevReplyIdRef = useRef<string | null>(replyTo?.msg_id ?? null);
+  const prevFocusSignalRef = useRef<number>(focusSignal);
+
+  useEffect(() => {
+    const nextReplyId = replyTo?.msg_id ?? null;
+    const shouldFocus = shouldFocusComposerOnReply(
+      prevReplyIdRef.current,
+      nextReplyId,
+      prevFocusSignalRef.current,
+      focusSignal,
+    );
+    prevReplyIdRef.current = nextReplyId;
+    prevFocusSignalRef.current = focusSignal;
+    if (!shouldFocus) return;
+    const rafId = window.requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (!el || el.disabled) return;
+      el.focus();
+      const len = el.value.length;
+      el.setSelectionRange(len, len);
+    });
+    return () => window.cancelAnimationFrame(rafId);
+  }, [replyTo?.msg_id, focusSignal]);
 
   useEffect(() => {
     if (!emojiOpen) return;

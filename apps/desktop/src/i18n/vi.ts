@@ -635,6 +635,16 @@ export const vi = {
   emojiStyleDesc: "Tự chuyển mã gõ tắt quen thuộc như :)) =)) :(( ;) >:) :-* và hiển thị emoticon động",
   emojiCatRetro: "Retro Cổ điển",
   retroShortcutHint: "Gõ tắt :), :D, :)), =)), :((, ;), >:), :-*, B-)...",
+
+  // File download progress & completion popup
+  downloadInProgress: "Đang tải tệp...",
+  downloadChoosingLocation: "Đang chọn nơi lưu...",
+  downloadCompleteTitle: "Tải tệp hoàn tất",
+  downloadCompleteQuestion: "Bạn có muốn mở tệp vừa tải về máy không?",
+  downloadOpenFile: "Mở tệp",
+  downloadRevealFolder: "Mở thư mục",
+  downloadExecutableBlocked:
+    "Tệp thực thi không được mở trực tiếp vì lý do an toàn. Hãy mở thư mục để kiểm tra.",
 } as const;
 
 export type TranslationKey = keyof typeof vi;

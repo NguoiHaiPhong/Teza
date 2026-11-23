@@ -625,4 +625,14 @@ export const en: Record<TranslationKey, string> = {
   emojiStyleDesc: "Convert classic shortcuts like :)) =)) :(( ;) >:) :-* and render animated emoticons",
   emojiCatRetro: "Retro Classic",
   retroShortcutHint: "Shortcuts :), :D, :)), =)), :((, ;), >:), :-*, B-)...",
+
+  // File download progress & completion popup
+  downloadInProgress: "Downloading file...",
+  downloadChoosingLocation: "Choosing save location...",
+  downloadCompleteTitle: "Download complete",
+  downloadCompleteQuestion: "Would you like to open the downloaded file?",
+  downloadOpenFile: "Open file",
+  downloadRevealFolder: "Show in folder",
+  downloadExecutableBlocked:
+    "Executable files cannot be opened directly for safety. Open the folder to inspect it.",
 };

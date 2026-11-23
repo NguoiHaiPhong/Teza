@@ -311,3 +311,22 @@ export interface ScreenCaptureDto {
   monitors: MonitorInfoDto[];
   active_monitor_index: number | null;
 }
+
+export type DownloadStage = "downloading" | "saving" | "done" | "cancelled" | "error";
+
+export interface DownloadProgressDto {
+  id: string;
+  file_name: string;
+  stage: DownloadStage;
+  downloaded_bytes: number;
+  total_bytes: number | null;
+  saved_path: string | null;
+  can_open_directly: boolean;
+  error: string | null;
+}
+
+export interface SavedFileResultDto {
+  path: string;
+  file_name: string;
+  can_open_directly: boolean;
+}

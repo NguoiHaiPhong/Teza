@@ -842,9 +842,23 @@ body.fx-off .fay-trail {
   }
 }
 
+@keyframes teza-indeterminate {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(320%);
+  }
+}
+
+.teza-progress-indeterminate {
+  animation: teza-indeterminate 1.25s ease-in-out infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .buzz-shaking,
   .notify-buzz-shaking,
+  .teza-progress-indeterminate,
   .re-anim-bounce,
   .re-anim-rofl,
   .re-anim-wink,

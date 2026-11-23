@@ -5,7 +5,8 @@ mod file_dialog;
 mod screen_shake;
 mod screenshot;
 
-use std::path::PathBuf;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -59,6 +60,7 @@ pub struct AppState {
     pub pending_notify: Arc<Mutex<Option<NotifyToastPayload>>>,
     pub notify_hide_gen: Arc<AtomicU64>,
     pub active_webapp_label: Arc<Mutex<Option<String>>>,
+    pub recent_saved_files: Arc<Mutex<VecDeque<PathBuf>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2526,28 +2528,188 @@ fn main_window_hwnd(app: &AppHandle) -> Option<usize> {
     }
 }
 
+const MAX_RECENT_SAVED_FILES: usize = 200;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DownloadProgressPayload {
+    pub id: String,
+    pub file_name: String,
+    pub stage: String,
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub saved_path: Option<String>,
+    pub can_open_directly: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SavedFileResult {
+    pub path: String,
+    pub file_name: String,
+    pub can_open_directly: bool,
+}
+
+fn emit_download_progress(app: &AppHandle, payload: DownloadProgressPayload) {
+    let _ = app.emit("core://download-progress", payload);
+}
+
+fn normalize_saved_lookup_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn record_recent_saved_file(list: &mut VecDeque<PathBuf>, path: &Path) -> PathBuf {
+    let canonical = normalize_saved_lookup_path(path);
+    if let Some(pos) = list.iter().position(|p| p == &canonical) {
+        list.remove(pos);
+    }
+    list.push_back(canonical.clone());
+    while list.len() > MAX_RECENT_SAVED_FILES {
+        list.pop_front();
+    }
+    canonical
+}
+
+fn is_recent_saved_file(list: &VecDeque<PathBuf>, candidate: &Path) -> Option<PathBuf> {
+    let canonical = std::fs::canonicalize(candidate).ok()?;
+    list.iter().find(|p| *p == &canonical).cloned()
+}
+
+fn validate_open_saved_file(list: &VecDeque<PathBuf>, candidate: &Path) -> Result<PathBuf, String> {
+    let canonical = is_recent_saved_file(list, candidate)
+        .ok_or_else(|| "Tệp không nằm trong danh sách tệp vừa tải trong phiên này".to_string())?;
+    if file_dialog::is_dangerous_executable_ext(&canonical) {
+        return Err(
+            "Vì lý do an toàn, không mở trực tiếp tệp thực thi. Hãy mở thư mục chứa tệp để kiểm tra."
+                .into(),
+        );
+    }
+    Ok(canonical)
+}
+
+fn validate_reveal_saved_file(list: &VecDeque<PathBuf>, candidate: &Path) -> Result<PathBuf, String> {
+    is_recent_saved_file(list, candidate)
+        .ok_or_else(|| "Tệp không nằm trong danh sách tệp vừa tải trong phiên này".to_string())
+}
+
 #[tauri::command]
 async fn save_remote_file(
     app: AppHandle,
     state: State<'_, AppState>,
     url: String,
     suggested_name: String,
-) -> Result<Option<String>, String> {
+    download_id: Option<String>,
+) -> Result<Option<SavedFileResult>, String> {
+    let dl_id = download_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("dl-{}", chrono_now_ms()));
+    let initial_name = {
+        let s = suggested_name.trim();
+        if s.is_empty() {
+            "download".to_string()
+        } else {
+            s.to_string()
+        }
+    };
+
+    emit_download_progress(
+        &app,
+        DownloadProgressPayload {
+            id: dl_id.clone(),
+            file_name: initial_name.clone(),
+            stage: "downloading".to_string(),
+            downloaded_bytes: 0,
+            total_bytes: None,
+            saved_path: None,
+            can_open_directly: false,
+            error: None,
+        },
+    );
+
     let trimmed = url.trim_start();
     let is_data_url = trimmed.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("data:"));
     let (bytes, mime, final_url, cd_name) = if is_data_url {
-        let (data, mime) = zalo_core::session::decode_data_url_bytes(trimmed, 25 * 1024 * 1024)
-            .map_err(|e| e.to_string())?;
+        let (data, mime) = match zalo_core::session::decode_data_url_bytes(trimmed, 25 * 1024 * 1024)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = e.to_string();
+                emit_download_progress(
+                    &app,
+                    DownloadProgressPayload {
+                        id: dl_id,
+                        file_name: initial_name,
+                        stage: "error".to_string(),
+                        downloaded_bytes: 0,
+                        total_bytes: None,
+                        saved_path: None,
+                        can_open_directly: false,
+                        error: Some(msg.clone()),
+                    },
+                );
+                return Err(msg);
+            }
+        };
+        let total = data.len() as u64;
+        emit_download_progress(
+            &app,
+            DownloadProgressPayload {
+                id: dl_id.clone(),
+                file_name: initial_name.clone(),
+                stage: "downloading".to_string(),
+                downloaded_bytes: total,
+                total_bytes: Some(total),
+                saved_path: None,
+                can_open_directly: false,
+                error: None,
+            },
+        );
         (data, mime, String::new(), None)
     } else {
         let sess_snapshot = {
             let sess = state.session.lock().await;
             sess.clone_shallow()
         };
-        let downloaded = sess_snapshot
-            .download_media_with_meta(&url, 100 * 1024 * 1024)
+        let app_prog = app.clone();
+        let dl_id_prog = dl_id.clone();
+        let initial_name_prog = initial_name.clone();
+        let downloaded = match sess_snapshot
+            .download_media_with_meta_progress(&url, 100 * 1024 * 1024, move |bytes, total| {
+                emit_download_progress(
+                    &app_prog,
+                    DownloadProgressPayload {
+                        id: dl_id_prog.clone(),
+                        file_name: initial_name_prog.clone(),
+                        stage: "downloading".to_string(),
+                        downloaded_bytes: bytes,
+                        total_bytes: total,
+                        saved_path: None,
+                        can_open_directly: false,
+                        error: None,
+                    },
+                );
+            })
             .await
-            .map_err(|e| e.to_string())?;
+        {
+            Ok(d) => d,
+            Err(e) => {
+                let msg = e.to_string();
+                emit_download_progress(
+                    &app,
+                    DownloadProgressPayload {
+                        id: dl_id,
+                        file_name: initial_name,
+                        stage: "error".to_string(),
+                        downloaded_bytes: 0,
+                        total_bytes: None,
+                        saved_path: None,
+                        can_open_directly: false,
+                        error: Some(msg.clone()),
+                    },
+                );
+                return Err(msg);
+            }
+        };
         (
             downloaded.bytes,
             downloaded.mime,
@@ -2556,6 +2718,7 @@ async fn save_remote_file(
         )
     };
 
+    let bytes_len = bytes.len() as u64;
     let source_url = if is_data_url { "" } else { url.as_str() };
     let (resolved_name, resolved_ext) = file_dialog::resolve_download_filename_and_ext(
         &suggested_name,
@@ -2565,19 +2728,160 @@ async fn save_remote_file(
         &mime,
         &bytes,
     );
+
+    emit_download_progress(
+        &app,
+        DownloadProgressPayload {
+            id: dl_id.clone(),
+            file_name: resolved_name.clone(),
+            stage: "saving".to_string(),
+            downloaded_bytes: bytes_len,
+            total_bytes: Some(bytes_len),
+            saved_path: None,
+            can_open_directly: false,
+            error: None,
+        },
+    );
+
     let owner_hwnd = main_window_hwnd(&app);
-    let target = tokio::task::spawn_blocking(move || {
-        file_dialog::pick_save_file(owner_hwnd, &resolved_name, resolved_ext.as_deref())
+    let resolved_name_for_dlg = resolved_name.clone();
+    let target = match tokio::task::spawn_blocking(move || {
+        file_dialog::pick_save_file(owner_hwnd, &resolved_name_for_dlg, resolved_ext.as_deref())
     })
     .await
-    .map_err(|e| format!("Lỗi hộp thoại lưu tệp: {e}"))??;
+    {
+        Ok(Ok(t)) => t,
+        Ok(Err(msg)) => {
+            emit_download_progress(
+                &app,
+                DownloadProgressPayload {
+                    id: dl_id,
+                    file_name: resolved_name,
+                    stage: "error".to_string(),
+                    downloaded_bytes: bytes_len,
+                    total_bytes: Some(bytes_len),
+                    saved_path: None,
+                    can_open_directly: false,
+                    error: Some(msg.clone()),
+                },
+            );
+            return Err(msg);
+        }
+        Err(e) => {
+            let msg = format!("Lỗi hộp thoại lưu tệp: {e}");
+            emit_download_progress(
+                &app,
+                DownloadProgressPayload {
+                    id: dl_id,
+                    file_name: resolved_name,
+                    stage: "error".to_string(),
+                    downloaded_bytes: bytes_len,
+                    total_bytes: Some(bytes_len),
+                    saved_path: None,
+                    can_open_directly: false,
+                    error: Some(msg.clone()),
+                },
+            );
+            return Err(msg);
+        }
+    };
     let Some(path) = target else {
+        emit_download_progress(
+            &app,
+            DownloadProgressPayload {
+                id: dl_id,
+                file_name: resolved_name,
+                stage: "cancelled".to_string(),
+                downloaded_bytes: bytes_len,
+                total_bytes: Some(bytes_len),
+                saved_path: None,
+                can_open_directly: false,
+                error: None,
+            },
+        );
         return Ok(None);
     };
-    tokio::fs::write(&path, &bytes)
+    if let Err(e) = tokio::fs::write(&path, &bytes).await {
+        let msg = format!("Không ghi được tệp: {e}");
+        emit_download_progress(
+            &app,
+            DownloadProgressPayload {
+                id: dl_id,
+                file_name: resolved_name,
+                stage: "error".to_string(),
+                downloaded_bytes: bytes_len,
+                total_bytes: Some(bytes_len),
+                saved_path: None,
+                can_open_directly: false,
+                error: Some(msg.clone()),
+            },
+        );
+        return Err(msg);
+    }
+
+    {
+        let mut recent = state.recent_saved_files.lock().await;
+        record_recent_saved_file(&mut recent, &path);
+    }
+
+    let display_path = file_dialog::normalize_os_display_path(&path);
+    let path_str = display_path.to_string_lossy().into_owned();
+    let saved_name = display_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&resolved_name)
+        .to_string();
+    let can_open_directly = !file_dialog::is_dangerous_executable_ext(&display_path);
+
+    emit_download_progress(
+        &app,
+        DownloadProgressPayload {
+            id: dl_id,
+            file_name: saved_name.clone(),
+            stage: "done".to_string(),
+            downloaded_bytes: bytes_len,
+            total_bytes: Some(bytes_len),
+            saved_path: Some(path_str.clone()),
+            can_open_directly,
+            error: None,
+        },
+    );
+
+    Ok(Some(SavedFileResult {
+        path: path_str,
+        file_name: saved_name,
+        can_open_directly,
+    }))
+}
+
+#[tauri::command]
+async fn open_saved_file(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("Đường dẫn tệp trống".into());
+    }
+    let canonical = {
+        let recent = state.recent_saved_files.lock().await;
+        validate_open_saved_file(&recent, Path::new(trimmed))?
+    };
+    tokio::task::spawn_blocking(move || file_dialog::open_local_file(&canonical))
         .await
-        .map_err(|e| format!("Không ghi được tệp: {e}"))?;
-    Ok(Some(path.to_string_lossy().into_owned()))
+        .map_err(|e| format!("Không thể mở tệp: {e}"))?
+}
+
+#[tauri::command]
+async fn reveal_saved_file(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("Đường dẫn tệp trống".into());
+    }
+    let canonical = {
+        let recent = state.recent_saved_files.lock().await;
+        validate_reveal_saved_file(&recent, Path::new(trimmed))?
+    };
+    tokio::task::spawn_blocking(move || file_dialog::reveal_local_file(&canonical))
+        .await
+        .map_err(|e| format!("Không thể mở thư mục chứa tệp: {e}"))?
 }
 
 #[tauri::command]
@@ -3417,6 +3721,7 @@ pub fn run() {
         pending_notify: Arc::new(Mutex::new(None)),
         notify_hide_gen: Arc::new(AtomicU64::new(0)),
         active_webapp_label: Arc::new(Mutex::new(None)),
+        recent_saved_files: Arc::new(Mutex::new(VecDeque::new())),
     };
 
     let builder = tauri::Builder::default();
@@ -3474,6 +3779,8 @@ pub fn run() {
             message_send_sticker,
             pick_attachment_file,
             save_remote_file,
+            open_saved_file,
+            reveal_saved_file,
             fetch_image_data_url,
             inspect_attachment_path,
             message_send_attachment_path,
@@ -3693,5 +4000,44 @@ mod tests {
 
         let text = InvokeBody::Json(serde_json::json!("abc"));
         assert!(super::extract_invoke_body_bytes(&text, 16).is_err());
+    }
+
+    #[test]
+    fn recent_saved_files_allowlist_validates_enforces_cap_and_blocks_executables() {
+        use std::collections::VecDeque;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("teza_saved_allowlist_{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let safe_file = dir.join("report.xlsx");
+        std::fs::write(&safe_file, b"ok").unwrap();
+        let exe_file = dir.join("payload.exe");
+        std::fs::write(&exe_file, b"mz").unwrap();
+        let other_file = dir.join("untracked.pdf");
+        std::fs::write(&other_file, b"pdf").unwrap();
+
+        let mut list = VecDeque::new();
+        super::record_recent_saved_file(&mut list, &safe_file);
+        super::record_recent_saved_file(&mut list, &exe_file);
+
+        assert!(super::validate_open_saved_file(&list, &safe_file).is_ok());
+        assert!(super::validate_reveal_saved_file(&list, &safe_file).is_ok());
+        assert!(super::validate_open_saved_file(&list, &exe_file).is_err());
+        assert!(super::validate_reveal_saved_file(&list, &exe_file).is_ok());
+        assert!(super::validate_open_saved_file(&list, &other_file).is_err());
+        assert!(super::validate_reveal_saved_file(&list, &other_file).is_err());
+
+        for idx in 0..(super::MAX_RECENT_SAVED_FILES + 5) {
+            super::record_recent_saved_file(&mut list, &dir.join(format!("synthetic_{idx}.txt")));
+        }
+        assert_eq!(list.len(), super::MAX_RECENT_SAVED_FILES);
+        assert!(super::is_recent_saved_file(&list, &safe_file).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

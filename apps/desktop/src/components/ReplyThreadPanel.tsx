@@ -88,6 +88,7 @@ export function ReplyThreadPanel({
 }: Props) {
   const { lang, t } = useI18n();
   const [replyTarget, setReplyTarget] = useState<MessageDto>(rootMessage);
+  const [replyFocusSeq, setReplyFocusSeq] = useState(0);
   const [threadHighlightId, setThreadHighlightId] = useState<string | null>(null);
   const listContainerRef = useRef<HTMLDivElement | null>(null);
   const listBottomRef = useRef<HTMLDivElement | null>(null);
@@ -109,6 +110,10 @@ export function ReplyThreadPanel({
   useEffect(() => {
     setReplyTarget(rootMessage);
   }, [rootMessage]);
+
+  useEffect(() => {
+    setReplyFocusSeq((n) => n + 1);
+  }, [rootMessage.msg_id]);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -320,7 +325,10 @@ export function ReplyThreadPanel({
                   translation={translationsByMsg[m.msg_id]}
                   replaceWithTranslation={replaceWithTranslation}
                   hideQuote={m.quote?.msg_id === rootMessage.msg_id}
-                  onReply={(target) => setReplyTarget(target)}
+                  onReply={(target) => {
+                    setReplyTarget(target);
+                    setReplyFocusSeq((n) => n + 1);
+                  }}
                   onReact={onReact}
                   onRecall={onRecall}
                   onDeleteLocal={onDeleteLocal}
@@ -347,6 +355,7 @@ export function ReplyThreadPanel({
       {/* Full Composer inside Thread (text + emoji/stickers + images/files + @mention + buzz) */}
       <Composer
         replyTo={replyTarget.msg_id !== rootMessage.msg_id ? replyTarget : null}
+        focusSignal={replyFocusSeq}
         pendingAttachment={pendingAttachment}
         onPendingAttachmentChange={onPendingAttachmentChange}
         mentionMembers={mentionMembers}

@@ -625,4 +625,14 @@ export const ko: Record<TranslationKey, string> = {
   emojiStyleDesc: ":)) =)) :(( ;) >:) :-* 같은 단축 입력을 변환하고 움직이는 레트로 이모티콘으로 표시",
   emojiCatRetro: "레트로 클래식",
   retroShortcutHint: "단축키 :), :D, :)), =)), :((, ;), >:), :-*, B-)...",
+
+  // File download progress & completion popup
+  downloadInProgress: "파일 다운로드 중...",
+  downloadChoosingLocation: "저장 위치 선택 중...",
+  downloadCompleteTitle: "다운로드 완료",
+  downloadCompleteQuestion: "다운로드한 파일을 여시겠습니까?",
+  downloadOpenFile: "파일 열기",
+  downloadRevealFolder: "폴더 열기",
+  downloadExecutableBlocked:
+    "보안을 위해 실행 파일은 직접 열 수 없습니다. 폴더를 열어 확인하세요.",
 };

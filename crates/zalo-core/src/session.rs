@@ -1117,6 +1117,19 @@ impl Session {
         url: &str,
         max_bytes: usize,
     ) -> Result<DownloadedMedia> {
+        self.download_media_with_meta_progress(url, max_bytes, |_, _| {})
+            .await
+    }
+
+    pub async fn download_media_with_meta_progress<F>(
+        &self,
+        url: &str,
+        max_bytes: usize,
+        mut on_progress: F,
+    ) -> Result<DownloadedMedia>
+    where
+        F: FnMut(u64, Option<u64>),
+    {
         let mut current_url = match normalize_allowed_media_url(url) {
             Ok(u) => u,
             Err(origin) => {
@@ -1182,7 +1195,8 @@ impl Session {
         if !status.is_success() {
             anyhow::bail!("Tải tệp thất bại (HTTP {})", status.as_u16());
         }
-        if let Some(len) = resp.content_length() {
+        let total_bytes = resp.content_length();
+        if let Some(len) = total_bytes {
             if len as usize > max_bytes {
                 anyhow::bail!("Kích thước tệp vượt quá giới hạn cho phép");
             }
@@ -1205,7 +1219,9 @@ impl Session {
             .unwrap_or("application/octet-stream")
             .to_string();
 
+        on_progress(0, total_bytes);
         let mut buf = Vec::new();
+        let mut last_emit = std::time::Instant::now();
         while let Some(chunk) = resp
             .chunk()
             .await
@@ -1215,7 +1231,12 @@ impl Session {
                 anyhow::bail!("Kích thước tệp vượt quá giới hạn cho phép");
             }
             buf.extend_from_slice(&chunk);
+            if last_emit.elapsed() >= std::time::Duration::from_millis(80) {
+                on_progress(buf.len() as u64, total_bytes);
+                last_emit = std::time::Instant::now();
+            }
         }
+        on_progress(buf.len() as u64, total_bytes.or(Some(buf.len() as u64)));
         Ok(DownloadedMedia {
             bytes: buf,
             mime,

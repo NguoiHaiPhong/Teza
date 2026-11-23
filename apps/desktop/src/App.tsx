@@ -94,6 +94,7 @@ import { AddGroupMembersModal } from "./components/AddGroupMembersModal";
 import { Composer } from "./components/Composer";
 import { CreatePollModal } from "./components/CreatePollModal";
 import { CreateReminderModal } from "./components/CreateReminderModal";
+import { DownloadOverlay } from "./components/DownloadOverlay";
 import { FindUserModal } from "./components/FindUserModal";
 import { FolderEditorModal, renderFolderIcon } from "./components/FolderEditorModal";
 import { ForwardModal } from "./components/ForwardModal";
@@ -129,6 +130,10 @@ import {
   savePasscodeConfig,
   verifyPasscode,
 } from "./utils/passcode";
+import {
+  applyDownloadProgress,
+  type DownloadProgressItem,
+} from "./utils/downloadState";
 import { parsePollPayload } from "./utils/richMessage";
 import {
   loadWebAppsConfig,
@@ -142,6 +147,7 @@ import type {
   BuiltInRailFolderId,
   ChatFolderDto,
   ConnectionStatus,
+  DownloadProgressDto,
   FolderFilter,
   MessageDto,
   MonitorInfoDto,
@@ -151,6 +157,7 @@ import type {
   PendingAttachment,
   RailDisplayMode,
   RelayConfigSummary,
+  SavedFileResultDto,
   StickerItem,
   ThemeMode,
   ThreadDetailsDto,
@@ -201,6 +208,9 @@ export default function App() {
   const [hasMoreHistory, setHasMoreHistory] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [replyTo, setReplyTo] = useState<MessageDto | null>(null);
+  const [replyFocusSeq, setReplyFocusSeq] = useState(0);
+  const [activeDownloads, setActiveDownloads] = useState<DownloadProgressItem[]>([]);
+  const [completedDownload, setCompletedDownload] = useState<SavedFileResultDto | null>(null);
   const [activeThreadRootId, setActiveThreadRootId] = useState<string | null>(null);
   const [localThreadLinks, setLocalThreadLinks] = useState<Record<string, string>>(() => {
     try {
@@ -358,6 +368,8 @@ export default function App() {
   const tRef = useRef(t);
   const myProfileRef = useRef<AccountProfile | null>(myProfile);
   const webToastTimerRef = useRef<number | null>(null);
+  const downloadSeqRef = useRef(0);
+  const handledDoneDownloadIdsRef = useRef<Set<string>>(new Set());
   const toastErrorTimerRef = useRef<number | null>(null);
   const buzzStreaksRef = useRef<BuzzStreakMap>(new Map());
   const buzzShakeTimerRef = useRef<number | null>(null);
@@ -789,6 +801,8 @@ export default function App() {
     setThreadMenuFoldersExpanded(false);
     setShowScrollDown(false);
     setUnreadBelow(0);
+    setActiveDownloads([]);
+    setCompletedDownload(null);
     setIsLocked(false);
     setActiveWebAppId(null);
     void bridge.webappHideAll();
@@ -1376,6 +1390,21 @@ export default function App() {
         listen<string>("core://open-thread", (ev) => {
           if (ev.payload) {
             openThreadById(ev.payload);
+          }
+        }),
+        listen<DownloadProgressDto>("core://download-progress", (ev) => {
+          const p = ev.payload;
+          setActiveDownloads((prev) => applyDownloadProgress(prev, p));
+          if (p.stage === "done" && p.saved_path && !handledDoneDownloadIdsRef.current.has(p.id)) {
+            if (handledDoneDownloadIdsRef.current.size > 200) {
+              handledDoneDownloadIdsRef.current.clear();
+            }
+            handledDoneDownloadIdsRef.current.add(p.id);
+            setCompletedDownload({
+              path: p.saved_path,
+              file_name: p.file_name,
+              can_open_directly: p.can_open_directly,
+            });
           }
         }),
       ]);
@@ -2143,6 +2172,7 @@ export default function App() {
 
   const handleReplyMessage = useCallback((target: MessageDto) => {
     setReplyTo(target);
+    setReplyFocusSeq((n) => n + 1);
   }, []);
 
   const handleJumpToMsgVoid = useCallback(
@@ -2282,7 +2312,37 @@ export default function App() {
 
   const handleSaveRemoteFile = useCallback(
     (url: string, suggestedName: string) => {
-      void bridge.saveRemoteFile(url, suggestedName).catch(showError);
+      const downloadId = `dl-${Date.now()}-${++downloadSeqRef.current}`;
+      if (isTauri()) {
+        setActiveDownloads((prev) =>
+          applyDownloadProgress(prev, {
+            id: downloadId,
+            file_name: suggestedName.trim() || "download",
+            stage: "downloading",
+            downloaded_bytes: 0,
+            total_bytes: null,
+            saved_path: null,
+            can_open_directly: false,
+            error: null,
+          }),
+        );
+      }
+      void bridge
+        .saveRemoteFile(url, suggestedName, downloadId)
+        .then((res) => {
+          setActiveDownloads((prev) => prev.filter((item) => item.id !== downloadId));
+          if (res && !handledDoneDownloadIdsRef.current.has(downloadId)) {
+            if (handledDoneDownloadIdsRef.current.size > 200) {
+              handledDoneDownloadIdsRef.current.clear();
+            }
+            handledDoneDownloadIdsRef.current.add(downloadId);
+            setCompletedDownload(res);
+          }
+        })
+        .catch((err) => {
+          setActiveDownloads((prev) => prev.filter((item) => item.id !== downloadId));
+          showError(err);
+        });
     },
     [showError],
   );
@@ -4607,6 +4667,7 @@ export default function App() {
               <Composer
                 threadKey={activeThread.id}
                 replyTo={replyTo}
+                focusSignal={replyFocusSeq}
                 draft={draftsByThread[activeThread.id] ?? ""}
                 onDraftChange={(val, tid) => setDraftForThread(tid ?? activeThread.id, val)}
                 pendingAttachment={pendingAttachment}
@@ -5486,6 +5547,17 @@ export default function App() {
         }}
         onError={showError}
       />
+
+      {!isLocked && (
+        <DownloadOverlay
+          activeDownloads={activeDownloads}
+          completedDownload={completedDownload}
+          onDismissCompleted={() => setCompletedDownload(null)}
+          onOpenFile={(path) => bridge.openSavedFile(path)}
+          onRevealFile={(path) => bridge.revealSavedFile(path)}
+          onError={showError}
+        />
+      )}
 
       {webNotifyToast && !isLocked && (
         <div
