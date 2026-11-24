@@ -1,5 +1,6 @@
 //! Tauri v2 CoreBridge connecting `zalo-core` to the Telegram-inspired React UI.
 
+mod call;
 mod clipboard;
 mod file_dialog;
 mod screen_shake;
@@ -61,6 +62,7 @@ pub struct AppState {
     pub notify_hide_gen: Arc<AtomicU64>,
     pub active_webapp_label: Arc<Mutex<Option<String>>>,
     pub recent_saved_files: Arc<Mutex<VecDeque<PathBuf>>>,
+    pub call_mgr: Arc<call::CallManager>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,14 +211,19 @@ async fn clear_expired_session(
             handle.abort();
         }
     }
-    {
+    let relay_on = {
         let mut sess = sess_arc.lock().await;
+        let was_relay = sess.relay.enabled;
         if let Ok(fresh) = Session::new_with_relay(sess.relay.clone()) {
             *sess = fresh;
         } else {
             sess.zpw_sek = None;
             sess.secret_key = None;
         }
+        was_relay
+    };
+    if let Some(st) = app.try_state::<AppState>() {
+        st.call_mgr.teardown(Some(app), false, relay_on).await;
     }
     let session_path = paths.session_file();
     if session_path.exists() {
@@ -233,6 +240,7 @@ async fn ensure_ws_worker(
     store_arc: Arc<Mutex<MessageStore>>,
     ws_task_arc: Arc<Mutex<Option<JoinHandle<()>>>>,
     active_thread_arc: Arc<Mutex<Option<String>>>,
+    call_mgr: Arc<call::CallManager>,
     paths: StoragePaths,
 ) {
     let already_running = {
@@ -246,6 +254,7 @@ async fn ensure_ws_worker(
             store_arc,
             ws_task_arc,
             active_thread_arc,
+            call_mgr,
             paths,
         )
         .await;
@@ -258,6 +267,7 @@ async fn restart_ws_worker(
     store_arc: Arc<Mutex<MessageStore>>,
     ws_task_arc: Arc<Mutex<Option<JoinHandle<()>>>>,
     active_thread_arc: Arc<Mutex<Option<String>>>,
+    call_mgr: Arc<call::CallManager>,
     paths: StoragePaths,
 ) {
     let mut guard = ws_task_arc.lock().await;
@@ -307,7 +317,11 @@ async fn restart_ws_worker(
                     break;
                 }
                 WsSignal::Event(ev) => {
-                    if !ev.is_chat_ish() && !ev.is_control_ish() && !ev.is_receipt_ish() {
+                    if !ev.is_chat_ish()
+                        && !ev.is_control_ish()
+                        && !ev.is_receipt_ish()
+                        && zalo_core::chat::parser::extract_voip_controls(&ev.payload).is_empty()
+                    {
                         continue;
                     }
                     let mut actions = parse_ws_event(&ev, &my_uid, &send2me_id);
@@ -340,6 +354,7 @@ async fn restart_ws_worker(
 
                     let active_id = active_thread_arc.lock().await.clone();
                     let mut pending_resolve_msgs: Vec<MessageDto> = Vec::new();
+                    let mut voip_events = Vec::new();
                     let mut threads_touched = false;
                     {
                         let mut store = store_arc.lock().await;
@@ -427,9 +442,12 @@ async fn restart_ws_worker(
                                     let _ = app.emit("core://message-updated", &updated);
                                 }
                             }
-                            WsParsedAction::Voip(_) => {}
+                            WsParsedAction::Voip(v) => voip_events.push(v),
                         }
                         }
+                    }
+                    for v in voip_events {
+                        call_mgr.feed_ws_voip(&v).await;
                     }
                     if threads_touched {
                         let _ = app.emit("core://threads-updated", ());
@@ -506,26 +524,38 @@ async fn auth_get_status(app: AppHandle, state: State<'_, AppState>) -> Result<A
                 let _ = sess.save_to_file(&state.paths.session_file());
             }
             ensure_ws_worker(
-                app,
+                app.clone(),
                 state.session.clone(),
                 state.store.clone(),
                 state.ws_task.clone(),
                 state.active_thread_id.clone(),
+                state.call_mgr.clone(),
                 state.paths.clone(),
             )
             .await;
+            let call_sess = state.session.lock().await.clone_shallow();
+            let _ = state
+                .call_mgr
+                .ensure_started(app, &call_sess, state.store.clone())
+                .await;
             Ok(AuthStatusDto::Authenticated { profile })
         }
         SessionStatus::Unreachable => {
             ensure_ws_worker(
-                app,
+                app.clone(),
                 state.session.clone(),
                 state.store.clone(),
                 state.ws_task.clone(),
                 state.active_thread_id.clone(),
+                state.call_mgr.clone(),
                 state.paths.clone(),
             )
             .await;
+            let call_sess = state.session.lock().await.clone_shallow();
+            let _ = state
+                .call_mgr
+                .ensure_started(app, &call_sess, state.store.clone())
+                .await;
             Ok(AuthStatusDto::Authenticated { profile })
         }
         SessionStatus::Expired { code } => {
@@ -574,6 +604,7 @@ async fn auth_start_qr(
     let store_arc = state.store.clone();
     let ws_task_arc = state.ws_task.clone();
     let active_thread_arc = state.active_thread_id.clone();
+    let call_mgr_arc = state.call_mgr.clone();
     let paths = state.paths.clone();
 
     let handle = tokio::spawn(async move {
@@ -617,13 +648,16 @@ async fn auth_start_qr(
                 let _ = app.emit("core://auth-authenticated", &profile);
                 restart_ws_worker(
                     app.clone(),
-                    sess_arc,
-                    store_arc,
+                    sess_arc.clone(),
+                    store_arc.clone(),
                     ws_task_arc,
                     active_thread_arc,
+                    call_mgr_arc.clone(),
                     paths,
                 )
                 .await;
+                let call_sess = sess_arc.lock().await.clone_shallow();
+                let _ = call_mgr_arc.restart(app, &call_sess, store_arc).await;
             }
             Err(e) => {
                 let _ = app.emit("core://auth-error", e.to_string());
@@ -636,7 +670,7 @@ async fn auth_start_qr(
 }
 
 #[tauri::command]
-async fn auth_logout(state: State<'_, AppState>) -> Result<(), String> {
+async fn auth_logout(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     if let Some(handle) = state.qr_task.lock().await.take() {
         handle.abort();
     }
@@ -644,10 +678,13 @@ async fn auth_logout(state: State<'_, AppState>) -> Result<(), String> {
         handle.abort();
     }
     *state.active_thread_id.lock().await = None;
-    {
+    let relay_on = {
         let mut sess = state.session.lock().await;
+        let was_relay = sess.relay.enabled;
         *sess = Session::new_with_relay(sess.relay.clone()).map_err(|e| e.to_string())?;
-    }
+        was_relay
+    };
+    state.call_mgr.teardown(Some(&app), false, relay_on).await;
     let path = state.paths.session_file();
     if path.exists() {
         std::fs::remove_file(&path).map_err(|e| format!("Không xóa được session.json: {e}"))?;
@@ -3266,9 +3303,21 @@ async fn relay_save_config(
             state.store.clone(),
             state.ws_task.clone(),
             state.active_thread_id.clone(),
+            state.call_mgr.clone(),
             state.paths.clone(),
         )
         .await;
+    }
+    if summary.enabled {
+        state.call_mgr.teardown(Some(&app), is_authed, true).await;
+    } else if is_authed {
+        let call_sess = state.session.lock().await.clone_shallow();
+        let _ = state
+            .call_mgr
+            .restart(app.clone(), &call_sess, state.store.clone())
+            .await;
+    } else {
+        state.call_mgr.teardown(Some(&app), false, false).await;
     }
     let _ = app.emit("core://relay-updated", &summary);
     Ok(summary)
@@ -3288,6 +3337,183 @@ async fn relay_test_connection(
     };
     let latency_ms = candidate.test_connection().await.map_err(|e| e.to_string())?;
     Ok(RelayTestDto { latency_ms })
+}
+
+#[tauri::command]
+async fn call_get_state(state: State<'_, AppState>) -> Result<call::CallStateDto, String> {
+    let (authed, relay_enabled) = {
+        let sess = state.session.lock().await;
+        (sess.is_authenticated(), sess.relay.enabled)
+    };
+    Ok(state
+        .call_mgr
+        .get_state(authed, relay_enabled, &state.store)
+        .await)
+}
+
+#[tauri::command]
+async fn call_list_devices(state: State<'_, AppState>) -> Result<call::CallDevicesDto, String> {
+    state.call_mgr.list_devices().await
+}
+
+#[tauri::command]
+async fn call_set_devices(
+    state: State<'_, AppState>,
+    input_device: Option<String>,
+    output_device: Option<String>,
+) -> Result<call::CallDevicesDto, String> {
+    state
+        .call_mgr
+        .set_devices(input_device, output_device)
+        .await
+}
+
+#[tauri::command]
+async fn call_test_audio(state: State<'_, AppState>) -> Result<call::CallAudioTestResultDto, String> {
+    state.call_mgr.test_audio().await
+}
+
+#[tauri::command]
+async fn call_start_voice(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    partner_id: String,
+    partner_name: Option<String>,
+) -> Result<call::CallStateDto, String> {
+    let sess_snap = {
+        let sess = state.session.lock().await;
+        if !sess.is_authenticated() {
+            return Err("Chưa đăng nhập".into());
+        }
+        if sess.relay.enabled {
+            return Err(teza_call::CallError::RelayUnsupported.to_string());
+        }
+        sess.clone_shallow()
+    };
+    state
+        .call_mgr
+        .ensure_started(app, &sess_snap, state.store.clone())
+        .await?;
+    let eng = state
+        .call_mgr
+        .active_engine()
+        .await
+        .ok_or_else(|| "Engine gọi thoại chưa sẵn sàng".to_string())?;
+    let display_name = partner_name
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| partner_id.clone());
+    eng.make_call(partner_id, display_name, teza_call::CallType::DirectVoice)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(state
+        .call_mgr
+        .get_state(true, false, &state.store)
+        .await)
+}
+
+#[tauri::command]
+async fn call_answer(
+    state: State<'_, AppState>,
+    call_id: Option<i64>,
+) -> Result<call::CallStateDto, String> {
+    {
+        let sess = state.session.lock().await;
+        if !sess.is_authenticated() {
+            return Err("Chưa đăng nhập".into());
+        }
+        if sess.relay.enabled {
+            return Err(teza_call::CallError::RelayUnsupported.to_string());
+        }
+    }
+    let eng = state
+        .call_mgr
+        .active_engine()
+        .await
+        .ok_or_else(|| "Không có cuộc gọi đến nào đang hoạt động".to_string())?;
+    eng.answer_call_by_id(call_id, true)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(state
+        .call_mgr
+        .get_state(true, false, &state.store)
+        .await)
+}
+
+#[tauri::command]
+async fn call_decline(
+    state: State<'_, AppState>,
+    call_id: Option<i64>,
+) -> Result<call::CallStateDto, String> {
+    {
+        let sess = state.session.lock().await;
+        if !sess.is_authenticated() {
+            return Err("Chưa đăng nhập".into());
+        }
+        if sess.relay.enabled {
+            return Err(teza_call::CallError::RelayUnsupported.to_string());
+        }
+    }
+    if let Some(eng) = state.call_mgr.active_engine().await {
+        eng.answer_call_by_id(call_id, false)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(state
+        .call_mgr
+        .get_state(true, false, &state.store)
+        .await)
+}
+
+#[tauri::command]
+async fn call_hangup(app: AppHandle, state: State<'_, AppState>) -> Result<call::CallStateDto, String> {
+    let (authed, relay_enabled) = {
+        let sess = state.session.lock().await;
+        (sess.is_authenticated(), sess.relay.enabled)
+    };
+    if relay_enabled || !authed {
+        state
+            .call_mgr
+            .teardown(Some(&app), authed, relay_enabled)
+            .await;
+        return Ok(state
+            .call_mgr
+            .get_state(authed, relay_enabled, &state.store)
+            .await);
+    }
+    if let Some(eng) = state.call_mgr.active_engine().await {
+        eng.end_call().await.map_err(|e| e.to_string())?;
+    }
+    Ok(state
+        .call_mgr
+        .get_state(true, false, &state.store)
+        .await)
+}
+
+#[tauri::command]
+async fn call_set_mute(
+    state: State<'_, AppState>,
+    muted: bool,
+) -> Result<call::CallStateDto, String> {
+    {
+        let sess = state.session.lock().await;
+        if !sess.is_authenticated() {
+            return Err("Chưa đăng nhập".into());
+        }
+        if sess.relay.enabled {
+            return Err(teza_call::CallError::RelayUnsupported.to_string());
+        }
+    }
+    let eng = state
+        .call_mgr
+        .active_engine()
+        .await
+        .ok_or_else(|| "Không có cuộc gọi nào đang hoạt động".to_string())?;
+    eng.set_mic_muted(muted).await.map_err(|e| e.to_string())?;
+    Ok(state
+        .call_mgr
+        .get_state(true, false, &state.store)
+        .await)
 }
 
 #[tauri::command]
@@ -3707,6 +3933,7 @@ pub fn run() {
 
     let close_to_tray = Arc::new(AtomicBool::new(true));
     let allow_exit = Arc::new(AtomicBool::new(false));
+    let call_mgr = Arc::new(call::CallManager::new(paths.clone()));
     let state = AppState {
         paths,
         session: sess_arc,
@@ -3723,6 +3950,7 @@ pub fn run() {
         notify_hide_gen: Arc::new(AtomicU64::new(0)),
         active_webapp_label: Arc::new(Mutex::new(None)),
         recent_saved_files: Arc::new(Mutex::new(VecDeque::new())),
+        call_mgr,
     };
 
     let builder = tauri::Builder::default();
@@ -3794,6 +4022,15 @@ pub fn run() {
             relay_get_config,
             relay_save_config,
             relay_test_connection,
+            call_get_state,
+            call_list_devices,
+            call_set_devices,
+            call_test_audio,
+            call_start_voice,
+            call_answer,
+            call_decline,
+            call_hangup,
+            call_set_mute,
             notify_show_popup,
             notify_get_current,
             notify_dismiss,
@@ -3831,7 +4068,13 @@ pub fn run() {
                         }
                     } else if event.id() == "quit" {
                         exit_flag.store(true, Ordering::SeqCst);
-                        app_handle.exit(0);
+                        let quit_app = app_handle.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Some(st) = quit_app.try_state::<AppState>() {
+                                st.call_mgr.teardown(None, false, false).await;
+                            }
+                            quit_app.exit(0);
+                        });
                     }
                 })
                 .on_tray_icon_event(|tray_icon, event| {

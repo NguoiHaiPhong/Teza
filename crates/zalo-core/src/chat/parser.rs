@@ -246,6 +246,181 @@ fn is_reminder_thumb_url(url: &str) -> bool {
     lower.contains("/reminder_") || lower.contains("/reminder-")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CallCardMeta {
+    call_type: &'static str,
+    outcome: &'static str,
+    duration_secs: u64,
+}
+
+fn format_call_mm_ss(secs: u64) -> String {
+    let mins = secs / 60;
+    let rem = secs % 60;
+    format!("{mins:02}:{rem:02}")
+}
+
+fn parse_duration_secs_from_text(text: &str) -> Option<u64> {
+    let bytes = text.as_bytes();
+    for i in 0..bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            continue;
+        }
+        let mut j = i;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j < bytes.len() && bytes[j] == b':' {
+            let mut k = j + 1;
+            while k < bytes.len() && bytes[k].is_ascii_digit() {
+                k += 1;
+            }
+            if k > j + 1 {
+                if let (Ok(m), Ok(s)) = (
+                    text[i..j].parse::<u64>(),
+                    text[j + 1..k].parse::<u64>(),
+                ) {
+                    if s < 60 {
+                        return Some(m.saturating_mul(60).saturating_add(s));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_call_meta(
+    raw: Option<&Value>,
+    msg_type: &str,
+    is_outgoing_hint: bool,
+) -> Option<CallCardMeta> {
+    let lower_type = msg_type.to_ascii_lowercase();
+    let explicit_type = matches!(
+        lower_type.as_str(),
+        "chat.call" | "call.voice" | "call.video" | "chat.voip" | "call" | "voip"
+    ) || lower_type.starts_with("call.");
+    let obj = raw.and_then(unwrap_json_object);
+    let inner_params = obj
+        .as_ref()
+        .and_then(|o| o.get("params"))
+        .and_then(unwrap_json_object);
+
+    if !explicit_type {
+        let looks_like_call = [obj.as_ref(), inner_params.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|node| {
+                node.get("callId").is_some()
+                    || node.get("call_id").is_some()
+                    || node.get("callType").is_some()
+                    || node.get("call_type").is_some()
+                    || node.get("callStatus").is_some()
+                    || node.get("call_status").is_some()
+            });
+        if !looks_like_call {
+            return None;
+        }
+    }
+
+    let find_str = |keys: &[&str]| -> Option<String> {
+        inner_params
+            .as_ref()
+            .and_then(|p| pick_str(p, keys))
+            .or_else(|| obj.as_ref().and_then(|o| pick_str(o, keys)))
+    };
+    let find_u64 = |keys: &[&str]| -> Option<u64> {
+        for key in keys {
+            for node in [inner_params.as_ref(), obj.as_ref()].into_iter().flatten() {
+                if let Some(v) = node.get(*key) {
+                    if let Some(n) = v
+                        .as_u64()
+                        .or_else(|| v.as_i64().filter(|x| *x >= 0).map(|x| x as u64))
+                        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+                    {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+        None
+    };
+
+    let raw_text_hint = raw.and_then(extract_content_text).unwrap_or_default();
+    let raw_call_type_str = find_str(&["callType", "call_type", "mediaType"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let raw_call_type_num = find_u64(&["callType", "call_type"]);
+    let is_video_flag = [inner_params.as_ref(), obj.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|node| node.get("isVideo").or_else(|| node.get("is_video")))
+        .any(value_as_bool_flag);
+    let is_video = lower_type.contains("video")
+        || is_video_flag
+        || raw_call_type_str.contains("video")
+        || raw_call_type_num == Some(3)
+        || raw_text_hint.to_ascii_lowercase().contains("video");
+    let call_type = if is_video { "video" } else { "voice" };
+
+    let duration_secs = find_u64(&["duration", "callDuration", "call_duration", "durationSecs"])
+        .or_else(|| parse_duration_secs_from_text(&raw_text_hint))
+        .unwrap_or(0);
+
+    let status_text = find_str(&[
+        "callStatus",
+        "call_status",
+        "reason",
+        "state",
+        "subType",
+        "status",
+        "title",
+        "description",
+    ])
+    .unwrap_or_default()
+    .to_ascii_lowercase();
+    let status_code = find_u64(&["callStatus", "call_status", "status", "reasonCode"]);
+    let combined_hint = format!("{status_text} {}", raw_text_hint.to_ascii_lowercase());
+
+    let outcome = if duration_secs > 0 {
+        "completed"
+    } else if combined_hint.contains("miss")
+        || combined_hint.contains("no_answer")
+        || combined_hint.contains("timeout")
+        || combined_hint.contains("nhỡ")
+        || combined_hint.contains("bỏ lỡ")
+        || combined_hint.contains("không trả lời")
+        || status_code == Some(6)
+    {
+        "missed"
+    } else if combined_hint.contains("cancel") || combined_hint.contains("hủy") || status_code == Some(2) {
+        "cancelled"
+    } else if combined_hint.contains("reject")
+        || combined_hint.contains("declin")
+        || combined_hint.contains("busy")
+        || combined_hint.contains("từ chối")
+        || combined_hint.contains("bận")
+        || matches!(status_code, Some(3 | 4))
+    {
+        "declined"
+    } else if combined_hint.contains("end")
+        || combined_hint.contains("complet")
+        || combined_hint.contains("answer")
+        || combined_hint.contains("kết thúc")
+    {
+        "completed"
+    } else if is_outgoing_hint {
+        "cancelled"
+    } else {
+        "missed"
+    };
+
+    Some(CallCardMeta {
+        call_type,
+        outcome,
+        duration_secs,
+    })
+}
+
 fn extract_reminder_meta(
     raw: Option<&Value>,
     msg_type: &str,
@@ -838,6 +1013,19 @@ pub fn parse_chat_message(
         sticker_meta = extract_sticker_info(it);
     }
 
+    let uid_from_hint =
+        pick_str(it, &["uidFrom", "fromUid", "fromId", "senderId"]).unwrap_or_default();
+    let clean_uid_from_hint = uid_from_hint.split('_').next().unwrap_or(uid_from_hint.as_str());
+    let is_self_flag_hint = [it.get("isSelf"), it.get("is_self")]
+        .into_iter()
+        .flatten()
+        .any(|v| v.as_bool() == Some(true) || v.as_i64() == Some(1) || v.as_str() == Some("1"));
+    let is_outgoing_hint = is_self_flag_hint
+        || clean_uid_from_hint == "0"
+        || clean_uid_from_hint.is_empty()
+        || (!my_uid.is_empty() && (uid_from_hint == my_uid || clean_uid_from_hint == my_uid))
+        || (!send2me_id.is_empty() && clean_uid_from_hint == send2me_id);
+
     let raw_msg_id = pick_str(it, &["msgId", "globalMsgId", "cliMsgId", "id"]);
     let reminder_meta = extract_reminder_meta(raw_content, &msg_type);
     let poll_meta = if reminder_meta.is_none() {
@@ -845,16 +1033,22 @@ pub fn parse_chat_message(
     } else {
         None
     };
-
-    let (mut attachment_url, mut attachment_name) = if reminder_meta.is_some() || poll_meta.is_some() {
-        (None, None)
+    let is_undo = matches!(msg_type.as_str(), "chat.undo" | "undo" | "31");
+    let call_meta = if !is_undo && reminder_meta.is_none() && poll_meta.is_none() {
+        extract_call_meta(raw_content, &msg_type, is_outgoing_hint)
     } else {
-        raw_content
-            .map(|rv| extract_attachment(rv, &msg_type))
-            .unwrap_or((None, None))
+        None
     };
 
-    let is_undo = matches!(msg_type.as_str(), "chat.undo" | "undo" | "31");
+    let (mut attachment_url, mut attachment_name) =
+        if reminder_meta.is_some() || poll_meta.is_some() || call_meta.is_some() {
+            (None, None)
+        } else {
+            raw_content
+                .map(|rv| extract_attachment(rv, &msg_type))
+                .unwrap_or((None, None))
+        };
+
     if is_undo {
         sticker_meta = None;
     } else if let Some((ref title, start_time, repeat, ref rid, ref schedule_text)) = reminder_meta {
@@ -878,6 +1072,16 @@ pub fn parse_chat_message(
         if let Ok(json_str) = serde_json::to_string(poll) {
             attachment_name = Some(format!("teza-poll:{json_str}"));
         }
+    } else if let Some(call) = call_meta {
+        msg_type = "chat.call".to_string();
+        sticker_meta = None;
+        attachment_url = None;
+        let meta_obj = serde_json::json!({
+            "callType": call.call_type,
+            "outcome": call.outcome,
+            "durationSecs": call.duration_secs,
+        });
+        attachment_name = Some(format!("teza-call:{meta_obj}"));
     } else if let Some((sid, cid, _)) = sticker_meta {
         msg_type = "chat.sticker".to_string();
         if attachment_url.is_none() {
@@ -902,6 +1106,22 @@ pub fn parse_chat_message(
             "[Bình chọn]".to_string()
         } else {
             format!("Bình chọn: {}", poll.question)
+        }
+    } else if let Some(call) = call_meta {
+        let noun = if call.call_type == "video" {
+            "Cuộc gọi video"
+        } else {
+            "Cuộc gọi thoại"
+        };
+        if call.duration_secs > 0 {
+            format!("{noun} ({})", format_call_mm_ss(call.duration_secs))
+        } else {
+            match call.outcome {
+                "missed" => format!("{noun} nhỡ"),
+                "cancelled" => format!("Đã hủy {}", noun.to_lowercase()),
+                "declined" => format!("{noun} bị từ chối"),
+                _ => noun.to_string(),
+            }
         }
     } else if sticker_meta.is_some() {
         "[Nhãn dán]".to_string()
@@ -2261,5 +2481,82 @@ mod tests {
             &a_615[0],
             WsParsedAction::Voip(v) if v.act == "ring_ring" && v.call_id() == 555_129
         ));
+    }
+
+    #[test]
+    fn parses_call_log_messages_into_structured_teza_call_cards() {
+        let voice_ok = json!({
+            "msgId": "c-1",
+            "uidFrom": "123",
+            "idTo": "456",
+            "msgType": "chat.call",
+            "content": {
+                "callType": 1,
+                "duration": 85,
+                "callStatus": "ended"
+            },
+            "ts": 1_700_000_000
+        });
+        let m1 = parse_chat_message(&voice_ok, None, "456", "", false).unwrap();
+        assert_eq!(m1.msg_type, "chat.call");
+        assert_eq!(m1.text, "Cuộc gọi thoại (01:25)");
+        assert_eq!(
+            m1.attachment_name.as_deref(),
+            Some(r#"teza-call:{"callType":"voice","durationSecs":85,"outcome":"completed"}"#)
+        );
+
+        let voice_missed = json!({
+            "msgId": "c-2",
+            "uidFrom": "123",
+            "idTo": "456",
+            "msgType": "call.voice",
+            "content": "{\"callId\":99,\"status\":6,\"duration\":0}",
+            "ts": 1_700_000_010
+        });
+        let m2 = parse_chat_message(&voice_missed, None, "456", "", false).unwrap();
+        assert_eq!(m2.msg_type, "chat.call");
+        assert_eq!(m2.text, "Cuộc gọi thoại nhỡ");
+        assert_eq!(
+            m2.attachment_name.as_deref(),
+            Some(r#"teza-call:{"callType":"voice","durationSecs":0,"outcome":"missed"}"#)
+        );
+
+        let video_declined = json!({
+            "msgId": "c-3",
+            "uidFrom": "456",
+            "idTo": "123",
+            "isSelf": true,
+            "msgType": "chat.text",
+            "content": {
+                "callId": 100,
+                "callType": 3,
+                "reason": "rejected"
+            },
+            "ts": 1_700_000_020
+        });
+        let m3 = parse_chat_message(&video_declined, None, "456", "", false).unwrap();
+        assert_eq!(m3.msg_type, "chat.call");
+        assert_eq!(m3.text, "Cuộc gọi video bị từ chối");
+        assert_eq!(
+            m3.attachment_name.as_deref(),
+            Some(r#"teza-call:{"callType":"video","durationSecs":0,"outcome":"declined"}"#)
+        );
+
+        let video_cancelled = json!({
+            "msgId": "c-4",
+            "uidFrom": "456",
+            "idTo": "123",
+            "isSelf": true,
+            "msgType": "call.video",
+            "content": { "params": "{\"duration\":0,\"callStatus\":\"cancelled\"}" },
+            "ts": 1_700_000_030
+        });
+        let m4 = parse_chat_message(&video_cancelled, None, "456", "", false).unwrap();
+        assert_eq!(m4.msg_type, "chat.call");
+        assert_eq!(m4.text, "Đã hủy cuộc gọi video");
+        assert_eq!(
+            m4.attachment_name.as_deref(),
+            Some(r#"teza-call:{"callType":"video","durationSecs":0,"outcome":"cancelled"}"#)
+        );
     }
 }

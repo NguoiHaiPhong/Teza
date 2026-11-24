@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  AlertTriangle,
   ArrowDownToLine,
   AtSign,
   Bell,
@@ -9,15 +10,18 @@ import {
   Eye,
   FolderKanban,
   Globe,
+  Headphones,
   Keyboard,
   Languages,
   Loader2,
   Lock,
   LogOut,
   MessageSquare,
+  Mic,
   Monitor,
   Network,
   Palette,
+  Phone,
   Plus,
   RefreshCw,
   Send,
@@ -38,6 +42,8 @@ import type {
   AccountProfile,
   AppUpdateInfo,
   BuiltInRailFolderId,
+  CallAudioTestResultDto,
+  CallDevicesDto,
   ConnectionStatus,
   NotificationPrefs,
   NotifyBadgeMode,
@@ -50,6 +56,7 @@ import type {
   ThemeMode,
   TranslateConfigSummary,
 } from "../types";
+import { resolveEffectiveCallDevices } from "../utils/callState";
 import { hashPasscode, validatePasscodeCandidate, verifyPasscode } from "../utils/passcode";
 import {
   extractWebAppDomain,
@@ -69,6 +76,7 @@ export type SettingsTab =
   | "appearance"
   | "folders"
   | "webapps"
+  | "calls"
   | "translate"
   | "network"
   | "system";
@@ -113,6 +121,10 @@ interface Props {
   relayCfg: RelayConfigSummary | null;
   onRelaySaved: (cfg: RelayConfigSummary) => void;
   focusRelay?: boolean;
+  callDevices: CallDevicesDto | null;
+  callDevicesLoading: boolean;
+  onRefreshCallDevices: () => void;
+  onSelectCallDevices: (input: string | null, output: string | null) => Promise<void> | void;
   appVersion: string;
   availableUpdate: AppUpdateInfo | null;
   onOpenUpdateModal: () => void;
@@ -131,6 +143,7 @@ const NAV_TABS: { id: SettingsTab; labelKey: TranslationKey; icon: typeof Bell }
   { id: "appearance", labelKey: "tabAppearance", icon: Palette },
   { id: "folders", labelKey: "tabFolders", icon: FolderKanban },
   { id: "webapps", labelKey: "tabWebApps", icon: Globe },
+  { id: "calls", labelKey: "tabCalls", icon: Phone },
   { id: "translate", labelKey: "tabTranslate", icon: Languages },
   { id: "network", labelKey: "tabNetwork", icon: Network },
   { id: "account", labelKey: "tabAccount", icon: User },
@@ -225,6 +238,10 @@ export function SettingsModal({
   relayCfg,
   onRelaySaved,
   focusRelay = false,
+  callDevices,
+  callDevicesLoading,
+  onRefreshCallDevices,
+  onSelectCallDevices,
   appVersion,
   availableUpdate,
   onOpenUpdateModal,
@@ -233,6 +250,14 @@ export function SettingsModal({
   const { lang, setLang, translateCode, t } = useI18n();
   const { emojiStyle, setEmojiStyle } = useEmojiStyle();
   const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab);
+  const [callDevicesSaved, setCallDevicesSaved] = useState(false);
+  const [callAudioTesting, setCallAudioTesting] = useState(false);
+  const [callAudioTestResult, setCallAudioTestResult] = useState<{
+    ok: boolean;
+    warn?: boolean;
+    text: string;
+  } | null>(null);
+  const effectiveCallDevices = resolveEffectiveCallDevices(callDevices);
   const [relayEnabled, setRelayEnabled] = useState(false);
   const [relayMode, setRelayMode] = useState<RelayMode>("socks5");
   const [relayHost, setRelayHost] = useState("");
@@ -260,6 +285,9 @@ export function SettingsModal({
   useEffect(() => {
     if (!open) return;
     setActiveTab(focusRelay ? "network" : initialTab);
+    setCallDevicesSaved(false);
+    setCallAudioTesting(false);
+    setCallAudioTestResult(null);
     setRelayEnabled(relayCfg?.enabled ?? false);
     setRelayMode(relayCfg?.mode ?? "socks5");
     setRelayHost(relayCfg?.host ?? "");
@@ -285,6 +313,12 @@ export function SettingsModal({
       }, 40);
     }
   }, [open, relayCfg, focusRelay, initialTab]);
+
+  useEffect(() => {
+    if (open && activeTab === "calls") {
+      onRefreshCallDevices();
+    }
+  }, [open, activeTab, onRefreshCallDevices]);
 
   useEffect(() => {
     if (!open) return;
@@ -1309,6 +1343,290 @@ export function SettingsModal({
                         </div>
                       </div>
                     ))
+                  )}
+                </div>
+              </section>
+            )}
+
+            {activeTab === "calls" && (
+              <section className="space-y-4">
+                <h4
+                  className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider"
+                  style={{ color: "var(--text-secondary)" }}
+                >
+                  <Phone className="h-3.5 w-3.5" />
+                  {t("callAudioSettingsHeading")}
+                </h4>
+
+                {relayCfg?.enabled ? (
+                  <div
+                    className="flex flex-wrap items-center justify-between gap-3 rounded-xl px-3.5 py-3 text-xs"
+                    style={{
+                      background: "var(--danger-bg)",
+                      color: "var(--danger-text)",
+                    }}
+                  >
+                    <span className="font-medium">{t("callRelayUnsupportedBanner")}</span>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab("network")}
+                      className="rounded-lg px-2.5 py-1 font-semibold underline hover:opacity-85"
+                    >
+                      {t("callOpenNetworkSettings")}
+                    </button>
+                  </div>
+                ) : (
+                  <div
+                    className="flex items-center gap-2 rounded-xl px-3.5 py-2.5 text-xs"
+                    style={{
+                      background: "rgba(16,185,129,0.12)",
+                      color: "#34d399",
+                    }}
+                  >
+                    <CheckCircle2 className="h-4 w-4 shrink-0" />
+                    <span>{t("callDirectStatusReady")}</span>
+                  </div>
+                )}
+
+                <div
+                  className="space-y-3 rounded-xl p-3.5"
+                  style={{ background: "var(--bg-surface)" }}
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-[13.5px] font-semibold">
+                      {t("callAudioDevicesBtn")}
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={callAudioTesting || callDevicesLoading}
+                        onClick={() => {
+                          setCallAudioTesting(true);
+                          setCallAudioTestResult(null);
+                          void bridge
+                            .callTestAudio()
+                            .then((res: CallAudioTestResultDto) => {
+                              const deviceLabel =
+                                res.output_device || t("callOsDefaultDevice");
+                              setCallAudioTestResult({
+                                ok: true,
+                                warn: res.output_is_virtual,
+                                text: res.output_is_virtual
+                                  ? t("callTestAudioVirtualResult", {
+                                      device: deviceLabel,
+                                    })
+                                  : t("callTestAudioOkResult", {
+                                      device: deviceLabel,
+                                    }),
+                              });
+                            })
+                            .catch((err) => {
+                              setCallAudioTestResult({
+                                ok: false,
+                                text:
+                                  err instanceof Error ? err.message : String(err),
+                              });
+                            })
+                            .finally(() => setCallAudioTesting(false));
+                        }}
+                        className="hover-menu inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium disabled:opacity-50"
+                        style={{
+                          border: "1px solid var(--border-subtle)",
+                          color: "var(--text-primary)",
+                        }}
+                      >
+                        {callAudioTesting ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Volume2 className="h-3.5 w-3.5" />
+                        )}
+                        <span>
+                          {callAudioTesting
+                            ? t("callTestingAudioLabel")
+                            : t("callTestAudioBtn")}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={callDevicesLoading}
+                        onClick={onRefreshCallDevices}
+                        className="hover-menu inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-medium disabled:opacity-50"
+                        style={{
+                          border: "1px solid var(--border-subtle)",
+                          color: "var(--accent)",
+                        }}
+                      >
+                        <RefreshCw
+                          className={`h-3.5 w-3.5 ${callDevicesLoading ? "animate-spin" : ""}`}
+                        />
+                        <span>{t("callRefreshDevicesBtn")}</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {callDevices && !effectiveCallDevices.hasPhysicalInput && (
+                    <div
+                      className="flex items-start gap-2 rounded-lg px-2.5 py-2 text-xs"
+                      style={{
+                        background: "rgba(245,158,11,0.12)",
+                        border: "1px solid rgba(245,158,11,0.3)",
+                        color: "#fbbf24",
+                      }}
+                    >
+                      <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                      <span>{t("callNoPhysicalMicWarning")}</span>
+                    </div>
+                  )}
+
+                  {callDevices &&
+                    (effectiveCallDevices.inputIsVirtual ||
+                      effectiveCallDevices.outputIsVirtual) && (
+                      <div
+                        className="flex items-start gap-2 rounded-lg px-2.5 py-2 text-xs"
+                        style={{
+                          background: "rgba(245,158,11,0.12)",
+                          border: "1px solid rgba(245,158,11,0.3)",
+                          color: "#fbbf24",
+                        }}
+                      >
+                        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                        <span>
+                          {t("callVirtualAudioWarningBanner", {
+                            input:
+                              effectiveCallDevices.effectiveInput?.name ||
+                              t("callOsDefaultDevice"),
+                            output:
+                              effectiveCallDevices.effectiveOutput?.name ||
+                              t("callOsDefaultDevice"),
+                          })}
+                        </span>
+                      </div>
+                    )}
+
+                  <label className="block space-y-1">
+                    <span
+                      className="flex items-center gap-1.5 text-xs font-medium"
+                      style={{ color: "var(--text-secondary)" }}
+                    >
+                      <Mic className="h-3.5 w-3.5" />
+                      {t("callInputDeviceLabel")}
+                    </span>
+                    <select
+                      value={callDevices?.selected_input ?? ""}
+                      onChange={(e) => {
+                        setCallDevicesSaved(false);
+                        setCallAudioTestResult(null);
+                        void Promise.resolve(
+                          onSelectCallDevices(
+                            e.target.value || null,
+                            callDevices?.selected_output ?? null,
+                          ),
+                        ).then(() => setCallDevicesSaved(true));
+                      }}
+                      className="w-full rounded-lg px-2.5 py-1.5 text-[13.5px] outline-none"
+                      style={{
+                        background: "var(--bg-sidebar)",
+                        border: "1px solid var(--border-subtle)",
+                        color: "var(--text-primary)",
+                      }}
+                    >
+                      <option value="">
+                        {effectiveCallDevices.defaultInput
+                          ? `${t("callOsDefaultDevice")} — ${effectiveCallDevices.defaultInput.name}${effectiveCallDevices.defaultInput.is_virtual ? ` [${t("callVirtualDeviceTag")}]` : ""}`
+                          : t("callOsDefaultDevice")}
+                      </option>
+                      {(callDevices?.inputs ?? []).map((dev) => (
+                        <option key={dev.name} value={dev.name}>
+                          {dev.name}
+                          {dev.is_default ? ` (${t("callOsDefaultDevice")})` : ""}
+                          {dev.is_virtual ? ` [${t("callVirtualDeviceTag")}]` : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label className="block space-y-1">
+                    <span
+                      className="flex items-center gap-1.5 text-xs font-medium"
+                      style={{ color: "var(--text-secondary)" }}
+                    >
+                      <Headphones className="h-3.5 w-3.5" />
+                      {t("callOutputDeviceLabel")}
+                    </span>
+                    <select
+                      value={callDevices?.selected_output ?? ""}
+                      onChange={(e) => {
+                        setCallDevicesSaved(false);
+                        setCallAudioTestResult(null);
+                        void Promise.resolve(
+                          onSelectCallDevices(
+                            callDevices?.selected_input ?? null,
+                            e.target.value || null,
+                          ),
+                        ).then(() => setCallDevicesSaved(true));
+                      }}
+                      className="w-full rounded-lg px-2.5 py-1.5 text-[13.5px] outline-none"
+                      style={{
+                        background: "var(--bg-sidebar)",
+                        border: "1px solid var(--border-subtle)",
+                        color: "var(--text-primary)",
+                      }}
+                    >
+                      <option value="">
+                        {effectiveCallDevices.defaultOutput
+                          ? `${t("callOsDefaultDevice")} — ${effectiveCallDevices.defaultOutput.name}${effectiveCallDevices.defaultOutput.is_virtual ? ` [${t("callVirtualDeviceTag")}]` : ""}`
+                          : t("callOsDefaultDevice")}
+                      </option>
+                      {(callDevices?.outputs ?? []).map((dev) => (
+                        <option key={dev.name} value={dev.name}>
+                          {dev.name}
+                          {dev.is_default ? ` (${t("callOsDefaultDevice")})` : ""}
+                          {dev.is_virtual ? ` [${t("callVirtualDeviceTag")}]` : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  {callAudioTestResult && (
+                    <div
+                      className="flex items-start gap-1.5 rounded-lg px-2.5 py-1.5 text-xs"
+                      style={
+                        !callAudioTestResult.ok
+                          ? {
+                              background: "var(--danger-bg)",
+                              color: "var(--danger-text)",
+                            }
+                          : callAudioTestResult.warn
+                            ? {
+                                background: "rgba(245,158,11,0.12)",
+                                color: "#fbbf24",
+                              }
+                            : {
+                                background: "rgba(16,185,129,0.12)",
+                                color: "#34d399",
+                              }
+                      }
+                    >
+                      {!callAudioTestResult.ok || callAudioTestResult.warn ? (
+                        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                      ) : (
+                        <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                      )}
+                      <span>{callAudioTestResult.text}</span>
+                    </div>
+                  )}
+
+                  {callDevicesSaved && (
+                    <div
+                      className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs"
+                      style={{
+                        background: "rgba(16,185,129,0.12)",
+                        color: "#34d399",
+                      }}
+                    >
+                      <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                      <span>{t("callDevicesSavedNotice")}</span>
+                    </div>
                   )}
                 </div>
               </section>

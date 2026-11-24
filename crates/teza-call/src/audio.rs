@@ -32,6 +32,93 @@ const MAX_RING_SAMPLES: usize = AUDIO_FRAME_SAMPLES * 25;
 pub struct AudioDeviceInfo {
     pub name: String,
     pub is_default: bool,
+    #[serde(default)]
+    pub is_virtual: bool,
+}
+
+/// Returns `true` when `name` looks like a virtual audio cable, loopback mix, or monitor sink
+/// that produces two-way silence if auto-selected instead of a real physical headset/mic.
+pub fn is_virtual_or_loopback_audio_device(name: &str) -> bool {
+    let low = name.trim().to_ascii_lowercase();
+    if low.is_empty() {
+        return false;
+    }
+    const PATTERNS: &[&str] = &[
+        "vb-audio",
+        "virtual cable",
+        "cable input",
+        "cable output",
+        "cable in ",
+        "cable out ",
+        "stereo mix",
+        "what u hear",
+        "wave out mix",
+        "loopback",
+        "monitor of ",
+        "blackhole",
+        "soundflower",
+        "virtual audio",
+    ];
+    PATTERNS.iter().any(|pat| low.contains(pat))
+}
+
+/// Returns `true` when an output name looks like a raw S/PDIF optical/coax port rather than
+/// analog speakers or headphones, so automatic fallback avoids picking it over real speakers.
+pub fn is_spdif_digital_output(name: &str) -> bool {
+    let low = name.trim().to_ascii_lowercase();
+    if low.is_empty() {
+        return false;
+    }
+    ["digital output", "s/pdif", "spdif", "iec958"]
+        .iter()
+        .any(|pat| low.contains(pat))
+}
+
+/// Resolve the best device name given an explicit user preference, the OS default, and the
+/// enumerated host device list.
+///
+/// Always honors an explicit non-empty `preferred` selection (even if virtual). When using OS
+/// default (`preferred == None`), avoids virtual/loopback OS defaults whenever a physical device
+/// is available (and prefers analog speakers/headphones over S/PDIF digital outputs).
+pub(crate) fn pick_preferred_device_name(
+    preferred: Option<&str>,
+    default_name: Option<&str>,
+    candidates: &[String],
+    avoid_spdif_on_auto: bool,
+) -> Option<String> {
+    if let Some(pref) = preferred.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(matched) = candidates.iter().find(|c| c.trim().eq_ignore_ascii_case(pref)) {
+            return Some(matched.clone());
+        }
+    }
+
+    let clean_default = default_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if let Some(ref def) = clean_default {
+        if !is_virtual_or_loopback_audio_device(def) {
+            return Some(def.clone());
+        }
+    }
+
+    if let Some(phys) = candidates.iter().find(|c| {
+        !is_virtual_or_loopback_audio_device(c)
+            && (!avoid_spdif_on_auto || !is_spdif_digital_output(c))
+    }) {
+        return Some(phys.clone());
+    }
+
+    if !avoid_spdif_on_auto {
+        if let Some(phys) = candidates
+            .iter()
+            .find(|c| !is_virtual_or_loopback_audio_device(c))
+        {
+            return Some(phys.clone());
+        }
+    }
+
+    clean_default.or_else(|| candidates.first().cloned())
 }
 
 /// Phase-preserving linear resampler for streaming PCM callbacks.
@@ -195,9 +282,11 @@ pub fn list_input_devices() -> CallResult<Vec<AudioDeviceInfo>> {
             let clean = name.trim().to_string();
             if !clean.is_empty() {
                 let is_default = default_name.as_deref() == Some(clean.as_str());
+                let is_virtual = is_virtual_or_loopback_audio_device(&clean);
                 out.push(AudioDeviceInfo {
                     name: clean,
                     is_default,
+                    is_virtual,
                 });
             }
         }
@@ -221,9 +310,11 @@ pub fn list_output_devices() -> CallResult<Vec<AudioDeviceInfo>> {
             let clean = name.trim().to_string();
             if !clean.is_empty() {
                 let is_default = default_name.as_deref() == Some(clean.as_str());
+                let is_virtual = is_virtual_or_loopback_audio_device(&clean);
                 out.push(AudioDeviceInfo {
                     name: clean,
                     is_default,
+                    is_virtual,
                 });
             }
         }
@@ -245,6 +336,8 @@ pub struct AudioControls {
     plc_frames: AtomicU64,
     fec_frames: AtomicU64,
     tx_errors: AtomicU64,
+    active_input_device: Mutex<Option<String>>,
+    active_output_device: Mutex<Option<String>>,
 }
 
 impl Default for AudioControls {
@@ -261,11 +354,13 @@ impl Default for AudioControls {
             plc_frames: AtomicU64::new(0),
             fec_frames: AtomicU64::new(0),
             tx_errors: AtomicU64::new(0),
+            active_input_device: Mutex::new(None),
+            active_output_device: Mutex::new(None),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AudioTelemetry {
     pub mic_muted: bool,
     pub has_input_device: bool,
@@ -278,9 +373,26 @@ pub struct AudioTelemetry {
     pub plc_frames: u64,
     pub fec_frames: u64,
     pub tx_errors: u64,
+    #[serde(default)]
+    pub active_input_device: Option<String>,
+    #[serde(default)]
+    pub active_output_device: Option<String>,
+    #[serde(default)]
+    pub input_is_virtual: bool,
+    #[serde(default)]
+    pub output_is_virtual: bool,
 }
 
 impl AudioControls {
+    pub fn set_active_devices(&self, input: Option<String>, output: Option<String>) {
+        if let Ok(mut g) = self.active_input_device.lock() {
+            *g = input.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        }
+        if let Ok(mut g) = self.active_output_device.lock() {
+            *g = output.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        }
+    }
+
     pub fn set_mic_muted(&self, muted: bool) {
         self.mic_muted.store(muted, Ordering::Relaxed);
         if muted {
@@ -325,6 +437,22 @@ impl AudioControls {
     }
 
     pub fn snapshot(&self) -> AudioTelemetry {
+        let active_input_device = self
+            .active_input_device
+            .lock()
+            .ok()
+            .and_then(|g| g.clone());
+        let active_output_device = self
+            .active_output_device
+            .lock()
+            .ok()
+            .and_then(|g| g.clone());
+        let input_is_virtual = active_input_device
+            .as_deref()
+            .is_some_and(is_virtual_or_loopback_audio_device);
+        let output_is_virtual = active_output_device
+            .as_deref()
+            .is_some_and(is_virtual_or_loopback_audio_device);
         AudioTelemetry {
             mic_muted: self.is_mic_muted(),
             has_input_device: self.has_input_device(),
@@ -337,12 +465,16 @@ impl AudioControls {
             plc_frames: self.plc_frames.load(Ordering::Relaxed),
             fec_frames: self.fec_frames.load(Ordering::Relaxed),
             tx_errors: self.tx_errors.load(Ordering::Relaxed),
+            active_input_device,
+            active_output_device,
+            input_is_virtual,
+            output_is_virtual,
         }
     }
 }
 
 /// Device selection configuration for starting an audio session.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioDeviceSelection {
     pub input_device_name: Option<String>,
     pub output_device_name: Option<String>,
@@ -633,6 +765,8 @@ struct AudioStreams {
     _output: cpal::Stream,
     capture_16k: Arc<Mutex<VecDeque<f32>>>,
     playback_16k: Arc<Mutex<VecDeque<f32>>>,
+    input_device_name: Option<String>,
+    output_device_name: String,
 }
 
 impl AudioStreams {
@@ -641,38 +775,90 @@ impl AudioStreams {
     }
 }
 
-fn select_input_device(preferred: Option<&str>) -> CallResult<cpal::Device> {
+fn select_input_device(preferred: Option<&str>) -> CallResult<(cpal::Device, String)> {
     let host = cpal::default_host();
-    if let Some(name) = preferred.map(str::trim).filter(|s| !s.is_empty()) {
-        if let Ok(mut devices) = host.input_devices() {
-            if let Some(dev) = devices.find(|d| {
+    let default_dev = host.default_input_device();
+    let default_name = default_dev
+        .as_ref()
+        .and_then(|d| d.name().ok())
+        .map(|n| n.trim().to_string());
+    let listed: Vec<(String, cpal::Device)> = host
+        .input_devices()
+        .ok()
+        .map(|devs| {
+            devs.filter_map(|d| {
                 d.name()
-                    .map(|n| n.trim().eq_ignore_ascii_case(name))
-                    .unwrap_or(false)
-            }) {
-                return Ok(dev);
-            }
+                    .ok()
+                    .map(|n| n.trim().to_string())
+                    .filter(|n| !n.is_empty())
+                    .map(|n| (n, d))
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+    let names: Vec<String> = listed.iter().map(|(n, _)| n.clone()).collect();
+    if let Some(chosen_name) =
+        pick_preferred_device_name(preferred, default_name.as_deref(), &names, false)
+    {
+        if let Some((_, dev)) = listed
+            .into_iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(&chosen_name))
+        {
+            return Ok((dev, chosen_name));
         }
     }
-    host.default_input_device()
-        .ok_or_else(|| CallError::Audio("Không tìm thấy micro mặc định trên máy".to_string()))
+    let dev = default_dev
+        .ok_or_else(|| CallError::Audio("Không tìm thấy micro mặc định trên máy".to_string()))?;
+    let fallback_name = dev
+        .name()
+        .ok()
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "Unknown Microphone".to_string());
+    Ok((dev, fallback_name))
 }
 
-fn select_output_device(preferred: Option<&str>) -> CallResult<cpal::Device> {
+fn select_output_device(preferred: Option<&str>) -> CallResult<(cpal::Device, String)> {
     let host = cpal::default_host();
-    if let Some(name) = preferred.map(str::trim).filter(|s| !s.is_empty()) {
-        if let Ok(mut devices) = host.output_devices() {
-            if let Some(dev) = devices.find(|d| {
+    let default_dev = host.default_output_device();
+    let default_name = default_dev
+        .as_ref()
+        .and_then(|d| d.name().ok())
+        .map(|n| n.trim().to_string());
+    let listed: Vec<(String, cpal::Device)> = host
+        .output_devices()
+        .ok()
+        .map(|devs| {
+            devs.filter_map(|d| {
                 d.name()
-                    .map(|n| n.trim().eq_ignore_ascii_case(name))
-                    .unwrap_or(false)
-            }) {
-                return Ok(dev);
-            }
+                    .ok()
+                    .map(|n| n.trim().to_string())
+                    .filter(|n| !n.is_empty())
+                    .map(|n| (n, d))
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+    let names: Vec<String> = listed.iter().map(|(n, _)| n.clone()).collect();
+    if let Some(chosen_name) =
+        pick_preferred_device_name(preferred, default_name.as_deref(), &names, true)
+    {
+        if let Some((_, dev)) = listed
+            .into_iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(&chosen_name))
+        {
+            return Ok((dev, chosen_name));
         }
     }
-    host.default_output_device()
-        .ok_or_else(|| CallError::Audio("Không tìm thấy loa mặc định trên máy".to_string()))
+    let dev = default_dev
+        .ok_or_else(|| CallError::Audio("Không tìm thấy loa mặc định trên máy".to_string()))?;
+    let fallback_name = dev
+        .name()
+        .ok()
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "Unknown Speaker".to_string());
+    Ok((dev, fallback_name))
 }
 
 fn push_captured_samples<S: Copy>(
@@ -780,8 +966,8 @@ fn f32_to_u16(v: f32) -> u16 {
 fn try_open_input_stream(
     devices: &AudioDeviceSelection,
     capture_16k: &Arc<Mutex<VecDeque<f32>>>,
-) -> CallResult<cpal::Stream> {
-    let input_dev = select_input_device(devices.input_device_name.as_deref())?;
+) -> CallResult<(cpal::Stream, String)> {
+    let (input_dev, input_name) = select_input_device(devices.input_device_name.as_deref())?;
     let in_cfg = input_dev
         .default_input_config()
         .map_err(|e| CallError::Audio(format!("Không đọc được cấu hình micro: {e}")))?;
@@ -843,7 +1029,7 @@ fn try_open_input_stream(
     input_stream
         .play()
         .map_err(|e| CallError::Audio(format!("Không chạy được micro: {e}")))?;
-    Ok(input_stream)
+    Ok((input_stream, input_name))
 }
 
 fn open_audio_streams(
@@ -859,9 +1045,13 @@ fn open_audio_streams_with<F>(
     open_input: F,
 ) -> CallResult<AudioStreams>
 where
-    F: FnOnce(&AudioDeviceSelection, &Arc<Mutex<VecDeque<f32>>>) -> CallResult<cpal::Stream>,
+    F: FnOnce(
+        &AudioDeviceSelection,
+        &Arc<Mutex<VecDeque<f32>>>,
+    ) -> CallResult<(cpal::Stream, String)>,
 {
-    let output_dev = select_output_device(devices.output_device_name.as_deref())?;
+    let (output_dev, output_device_name) =
+        select_output_device(devices.output_device_name.as_deref())?;
     let out_cfg = output_dev
         .default_output_config()
         .map_err(|e| CallError::Audio(format!("Không đọc được cấu hình loa: {e}")))?;
@@ -876,13 +1066,13 @@ where
     let playback_16k: Arc<Mutex<VecDeque<f32>>> =
         Arc::new(Mutex::new(VecDeque::with_capacity(AUDIO_FRAME_SAMPLES * 8)));
 
-    let input_stream = match open_input(devices, &capture_16k) {
-        Ok(stream) => Some(stream),
+    let (input_stream, input_device_name) = match open_input(devices, &capture_16k) {
+        Ok((stream, name)) => (Some(stream), Some(name)),
         Err(err) if allow_missing_input => {
             eprintln!(
                 "[teza-call][audio] không mở được micro ({err}); chuyển sang chế độ chỉ nghe (receive-only)."
             );
-            None
+            (None, None)
         }
         Err(err) => return Err(err),
     };
@@ -973,6 +1163,8 @@ where
         _output: output_stream,
         capture_16k,
         playback_16k,
+        input_device_name,
+        output_device_name,
     })
 }
 
@@ -1170,6 +1362,10 @@ fn run_udp_audio_loop(
         }
     };
     controls.set_has_input_device(streams.has_input_device());
+    controls.set_active_devices(
+        streams.input_device_name.clone(),
+        Some(streams.output_device_name.clone()),
+    );
     let mut codec = match OpusVoiceCodec::new() {
         Ok(c) => c,
         Err(e) => {
@@ -1347,6 +1543,10 @@ fn run_loopback_audio_loop(
         }
     };
     controls.set_has_input_device(streams.has_input_device() || inject_tone_hz.is_some());
+    controls.set_active_devices(
+        streams.input_device_name.clone(),
+        Some(streams.output_device_name.clone()),
+    );
     let mut codec = match OpusVoiceCodec::new() {
         Ok(c) => c,
         Err(e) => {
@@ -2000,5 +2200,106 @@ mod tests {
         // Once distinct RTCP port acks InitZRTP, switch to udp_rtcp_sock with RTCP token.
         live_rtcp.store(0x3333_4444, Ordering::Relaxed);
         assert_eq!(cfg.resolve_rtcp_send_route(), (0x3333_4444, rtcp_target, true));
+    }
+
+    #[test]
+    fn virtual_and_spdif_audio_device_classification() {
+        assert!(is_virtual_or_loopback_audio_device("CABLE Output (VB-Audio Virtual Cable)"));
+        assert!(is_virtual_or_loopback_audio_device("CABLE Input (VB-Audio Virtual Cable)"));
+        assert!(is_virtual_or_loopback_audio_device("CABLE In 16ch (VB-Audio Virtual Cable)"));
+        assert!(is_virtual_or_loopback_audio_device("Stereo Mix (Realtek(R) Audio)"));
+        assert!(is_virtual_or_loopback_audio_device("BlackHole 2ch"));
+        assert!(is_virtual_or_loopback_audio_device("Monitor of Built-in Audio"));
+        assert!(!is_virtual_or_loopback_audio_device("Microphone (Realtek(R) Audio)"));
+        assert!(!is_virtual_or_loopback_audio_device("Speakers (Realtek(R) Audio)"));
+
+        assert!(is_spdif_digital_output("Realtek Digital Output (Realtek(R) Audio)"));
+        assert!(is_spdif_digital_output("SPDIF Interface (TX)"));
+        assert!(!is_spdif_digital_output("Headphones (Sony WH-1000XM5)"));
+    }
+
+    #[test]
+    fn smart_device_picker_avoids_virtual_default_when_physical_exists_and_honors_explicit() {
+        // 1. OS default is VB-Audio, USB headset also present -> auto-select USB headset!
+        let outputs = vec![
+            "CABLE Input (VB-Audio Virtual Cable)".to_string(),
+            "Realtek Digital Output (Realtek(R) Audio)".to_string(),
+            "Speakers (USB Audio Device)".to_string(),
+        ];
+        assert_eq!(
+            pick_preferred_device_name(
+                None,
+                Some("CABLE Input (VB-Audio Virtual Cable)"),
+                &outputs,
+                true,
+            )
+            .as_deref(),
+            Some("Speakers (USB Audio Device)"),
+        );
+
+        let inputs = vec![
+            "CABLE Output (VB-Audio Virtual Cable)".to_string(),
+            "Stereo Mix (Realtek(R) Audio)".to_string(),
+            "Microphone (USB Audio Device)".to_string(),
+        ];
+        assert_eq!(
+            pick_preferred_device_name(
+                None,
+                Some("CABLE Output (VB-Audio Virtual Cable)"),
+                &inputs,
+                false,
+            )
+            .as_deref(),
+            Some("Microphone (USB Audio Device)"),
+        );
+
+        // 2. When NO physical analog output exists, fall back cleanly to OS default
+        let virtual_and_spdif_only = vec![
+            "CABLE Input (VB-Audio Virtual Cable)".to_string(),
+            "Realtek Digital Output (Realtek(R) Audio)".to_string(),
+        ];
+        assert_eq!(
+            pick_preferred_device_name(
+                None,
+                Some("CABLE Input (VB-Audio Virtual Cable)"),
+                &virtual_and_spdif_only,
+                true,
+            )
+            .as_deref(),
+            Some("CABLE Input (VB-Audio Virtual Cable)"),
+        );
+
+        // 3. Explicit user selection (even a virtual cable) is always honored verbatim
+        assert_eq!(
+            pick_preferred_device_name(
+                Some("cable output (vb-audio virtual cable)"),
+                Some("Microphone (USB Audio Device)"),
+                &inputs,
+                false,
+            )
+            .as_deref(),
+            Some("CABLE Output (VB-Audio Virtual Cable)"),
+        );
+    }
+
+    #[test]
+    fn audio_controls_snapshot_reports_active_device_names_and_virtual_flags() {
+        let ctrl = AudioControls::default();
+        ctrl.set_has_input_device(true);
+        ctrl.set_active_devices(
+            Some("CABLE Output (VB-Audio Virtual Cable)".to_string()),
+            Some("Speakers (USB Audio Device)".to_string()),
+        );
+        let snap = ctrl.snapshot();
+        assert_eq!(
+            snap.active_input_device.as_deref(),
+            Some("CABLE Output (VB-Audio Virtual Cable)")
+        );
+        assert_eq!(
+            snap.active_output_device.as_deref(),
+            Some("Speakers (USB Audio Device)")
+        );
+        assert!(snap.input_is_virtual);
+        assert!(!snap.output_is_virtual);
     }
 }

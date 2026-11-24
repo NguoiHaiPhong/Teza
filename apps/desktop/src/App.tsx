@@ -30,6 +30,7 @@ import {
   MessagesSquare,
   PanelLeftClose,
   PanelLeftOpen,
+  Phone,
   Pin,
   PinOff,
   Play,
@@ -85,11 +86,21 @@ import {
   upsertMsg,
 } from "./utils/threadState";
 import {
+  playCallCueTone,
+  startIncomingRingtone,
+} from "./utils/callRingtone";
+import {
+  canStartVoiceCall,
+  classifyCallEndReason,
+  formatCallDuration,
+} from "./utils/callState";
+import {
   classifySkipTranslation,
   isEffectivelySameText,
   isSameLangCode,
   normalizeLangBase,
 } from "./utils/translateFilter";
+import { ActiveCallBar } from "./components/ActiveCallBar";
 import { AddGroupMembersModal } from "./components/AddGroupMembersModal";
 import { Composer } from "./components/Composer";
 import { CreatePollModal } from "./components/CreatePollModal";
@@ -98,6 +109,7 @@ import { DownloadOverlay } from "./components/DownloadOverlay";
 import { FindUserModal } from "./components/FindUserModal";
 import { FolderEditorModal, renderFolderIcon } from "./components/FolderEditorModal";
 import { ForwardModal } from "./components/ForwardModal";
+import { IncomingCallModal } from "./components/IncomingCallModal";
 import { MediaLightbox, type LightboxItem } from "./components/MediaLightbox";
 import { MessageBubble, type MessageTranslationState } from "./components/MessageBubble";
 import { NavDrawer } from "./components/NavDrawer";
@@ -145,6 +157,10 @@ import type {
   AccountProfile,
   AppUpdateInfo,
   BuiltInRailFolderId,
+  CallDevicesDto,
+  CallEventEnvelopeDto,
+  CallStateDto,
+  CallTelemetryDto,
   ChatFolderDto,
   ConnectionStatus,
   DownloadProgressDto,
@@ -173,6 +189,13 @@ const FOLDERS: { id: FolderFilter; labelKey: TranslationKey; icon: typeof Messag
   { id: "group", labelKey: "folderGroup", icon: Users },
   { id: "cloud", labelKey: "folderCloud", icon: Bookmark },
 ];
+
+const DEFAULT_CALL_STATE: CallStateDto = {
+  available: false,
+  unavailable_reason: null,
+  phase: "idle",
+  active: null,
+};
 
 export default function App() {
   const { lang, translateCode, t } = useI18n();
@@ -354,6 +377,15 @@ export default function App() {
   const [lastUpdateCheckAt, setLastUpdateCheckAt] = useState<number | null>(null);
   const [relayCfg, setRelayCfg] = useState<RelayConfigSummary | null>(null);
   const [focusRelaySettings, setFocusRelaySettings] = useState(false);
+  const [callState, setCallState] = useState<CallStateDto>(DEFAULT_CALL_STATE);
+  const [callTelemetry, setCallTelemetry] = useState<CallTelemetryDto | null>(null);
+  const [callDevices, setCallDevices] = useState<CallDevicesDto | null>(null);
+  const [callDevicesLoading, setCallDevicesLoading] = useState(false);
+  const [callActionBusy, setCallActionBusy] = useState(false);
+  const [callNotice, setCallNotice] = useState<{
+    text: string;
+    tone: "info" | "warn" | "error";
+  } | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
     const raw = Number(localStorage.getItem("litechat.sidebarWidth"));
     return Number.isFinite(raw) && raw >= 240 && raw <= 440 ? raw : 308;
@@ -371,6 +403,7 @@ export default function App() {
   const downloadSeqRef = useRef(0);
   const handledDoneDownloadIdsRef = useRef<Set<string>>(new Set());
   const toastErrorTimerRef = useRef<number | null>(null);
+  const callNoticeTimerRef = useRef<number | null>(null);
   const buzzStreaksRef = useRef<BuzzStreakMap>(new Map());
   const buzzShakeTimerRef = useRef<number | null>(null);
   const buzzToastTimerRef = useRef<number | null>(null);
@@ -747,6 +780,121 @@ export default function App() {
     }, 5000);
   }, []);
 
+  const showCallNotice = useCallback((text: string, tone: "info" | "warn" | "error" = "info") => {
+    setCallNotice({ text, tone });
+    if (callNoticeTimerRef.current !== null) {
+      window.clearTimeout(callNoticeTimerRef.current);
+    }
+    callNoticeTimerRef.current = window.setTimeout(() => {
+      callNoticeTimerRef.current = null;
+      setCallNotice(null);
+    }, 4500);
+  }, []);
+
+  const refreshCallDevices = useCallback(() => {
+    setCallDevicesLoading(true);
+    void bridge
+      .callListDevices()
+      .then(setCallDevices)
+      .catch(() => undefined)
+      .finally(() => setCallDevicesLoading(false));
+  }, []);
+
+  const handleSelectCallDevices = useCallback(
+    async (input: string | null, output: string | null) => {
+      setCallDevicesLoading(true);
+      try {
+        const next = await bridge.callSetDevices(input, output);
+        setCallDevices(next);
+      } catch (err) {
+        showError(err);
+      } finally {
+        setCallDevicesLoading(false);
+      }
+    },
+    [showError],
+  );
+
+  const handleStartVoiceCall = useCallback(
+    async (partnerId: string, partnerName?: string) => {
+      if (callActionBusy) return;
+      setCallActionBusy(true);
+      setCallNotice(null);
+      try {
+        const next = await bridge.callStartVoice(partnerId, partnerName);
+        setCallState(next);
+      } catch (err) {
+        showError(err);
+      } finally {
+        setCallActionBusy(false);
+      }
+    },
+    [callActionBusy, showError],
+  );
+
+  const handleAnswerCall = useCallback(
+    async (callId: number) => {
+      if (callActionBusy) return;
+      setCallActionBusy(true);
+      try {
+        const next = await bridge.callAnswer(callId);
+        setCallState(next);
+      } catch (err) {
+        showError(err);
+      } finally {
+        setCallActionBusy(false);
+      }
+    },
+    [callActionBusy, showError],
+  );
+
+  const handleDeclineCall = useCallback(
+    async (callId: number) => {
+      if (callActionBusy) return;
+      setCallActionBusy(true);
+      try {
+        const next = await bridge.callDecline(callId);
+        setCallState(next);
+        if (next.phase === "idle") setCallTelemetry(null);
+      } catch (err) {
+        showError(err);
+      } finally {
+        setCallActionBusy(false);
+      }
+    },
+    [callActionBusy, showError],
+  );
+
+  const handleHangupCall = useCallback(async () => {
+    if (callActionBusy) return;
+    setCallActionBusy(true);
+    try {
+      const next = await bridge.callHangup();
+      setCallState(next);
+      if (next.phase === "idle") setCallTelemetry(null);
+    } catch (err) {
+      showError(err);
+    } finally {
+      setCallActionBusy(false);
+    }
+  }, [callActionBusy, showError]);
+
+  const handleToggleCallMute = useCallback(
+    async (nextMuted: boolean) => {
+      if (callActionBusy) return;
+      setCallActionBusy(true);
+      try {
+        const next = await bridge.callSetMute(nextMuted);
+        setCallState(next);
+      } catch (err) {
+        showError(err);
+      } finally {
+        setCallActionBusy(false);
+      }
+    },
+    [callActionBusy, showError],
+  );
+
   const snapScrollToBottom = useCallback(() => {
     const el = scrollContainerRef.current;
     if (!el) return;
@@ -759,6 +907,10 @@ export default function App() {
       if (toastErrorTimerRef.current !== null) {
         window.clearTimeout(toastErrorTimerRef.current);
         toastErrorTimerRef.current = null;
+      }
+      if (callNoticeTimerRef.current !== null) {
+        window.clearTimeout(callNoticeTimerRef.current);
+        callNoticeTimerRef.current = null;
       }
     };
   }, []);
@@ -803,6 +955,10 @@ export default function App() {
     setUnreadBelow(0);
     setActiveDownloads([]);
     setCompletedDownload(null);
+    setCallState(DEFAULT_CALL_STATE);
+    setCallTelemetry(null);
+    setCallActionBusy(false);
+    setCallNotice(null);
     setIsLocked(false);
     setActiveWebAppId(null);
     void bridge.webappHideAll();
@@ -814,7 +970,17 @@ export default function App() {
       .getTranslateConfig()
       .then(setTranslateCfg)
       .catch(() => undefined);
-  }, [authed]);
+    void bridge
+      .callGetState()
+      .then(setCallState)
+      .catch(() => undefined);
+    refreshCallDevices();
+  }, [authed, refreshCallDevices]);
+
+  useEffect(() => {
+    if (!authed || isLocked || callState.phase !== "incoming_ringing") return;
+    return startIncomingRingtone(notifyPrefs.sound);
+  }, [authed, isLocked, callState.phase, notifyPrefs.sound]);
 
   const isTranslatableText = useCallback((m: MessageDto) => {
     if (m.is_recalled) return false;
@@ -1387,6 +1553,63 @@ export default function App() {
         listen<RelayConfigSummary>("core://relay-updated", (ev) => {
           applyRelaySummary(ev.payload);
         }),
+        listen<CallStateDto>("core://call-availability", (ev) => {
+          setCallState(ev.payload);
+          if (ev.payload.phase !== "connected") {
+            setCallTelemetry(null);
+          }
+        }),
+        listen<CallEventEnvelopeDto>("core://call-event", (ev) => {
+          const { event, state } = ev.payload;
+          setCallState(state);
+          if (state.phase !== "connected") {
+            setCallTelemetry(null);
+          }
+          if (event.type === "connected") {
+            playCallCueTone("connect", notifyPrefsRef.current.sound);
+          } else if (event.type === "media_warning") {
+            showCallNotice(event.message, "warn");
+          } else if (event.type === "signaling_warning") {
+            showCallNotice(event.message, "error");
+          } else if (event.type === "call_ended") {
+            setCallTelemetry(null);
+            playCallCueTone("end", notifyPrefsRef.current.sound);
+            const classified = classifyCallEndReason(event.reason);
+            if (!classified.isSilent) {
+              if (classified.kind === "answered_on_other_device") {
+                showCallNotice(tRef.current("callAnsweredElsewhereNotice"), "info");
+              } else if (classified.kind === "ended_on_other_device") {
+                showCallNotice(tRef.current("callEndedElsewhereNotice"), "info");
+              } else if (classified.kind === "remote_cancelled") {
+                showCallNotice(tRef.current("callRemoteCancelledNotice"), "info");
+              } else if (classified.kind === "ring_timeout") {
+                showCallNotice(tRef.current("callRingTimeoutNotice"), "warn");
+              } else if (classified.kind === "remote_rejected") {
+                showCallNotice(
+                  classified.detailMessage || tRef.current("callEndedNotice"),
+                  "warn",
+                );
+              } else if (classified.kind === "error") {
+                showCallNotice(
+                  classified.detailMessage || tRef.current("callEndedNotice"),
+                  "error",
+                );
+              } else if (event.duration_secs > 0) {
+                showCallNotice(
+                  tRef.current("callEndedDurationNotice", {
+                    duration: formatCallDuration(event.duration_secs),
+                  }),
+                  "info",
+                );
+              } else if (classified.kind === "remote_ended") {
+                showCallNotice(tRef.current("callEndedNotice"), "info");
+              }
+            }
+          }
+        }),
+        listen<CallTelemetryDto>("core://call-telemetry", (ev) => {
+          setCallTelemetry(ev.payload);
+        }),
         listen<string>("core://open-thread", (ev) => {
           if (ev.payload) {
             openThreadById(ev.payload);
@@ -1430,6 +1653,7 @@ export default function App() {
     openThreadById,
     triggerNotifyPopup,
     snapScrollToBottom,
+    showCallNotice,
   ]);
 
   useEffect(() => {
@@ -1847,6 +2071,25 @@ export default function App() {
     [threads, selectedId],
   );
   const hasActiveThread = Boolean(activeThread);
+  const activeCallCheck = useMemo(
+    () =>
+      canStartVoiceCall({
+        threadKind: activeThread?.kind ?? null,
+        threadId: activeThread?.id ?? "",
+        myUid: myProfile?.uid ?? "",
+        relayEnabled: Boolean(relayCfg?.enabled),
+        callPhase: callState.phase,
+        authed,
+      }),
+    [
+      activeThread?.kind,
+      activeThread?.id,
+      myProfile?.uid,
+      relayCfg?.enabled,
+      callState.phase,
+      authed,
+    ],
+  );
 
   useEffect(() => {
     if (!authed || !selectedId || !hasActiveThread) return;
@@ -2974,6 +3217,10 @@ export default function App() {
           }
         }}
         focusRelay={focusRelaySettings}
+        callDevices={callDevices}
+        callDevicesLoading={callDevicesLoading}
+        onRefreshCallDevices={refreshCallDevices}
+        onSelectCallDevices={handleSelectCallDevices}
         appVersion={appVersion}
         availableUpdate={availableUpdate}
         onOpenUpdateModal={() => setUpdateModalOpen(true)}
@@ -4084,6 +4331,33 @@ export default function App() {
                 </div>
               </div>
               <div className="flex items-center gap-2">
+                {activeThread.kind === "direct" &&
+                  activeThread.id !== "cloud-me" &&
+                  activeThread.id !== myProfile?.uid && (
+                    <button
+                      type="button"
+                      disabled={!activeCallCheck.allowed || callActionBusy}
+                      onClick={() => void handleStartVoiceCall(activeThread.id, activeThread.title)}
+                      title={
+                        activeCallCheck.disabledReason === "relay_enabled"
+                          ? t("callDisabledRelayTooltip")
+                          : activeCallCheck.disabledReason === "busy"
+                            ? t("callAlreadyActiveTooltip")
+                            : t("callVoiceTitle")
+                      }
+                      className="rounded-lg p-2 transition hover:opacity-80 disabled:cursor-not-allowed disabled:opacity-40"
+                      style={{
+                        color: activeCallCheck.allowed
+                          ? "var(--accent)"
+                          : "var(--text-secondary)",
+                        background: activeCallCheck.allowed
+                          ? "var(--accent-soft)"
+                          : "transparent",
+                      }}
+                    >
+                      <Phone className="h-4 w-4" />
+                    </button>
+                  )}
                 <button
                   onClick={handleToggleThreadTranslate}
                   title={
@@ -4571,6 +4845,8 @@ export default function App() {
                         onCopyError={showError}
                         onVotePoll={handleVotePoll}
                         onRefreshPoll={handleRefreshPoll}
+                        onStartVoiceCall={handleStartVoiceCall}
+                        callDisabledReason={activeCallCheck.disabledReason}
                       />
                     </div>
                   );
@@ -5639,6 +5915,72 @@ export default function App() {
               {t("notifyClickHint")}
             </div>
           </div>
+        </div>
+      )}
+
+      {authed &&
+        !isLocked &&
+        callState.active &&
+        callState.phase !== "idle" &&
+        callState.phase !== "incoming_ringing" && (
+          <ActiveCallBar
+            active={callState.active}
+            telemetry={callTelemetry}
+            devices={callDevices}
+            devicesLoading={callDevicesLoading}
+            busy={callActionBusy}
+            onToggleMute={(nextMuted) => void handleToggleCallMute(nextMuted)}
+            onHangup={() => void handleHangupCall()}
+            onSelectThread={(partnerId) => openThreadById(partnerId)}
+            onRefreshDevices={refreshCallDevices}
+            onSelectDevices={(inp, out) => void handleSelectCallDevices(inp, out)}
+          />
+        )}
+
+      {authed &&
+        !isLocked &&
+        callState.phase === "incoming_ringing" &&
+        callState.active && (
+          <IncomingCallModal
+            active={callState.active}
+            devices={callDevices}
+            devicesLoading={callDevicesLoading}
+            busy={callActionBusy}
+            onAnswer={(cid) => void handleAnswerCall(cid)}
+            onDecline={(cid) => void handleDeclineCall(cid)}
+            onRefreshDevices={refreshCallDevices}
+            onSelectDevices={(inp, out) => void handleSelectCallDevices(inp, out)}
+          />
+        )}
+
+      {callNotice && !isLocked && (
+        <div className="fixed right-4 top-20 z-[80] max-w-sm">
+          <button
+            type="button"
+            onClick={() => setCallNotice(null)}
+            className="flex items-center gap-2 rounded-xl px-3.5 py-2 text-left text-xs font-medium shadow-2xl transition hover:opacity-90"
+            style={{
+              background:
+                callNotice.tone === "error"
+                  ? "var(--danger-bg)"
+                  : callNotice.tone === "warn"
+                    ? "rgba(245, 158, 11, 0.16)"
+                    : "var(--bg-sidebar)",
+              border:
+                callNotice.tone === "warn"
+                  ? "1px solid rgba(245, 158, 11, 0.45)"
+                  : "1px solid var(--border-subtle)",
+              color:
+                callNotice.tone === "error"
+                  ? "var(--danger-text)"
+                  : callNotice.tone === "warn"
+                    ? "#f59e0b"
+                    : "var(--text-primary)",
+            }}
+          >
+            <Phone className="h-3.5 w-3.5 shrink-0" />
+            <span>{callNotice.text}</span>
+          </button>
         </div>
       )}
 

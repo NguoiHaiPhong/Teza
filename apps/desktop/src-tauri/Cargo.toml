@@ -24,4 +24,5 @@ tauri-plugin-process = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2"
 tokio = { version = "1", features = ["sync", "time"] }
+teza-call = { path = "../../../crates/teza-call" }
 zalo-core = { path = "../../../crates/zalo-core" }

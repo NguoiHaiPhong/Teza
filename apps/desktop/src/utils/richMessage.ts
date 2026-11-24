@@ -1,7 +1,8 @@
-import type { MessageDto, PollDto, ReminderPayload } from "../types";
+import type { CallCardPayload, MessageDto, PollDto, ReminderPayload } from "../types.ts";
 
 export const REMINDER_PREFIX = "teza-reminder:";
 export const POLL_PREFIX = "teza-poll:";
+export const CALL_PREFIX = "teza-call:";
 
 export function isReminderThumbUrl(url?: string | null): boolean {
   if (!url) return false;
@@ -77,6 +78,83 @@ export function isPollMessage(msg: Pick<MessageDto, "msg_type" | "attachment_nam
   if (msg.attachment_name?.startsWith(POLL_PREFIX)) return true;
   const trimmed = (msg.text || "").trim();
   return trimmed.startsWith("[Bình chọn]") || trimmed.startsWith("Bình chọn:");
+}
+
+export function isCallMessage(msg: Pick<MessageDto, "msg_type" | "attachment_name">): boolean {
+  const mt = (msg.msg_type || "").trim().toLowerCase();
+  if (
+    mt === "chat.call" ||
+    mt === "chat.voip" ||
+    mt === "call" ||
+    mt === "voip" ||
+    mt.startsWith("call.")
+  ) {
+    return true;
+  }
+  return Boolean(msg.attachment_name?.startsWith(CALL_PREFIX));
+}
+
+export function parseCallPayload(
+  msg: Pick<MessageDto, "msg_type" | "attachment_name" | "text" | "is_outgoing">,
+): CallCardPayload | null {
+  if (!isCallMessage(msg)) return null;
+  if (msg.attachment_name?.startsWith(CALL_PREFIX)) {
+    try {
+      const raw = JSON.parse(msg.attachment_name.slice(CALL_PREFIX.length)) as Partial<CallCardPayload>;
+      const callType = raw.callType === "video" ? "video" : "voice";
+      const durationSecs =
+        typeof raw.durationSecs === "number" && Number.isFinite(raw.durationSecs) && raw.durationSecs > 0
+          ? Math.floor(raw.durationSecs)
+          : 0;
+      const validOutcome =
+        raw.outcome === "completed" ||
+        raw.outcome === "missed" ||
+        raw.outcome === "cancelled" ||
+        raw.outcome === "declined"
+          ? raw.outcome
+          : durationSecs > 0
+            ? "completed"
+            : msg.is_outgoing
+              ? "cancelled"
+              : "missed";
+      return {
+        callType,
+        outcome: validOutcome,
+        durationSecs,
+      };
+    } catch {
+      // fall through to text/type fallback
+    }
+  }
+
+  const mt = (msg.msg_type || "").toLowerCase();
+  const txt = (msg.text || "").trim();
+  const lowTxt = txt.toLowerCase();
+  const callType: "voice" | "video" =
+    mt.includes("video") || lowTxt.includes("video") ? "video" : "voice";
+  const mmss = txt.match(/(\d+):(\d{2})/);
+  const durationSecs = mmss
+    ? Number.parseInt(mmss[1], 10) * 60 + Number.parseInt(mmss[2], 10)
+    : 0;
+
+  let outcome: CallCardPayload["outcome"];
+  if (durationSecs > 0) {
+    outcome = "completed";
+  } else if (/nhỡ|bỏ lỡ|miss|no_answer|không trả lời/i.test(lowTxt)) {
+    outcome = "missed";
+  } else if (/hủy|cancel/i.test(lowTxt)) {
+    outcome = "cancelled";
+  } else if (/từ chối|bận|reject|declin|busy/i.test(lowTxt)) {
+    outcome = "declined";
+  } else {
+    outcome = msg.is_outgoing ? "cancelled" : "missed";
+  }
+
+  return {
+    callType,
+    outcome,
+    durationSecs,
+  };
 }
 
 export function parseReminderPayload(

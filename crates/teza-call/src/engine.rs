@@ -71,6 +71,8 @@ pub struct CallSnapshot {
     pub is_caller: bool,
     pub phase: CallPhase,
     pub mic_muted: bool,
+    #[serde(default)]
+    pub peer_mic_muted: bool,
     pub rtp_ip: String,
     pub rtcp_ip: String,
     pub relay_token: u32,
@@ -113,6 +115,10 @@ pub enum CallEvent {
         call_id: i64,
         mic_muted: bool,
     },
+    PeerMediaChanged {
+        call_id: i64,
+        mic_muted: bool,
+    },
     MediaWarning {
         call_id: i64,
         message: String,
@@ -141,6 +147,7 @@ pub struct ActiveCallRecord {
     pub partner_uid_u32: u32,
     pub relay_token: u32,
     pub mic_muted: bool,
+    pub peer_mic_muted: bool,
     pub started_at_ms: i64,
     pub connected_at_ms: Option<i64>,
     pub invite_payload: Value,
@@ -162,6 +169,7 @@ impl ActiveCallRecord {
             is_caller: self.is_caller,
             phase: self.phase,
             mic_muted: self.mic_muted,
+            peer_mic_muted: self.peer_mic_muted,
             rtp_ip: self.rtp_ip.clone(),
             rtcp_ip: self.rtcp_ip.clone(),
             relay_token: self.relay_token,
@@ -330,6 +338,7 @@ impl CallStateMachine {
             partner_uid_u32: uid_str_to_u32(&partner_id),
             relay_token: 0,
             mic_muted: false,
+            peer_mic_muted: false,
             started_at_ms: now_ms,
             connected_at_ms: None,
             invite_payload: Value::Null,
@@ -706,8 +715,64 @@ impl CallStateMachine {
             "answer" => self.on_answer(ev, ev_call_id, now_ms),
             "end_call" | "cancel" => self.on_remote_end(act, ev_call_id, now_ms),
             "request" => self.on_incoming_request(ev, ev_call_id, data, now_ms),
+            "mute_audio" => self.on_peer_mute_audio(ev, ev_call_id),
             _ => TransitionOutput::default(),
         }
+    }
+
+    fn on_peer_mute_audio(&mut self, ev: &VoipControlEvent, ev_call_id: i64) -> TransitionOutput {
+        let mut out = TransitionOutput::default();
+        let Some(st) = self.active.as_mut() else {
+            return out;
+        };
+        if (ev_call_id != 0 && ev_call_id != st.call_id)
+            || !matches!(st.phase, CallPhase::Connecting | CallPhase::Connected)
+        {
+            return out;
+        }
+        let mp = ev.media_params();
+        let raw_muted = mp
+            .get("type")
+            .or_else(|| ev.data.get("type"))
+            .and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+            })
+            .map(|t| t != 0)
+            .or_else(|| {
+                mp.get("isOnMic")
+                    .or_else(|| ev.data.get("isOnMic"))
+                    .and_then(|v| {
+                        v.as_i64()
+                            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+                            .or_else(|| v.as_bool().map(i64::from))
+                    })
+                    .map(|on| on == 0)
+            })
+            .or_else(|| {
+                mp.get("mute")
+                    .or_else(|| ev.data.get("mute"))
+                    .and_then(|v| {
+                        v.as_bool()
+                            .or_else(|| v.as_i64().map(|n| n != 0))
+                            .or_else(|| {
+                                v.as_str()
+                                    .and_then(|s| s.trim().parse::<i64>().ok())
+                                    .map(|n| n != 0)
+                            })
+                    })
+            });
+        let Some(muted) = raw_muted else {
+            return out;
+        };
+        if st.peer_mic_muted != muted {
+            st.peer_mic_muted = muted;
+            out.events.push(CallEvent::PeerMediaChanged {
+                call_id: st.call_id,
+                mic_muted: muted,
+            });
+        }
+        out
     }
 
     fn on_ring_ring(&mut self, ev_call_id: i64) -> TransitionOutput {
@@ -1029,7 +1094,7 @@ impl CallStateMachine {
             .map(str::to_string);
         let caller_name = raw_caller_name
             .clone()
-            .unwrap_or_else(|| "Người dùng Zalo".to_string());
+            .unwrap_or_else(|| "Người dùng".to_string());
 
         let ext_parsed: Value = media
             .get("extendData")
@@ -1137,6 +1202,7 @@ impl CallStateMachine {
             partner_uid_u32,
             relay_token: 0,
             mic_muted: false,
+            peer_mic_muted: false,
             started_at_ms: now_ms,
             connected_at_ms: None,
             invite_payload: relay_source,
@@ -1245,10 +1311,31 @@ fn response_error_msg(resp: &Value, fallback: &str) -> String {
         .to_string()
 }
 
+pub(crate) fn format_virtual_audio_warning(telem: &AudioTelemetry) -> Option<String> {
+    let mic = telem.active_input_device.as_deref().unwrap_or("Micro ảo");
+    let spk = telem.active_output_device.as_deref().unwrap_or("Loa ảo");
+    if telem.has_input_device && telem.input_is_virtual && telem.output_is_virtual {
+        Some(format!(
+            "Đang dùng thiết bị âm thanh ảo ({mic} / {spk}) — cuộc gọi có thể bị mất tiếng 2 chiều. Hãy cắm tai nghe/micro thật và chọn lại trong Thiết bị âm thanh."
+        ))
+    } else if telem.has_input_device && telem.input_is_virtual {
+        Some(format!(
+            "Micro hiện tại ({mic}) là thiết bị ảo/loopback — bên kia có thể không nghe thấy giọng bạn. Hãy chọn micro thật trong Thiết bị âm thanh."
+        ))
+    } else if telem.output_is_virtual {
+        Some(format!(
+            "Loa hiện tại ({spk}) là thiết bị ảo/loopback — bạn có thể không nghe thấy bên kia nói. Hãy chọn loa/tai nghe thật trong Thiết bị âm thanh."
+        ))
+    } else {
+        None
+    }
+}
+
 /// Live 1-1 VoIP call engine orchestrating signaling, UDP ZRTP relay, and Opus audio pipeline.
 pub struct CallEngine {
     transport: Arc<dyn SignalingTransport>,
     config: CallEngineConfig,
+    devices: Arc<Mutex<AudioDeviceSelection>>,
     sm: Arc<Mutex<CallStateMachine>>,
     zrtp: Arc<Mutex<Option<(i64, ZrtpRelaySession)>>>,
     media: Arc<Mutex<Option<(i64, AudioMediaSession)>>>,
@@ -1285,9 +1372,11 @@ impl CallEngine {
         let uid_str = transport.self_uid();
         let uid_u32 = transport.self_uid_u32();
         let (events_tx, _) = broadcast::channel(128);
+        let devices = Arc::new(Mutex::new(config.devices.clone()));
         Ok(Self {
             transport,
             config,
+            devices,
             sm: Arc::new(Mutex::new(CallStateMachine::new(uid_str, uid_u32))),
             zrtp: Arc::new(Mutex::new(None)),
             media: Arc::new(Mutex::new(None)),
@@ -1636,6 +1725,7 @@ impl CallEngine {
         if !self.config.enable_audio {
             return;
         }
+        let selected_devices = self.devices.lock().await.clone();
         let cfg = AudioMediaConfig {
             rtp_target,
             rtcp_target,
@@ -1649,7 +1739,7 @@ impl CallEngine {
             udp_rtp_sock: std_rtp_sock,
             udp_rtcp_sock: Some(std_rtcp_sock),
             rtcp_inbox: Some(rtcp_inbox),
-            devices: self.config.devices.clone(),
+            devices: selected_devices,
         };
         #[cfg(test)]
         let start_res = AudioMediaSession::start_with_fault(cfg, self.audio_fault);
@@ -1657,7 +1747,9 @@ impl CallEngine {
         let start_res = AudioMediaSession::start(cfg);
         match start_res {
             Ok(session) => {
-                let receive_only = !session.telemetry().has_input_device;
+                let telem = session.telemetry();
+                let receive_only = !telem.has_input_device;
+                let virtual_warn = format_virtual_audio_warning(&telem);
                 // Re-verify the call wasn't ended or replaced while OS audio devices were opening,
                 // storing `(call_id, session)` atomically under `sm` -> `media`.
                 let prev = {
@@ -1680,6 +1772,13 @@ impl CallEngine {
                     let msg =
                         "Không phát hiện micro — đang chạy chế độ chỉ nghe (receive-only)."
                             .to_string();
+                    eprintln!("[teza-call][engine] call_id={call_id}: {msg}");
+                    self.emit_events(vec![CallEvent::MediaWarning {
+                        call_id,
+                        message: msg,
+                    }]);
+                }
+                if let Some(msg) = virtual_warn {
                     eprintln!("[teza-call][engine] call_id={call_id}: {msg}");
                     self.emit_events(vec![CallEvent::MediaWarning {
                         call_id,
@@ -2207,6 +2306,81 @@ impl CallEngine {
         let out = self.sm.lock().await.end_call(now_ms());
         self.apply_transition(out).await;
         Ok(())
+    }
+
+    /// Return the currently configured audio input/output device selection.
+    pub async fn devices(&self) -> AudioDeviceSelection {
+        self.devices.lock().await.clone()
+    }
+
+    /// Update the preferred audio input/output devices.
+    ///
+    /// If a call is currently `Connected` with an active audio media session, the audio stream
+    /// restarts immediately using the newly selected devices while preserving the live ZRTP relay
+    /// session and current microphone mute state.
+    pub async fn set_devices(&self, devices: AudioDeviceSelection) {
+        *self.devices.lock().await = devices;
+        let restart_params = {
+            let sm_g = self.sm.lock().await;
+            sm_g.active().and_then(|st| {
+                (st.phase == CallPhase::Connected && !st.rtp_ip.is_empty()).then(|| {
+                    (
+                        st.call_id,
+                        st.rtp_ip.clone(),
+                        st.rtcp_ip.clone(),
+                        st.from_uid_u32,
+                        st.sess_id.clone(),
+                    )
+                })
+            })
+        };
+        if let Some((call_id, rtp_ip, rtcp_ip, from_uid_u32, sess_id)) = restart_params {
+            let old_media = {
+                let mut g = self.media.lock().await;
+                if g.as_ref().is_some_and(|(cid, _)| *cid == call_id) {
+                    g.take()
+                } else {
+                    None
+                }
+            };
+            if let Some((_, m)) = old_media {
+                m.stop();
+                self.start_audio_on_active_zrtp(call_id, &rtp_ip, &rtcp_ip, from_uid_u32, &sess_id)
+                    .await;
+            }
+        }
+    }
+
+    /// Force-stop any active call, ZRTP relay, and local audio streams without sending HTTP
+    /// signaling requests (used when shutting down, logging out, or switching into Relay mode).
+    pub async fn force_stop(&self, reason: Option<CallEndReason>) {
+        let ended = {
+            let mut sm_g = self.sm.lock().await;
+            let taken = sm_g.active.take();
+            if let Some(ref st) = taken {
+                sm_g.mark_dismissed(st.call_id);
+            }
+            taken
+        };
+        self.stop_media_and_zrtp().await;
+        if let Some(st) = ended {
+            let duration_secs = match st.connected_at_ms {
+                Some(ts) => now_ms().saturating_sub(ts).max(0) as u64 / 1000,
+                None => 0,
+            };
+            self.emit_events(vec![
+                CallEvent::CallEnded {
+                    call_id: st.call_id,
+                    partner_id: st.partner_id,
+                    duration_secs,
+                    reason: reason.unwrap_or(CallEndReason::LocalHangup),
+                },
+                CallEvent::StateChanged {
+                    phase: CallPhase::Idle,
+                    call_id: Some(st.call_id),
+                },
+            ]);
+        }
     }
 
     /// Feed a parsed [`VoipControlEvent`] (from `zalo-core` WS or `lp_control` polling) into the engine.
@@ -4447,5 +4621,157 @@ mod tests {
 
         let _ = stop_tx.send(true);
         let _ = relay_task.await;
+    }
+
+    #[tokio::test]
+    async fn mute_audio_set_devices_and_force_stop_work_cleanly() {
+        let (rtp_addr, rtcp_addr, stop_tx, relay_task) = spawn_mock_zrtp_relay().await;
+        let transport = Arc::new(MockSignalingTransport::new(json!({
+            "id": 998_001,
+            "status": 0,
+            "fromId": 1000,
+            "toId": 2000,
+            "sessId": "sess_998001",
+            "servers": [{ "rtpaddr": rtp_addr, "rtcpaddr": rtcp_addr }]
+        })));
+        let engine = CallEngine::with_transport(
+            transport.clone(),
+            CallEngineConfig {
+                enable_audio: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut rx = engine.subscribe();
+
+        let call_id = engine
+            .make_call("2000", "Alice", CallType::DirectVoice)
+            .await
+            .unwrap();
+        assert_eq!(call_id, 998_001);
+
+        let ans = voip_event_from_parts(
+            "answer",
+            json!({
+                "callId": 998_001,
+                "status": 0,
+                "params": json!({ "rtpSerIp": rtp_addr }).to_string(),
+            }),
+        );
+        engine.handle_voip_event(&ans).await.unwrap();
+        assert!(!engine.snapshot().await.unwrap().peer_mic_muted);
+
+        // Peer mutes microphone (`act: "mute_audio"`, `params.type: 1`)
+        let peer_mute = voip_event_from_parts(
+            "mute_audio",
+            json!({
+                "callId": 998_001,
+                "params": r#"{"type":1}"#,
+            }),
+        );
+        engine.handle_voip_event(&peer_mute).await.unwrap();
+        assert!(engine.snapshot().await.unwrap().peer_mic_muted);
+
+        // Repeated identical state does not spam duplicate event, unmute (`type: 0`) clears it
+        engine.handle_voip_event(&peer_mute).await.unwrap();
+        let peer_unmute = voip_event_from_parts(
+            "mute_audio",
+            json!({
+                "callId": 998_001,
+                "params": r#"{"type":0}"#,
+            }),
+        );
+        engine.handle_voip_event(&peer_unmute).await.unwrap();
+        assert!(!engine.snapshot().await.unwrap().peer_mic_muted);
+
+        let next_dev = AudioDeviceSelection {
+            input_device_name: Some("Headset Mic".into()),
+            output_device_name: Some("Headset Ear".into()),
+        };
+        engine.set_devices(next_dev.clone()).await;
+        assert_eq!(engine.devices().await, next_dev);
+
+        // force_stop tears down state and ZRTP without sending HTTP 409/406
+        let sig_before = transport.recorded().len();
+        engine
+            .force_stop(Some(CallEndReason::Error("relay turned on".into())))
+            .await;
+        assert_eq!(engine.phase().await, CallPhase::Idle);
+        assert!(!engine.has_active_zrtp().await);
+        assert_eq!(
+            transport.recorded().len(),
+            sig_before,
+            "force_stop must not send HTTP signaling requests"
+        );
+
+        let mut peer_changes = Vec::new();
+        let mut saw_forced_end = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                CallEvent::PeerMediaChanged { call_id: 998_001, mic_muted } => {
+                    peer_changes.push(mic_muted);
+                }
+                CallEvent::CallEnded {
+                    call_id: 998_001,
+                    reason: CallEndReason::Error(msg),
+                    ..
+                } if msg == "relay turned on" => {
+                    saw_forced_end = true;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(peer_changes, vec![true, false]);
+        assert!(saw_forced_end);
+
+        let _ = stop_tx.send(true);
+        let _ = relay_task.await;
+    }
+
+    #[test]
+    fn format_virtual_audio_warning_covers_both_mic_and_speaker_cases() {
+        let both_virt = AudioTelemetry {
+            has_input_device: true,
+            active_input_device: Some("CABLE Output (VB-Audio Virtual Cable)".into()),
+            active_output_device: Some("CABLE Input (VB-Audio Virtual Cable)".into()),
+            input_is_virtual: true,
+            output_is_virtual: true,
+            ..Default::default()
+        };
+        let msg_both = format_virtual_audio_warning(&both_virt).unwrap();
+        assert!(msg_both.contains("CABLE Output"));
+        assert!(msg_both.contains("CABLE Input"));
+
+        let mic_virt = AudioTelemetry {
+            has_input_device: true,
+            active_input_device: Some("Stereo Mix (Realtek(R) Audio)".into()),
+            active_output_device: Some("Speakers (Realtek)".into()),
+            input_is_virtual: true,
+            output_is_virtual: false,
+            ..Default::default()
+        };
+        let msg_mic = format_virtual_audio_warning(&mic_virt).unwrap();
+        assert!(msg_mic.contains("Stereo Mix"));
+
+        let spk_virt = AudioTelemetry {
+            has_input_device: false,
+            active_input_device: None,
+            active_output_device: Some("CABLE Input (VB-Audio Virtual Cable)".into()),
+            input_is_virtual: false,
+            output_is_virtual: true,
+            ..Default::default()
+        };
+        let msg_spk = format_virtual_audio_warning(&spk_virt).unwrap();
+        assert!(msg_spk.contains("CABLE Input"));
+
+        let clean = AudioTelemetry {
+            has_input_device: true,
+            active_input_device: Some("USB Mic".into()),
+            active_output_device: Some("Headset".into()),
+            input_is_virtual: false,
+            output_is_virtual: false,
+            ..Default::default()
+        };
+        assert!(format_virtual_audio_warning(&clean).is_none());
     }
 }

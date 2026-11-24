@@ -4,6 +4,9 @@ import type {
   AddGroupMembersResultDto,
   AppUpdateInfo,
   AttachmentMeta,
+  CallAudioTestResultDto,
+  CallDevicesDto,
+  CallStateDto,
   ChatFolderDto,
   FolderFilter,
   MessageDto,
@@ -1084,5 +1087,103 @@ export const bridge = {
       monitorIndex: opts?.monitorIndex ?? null,
       captureAll: opts?.captureAll ?? false,
     });
+  },
+  async callGetState(): Promise<CallStateDto> {
+    if (!isTauri()) {
+      return {
+        available: false,
+        unavailable_reason: "desktop_only",
+        phase: "idle",
+        active: null,
+      };
+    }
+    return invoke<CallStateDto>("call_get_state");
+  },
+  async callListDevices(): Promise<CallDevicesDto> {
+    if (!isTauri()) {
+      return {
+        inputs: [{ name: "Default Microphone", is_default: true, is_virtual: false }],
+        outputs: [{ name: "Default Speakers", is_default: true, is_virtual: false }],
+        selected_input: null,
+        selected_output: null,
+      };
+    }
+    return invoke<CallDevicesDto>("call_list_devices");
+  },
+  async callSetDevices(
+    inputDevice: string | null,
+    outputDevice: string | null,
+  ): Promise<CallDevicesDto> {
+    if (!isTauri()) {
+      return {
+        inputs: [{ name: "Default Microphone", is_default: true, is_virtual: false }],
+        outputs: [{ name: "Default Speakers", is_default: true, is_virtual: false }],
+        selected_input: inputDevice?.trim() || null,
+        selected_output: outputDevice?.trim() || null,
+      };
+    }
+    return invoke<CallDevicesDto>("call_set_devices", {
+      inputDevice: inputDevice ?? null,
+      outputDevice: outputDevice ?? null,
+    });
+  },
+  async callTestAudio(): Promise<CallAudioTestResultDto> {
+    if (!isTauri()) {
+      throw new Error("Kiểm tra âm thanh chỉ khả dụng trên ứng dụng desktop");
+    }
+    return invoke<CallAudioTestResultDto>("call_test_audio");
+  },
+  async callStartVoice(partnerId: string, partnerName?: string): Promise<CallStateDto> {
+    if (!isTauri()) {
+      throw new Error("Tính năng gọi thoại chỉ khả dụng trên ứng dụng desktop");
+    }
+    return invoke<CallStateDto>("call_start_voice", {
+      partnerId,
+      partnerName: partnerName ?? null,
+    });
+  },
+  async callAnswer(callId?: number): Promise<CallStateDto> {
+    if (!isTauri()) {
+      return {
+        available: false,
+        unavailable_reason: "desktop_only",
+        phase: "idle",
+        active: null,
+      };
+    }
+    return invoke<CallStateDto>("call_answer", { callId: callId ?? null });
+  },
+  async callDecline(callId?: number): Promise<CallStateDto> {
+    if (!isTauri()) {
+      return {
+        available: false,
+        unavailable_reason: "desktop_only",
+        phase: "idle",
+        active: null,
+      };
+    }
+    return invoke<CallStateDto>("call_decline", { callId: callId ?? null });
+  },
+  async callHangup(): Promise<CallStateDto> {
+    if (!isTauri()) {
+      return {
+        available: false,
+        unavailable_reason: "desktop_only",
+        phase: "idle",
+        active: null,
+      };
+    }
+    return invoke<CallStateDto>("call_hangup");
+  },
+  async callSetMute(muted: boolean): Promise<CallStateDto> {
+    if (!isTauri()) {
+      return {
+        available: false,
+        unavailable_reason: "desktop_only",
+        phase: "idle",
+        active: null,
+      };
+    }
+    return invoke<CallStateDto>("call_set_mute", { muted });
   },
 };

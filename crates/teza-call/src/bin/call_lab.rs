@@ -254,7 +254,7 @@ async fn print_engine_status(engine: &CallEngine) {
     if let Some(t) = telem {
         let mode = if t.has_input_device { "duplex" } else { "rx-only" };
         println!(
-            "[STATUS] audio({mode}) muted={} mic={}‰ remote={}‰ speaking={} tx={} rx={} fec={} plc={} tx_err={}",
+            "[STATUS] audio({mode}) muted={} mic={}‰ remote={}‰ speaking={} tx={} rx={} fec={} plc={} tx_err={} in={:?}(virt={}) out={:?}(virt={})",
             t.mic_muted,
             t.mic_level_permille,
             t.remote_level_permille,
@@ -264,6 +264,10 @@ async fn print_engine_status(engine: &CallEngine) {
             t.fec_frames,
             t.plc_frames,
             t.tx_errors,
+            t.active_input_device,
+            t.input_is_virtual,
+            t.active_output_device,
+            t.output_is_virtual,
         );
     }
 }
@@ -370,8 +374,9 @@ fn cmd_devices() -> Result<()> {
     match list_input_devices() {
         Ok(list) if !list.is_empty() => {
             for (i, d) in list.iter().enumerate() {
-                let mark = if d.is_default { " [DEFAULT]" } else { "" };
-                println!("  [{i}] {}{mark}", d.name);
+                let def = if d.is_default { " [DEFAULT]" } else { "" };
+                let virt = if d.is_virtual { " [VIRTUAL/LOOPBACK]" } else { "" };
+                println!("  [{i}] {}{def}{virt}", d.name);
             }
         }
         Ok(_) => println!("  (none detected)"),
@@ -382,8 +387,9 @@ fn cmd_devices() -> Result<()> {
     match list_output_devices() {
         Ok(list) if !list.is_empty() => {
             for (i, d) in list.iter().enumerate() {
-                let mark = if d.is_default { " [DEFAULT]" } else { "" };
-                println!("  [{i}] {}{mark}", d.name);
+                let def = if d.is_default { " [DEFAULT]" } else { "" };
+                let virt = if d.is_virtual { " [VIRTUAL/LOOPBACK]" } else { "" };
+                println!("  [{i}] {}{def}{virt}", d.name);
             }
         }
         Ok(_) => println!("  (none detected)"),
@@ -1109,6 +1115,11 @@ async fn cmd_serve(args: &[String]) -> Result<()> {
                             }
                             CallEvent::CallEnded { .. } if once => {
                                 break;
+                            }
+                            CallEvent::PeerMediaChanged { call_id, mic_muted } => {
+                                println!(
+                                    "[PEER] call_id={call_id} peer_mic_muted={mic_muted}"
+                                );
                             }
                             _ => {}
                         }

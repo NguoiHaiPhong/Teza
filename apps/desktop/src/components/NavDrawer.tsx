@@ -40,6 +40,7 @@ interface Props {
       | "appearance"
       | "folders"
       | "webapps"
+      | "calls"
       | "translate"
       | "network"
       | "system",

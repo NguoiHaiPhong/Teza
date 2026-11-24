@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 import type { MessageDto } from "../src/types.ts";
 import {
   formatReminderCountdown,
+  isCallMessage,
   isPollMessage,
   isReminderMessage,
+  parseCallPayload,
   parsePollPayload,
   parseReminderPayload,
 } from "../src/utils/richMessage.ts";
@@ -97,4 +99,49 @@ test("formatReminderCountdown formats relative time accurately across locales", 
   assert.equal(formatReminderCountdown(now + 45 * 60_000, now, "vi"), "Còn 45 phút");
   assert.equal(formatReminderCountdown(now + 90 * 60_000, now, "en"), "In 1h 30m");
   assert.equal(formatReminderCountdown(now - 120_000, now, "ko"), "지남");
+});
+
+test("parseCallPayload parses structured teza-call metadata and legacy text fallbacks", () => {
+  const voiceCompleted = makeMsg({
+    msg_id: "c1",
+    msg_type: "chat.call",
+    text: "Cuộc gọi thoại (02:05)",
+    attachment_name: 'teza-call:{"callType":"voice","outcome":"completed","durationSecs":125}',
+  });
+  assert.equal(isCallMessage(voiceCompleted), true);
+  assert.deepEqual(parseCallPayload(voiceCompleted), {
+    callType: "voice",
+    outcome: "completed",
+    durationSecs: 125,
+  });
+
+  const videoMissed = makeMsg({
+    msg_id: "c2",
+    msg_type: "chat.call",
+    text: "Cuộc gọi video nhỡ",
+    attachment_name: 'teza-call:{"callType":"video","outcome":"missed","durationSecs":0}',
+  });
+  assert.deepEqual(parseCallPayload(videoMissed), {
+    callType: "video",
+    outcome: "missed",
+    durationSecs: 0,
+  });
+
+  const legacyCancelled = makeMsg({
+    msg_id: "c3",
+    msg_type: "call.voice",
+    text: "Đã hủy cuộc gọi thoại",
+    is_outgoing: true,
+    attachment_name: null,
+  });
+  assert.equal(isCallMessage(legacyCancelled), true);
+  assert.deepEqual(parseCallPayload(legacyCancelled), {
+    callType: "voice",
+    outcome: "cancelled",
+    durationSecs: 0,
+  });
+
+  const normalText = makeMsg({ msg_id: "t1", msg_type: "chat.text", text: "Xin chào" });
+  assert.equal(isCallMessage(normalText), false);
+  assert.equal(parseCallPayload(normalText), null);
 });

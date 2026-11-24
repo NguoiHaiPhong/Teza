@@ -19,9 +19,9 @@ pub mod trace;
 pub mod zrtp;
 
 pub use audio::{
-    list_input_devices, list_output_devices, AudioControls, AudioDeviceInfo, AudioDeviceSelection,
-    AudioLoopbackSession, AudioMediaConfig, AudioMediaSession, AudioTelemetry, LinearResampler,
-    OpusVoiceCodec,
+    is_virtual_or_loopback_audio_device, list_input_devices, list_output_devices, AudioControls,
+    AudioDeviceInfo, AudioDeviceSelection, AudioLoopbackSession, AudioMediaConfig,
+    AudioMediaSession, AudioTelemetry, LinearResampler, OpusVoiceCodec,
 };
 pub use engine::{
     CallEffect, CallEndReason, CallEngine, CallEngineConfig, CallEvent, CallPhase, CallSnapshot,

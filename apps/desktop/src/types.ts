@@ -330,3 +330,128 @@ export interface SavedFileResultDto {
   file_name: string;
   can_open_directly: boolean;
 }
+
+export type CallPhase =
+  | "idle"
+  | "dialing"
+  | "ringing_outgoing"
+  | "incoming_ringing"
+  | "connecting"
+  | "connected";
+
+export type CallType = "DirectVoice" | "DirectVideo";
+
+export type CallEndReason =
+  | "local_hangup"
+  | "local_declined"
+  | "local_cancelled"
+  | "remote_ended"
+  | "remote_cancelled"
+  | "answered_on_other_device"
+  | "ended_on_other_device"
+  | "ring_timeout"
+  | { remote_rejected: { code: number; message: string } }
+  | { error: string };
+
+export interface CallSnapshotDto {
+  call_id: number;
+  partner_id: string;
+  partner_name: string;
+  partner_avatar: string;
+  call_type: CallType;
+  is_caller: boolean;
+  phase: CallPhase;
+  mic_muted: boolean;
+  peer_mic_muted: boolean;
+  duration_secs: number;
+}
+
+export interface CallStateDto {
+  available: boolean;
+  unavailable_reason: string | null;
+  phase: CallPhase;
+  active: CallSnapshotDto | null;
+}
+
+export type CallEvent =
+  | { type: "state_changed"; phase: CallPhase; call_id: number | null }
+  | {
+      type: "incoming_call";
+      call_id: number;
+      caller_id: string;
+      caller_name: string;
+      call_type: CallType;
+    }
+  | { type: "remote_ringing"; call_id: number }
+  | { type: "connected"; call_id: number; partner_id: string; rtp_ip: string }
+  | { type: "dismissed_by_other_device"; call_id: number; answered_elsewhere: boolean }
+  | {
+      type: "call_ended";
+      call_id: number;
+      partner_id: string;
+      duration_secs: number;
+      reason: CallEndReason;
+    }
+  | { type: "media_state_changed"; call_id: number; mic_muted: boolean }
+  | { type: "peer_media_changed"; call_id: number; mic_muted: boolean }
+  | { type: "media_warning"; call_id: number; message: string }
+  | {
+      type: "signaling_warning";
+      call_id: number;
+      command: number;
+      code: number | null;
+      message: string;
+    };
+
+export interface CallEventEnvelopeDto {
+  event: CallEvent;
+  state: CallStateDto;
+  partner_name: string | null;
+  partner_avatar: string | null;
+}
+
+export interface CallTelemetryDto {
+  call_id: number;
+  duration_secs: number;
+  mic_muted: boolean;
+  has_input_device: boolean;
+  mic_level_permille: number;
+  remote_level_permille: number;
+  remote_speaking: boolean;
+  tx_packets: number;
+  rx_packets: number;
+  active_input_device: string | null;
+  active_output_device: string | null;
+  input_is_virtual: boolean;
+  output_is_virtual: boolean;
+  tx_errors: number;
+}
+
+export interface AudioDeviceInfoDto {
+  name: string;
+  is_default: boolean;
+  is_virtual?: boolean;
+}
+
+export interface CallDevicesDto {
+  inputs: AudioDeviceInfoDto[];
+  outputs: AudioDeviceInfoDto[];
+  selected_input: string | null;
+  selected_output: string | null;
+}
+
+export interface CallAudioTestResultDto {
+  output_device: string | null;
+  output_is_virtual: boolean;
+  input_device: string | null;
+  input_is_virtual: boolean;
+  has_input_device: boolean;
+  tx_packets: number;
+  rx_packets: number;
+}
+
+export interface CallCardPayload {
+  callType: "voice" | "video";
+  outcome: "completed" | "missed" | "cancelled" | "declined";
+  durationSecs: number;
+}

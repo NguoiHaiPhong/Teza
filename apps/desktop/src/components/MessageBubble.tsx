@@ -16,18 +16,24 @@ import {
   Languages,
   Loader2,
   MessagesSquare,
+  Phone,
+  PhoneIncoming,
+  PhoneMissed,
+  PhoneOutgoing,
   Pin,
   RefreshCw,
   Repeat,
   RotateCcw,
   Smile,
   Trash2,
+  Video,
   Zap,
 } from "lucide-react";
 import { bridge } from "../bridge";
 import type { MessageDto, ThreadKind } from "../types";
 import { useI18n } from "../i18n";
 import { isBuzzMessage } from "../utils/buzz";
+import { formatCallDuration, type CallStartDisabledReason } from "../utils/callState";
 import { copyImageReliable, copyTextReliable } from "../utils/clipboard";
 import { useEmojiStyle } from "../utils/emojiStyleContext";
 import {
@@ -47,6 +53,7 @@ import {
 } from "../utils/mediaCache";
 import {
   formatReminderCountdown,
+  parseCallPayload,
   parsePollPayload,
   parseReminderPayload,
 } from "../utils/richMessage";
@@ -104,6 +111,8 @@ interface Props {
   onCopyError?: (err: unknown) => void;
   onVotePoll?: (msg: MessageDto, optionIds: number[]) => Promise<void> | void;
   onRefreshPoll?: (msg: MessageDto) => Promise<void> | void;
+  onStartVoiceCall?: (partnerId: string, partnerName?: string) => void;
+  callDisabledReason?: CallStartDisabledReason | null;
 }
 
 function formatClock(ts: number): string {
@@ -328,6 +337,8 @@ export const MessageBubble = memo(function MessageBubble({
   onCopyError,
   onVotePoll,
   onRefreshPoll,
+  onStartVoiceCall,
+  callDisabledReason = null,
 }: Props) {
   const { lang, locale, t } = useI18n();
   const { emojiStyle } = useEmojiStyle();
@@ -347,7 +358,8 @@ export const MessageBubble = memo(function MessageBubble({
   const isReplaced = Boolean(replaceWithTranslation && hasVisibleTranslation && !showOriginal);
   const reminderData = !msg.is_recalled ? parseReminderPayload(msg) : null;
   const pollData = !msg.is_recalled && !reminderData ? parsePollPayload(msg) : null;
-  const isRichCard = Boolean(reminderData || pollData);
+  const callData = !msg.is_recalled && !reminderData && !pollData ? parseCallPayload(msg) : null;
+  const isRichCard = Boolean(reminderData || pollData || callData);
   const isBuzz = !isRichCard && isBuzzMessage(msg);
   const isStickerKind =
     !msg.is_recalled && !isRichCard && isStickerMessage(msg, normalizedAttachmentUrl);
@@ -393,7 +405,9 @@ export const MessageBubble = memo(function MessageBubble({
     !displayText &&
     !isBuzz &&
     !(threadKind === "group" && !msg.is_outgoing && !groupedWithPrev);
-  const hasTranslatableBody = Boolean(!msg.is_recalled && getDisplayBodyText(msg).trim());
+  const hasTranslatableBody = Boolean(
+    !msg.is_recalled && !isRichCard && getDisplayBodyText(msg).trim(),
+  );
   const safeDownloadUrl =
     nonMediaAction === "save_file" &&
     (isRemoteMediaUrl(normalizedAttachmentUrl) || isDataUrl(normalizedAttachmentUrl))
@@ -1159,6 +1173,94 @@ export const MessageBubble = memo(function MessageBubble({
                 })()
               )}
             </div>
+          </div>
+        ) : callData ? (
+          <div
+            className="my-0.5 flex min-w-[220px] max-w-[320px] items-center gap-3 rounded-xl px-3 py-2"
+            style={{
+              background: msg.is_outgoing ? "rgba(0,0,0,0.16)" : "var(--bg-surface)",
+              border: "1px solid var(--border-subtle)",
+            }}
+          >
+            <div
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full"
+              style={{
+                background:
+                  callData.outcome === "missed" || callData.outcome === "declined"
+                    ? "var(--danger-bg)"
+                    : "var(--accent-soft)",
+                color:
+                  callData.outcome === "missed" || callData.outcome === "declined"
+                    ? "var(--danger-text)"
+                    : "var(--accent)",
+              }}
+            >
+              {callData.callType === "video" ? (
+                <Video className="h-4 w-4" />
+              ) : callData.outcome === "missed" ? (
+                <PhoneMissed className="h-4 w-4" />
+              ) : msg.is_outgoing ? (
+                <PhoneOutgoing className="h-4 w-4" />
+              ) : (
+                <PhoneIncoming className="h-4 w-4" />
+              )}
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-[13.5px] font-semibold">
+                {callData.callType === "video"
+                  ? t("callCardVideoTitle")
+                  : t("callCardVoiceTitle")}
+              </div>
+              <div
+                className="text-xs tabular-nums"
+                style={{
+                  color:
+                    callData.outcome === "missed" || callData.outcome === "declined"
+                      ? "var(--danger-text)"
+                      : "var(--text-secondary)",
+                }}
+              >
+                {callData.durationSecs > 0
+                  ? t("callCardCompleted", {
+                      duration: formatCallDuration(callData.durationSecs),
+                    })
+                  : callData.outcome === "missed"
+                    ? t("callCardMissed")
+                    : callData.outcome === "cancelled"
+                      ? t("callCardCancelled")
+                      : callData.outcome === "declined"
+                        ? t("callCardDeclined")
+                        : t("callCardVoiceTitle")}
+              </div>
+            </div>
+            {threadKind === "direct" && onStartVoiceCall && (
+              <button
+                type="button"
+                disabled={Boolean(callDisabledReason)}
+                onClick={() =>
+                  onStartVoiceCall(
+                    msg.thread_id,
+                    msg.is_outgoing ? undefined : msg.sender_name,
+                  )
+                }
+                title={
+                  callDisabledReason === "relay_enabled"
+                    ? t("callDisabledRelayTooltip")
+                    : callDisabledReason === "busy"
+                      ? t("callAlreadyActiveTooltip")
+                      : t("callCardCallBack")
+                }
+                className="hover-menu inline-flex shrink-0 items-center gap-1 rounded-lg px-2 py-1 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-45"
+                style={{
+                  background: "var(--bg-sidebar)",
+                  border: "1px solid var(--border-subtle)",
+                  color: "var(--accent)",
+                }}
+              >
+                <Phone className="h-3.5 w-3.5" />
+                <span>{t("callCardCallBack")}</span>
+              </button>
+            )}
           </div>
         ) : isBuzz ? (
           <div className="my-0.5 inline-flex items-center gap-2 rounded-xl bg-amber-500/20 px-3 py-1.5 font-extrabold tracking-wider text-amber-400 ring-1 ring-amber-400/40">
