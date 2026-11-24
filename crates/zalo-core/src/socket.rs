@@ -45,11 +45,13 @@ pub const CMD_GET_MSG: u16 = 570;
 pub const CMD_CTRL_PUSH_CTRL: u16 = 601;
 pub const CMD_CTRL_ACTION: u16 = 602;
 pub const CMD_CTRL_PULL_CTRL: u16 = 603;
+pub const CMD_CTRL_PULL_VOIP: u16 = 604;
+pub const CMD_CTRL_PULL_610: u16 = 610;
 
-const PING_SECS: u64 = 25;
+const PING_SECS: u64 = 15;
 const WS_WRITE_TIMEOUT_SECS: u64 = 10;
 const BROWSER_UA: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) ZaloPC/26.10.11 Chrome/122.0.0.0 Electron/29.0.0 Safari/537.36";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -86,7 +88,18 @@ impl WsEvent {
     }
 
     pub fn is_control_ish(&self) -> bool {
-        matches!(self.cmd, CMD_CTRL_PUSH_CTRL | CMD_CTRL_ACTION | CMD_CTRL_PULL_CTRL)
+        matches!(
+            self.cmd,
+            CMD_CTRL_PUSH_CTRL
+                | CMD_CTRL_ACTION
+                | CMD_CTRL_PULL_CTRL
+                | CMD_CTRL_PULL_VOIP
+                | CMD_CTRL_PULL_610
+        )
+    }
+
+    pub fn is_voip_ish(&self) -> bool {
+        self.is_control_ish()
     }
 
     pub fn is_receipt_ish(&self) -> bool {
@@ -303,11 +316,9 @@ pub fn spawn(sess: Session) -> mpsc::UnboundedReceiver<WsSignal> {
         let mut backoff = 2u64;
         let mut endpoint_idx = 0usize;
         loop {
-            let _ = tx.send(WsSignal::Status(if endpoint_idx == 0 {
-                WsStatus::Connecting
-            } else {
-                WsStatus::Reconnecting
-            }));
+            if endpoint_idx == 0 {
+                let _ = tx.send(WsSignal::Status(WsStatus::Connecting));
+            }
             match run_once(&sess, &tx, endpoint_idx).await {
                 Ok(WsRunOutcome::Disconnected) => {
                     backoff = 2;
@@ -345,16 +356,12 @@ async fn run_once(
     let mut req = url.clone().into_client_request()?;
     {
         let h = req.headers_mut();
-        if let Some(sek) = sess
-            .zpw_sek
-            .as_deref()
-            .filter(|s| !s.is_empty() && *s != "EXPIRED")
-        {
+        if let Some(sek) = sess.effective_zpw_sek() {
             h.insert(
                 COOKIE,
                 HeaderValue::from_str(&format!("zpw_sek={sek}; _zlang=vi"))?,
             );
-            h.insert("zpw_sek", HeaderValue::from_str(sek)?);
+            h.insert("zpw_sek", HeaderValue::from_str(&sek)?);
         }
         h.insert(ORIGIN, HeaderValue::from_static("https://chat.zalo.me"));
         h.insert(USER_AGENT, HeaderValue::from_static(BROWSER_UA));
@@ -602,5 +609,19 @@ mod tests {
             }
         });
         assert_eq!(queues_from_auth(&auth), vec![(603, 0), (510, 1), (511, 0)]);
+    }
+
+    #[test]
+    fn control_cmd_610_and_ws_constants_match_pc_profile() {
+        let ev = WsEvent {
+            cmd: CMD_CTRL_PULL_610,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({}),
+        };
+        assert!(ev.is_control_ish());
+        assert!(ev.is_voip_ish());
+        assert_eq!(PING_SECS, 15);
+        assert!(BROWSER_UA.contains("ZaloPC/26.10.11"));
     }
 }

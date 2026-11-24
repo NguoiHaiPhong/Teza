@@ -427,6 +427,7 @@ async fn restart_ws_worker(
                                     let _ = app.emit("core://message-updated", &updated);
                                 }
                             }
+                            WsParsedAction::Voip(_) => {}
                         }
                         }
                     }

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/zalo-core",
     "crates/litechat-relay",
+    "crates/teza-call",
     "apps/desktop/src-tauri",
 ]
 

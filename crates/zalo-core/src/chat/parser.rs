@@ -1,16 +1,60 @@
 //! Parsing Zalo thread/message JSON payloads and WebSocket events into clean DTOs.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::chat::{
     MessageDto, PollDto, PollOptionDto, QuoteRef, ReactionSummary, ThreadDto, ThreadKind,
 };
 use crate::socket::{
-    WsEvent, CMD_CTRL_ACTION, CMD_CTRL_PULL_CTRL, CMD_CTRL_PUSH_CTRL, CMD_DELIVERED_1_1,
-    CMD_DELIVERED_GROUP, CMD_GET_MSG, CMD_PULL_MSG_1_1, CMD_PULL_MSG_513, CMD_PULL_MSG_514,
-    CMD_PULL_MSG_515, CMD_PULL_MSG_517, CMD_PULL_MSG_518, CMD_PULL_MSG_GROUP, CMD_PUSH_MISS_MSG,
-    CMD_PUSH_MSG_1_1, CMD_PUSH_MSG_GROUP, CMD_SEEN_1_1, CMD_SEEN_GROUP,
+    WsEvent, CMD_AUTHEN, CMD_CTRL_ACTION, CMD_CTRL_PULL_610, CMD_CTRL_PULL_CTRL,
+    CMD_CTRL_PULL_VOIP, CMD_CTRL_PUSH_CTRL, CMD_DELIVERED_1_1, CMD_DELIVERED_GROUP, CMD_GET_MSG,
+    CMD_PING, CMD_PULL_MSG_1_1, CMD_PULL_MSG_513, CMD_PULL_MSG_514, CMD_PULL_MSG_515,
+    CMD_PULL_MSG_517, CMD_PULL_MSG_518, CMD_PULL_MSG_GROUP, CMD_PUSH_MISS_MSG, CMD_PUSH_MSG_1_1,
+    CMD_PUSH_MSG_GROUP, CMD_SEEN_1_1, CMD_SEEN_GROUP,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoipControlEvent {
+    pub act: String,
+    pub data: Value,
+}
+
+impl VoipControlEvent {
+    pub fn call_id(&self) -> i64 {
+        self.data
+            .get("callId")
+            .or_else(|| self.data.get("id"))
+            .and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+            })
+            .unwrap_or(0)
+    }
+
+    pub fn status(&self) -> Option<i64> {
+        self.data.get("status").and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+        })
+    }
+
+    /// Parse the nested JSON string (or object) carried inside `data.params`.
+    pub fn media_params(&self) -> Value {
+        match self.data.get("params") {
+            Some(Value::Object(_)) => self.data.get("params").cloned().unwrap_or(Value::Null),
+            Some(Value::String(raw)) => {
+                let trimmed = raw.trim();
+                if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                    serde_json::from_str::<Value>(trimmed).unwrap_or(Value::Null)
+                } else {
+                    Value::Null
+                }
+            }
+            _ => Value::Null,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum WsParsedAction {
@@ -29,6 +73,7 @@ pub enum WsParsedAction {
         me: bool,
         removed: bool,
     },
+    Voip(VoipControlEvent),
 }
 
 pub fn pick_str(v: &Value, keys: &[&str]) -> Option<String> {
@@ -1010,8 +1055,15 @@ pub fn parse_ws_event(ev: &WsEvent, my_uid: &str, send2me_id: &str) -> Vec<WsPar
     ) {
         let is_group_cmd = matches!(ev.cmd, CMD_PUSH_MSG_GROUP | CMD_PULL_MSG_GROUP);
         collect_messages_from_node(data, is_group_cmd, my_uid, send2me_id, &mut actions);
-    } else if matches!(ev.cmd, CMD_CTRL_PUSH_CTRL | CMD_CTRL_ACTION | CMD_CTRL_PULL_CTRL) {
-        collect_controls_from_node(data, my_uid, send2me_id, &mut actions);
+    } else if matches!(
+        ev.cmd,
+        CMD_CTRL_PUSH_CTRL
+            | CMD_CTRL_ACTION
+            | CMD_CTRL_PULL_CTRL
+            | CMD_CTRL_PULL_VOIP
+            | CMD_CTRL_PULL_610
+    ) {
+        collect_controls_from_node(&ev.payload, my_uid, send2me_id, &mut actions);
     } else if matches!(
         ev.cmd,
         CMD_DELIVERED_1_1 | CMD_SEEN_1_1 | CMD_DELIVERED_GROUP | CMD_SEEN_GROUP
@@ -1026,6 +1078,10 @@ pub fn parse_ws_event(ev: &WsEvent, my_uid: &str, send2me_id: &str) -> Vec<WsPar
             send2me_id,
             &mut actions,
         );
+    } else if ev.cmd != CMD_AUTHEN && ev.cmd != CMD_PING {
+        for voip_ev in extract_voip_controls(&ev.payload) {
+            actions.push(WsParsedAction::Voip(voip_ev));
+        }
     }
     actions
 }
@@ -1191,22 +1247,123 @@ fn push_single_item(
     }
 }
 
+fn has_controls_array(v: &Value) -> bool {
+    v.get("controls").and_then(Value::as_array).is_some()
+}
+
+fn value_wraps_controls(v: &Value) -> bool {
+    has_controls_array(v)
+        || v.is_array()
+        || v.get("data")
+            .is_some_and(|inner| has_controls_array(inner) || inner.is_array())
+}
+
+/// Unwrap outer `{ "data": ... }` transport envelopes around control lists without stripping
+/// the `data` field of an actual control item (`act_type` / string `type` / `content` / `controls`).
+fn unwrap_control_container(mut node: &Value) -> &Value {
+    for _ in 0..3 {
+        if has_controls_array(node)
+            || node.get("act_type").is_some()
+            || node.get("content").is_some()
+        {
+            break;
+        }
+        let data_wraps_controls = node.get("data").is_some_and(value_wraps_controls);
+        let is_direct_typed_control = node
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+            && !data_wraps_controls;
+        if is_direct_typed_control {
+            break;
+        }
+        match node.get("data") {
+            Some(inner) if inner.is_object() || inner.is_array() => node = inner,
+            _ => break,
+        }
+    }
+    node
+}
+
+/// Parse a single control entry into a [`VoipControlEvent`] when `act_type == "voip"`.
+///
+/// Accepts top-level `{ act_type: "voip", act, data }`, outer `{ act_type: "voip", content: { act, data } }`,
+/// and Zalo's wrapped `{ content: { act_type: "voip", act, data } }` (including JSON-stringified `content` or `data`).
+pub fn parse_voip_control_item(item: &Value) -> Option<VoipControlEvent> {
+    let content_obj = item.get("content").and_then(unwrap_json_object);
+    let (src, fallback) = if let Some(ref c) = content_obj {
+        if pick_str(c, &["act_type", "type"]).as_deref() == Some("voip") {
+            (c, Some(item))
+        } else if pick_str(item, &["act_type", "type"]).as_deref() == Some("voip") {
+            (item, Some(c))
+        } else {
+            return None;
+        }
+    } else if pick_str(item, &["act_type", "type"]).as_deref() == Some("voip") {
+        (item, None)
+    } else {
+        return None;
+    };
+
+    let act = pick_str(src, &["act", "action"])
+        .or_else(|| fallback.and_then(|f| pick_str(f, &["act", "action"])))
+        .unwrap_or_default();
+    let raw_data = src
+        .get("data")
+        .or_else(|| fallback.and_then(|f| f.get("data").or(Some(f))))
+        .unwrap_or(&Value::Null);
+    let data = match raw_data {
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                serde_json::from_str::<Value>(trimmed).unwrap_or_else(|_| raw_data.clone())
+            } else {
+                raw_data.clone()
+            }
+        }
+        other => other.clone(),
+    };
+    Some(VoipControlEvent { act, data })
+}
+
+/// Extract all `act_type == "voip"` control events from a WebSocket or `lp_control` payload node.
+pub fn extract_voip_controls(node: &Value) -> Vec<VoipControlEvent> {
+    let mut items: Vec<&Value> = Vec::new();
+    let inner = unwrap_control_container(node);
+    if let Some(arr) = inner.get("controls").and_then(Value::as_array) {
+        items.extend(arr.iter());
+    } else if let Some(arr) = inner.as_array() {
+        items.extend(arr.iter());
+    } else if inner.is_object() {
+        items.push(inner);
+    }
+    items
+        .into_iter()
+        .filter_map(parse_voip_control_item)
+        .collect()
+}
+
 fn collect_controls_from_node(
     node: &Value,
     my_uid: &str,
     send2me_id: &str,
     out: &mut Vec<WsParsedAction>,
 ) {
+    let effective = unwrap_control_container(node);
     let mut items: Vec<&Value> = Vec::new();
-    if let Some(arr) = node.get("controls").and_then(Value::as_array) {
+    if let Some(arr) = effective.get("controls").and_then(Value::as_array) {
         items.extend(arr.iter());
-    } else if let Some(arr) = node.as_array() {
+    } else if let Some(arr) = effective.as_array() {
         items.extend(arr.iter());
-    } else if node.is_object() {
-        items.push(node);
+    } else if effective.is_object() {
+        items.push(effective);
     }
 
     for item in items {
+        if let Some(voip_ev) = parse_voip_control_item(item) {
+            out.push(WsParsedAction::Voip(voip_ev));
+            continue;
+        }
         let act_type = pick_str(item, &["act_type", "type"]).unwrap_or_default();
         let data_node = item
             .get("content")
@@ -1789,5 +1946,320 @@ mod tests {
             Some("https://files.zalo.cloud/dl/bao_cao.xlsx")
         );
         assert_eq!(parsed.attachment_name.as_deref(), Some("bao_cao.xlsx"));
+    }
+
+    #[test]
+    fn parses_ws_voip_control_events_across_wrapped_and_direct_shapes() {
+        let ev_push = WsEvent {
+            cmd: CMD_CTRL_PUSH_CTRL,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "controls": [
+                        {
+                            "content": {
+                                "act_type": "voip",
+                                "act": "request",
+                                "data": r#"{"callId":464564007,"uidN":"1000000000000000002","params":"{\"sessId\":\"abc\",\"rtpIP\":\"42.113.206.4:10490\"}"}"#
+                            }
+                        },
+                        {
+                            "content": "{\"act_type\":\"voip\",\"act\":\"ring_ring\",\"data\":{\"callId\":464564007,\"status\":0}}"
+                        }
+                    ]
+                }
+            }),
+        };
+        let a1 = parse_ws_event(&ev_push, "456", "");
+        assert_eq!(a1.len(), 2);
+        match &a1[0] {
+            WsParsedAction::Voip(v) => {
+                assert_eq!(v.act, "request");
+                assert_eq!(v.call_id(), 464564007);
+                let mp = v.media_params();
+                assert_eq!(mp["sessId"], "abc");
+                assert_eq!(mp["rtpIP"], "42.113.206.4:10490");
+            }
+            other => panic!("expected Voip, got {other:?}"),
+        }
+        match &a1[1] {
+            WsParsedAction::Voip(v) => {
+                assert_eq!(v.act, "ring_ring");
+                assert_eq!(v.call_id(), 464564007);
+                assert_eq!(v.status(), Some(0));
+            }
+            other => panic!("expected Voip, got {other:?}"),
+        }
+
+        let ev_pull_voip = WsEvent {
+            cmd: CMD_CTRL_PULL_VOIP,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "controls": [
+                        {
+                            "act_type": "voip",
+                            "act": "answer",
+                            "data": { "callId": "464564007", "status": "0" }
+                        },
+                        {
+                            "act_type": "voip",
+                            "act": "end_call",
+                            "data": { "callId": 464564007 }
+                        }
+                    ]
+                }
+            }),
+        };
+        let a2 = parse_ws_event(&ev_pull_voip, "456", "");
+        assert_eq!(a2.len(), 2);
+        assert!(matches!(
+            &a2[0],
+            WsParsedAction::Voip(v) if v.act == "answer" && v.call_id() == 464564007 && v.status() == Some(0)
+        ));
+        assert!(matches!(
+            &a2[1],
+            WsParsedAction::Voip(v) if v.act == "end_call" && v.call_id() == 464564007
+        ));
+
+        // Mixed batch with non-VoIP reaction + VoIP control in the same frame
+        let ev_mixed = WsEvent {
+            cmd: CMD_CTRL_PUSH_CTRL,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "controls": [
+                        {
+                            "act_type": "reaction",
+                            "data": { "uidFrom": "999", "idTo": "456", "msgId": "m99", "rIcon": "/-heart" }
+                        },
+                        {
+                            "content": { "act_type": "voip", "act": "cancel", "data": { "callId": 12345 } }
+                        }
+                    ]
+                }
+            }),
+        };
+        let a3 = parse_ws_event(&ev_mixed, "456", "");
+        assert_eq!(a3.len(), 2);
+        assert!(matches!(&a3[0], WsParsedAction::Reaction { msg_id, .. } if msg_id == "m99"));
+        assert!(matches!(&a3[1], WsParsedAction::Voip(v) if v.act == "cancel" && v.call_id() == 12345));
+
+        // Direct top-level `{ act_type: "voip", act, data: { ... } }` (no outer `data`/`controls` wrapper)
+        let direct_payload = json!({
+            "act_type": "voip",
+            "act": "request",
+            "data": { "callId": 888999, "uidN": "1000000000000000009" }
+        });
+        let direct_extracted = extract_voip_controls(&direct_payload);
+        assert_eq!(direct_extracted.len(), 1);
+        assert_eq!(direct_extracted[0].act, "request");
+        assert_eq!(direct_extracted[0].call_id(), 888999);
+
+        let ev_direct = WsEvent {
+            cmd: CMD_CTRL_PUSH_CTRL,
+            sub_cmd: 0,
+            version: 1,
+            payload: direct_payload,
+        };
+        let a4 = parse_ws_event(&ev_direct, "456", "");
+        assert_eq!(a4.len(), 1);
+        assert!(matches!(&a4[0], WsParsedAction::Voip(v) if v.act == "request" && v.call_id() == 888999));
+
+        // Array inside `data`, double-wrapped `data.data`, and outer `act_type` with inner `content`
+        let arr_in_data = json!({
+            "data": [
+                { "act_type": "voip", "content": { "act": "ring_ring", "data": { "callId": 77 } } }
+            ]
+        });
+        let extracted_arr = extract_voip_controls(&arr_in_data);
+        assert_eq!(extracted_arr.len(), 1);
+        assert_eq!(extracted_arr[0].act, "ring_ring");
+        assert_eq!(extracted_arr[0].call_id(), 77);
+
+        let double_wrapped = json!({
+            "data": {
+                "data": {
+                    "controls": [
+                        { "content": { "act_type": "voip", "act": "end_call", "data": { "callId": 88 } } }
+                    ]
+                }
+            }
+        });
+        let extracted_dw = extract_voip_controls(&double_wrapped);
+        assert_eq!(extracted_dw.len(), 1);
+        assert_eq!(extracted_dw[0].act, "end_call");
+        assert_eq!(extracted_dw[0].call_id(), 88);
+    }
+
+    #[test]
+    fn parses_ws_controls_inside_numeric_type_envelope_without_breaking_direct_typed_controls() {
+        // 1. Outer WS control envelope with numeric `"type": 1` + `"data": { "controls": [...] }`
+        let ev_num_type = WsEvent {
+            cmd: CMD_CTRL_PUSH_CTRL,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "type": 1,
+                "data": {
+                    "controls": [
+                        {
+                            "act_type": "undo_msg",
+                            "data": { "uidFrom": "999", "idTo": "456", "globalMsgId": "gm-num-1" }
+                        },
+                        {
+                            "content": {
+                                "act_type": "voip",
+                                "act": "request",
+                                "data": { "callId": 555_123, "uidN": "999" }
+                            }
+                        }
+                    ]
+                }
+            }),
+        };
+        let a_num = parse_ws_event(&ev_num_type, "456", "");
+        assert_eq!(a_num.len(), 2);
+        assert!(matches!(
+            &a_num[0],
+            WsParsedAction::Recalled { thread_id, msg_id } if thread_id == "999" && msg_id == "gm-num-1"
+        ));
+        assert!(matches!(
+            &a_num[1],
+            WsParsedAction::Voip(v) if v.act == "request" && v.call_id() == 555_123
+        ));
+
+        let extracted_num = extract_voip_controls(&ev_num_type.payload);
+        assert_eq!(extracted_num.len(), 1);
+        assert_eq!(extracted_num[0].call_id(), 555_123);
+
+        // 2. Outer envelope with string `"type"` whose `data` wraps `"controls"` must still unwrap
+        let ev_str_envelope = WsEvent {
+            cmd: CMD_CTRL_ACTION,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "type": "ctrl_envelope",
+                "data": {
+                    "controls": [
+                        {
+                            "act_type": "voip",
+                            "act": "ring_ring",
+                            "data": { "callId": 555_124 }
+                        }
+                    ]
+                }
+            }),
+        };
+        let a_env = parse_ws_event(&ev_str_envelope, "456", "");
+        assert_eq!(a_env.len(), 1);
+        assert!(matches!(
+            &a_env[0],
+            WsParsedAction::Voip(v) if v.act == "ring_ring" && v.call_id() == 555_124
+        ));
+
+        // 3. Direct control item using string `"type": "voip"` (whose `data` is the event payload,
+        // NOT wrapping `"controls"`) must NOT be unwrapped.
+        let ev_direct_type = WsEvent {
+            cmd: CMD_CTRL_PUSH_CTRL,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "type": "voip",
+                "act": "answer",
+                "data": { "callId": 555_125, "status": 0 }
+            }),
+        };
+        let a_direct = parse_ws_event(&ev_direct_type, "456", "");
+        assert_eq!(a_direct.len(), 1);
+        assert!(matches!(
+            &a_direct[0],
+            WsParsedAction::Voip(v) if v.act == "answer" && v.call_id() == 555_125 && v.status() == Some(0)
+        ));
+
+        // 4. Outer numeric `"type"` with `"controls": null` and inner `"data": { "controls": [...] }`
+        // and numeric `"type"` wrapping direct `"act_type": "voip"` inside `"data"`.
+        let ev_null_controls = WsEvent {
+            cmd: CMD_CTRL_PUSH_CTRL,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "type": 1,
+                "controls": null,
+                "data": {
+                    "controls": [
+                        { "act_type": "voip", "act": "cancel", "data": { "callId": 555_126 } }
+                    ]
+                }
+            }),
+        };
+        let a_null_ctrl = parse_ws_event(&ev_null_controls, "456", "");
+        assert_eq!(a_null_ctrl.len(), 1);
+        assert!(matches!(
+            &a_null_ctrl[0],
+            WsParsedAction::Voip(v) if v.act == "cancel" && v.call_id() == 555_126
+        ));
+
+        let ev_num_direct_inner = WsEvent {
+            cmd: CMD_CTRL_PUSH_CTRL,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "type": 1,
+                "data": {
+                    "act_type": "voip",
+                    "act": "end_call",
+                    "data": { "callId": 555_127 }
+                }
+            }),
+        };
+        let a_num_inner = parse_ws_event(&ev_num_direct_inner, "456", "");
+        assert_eq!(a_num_inner.len(), 1);
+        assert!(matches!(
+            &a_num_inner[0],
+            WsParsedAction::Voip(v) if v.act == "end_call" && v.call_id() == 555_127
+        ));
+
+        // 5. Control cmd 610 and fallback non-standard cmd carrying VoIP events are both parsed.
+        let ev_610 = WsEvent {
+            cmd: CMD_CTRL_PULL_610,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "controls": [
+                        { "act_type": "voip", "act": "request", "data": { "callId": 555_128 } }
+                    ]
+                }
+            }),
+        };
+        let a_610 = parse_ws_event(&ev_610, "456", "");
+        assert_eq!(a_610.len(), 1);
+        assert!(matches!(
+            &a_610[0],
+            WsParsedAction::Voip(v) if v.act == "request" && v.call_id() == 555_128
+        ));
+
+        let ev_615 = WsEvent {
+            cmd: 615,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "controls": [
+                        { "act_type": "voip", "act": "ring_ring", "data": { "callId": 555_129 } }
+                    ]
+                }
+            }),
+        };
+        let a_615 = parse_ws_event(&ev_615, "456", "");
+        assert_eq!(a_615.len(), 1);
+        assert!(matches!(
+            &a_615[0],
+            WsParsedAction::Voip(v) if v.act == "ring_ring" && v.call_id() == 555_129
+        ));
     }
 }

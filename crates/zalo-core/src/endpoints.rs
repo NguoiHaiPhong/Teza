@@ -21,6 +21,7 @@ pub const CONVERS_CTL: &str = "https://p5-ctl-chat.zaloapp.com";
 pub const MSG_CHAT: &str = "https://p5-msg-chat.zaloapp.com";
 pub const CLOUD_MSG_FALLBACK: &str = "https://tt-group-cm.api.zaloapp.com";
 pub const REACTION_FALLBACK: &str = "https://reaction.api.zaloapp.com";
+pub const VOICE_CALL_FALLBACK: &str = "https://voicecall-wpa.chat.zalo.me";
 pub const AUTH: &str = "https://wpa.zaloapp.com";
 pub const WPA_CHAT: &str = "https://wpa.chat.zalo.me";
 pub const GROUP_BOARD: &str = "https://groupboard-wpa.chat.zalo.me";

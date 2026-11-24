@@ -249,6 +249,8 @@ pub struct Domains {
     #[serde(default = "default_reaction")]
     pub reaction: String,
     pub sticker: String,
+    #[serde(default = "default_voice_call")]
+    pub voice_call: String,
     pub ws: Vec<String>,
     #[serde(skip)]
     pub service_map_candidates: BTreeMap<String, Vec<String>>,
@@ -274,6 +276,12 @@ fn default_reaction() -> String {
         .into()
 }
 
+fn default_voice_call() -> String {
+    endpoints::service("voice_call")
+        .unwrap_or(endpoints::VOICE_CALL_FALLBACK)
+        .into()
+}
+
 impl Default for Domains {
     fn default() -> Self {
         Self {
@@ -292,6 +300,7 @@ impl Default for Domains {
             cloud_msg: default_cloud_msg(),
             reaction: default_reaction(),
             sticker: endpoints::service("sticker").unwrap_or_default().into(),
+            voice_call: default_voice_call(),
             ws: (1..=8).map(|n| format!("wss://ws{n}-msg.chat.zalo.me")).collect(),
             service_map_candidates: BTreeMap::new(),
         }
@@ -345,6 +354,7 @@ impl Domains {
             (&mut self.cloud_msg, &def.cloud_msg),
             (&mut self.reaction, &def.reaction),
             (&mut self.sticker, &def.sticker),
+            (&mut self.voice_call, &def.voice_call),
         ] {
             if !is_allowed_zalo_http_url(slot) {
                 *slot = fallback.clone();
@@ -388,6 +398,9 @@ impl Domains {
         if let Some(v) = endpoints::service("sticker") {
             self.sticker = v.into();
         }
+        if let Some(v) = endpoints::service("voice_call") {
+            self.voice_call = v.into();
+        }
         self.sanitize();
     }
 
@@ -402,6 +415,7 @@ impl Domains {
             ("group_cloud_message", &mut self.cloud_msg),
             ("reaction", &mut self.reaction),
             ("sticker", &mut self.sticker),
+            ("voice_call", &mut self.voice_call),
         ] {
             let urls = map.get(key).map(all_urls).unwrap_or_default();
             if !urls.is_empty() {
@@ -426,6 +440,7 @@ impl Domains {
             "group_cloud_message" => self.cloud_msg.as_str(),
             "reaction" => self.reaction.as_str(),
             "sticker" => self.sticker.as_str(),
+            "voice_call" => self.voice_call.as_str(),
             _ => "",
         };
         if !primary.is_empty() && is_allowed_zalo_http_url(primary) {
@@ -853,9 +868,12 @@ impl Session {
             });
         }
 
+        let parsed = reqwest::Url::parse(&url).map_err(|e| SessionError::Protocol {
+            code: -1,
+            message: format!("URL không hợp lệ: {e}"),
+        })?;
         let resp = self
-            .http
-            .get(&url)
+            .attach_zalo_auth_headers(self.http.get(parsed.clone()), &parsed)
             .send()
             .await
             .map_err(|e| SessionError::Network(e.to_string()))?;
@@ -891,11 +909,21 @@ impl Session {
     }
 
     pub async fn get_json(&self, url: &str) -> Result<Value> {
-        self.send_raw(Method::GET, url, None).await
+        self.send_raw_with_timeout(Method::GET, url, None, None).await
+    }
+
+    pub async fn get_json_with_timeout(
+        &self,
+        url: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Value> {
+        self.send_raw_with_timeout(Method::GET, url, None, Some(timeout))
+            .await
     }
 
     pub async fn post_form(&self, url: &str, body: String) -> Result<Value> {
-        self.send_raw(Method::POST, url, Some(body)).await
+        self.send_raw_with_timeout(Method::POST, url, Some(body), None)
+            .await
     }
 
     pub async fn post_multipart(
@@ -924,7 +952,7 @@ impl Session {
         let form = Form::new().part(field_name.to_string(), part);
         let req = self.http.post(parsed.clone()).multipart(form);
         let resp = self
-            .attach_sek_cookie_if_missing(req, &parsed)
+            .attach_zalo_auth_headers(req, &parsed)
             .send()
             .await
             .map_err(|e| SessionError::Network(e.to_string()))?;
@@ -949,25 +977,38 @@ impl Session {
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Không có host khả dụng cho {endpoint}")))
     }
 
-    fn attach_sek_cookie_if_missing(
+    fn attach_zalo_auth_headers(
         &self,
-        req: reqwest::RequestBuilder,
+        mut req: reqwest::RequestBuilder,
         parsed: &reqwest::Url,
     ) -> reqwest::RequestBuilder {
         if let Some(sek) = self.effective_zpw_sek() {
-            let jar_has_sek = self
+            if let Ok(hv) = HeaderValue::from_str(&sek) {
+                req = req.header("zpw_sek", hv);
+            }
+            let existing = self
                 .jar
                 .cookies(parsed)
-                .and_then(|v| v.to_str().ok().map(|s| s.contains("zpw_sek=")))
-                .unwrap_or(false);
+                .and_then(|v| v.to_str().ok().map(str::to_string))
+                .unwrap_or_default();
+            let jar_has_sek = existing.contains("zpw_sek=");
+            let jar_has_zlang = existing.contains("_zlang=");
             if !jar_has_sek {
-                return req.header(COOKIE, format!("zpw_sek={sek}; _zlang=vi"));
+                req = req.header(COOKIE, format!("zpw_sek={sek}; _zlang=vi"));
+            } else if !jar_has_zlang {
+                self.jar.add_cookie_str("_zlang=vi; Path=/", parsed);
             }
         }
         req
     }
 
-    async fn send_raw(&self, method: Method, url: &str, form_body: Option<String>) -> Result<Value> {
+    async fn send_raw_with_timeout(
+        &self,
+        method: Method,
+        url: &str,
+        form_body: Option<String>,
+        timeout_override: Option<std::time::Duration>,
+    ) -> Result<Value> {
         if !is_allowed_zalo_http_url(url) {
             return Err(SessionError::Protocol {
                 code: -1,
@@ -979,17 +1020,63 @@ impl Session {
             code: -1,
             message: format!("URL không hợp lệ: {e}"),
         })?;
-        let mut req = self.attach_sek_cookie_if_missing(self.http.request(method, parsed.clone()), &parsed);
+        let mut req =
+            self.attach_zalo_auth_headers(self.http.request(method, parsed.clone()), &parsed);
+        if let Some(timeout) = timeout_override {
+            req = req.timeout(timeout);
+        }
         if let Some(body) = form_body {
             req = req
                 .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .body(body);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| SessionError::Network(e.to_string()))?;
+        let resp = req.send().await.map_err(|e| {
+            if e.is_timeout() {
+                SessionError::Network(format!("timeout: {e}"))
+            } else {
+                SessionError::Network(e.to_string())
+            }
+        })?;
         Self::decode_http_response(resp).await
+    }
+
+    pub(crate) fn decode_http_body(status: u16, text: &str) -> Result<Value> {
+        if status != 200 {
+            return Err(SessionError::Http {
+                status,
+                body: truncate(text, 200),
+            }
+            .into());
+        }
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Ok(serde_json::json!({ "error_code": 0, "data": Value::Null }));
+        }
+        let v: Value = match serde_json::from_str(trimmed) {
+            Ok(val) => val,
+            Err(e) => {
+                let looks_like_b64 = trimmed.len() >= 16
+                    && trimmed.len().is_multiple_of(4)
+                    && trimmed
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+                    && B64.decode(trimmed).is_ok();
+                if looks_like_b64 {
+                    serde_json::json!({ "error_code": 0, "data": trimmed })
+                } else {
+                    return Err(SessionError::Protocol {
+                        code: -1,
+                        message: format!("Invalid JSON: {e}"),
+                    }
+                    .into());
+                }
+            }
+        };
+        let code = v.get("error_code").and_then(Value::as_i64).unwrap_or(0);
+        if is_session_expired_code(code) {
+            return Err(SessionError::Expired { code }.into());
+        }
+        Ok(v)
     }
 
     async fn decode_http_response(resp: reqwest::Response) -> Result<Value> {
@@ -998,22 +1085,7 @@ impl Session {
             .text()
             .await
             .map_err(|e| SessionError::Network(e.to_string()))?;
-        if status != 200 {
-            return Err(SessionError::Http {
-                status,
-                body: truncate(&text, 200),
-            }
-            .into());
-        }
-        let v: Value = serde_json::from_str(&text).map_err(|e| SessionError::Protocol {
-            code: -1,
-            message: format!("Invalid JSON: {e}"),
-        })?;
-        let code = v.get("error_code").and_then(Value::as_i64).unwrap_or(0);
-        if is_session_expired_code(code) {
-            return Err(SessionError::Expired { code }.into());
-        }
-        Ok(v)
+        Self::decode_http_body(status, &text)
     }
 
     /// Verify with Zalo's `/api/social/profile/me-v2` whether the stored `zpw_sek` and `secret_key`
@@ -1487,6 +1559,8 @@ pub fn seed_zpw_sek_cookies(jar: &Jar, sek: &str) {
         if let Ok(url) = reqwest::Url::parse(base_url) {
             jar.add_cookie_str(&format!("zpw_sek={sek}; Domain={domain}; Path=/"), &url);
             jar.add_cookie_str(&format!("zpw_sek={sek}; Domain=.{domain}; Path=/"), &url);
+            jar.add_cookie_str(&format!("_zlang=vi; Domain={domain}; Path=/"), &url);
+            jar.add_cookie_str(&format!("_zlang=vi; Domain=.{domain}; Path=/"), &url);
         }
     }
     for host in [
@@ -1500,11 +1574,13 @@ pub fn seed_zpw_sek_cookies(jar: &Jar, sek: &str) {
     ] {
         if let Ok(url) = reqwest::Url::parse(host) {
             jar.add_cookie_str(&format!("zpw_sek={sek}; Path=/"), &url);
+            jar.add_cookie_str("_zlang=vi; Path=/", &url);
         }
     }
     for (_, host) in endpoints::SERVICE_MAP_V3 {
         if let Ok(url) = reqwest::Url::parse(host) {
             jar.add_cookie_str(&format!("zpw_sek={sek}; Path=/"), &url);
+            jar.add_cookie_str("_zlang=vi; Path=/", &url);
         }
     }
 }
@@ -1935,5 +2011,107 @@ mod tests {
             Some("archive.7z".to_string())
         );
         assert_eq!(parse_content_disposition_filename("attachment"), None);
+    }
+
+    #[test]
+    fn domains_wires_voice_call_with_backward_compatible_default_and_sanitization() {
+        let def = Domains::default();
+        assert_eq!(def.voice_call, "https://voicecall-wpa.chat.zalo.me");
+        assert_eq!(
+            def.candidates("voice_call"),
+            vec!["https://voicecall-wpa.chat.zalo.me".to_string()]
+        );
+
+        // Legacy session JSON without `voice_call` must deserialize cleanly.
+        let mut legacy = serde_json::to_value(&def).unwrap();
+        legacy.as_object_mut().unwrap().remove("voice_call");
+        let parsed: Domains = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.voice_call, "https://voicecall-wpa.chat.zalo.me");
+
+        // Poisoned `voice_call` is sanitized back to official host while valid extra candidates are kept.
+        let mut d = Domains {
+            voice_call: "https://evil.example".into(),
+            ..Default::default()
+        };
+        d.apply_service_map(&serde_json::json!({
+            "voice_call": [
+                "http://voicecall-wpa.chat.zalo.me",
+                "https://evil.example",
+                "https://voicecall2-wpa.chat.zalo.me"
+            ]
+        }));
+        assert_eq!(d.voice_call, "https://voicecall-wpa.chat.zalo.me");
+        let cands = d.candidates("voice_call");
+        assert!(cands.contains(&"https://voicecall-wpa.chat.zalo.me".to_string()));
+        assert!(cands.contains(&"https://voicecall2-wpa.chat.zalo.me".to_string()));
+        assert!(!cands.iter().any(|u| u.contains("evil.example")));
+    }
+
+    #[test]
+    fn decode_http_body_handles_empty_keepalive_bare_base64_and_rejects_html() {
+        let empty = Session::decode_http_body(200, "").unwrap();
+        assert_eq!(empty["error_code"], 0);
+        assert!(empty["data"].is_null());
+
+        let ws_only = Session::decode_http_body(200, "  \r\n\t ").unwrap();
+        assert_eq!(ws_only["error_code"], 0);
+        assert!(ws_only["data"].is_null());
+
+        // Bare base64 AES body is wrapped so `maybe_decrypt` can decode it transparently.
+        let mut s = Session::new().unwrap();
+        s.set_zpw_enk("0123456789abcdef0123456789abcdef");
+        let b64_enc =
+            crypto::encode_aes(s.session_key_bytes(), r#"{"error_code":0,"data":{"ok":1}}"#)
+                .unwrap();
+        let wrapped = Session::decode_http_body(200, &b64_enc).unwrap();
+        assert_eq!(wrapped["error_code"], 0);
+        let dec = s.maybe_decrypt(wrapped, s.session_key_bytes());
+        assert_eq!(dec["data"]["ok"], 1);
+
+        // HTML error pages must still fail with Protocol(-1), never be mistaken for base64.
+        let html_err = Session::decode_http_body(200, "<html><body>bad</body></html>").unwrap_err();
+        assert!(matches!(
+            html_err.downcast_ref::<SessionError>(),
+            Some(SessionError::Protocol { code: -1, .. })
+        ));
+
+        // Session expired code 600 propagates as SessionError::Expired.
+        let exp_err =
+            Session::decode_http_body(200, r#"{"error_code":600,"error_message":"expired"}"#)
+                .unwrap_err();
+        assert!(matches!(
+            exp_err.downcast_ref::<SessionError>(),
+            Some(SessionError::Expired { code: 600 })
+        ));
+    }
+
+    #[test]
+    fn zpw_sek_header_and_zlang_cookie_attached_for_zalo_domains() {
+        let mut s = Session::new().unwrap();
+        s.set_zpw_sek("test_sek_token_123".into());
+
+        // Jar contains both zpw_sek and _zlang=vi for lp_control and voice_call domains.
+        for raw_url in [
+            "https://p3-ctl-chat.zaloapp.com/",
+            "https://voicecall-wpa.chat.zalo.me/api/voicecall/requestcall",
+        ] {
+            let url = reqwest::Url::parse(raw_url).unwrap();
+            let cookies = s
+                .jar
+                .cookies(&url)
+                .and_then(|v| v.to_str().ok().map(str::to_string))
+                .unwrap_or_default();
+            assert!(cookies.contains("zpw_sek=test_sek_token_123"), "missing zpw_sek for {raw_url}: {cookies}");
+            assert!(cookies.contains("_zlang=vi"), "missing _zlang=vi for {raw_url}: {cookies}");
+
+            let req = s
+                .attach_zalo_auth_headers(s.http.get(url.clone()), &url)
+                .build()
+                .unwrap();
+            assert_eq!(
+                req.headers().get("zpw_sek").and_then(|v| v.to_str().ok()),
+                Some("test_sek_token_123")
+            );
+        }
     }
 }
