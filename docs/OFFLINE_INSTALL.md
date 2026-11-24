@@ -70,9 +70,9 @@ Start-Process -FilePath ".\VC_redist.x64.exe" -ArgumentList "/install /quiet /no
 Start-Process -FilePath ".\MicrosoftEdgeWebView2RuntimeInstallerX64.exe" -ArgumentList "/silent /install" -Wait
 
 # 3. Cài Teza (chọn 1 trong 2 dòng tương ứng với bộ cài bạn tải)
-Start-Process -FilePath ".\Teza_0.4.2_x64-setup.exe" -ArgumentList "/S" -Wait
+Start-Process -FilePath ".\Teza_0.5.0_x64-setup.exe" -ArgumentList "/S" -Wait
 # Hoặc nếu dùng gói MSI:
-# Start-Process -FilePath "msiexec.exe" -ArgumentList "/i Teza_0.4.2_x64_en-US.msi /qn" -Wait
+# Start-Process -FilePath "msiexec.exe" -ArgumentList "/i Teza_0.5.0_x64_en-US.msi /qn" -Wait
 ```
 
 ---

@@ -2242,7 +2242,7 @@ export function SettingsModal({
                     >
                       <div>
                         <div className="text-[13.5px] font-medium">
-                          {t("appVersionTitle", { version: appVersion || "0.4.2" })}
+                          {t("appVersionTitle", { version: appVersion || "0.5.0" })}
                         </div>
                         <div className="text-xs" style={{ color: "var(--text-secondary)" }}>
                           {availableUpdate

@@ -335,7 +335,7 @@ export function NavDrawer({
             color: "var(--text-secondary)",
           }}
         >
-          Teza v{appVersion || "0.4.2"}
+          Teza v{appVersion || "0.5.0"}
         </div>
       </aside>
     </div>
