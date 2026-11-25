@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Privacy Policy — Teza Desktop</title>
+  <link rel="icon" type="image/png" href="./icon.png" />
+  <style>
+    :root {
+      --bg: #0b1120;
+      --surface: #111827;
+      --border: #1f2937;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --body: #cbd5e1;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.7;
+    }
+    a { color: #60a5fa; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .wrap { max-width: 820px; margin: 0 auto; padding: 28px 20px 64px; }
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 16px; flex-wrap: wrap; padding-bottom: 20px;
+      border-bottom: 1px solid var(--border);
+    }
+    .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 19px; color: var(--text); }
+    .brand img { width: 34px; height: 34px; border-radius: 9px; }
+    nav { display: flex; gap: 18px; font-size: 14px; }
+    h1 { font-size: 30px; margin: 28px 0 6px; }
+    .meta { color: var(--muted); font-size: 13.5px; margin-bottom: 26px; }
+    h2 { font-size: 19px; margin: 28px 0 10px; color: #e2e8f0; }
+    p, li { color: var(--body); font-size: 15px; }
+    ul { padding-left: 22px; }
+    code {
+      background: #1e293b; padding: 2px 6px; border-radius: 6px;
+      font-size: 13.5px; color: #93c5fd;
+    }
+    .box {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 12px; padding: 16px 20px; margin: 16px 0;
+    }
+    footer {
+      margin-top: 48px; padding-top: 18px; border-top: 1px solid var(--border);
+      color: var(--muted); font-size: 13px;
+      display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <a class="brand" href="./">
+        <img src="./icon.png" alt="Teza logo" />
+        <span>Teza</span>
+      </a>
+      <nav>
+        <a href="./">Home</a>
+        <a href="./privacy.html">Privacy Policy</a>
+        <a href="./terms.html">Terms of Service</a>
+      </nav>
+    </header>
+
+    <main>
+      <h1>Privacy Policy</h1>
+      <p class="meta">Effective Date: November 25, 2026 &middot; Application: Teza Desktop (<code>https://nguoihaiphong.github.io/Teza/</code>)</p>
+
+      <p>
+        Teza Desktop (&ldquo;Teza&rdquo;, &ldquo;we&rdquo;, &ldquo;our&rdquo;) is a local-first desktop messaging client designed to keep your data under your direct control. This Privacy Policy explains what information Teza accesses, how optional Google Drive synchronization works, and how you can manage or delete your data.
+      </p>
+
+      <h2>1. Local-First Architecture &amp; Data Storage</h2>
+      <p>
+        Teza runs directly on your personal computer and does not operate a central developer database storing your messages, contacts, or media files. Local message indices and cached media files are stored exclusively on your device and protected at rest using AES-256-GCM encryption and Windows DPAPI key sealing.
+      </p>
+
+      <h2>2. Google Account &amp; Google Drive Data Accessed</h2>
+      <p>
+        Google Drive integration in Teza is completely optional and only activates if you explicitly click <strong>Sign in with Google</strong> in Teza Settings. When connected, Teza requests only a single narrow, non-sensitive OAuth 2.0 scope:
+      </p>
+      <div class="box">
+        <strong>Requested Scope:</strong> <code>https://www.googleapis.com/auth/drive.file</code>
+        <ul>
+          <li>Allows Teza to create, read, update, and delete <strong>only</strong> the files and folders created by Teza itself inside your dedicated <code>Teza Vault/</code> folder.</li>
+          <li>Teza <strong>cannot</strong> view, read, modify, or delete any other files or folders in your Google Drive.</li>
+          <li>Teza also reads your Google Drive storage quota summary and basic account email/display name via the Drive <code>about.get</code> endpoint solely to display your connection status and Cloud Storage Manager usage bar inside the app.</li>
+        </ul>
+      </div>
+
+      <h2>3. How Google User Data Is Used &amp; Protected</h2>
+      <ul>
+        <li><strong>End-to-End Encryption (E2EE):</strong> Before any media file or chat history delta leaves your computer for Google Drive, Teza encrypts it locally with AES-256-GCM using a key derived from your private Sync Passphrase (PBKDF2-HMAC-SHA256, 600,000 iterations). Your Sync Passphrase never leaves your device.</li>
+        <li><strong>Direct Device-to-Google Communication:</strong> Encrypted backups are uploaded directly from your computer to Google Drive APIs over HTTPS.</li>
+        <li><strong>Local Token Protection:</strong> OAuth access and refresh tokens are stored exclusively on your local machine encrypted with Windows DPAPI.</li>
+        <li><strong>No Sharing, Selling, or Advertising:</strong> We never sell, rent, trade, or transfer Google user data to third parties, and we never use Google user data for advertising, profiling, or training AI/ML models.</li>
+      </ul>
+
+      <h2>4. Google API Services User Data Policy (Limited Use)</h2>
+      <p>
+        Teza&rsquo;s use and transfer to any other app of information received from Google APIs will adhere to the
+        <a href="https://developers.google.com/terms/api-services-user-data-policy" rel="noopener">Google API Services User Data Policy</a>,
+        including the <strong>Limited Use requirements</strong>.
+      </p>
+
+      <h2>5. Data Retention, Deletion &amp; Revoking Access</h2>
+      <ul>
+        <li><strong>Disconnect inside Teza:</strong> Open <em>Settings &rarr; Storage &amp; Media &rarr; Cloud Storage</em> and click <strong>Disconnect</strong> to immediately remove local OAuth tokens and cached encryption keys from your computer.</li>
+        <li><strong>Delete Cloud Backups:</strong> Use Teza&rsquo;s built-in <strong>Cloud Storage Manager</strong> to selectively delete items by conversation, largest files, or age, or delete the <code>Teza Vault</code> folder directly from your Google Drive at any time.</li>
+        <li><strong>Revoke Google Access:</strong> You may revoke Teza&rsquo;s access at any time from your <a href="https://myaccount.google.com/permissions" rel="noopener">Google Account Permissions</a> page.</li>
+      </ul>
+
+      <h2>6. Vietnamese Summary (T&oacute;m t&#7855;t ti&#7871;ng Vi&#7879;t)</h2>
+      <p>
+        Teza l&agrave; &#7913;ng d&#7909;ng nh&#7855;n tin ch&#7841;y c&#7909;c b&#7897; tr&ecirc;n m&aacute;y t&iacute;nh. T&iacute;nh n&#259;ng &#273;&#7891;ng b&#7897; Google Drive ho&agrave;n to&agrave;n t&ugrave;y ch&#7885;n, ch&#7881; xin quy&#7873;n h&#7865;p <code>drive.file</code> &#273;&#7875; &#273;&#7885;c/ghi trong th&#432; m&#7909;c ri&ecirc;ng <code>Teza Vault/</code> v&agrave; m&atilde; h&oacute;a &#273;&#7847;u cu&#7889;i (E2EE) tr&ecirc;n m&aacute;y tr&#432;&#7899;c khi t&#7843;i l&ecirc;n. Teza kh&ocirc;ng c&oacute; m&aacute;y ch&#7911; thu th&#7853;p, kh&ocirc;ng chia s&#7867; v&agrave; kh&ocirc;ng b&aacute;n d&#7919; li&#7879;u ng&#432;&#7901;i d&ugrave;ng.
+      </p>
+
+      <h2>7. Contact Us</h2>
+      <p>
+        If you have any questions about this Privacy Policy or your data, please contact us at
+        <a href="mailto:h2pdual@gmail.com">h2pdual@gmail.com</a>.
+      </p>
+    </main>
+
+    <footer>
+      <span>&copy; 2026 Teza Desktop</span>
+      <span><a href="./">Home</a> &middot; <a href="./terms.html">Terms of Service</a></span>
+    </footer>
+  </div>
+</body>
+</html>
