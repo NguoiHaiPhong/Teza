@@ -28,6 +28,7 @@ pub const SUB_KEEP_CONNECTION: u8 = 1;
 pub const CMD_PUSH_MSG_1_1: u16 = 501;
 pub const CMD_DELIVERED_1_1: u16 = 502;
 pub const CMD_SEEN_1_1: u16 = 503;
+pub const CMD_CLEAR_UNREAD_1_1: u16 = 504;
 pub const CMD_PULL_MSG_1_1: u16 = 510;
 pub const CMD_PULL_MSG_GROUP: u16 = 511;
 pub const CMD_PULL_MSG_513: u16 = 513;
@@ -35,11 +36,15 @@ pub const CMD_PULL_MSG_514: u16 = 514;
 pub const CMD_PULL_MSG_515: u16 = 515;
 pub const CMD_PULL_MSG_517: u16 = 517;
 pub const CMD_PULL_MSG_518: u16 = 518;
+pub const CMD_PULL_ACK_GROUP: u16 = 519;
 pub const CMD_PUSH_MSG_GROUP: u16 = 521;
 pub const CMD_DELIVERED_GROUP: u16 = 522;
 pub const CMD_SEEN_GROUP: u16 = 523;
+pub const CMD_CLEAR_UNREAD_GROUP: u16 = 524;
 pub const CMD_HAS_MSG: u16 = 533;
 pub const CMD_PUSH_MISS_MSG: u16 = 534;
+pub const CMD_E2EE_DELIVER_SEEN_1_1: u16 = 553;
+pub const CMD_E2EE_DELIVER_SEEN_GROUP: u16 = 554;
 pub const CMD_GET_MSG: u16 = 570;
 
 pub const CMD_CTRL_PUSH_CTRL: u16 = 601;
@@ -105,7 +110,15 @@ impl WsEvent {
     pub fn is_receipt_ish(&self) -> bool {
         matches!(
             self.cmd,
-            CMD_DELIVERED_1_1 | CMD_SEEN_1_1 | CMD_DELIVERED_GROUP | CMD_SEEN_GROUP
+            CMD_DELIVERED_1_1
+                | CMD_SEEN_1_1
+                | CMD_CLEAR_UNREAD_1_1
+                | CMD_PULL_ACK_GROUP
+                | CMD_DELIVERED_GROUP
+                | CMD_SEEN_GROUP
+                | CMD_CLEAR_UNREAD_GROUP
+                | CMD_E2EE_DELIVER_SEEN_1_1
+                | CMD_E2EE_DELIVER_SEEN_GROUP
         )
     }
 }
@@ -276,7 +289,11 @@ fn queues_from_auth(auth: &Value) -> Vec<(u16, u8)> {
         if let Some(arr) = auth.pointer(&format!("/data/{key}")).and_then(Value::as_array) {
             for q in arr {
                 let cmd = q.get("cmd").and_then(Value::as_u64);
-                let sub = q.get("subCmd").and_then(Value::as_u64).unwrap_or(0);
+                let sub = q
+                    .get("subCmd")
+                    .or_else(|| q.get("sub_cmd"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
                 if let Some(c) = cmd {
                     let pair = (c as u16, sub as u8);
                     if !out.contains(&pair) {
@@ -623,5 +640,38 @@ mod tests {
         assert!(ev.is_voip_ish());
         assert_eq!(PING_SECS, 15);
         assert!(BROWSER_UA.contains("ZaloPC/26.10.11"));
+    }
+
+    #[test]
+    fn clear_unread_and_e2ee_ack_cmds_are_receipt_ish() {
+        for cmd in [
+            CMD_DELIVERED_1_1,
+            CMD_SEEN_1_1,
+            CMD_CLEAR_UNREAD_1_1,
+            CMD_PULL_ACK_GROUP,
+            CMD_DELIVERED_GROUP,
+            CMD_SEEN_GROUP,
+            CMD_CLEAR_UNREAD_GROUP,
+            CMD_E2EE_DELIVER_SEEN_1_1,
+            CMD_E2EE_DELIVER_SEEN_GROUP,
+        ] {
+            let ev = WsEvent {
+                cmd,
+                sub_cmd: 0,
+                version: 1,
+                payload: json!({}),
+            };
+            assert!(ev.is_receipt_ish(), "cmd {cmd} should be receipt-ish");
+        }
+
+        let auth = json!({
+            "data": {
+                "qCmds": [
+                    { "cmd": 504, "sub_cmd": 1 },
+                    { "cmd": 524, "subCmd": 1 }
+                ]
+            }
+        });
+        assert_eq!(queues_from_auth(&auth), vec![(504, 1), (524, 1)]);
     }
 }

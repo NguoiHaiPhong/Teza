@@ -293,12 +293,65 @@ fn build_thread_read_synced_payload(thread_id: &str, is_unread: bool) -> serde_j
     })
 }
 
-fn pick_latest_incoming_for_seen(messages: &[MessageDto]) -> Option<(String, String, String)> {
+fn record_read_sync_watermark(
+    cleared_up_to: &mut std::collections::HashMap<String, i64>,
+    thread_id: &str,
+    is_unread: bool,
+    last_msg_id: Option<&str>,
+) {
+    if is_unread {
+        cleared_up_to.remove(thread_id);
+        return;
+    }
+    if let Some(id_num) = last_msg_id
+        .map(str::trim)
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|n| *n > 0)
+    {
+        cleared_up_to
+            .entry(thread_id.to_string())
+            .and_modify(|cur| *cur = (*cur).max(id_num))
+            .or_insert(id_num);
+    }
+}
+
+fn is_msg_cleared_by_read_sync(
+    cleared_up_to: &std::collections::HashMap<String, i64>,
+    thread_id: &str,
+    msg_id: &str,
+) -> bool {
+    let Some(&cleared_id) = cleared_up_to.get(thread_id) else {
+        return false;
+    };
+    msg_id
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .is_some_and(|mid| mid > 0 && mid <= cleared_id)
+}
+
+fn pick_latest_incoming_meta_for_seen(
+    messages: &[MessageDto],
+) -> Option<zalo_core::store::IncomingSeenMeta> {
     messages
         .iter()
         .filter(|m| !m.is_outgoing && is_server_msg_id(&m.msg_id))
         .max_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.msg_id.cmp(&b.msg_id)))
-        .map(|m| (m.msg_id.clone(), m.sender_id.clone(), m.msg_type.clone()))
+        .map(|m| {
+            (
+                m.msg_id.clone(),
+                m.cli_msg_id.clone(),
+                m.sender_id.clone(),
+                m.msg_type.clone(),
+                m.ts,
+            )
+        })
+}
+
+#[cfg(test)]
+fn pick_latest_incoming_for_seen(messages: &[MessageDto]) -> Option<(String, String, String)> {
+    pick_latest_incoming_meta_for_seen(messages)
+        .map(|(mid, _cli, sender, msg_type, _ts)| (mid, sender, msg_type))
 }
 
 fn is_main_window_focused(app: &AppHandle) -> bool {
@@ -385,6 +438,8 @@ async fn restart_ws_worker(
             .unwrap_or_default();
         let ws_name_cache = Arc::new(Mutex::new(initial_titles));
         let in_flight_uids = Arc::new(Mutex::new(std::collections::HashSet::<String>::new()));
+        let mut cleared_up_to_msg_id: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
 
         while let Some(sig) = rx.recv().await {
             match sig {
@@ -466,12 +521,22 @@ async fn restart_ws_worker(
                                         &msg.sender_name,
                                         is_group,
                                     );
-                                    let (inc_unread, clear_unread) = classify_ws_message_unread(
-                                        msg.is_outgoing,
-                                        active_id.as_deref(),
-                                        &msg.thread_id,
-                                        main_focused,
-                                    );
+                                    let already_cleared = !msg.is_outgoing
+                                        && is_msg_cleared_by_read_sync(
+                                            &cleared_up_to_msg_id,
+                                            &msg.thread_id,
+                                            &msg.msg_id,
+                                        );
+                                    let (inc_unread, clear_unread) = if already_cleared {
+                                        (false, false)
+                                    } else {
+                                        classify_ws_message_unread(
+                                            msg.is_outgoing,
+                                            active_id.as_deref(),
+                                            &msg.thread_id,
+                                            main_focused,
+                                        )
+                                    };
                                     let created = store
                                         .update_thread_preview_returning_created(
                                             &msg.thread_id,
@@ -481,7 +546,13 @@ async fn restart_ws_worker(
                                             clear_unread,
                                         )
                                         .unwrap_or(false);
-                                    if created {
+                                    if already_cleared {
+                                        let _ = store.advance_last_read_in_ts(
+                                            &msg.thread_id,
+                                            msg.ts,
+                                        );
+                                        threads_touched = true;
+                                    } else if created {
                                         threads_touched = true;
                                     }
                                     if let Some(ref att_url) = msg.attachment_url {
@@ -508,7 +579,14 @@ async fn restart_ws_worker(
                                 WsParsedAction::Read {
                                     thread_id,
                                     is_unread,
+                                    last_msg_id,
                                 } => {
+                                    record_read_sync_watermark(
+                                        &mut cleared_up_to_msg_id,
+                                        &thread_id,
+                                        is_unread,
+                                        last_msg_id.as_deref(),
+                                    );
                                     let _ = store.set_thread_unread(
                                         &thread_id,
                                         if is_unread { 1 } else { 0 },
@@ -1040,10 +1118,10 @@ async fn thread_mark_read(
             .flatten()
             .unwrap_or(ThreadKind::Direct);
         let latest = store
-            .get_latest_incoming_message_with_type(&thread_id)
+            .get_latest_incoming_message_for_seen(&thread_id)
             .ok()
             .flatten()
-            .filter(|(mid, _, _)| is_server_msg_id(mid));
+            .filter(|(mid, _, _, _, _)| is_server_msg_id(mid));
         (kind, latest)
     };
     if thread_id != "cloud-me" {
@@ -1059,19 +1137,21 @@ async fn thread_mark_read(
                 let target = match latest_incoming {
                     Some(item) => Some(item),
                     None => match threads::fetch_thread_history(&sess, &tid, kind, 10).await {
-                        Ok(msgs) => pick_latest_incoming_for_seen(&msgs),
+                        Ok(msgs) => pick_latest_incoming_meta_for_seen(&msgs),
                         Err(e) if expired_code(&e).is_some() => return Err(e),
                         Err(_) => None,
                     },
                 };
-                if let Some((mid, sender_id, msg_type)) = target {
-                    let seen_res = threads::send_seen_event_with_type(
+                if let Some((mid, cli_mid, sender_id, msg_type, ts)) = target {
+                    let seen_res = threads::send_seen_event_with_meta(
                         &sess,
                         &tid,
                         kind,
                         &mid,
+                        cli_mid.as_deref(),
                         &sender_id,
                         &msg_type,
+                        ts,
                     )
                     .await;
                     if seen_res.as_ref().is_err_and(|e| expired_code(e).is_some()) {
@@ -9131,9 +9211,42 @@ mod tests {
         assert!(super::should_dispatch_ws_event(&mk_ev(
             zalo_core::socket::CMD_PUSH_MSG_1_1
         )));
+        assert!(super::should_dispatch_ws_event(&mk_ev(
+            zalo_core::socket::CMD_CLEAR_UNREAD_1_1
+        )));
+        assert!(super::should_dispatch_ws_event(&mk_ev(
+            zalo_core::socket::CMD_CLEAR_UNREAD_GROUP
+        )));
+        assert!(super::should_dispatch_ws_event(&mk_ev(
+            zalo_core::socket::CMD_PULL_ACK_GROUP
+        )));
+        assert!(super::should_dispatch_ws_event(&mk_ev(
+            zalo_core::socket::CMD_E2EE_DELIVER_SEEN_1_1
+        )));
+        assert!(super::should_dispatch_ws_event(&mk_ev(
+            zalo_core::socket::CMD_E2EE_DELIVER_SEEN_GROUP
+        )));
         assert!(!super::should_dispatch_ws_event(&mk_ev(
             zalo_core::socket::CMD_PING
         )));
+    }
+
+    #[test]
+    fn read_sync_watermark_suppresses_late_offline_msgs_without_hiding_newer_ones() {
+        let mut map = std::collections::HashMap::new();
+        super::record_read_sync_watermark(&mut map, "u1", false, Some("7451000"));
+        assert!(super::is_msg_cleared_by_read_sync(&map, "u1", "7450999"));
+        assert!(super::is_msg_cleared_by_read_sync(&map, "u1", "7451000"));
+        assert!(!super::is_msg_cleared_by_read_sync(&map, "u1", "7451001"));
+        assert!(!super::is_msg_cleared_by_read_sync(&map, "u2", "7451000"));
+
+        // Older clear watermark must not regress a newer watermark
+        super::record_read_sync_watermark(&mut map, "u1", false, Some("7450500"));
+        assert!(super::is_msg_cleared_by_read_sync(&map, "u1", "7451000"));
+
+        // Explicit mark-unread clears watermark
+        super::record_read_sync_watermark(&mut map, "u1", true, None);
+        assert!(!super::is_msg_cleared_by_read_sync(&map, "u1", "7451000"));
     }
 
     #[test]

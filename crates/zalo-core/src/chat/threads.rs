@@ -697,30 +697,36 @@ pub fn parse_unread_marks_response(resp: &Value) -> Option<HashSet<String>> {
     Some(unread_ids)
 }
 
-/// Best-effort fetch of `/api/convers/get-unread-mark` on the `conversation` service host.
+/// Best-effort fetch of `/api/conv/getUnreadMark` (with fallback to legacy
+/// `/api/convers/get-unread-mark`) on the `conversation` service host.
 /// Propagates `SessionError::Expired`; falls back to `Ok(None)` on network errors or unknown schema.
 pub async fn fetch_unread_marks(session: &Session) -> Result<Option<HashSet<String>>> {
     if !session.is_authenticated() || session.domains.conversation.is_empty() {
         return Ok(None);
     }
-    let body = obj(&[("imei", json!(session.imei))]);
-    let params = session
-        .encoded_params(&body)
-        .map(|p| format!("params={p}"))
-        .unwrap_or_else(|_| Session::plain_params(&body));
-    let url = format!(
-        "{}/api/convers/get-unread-mark?{}&{params}",
-        session.domains.conversation.trim_end_matches('/'),
-        session.common_params()
-    );
-    let raw = match session.get_json(&url).await {
-        Ok(v) => v,
-        Err(e) if is_expired_err(&e) => return Err(e),
-        Err(_) => return Ok(None),
-    };
-    let resp = unwrap_data_str(session.maybe_decrypt(raw, session.session_key_bytes()));
-    ensure_not_expired(&resp)?;
-    Ok(parse_unread_marks_response(&resp))
+    let base_host = session.domains.conversation.trim_end_matches('/');
+    let attempts = [
+        ("api/conv/getUnreadMark", json!({})),
+        ("api/convers/get-unread-mark", obj(&[("imei", json!(session.imei))])),
+    ];
+    for (path, body) in attempts {
+        let params = session
+            .encoded_params(&body)
+            .map(|p| format!("params={p}"))
+            .unwrap_or_else(|_| Session::plain_params(&body));
+        let url = format!("{base_host}/{path}?{}&{params}", session.common_params());
+        let raw = match session.get_json(&url).await {
+            Ok(v) => v,
+            Err(e) if is_expired_err(&e) => return Err(e),
+            Err(_) => continue,
+        };
+        let resp = unwrap_data_str(session.maybe_decrypt(raw, session.session_key_bytes()));
+        ensure_not_expired(&resp)?;
+        if let Some(parsed) = parse_unread_marks_response(&resp) {
+            return Ok(Some(parsed));
+        }
+    }
+    Ok(None)
 }
 
 fn apply_unread_marks_to_threads(
@@ -1337,12 +1343,15 @@ fn extract_last_msg_read_state(item: &Value, is_outgoing: bool, my_uid: &str) ->
             return (if b { 0 } else { 1 }, true);
         }
     }
-    if !my_uid.is_empty() {
-        if let Some(arr) = item
-            .get("seenUids")
-            .or_else(|| item.get("seen_uids"))
-            .and_then(Value::as_array)
-        {
+    if let Some(raw) = item.get("seenUids").or_else(|| item.get("seen_uids")) {
+        let parsed_arr: Option<Vec<Value>> = match raw {
+            Value::Array(arr) => Some(arr.clone()),
+            Value::String(s) if s.trim().starts_with('[') => {
+                serde_json::from_str::<Vec<Value>>(s.trim()).ok()
+            }
+            _ => None,
+        };
+        if let Some(arr) = parsed_arr {
             let self_seen = arr.iter().any(|v| {
                 let s = match v {
                     Value::String(s) => s.trim().to_string(),
@@ -1350,7 +1359,7 @@ fn extract_last_msg_read_state(item: &Value, is_outgoing: bool, my_uid: &str) ->
                     _ => String::new(),
                 };
                 let clean = s.split('_').next().unwrap_or(s.as_str());
-                !clean.is_empty() && (s == my_uid || clean == my_uid)
+                clean == "0" || (!my_uid.is_empty() && !clean.is_empty() && (s == my_uid || clean == my_uid))
             });
             if self_seen {
                 return (0, true);
@@ -2565,6 +2574,37 @@ pub async fn sync_pin_thread(
     ensure_not_expired(&dec)
 }
 
+fn build_conv_unread_mark_body(
+    id_val: &str,
+    is_group: bool,
+    unread: bool,
+    ts_ms: i64,
+    imei: &str,
+) -> Value {
+    let inner = if unread {
+        let entry = json!({
+            "id": id_val,
+            "cliMsgId": ts_ms.to_string(),
+            "fromUid": "0",
+            "ts": ts_ms,
+        });
+        json!({
+            "convsGroup": if is_group { json!([entry]) } else { json!([]) },
+            "convsUser": if is_group { json!([]) } else { json!([entry]) },
+            "imei": imei,
+        })
+    } else {
+        let data_entry = json!({ "id": id_val, "ts": ts_ms });
+        json!({
+            "convsGroup": if is_group { json!([id_val]) } else { json!([]) },
+            "convsUser": if is_group { json!([]) } else { json!([id_val]) },
+            "convsGroupData": if is_group { json!([data_entry]) } else { json!([]) },
+            "convsUserData": if is_group { json!([]) } else { json!([data_entry]) },
+        })
+    };
+    obj(&[("param", json!(inner.to_string()))])
+}
+
 pub async fn sync_unread_mark(
     session: &Session,
     thread_id: &str,
@@ -2580,28 +2620,64 @@ pub async fn sync_unread_mark(
     } else {
         thread_id.to_string()
     };
-    let ts_str = chrono::Utc::now().timestamp_millis().to_string();
-    let entry = json!({ "id": id_val, "ts": ts_str });
-    let inner = json!({
+    let ts_ms = chrono::Utc::now().timestamp_millis();
+    let base_host = session.domains.conversation.trim_end_matches('/');
+
+    // Canonical Zalo endpoint (`/api/conv/addUnreadMark` / `/api/conv/removeUnreadMark`).
+    let conv_endpoint = if unread {
+        "api/conv/addUnreadMark"
+    } else {
+        "api/conv/removeUnreadMark"
+    };
+    let conv_body = build_conv_unread_mark_body(&id_val, is_group, unread, ts_ms, &session.imei);
+    let conv_params = session.encoded_params(&conv_body)?;
+    let conv_url = format!("{base_host}/{conv_endpoint}?{}", session.common_params());
+    let primary_err: Option<anyhow::Error> = match session
+        .post_form(&conv_url, format!("params={conv_params}"))
+        .await
+    {
+        Ok(raw) => {
+            let dec = unwrap_data_str(session.maybe_decrypt(raw, session.session_key_bytes()));
+            ensure_not_expired(&dec)?;
+            let code = dec.get("error_code").and_then(value_as_i64).unwrap_or(0);
+            if code == 0 {
+                return Ok(());
+            }
+            Some(anyhow::anyhow!("conv unread mark error_code={code}"))
+        }
+        Err(e) if is_expired_err(&e) => return Err(e),
+        Err(e) => Some(e),
+    };
+
+    // Legacy fallback (`/api/convers/add-unread-mark` / `/api/convers/remove-unread-mark`).
+    let entry = json!({ "id": id_val, "ts": ts_ms.to_string() });
+    let legacy_inner = json!({
         "convsGroup": if is_group { json!([entry]) } else { json!([]) },
         "convsUser": if is_group { json!([]) } else { json!([entry]) },
         "imei": session.imei,
     });
-    let body = obj(&[("param", json!(inner.to_string()))]);
-    let params = session.encoded_params(&body)?;
-    let endpoint = if unread {
+    let legacy_body = obj(&[("param", json!(legacy_inner.to_string()))]);
+    let legacy_params = session.encoded_params(&legacy_body)?;
+    let legacy_endpoint = if unread {
         "add-unread-mark"
     } else {
         "remove-unread-mark"
     };
-    let url = format!(
-        "{}/api/convers/{endpoint}?{}",
-        session.domains.conversation.trim_end_matches('/'),
+    let legacy_url = format!(
+        "{base_host}/api/convers/{legacy_endpoint}?{}",
         session.common_params()
     );
-    let raw = session.post_form(&url, format!("params={params}")).await?;
-    let dec = session.maybe_decrypt(raw, session.session_key_bytes());
-    ensure_not_expired(&dec)
+    match session
+        .post_form(&legacy_url, format!("params={legacy_params}"))
+        .await
+    {
+        Ok(raw) => {
+            let dec = session.maybe_decrypt(raw, session.session_key_bytes());
+            ensure_not_expired(&dec)
+        }
+        Err(e) if is_expired_err(&e) => Err(e),
+        Err(e) => Err(primary_err.unwrap_or(e)),
+    }
 }
 
 pub async fn sync_mute_thread(
@@ -2645,7 +2721,15 @@ pub async fn sync_mute_thread(
     ensure_not_expired(&dec)
 }
 
-fn build_seen_event_item(msg_id: &str, sender: &str, id_val: &str, msg_type: &str) -> Value {
+fn build_seen_event_item(
+    msg_id: &str,
+    cli_msg_id: Option<&str>,
+    sender: &str,
+    id_val: &str,
+    is_group: bool,
+    msg_type: &str,
+    ts: i64,
+) -> Value {
     let normalized_msg_type = {
         let trimmed = msg_type.trim();
         if trimmed.is_empty() {
@@ -2654,13 +2738,32 @@ fn build_seen_event_item(msg_id: &str, sender: &str, id_val: &str, msg_type: &st
             trimmed
         }
     };
+    let gmi = msg_id.trim();
+    let cmi = cli_msg_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "0")
+        .unwrap_or(gmi);
+    let di = if is_group { id_val } else { "0" };
+    let normalized_ts = if ts > 0 { normalize_ts_ms(ts) } else { -1 };
     json!({
-        "cmi": msg_id.trim(),
-        "gmi": msg_id.trim(),
-        "uidFrom": sender,
-        "idTo": id_val,
-        "msgType": normalized_msg_type,
+        "cmi": cmi,
+        "gmi": gmi,
+        "si": sender,
+        "di": di,
+        "mt": normalized_msg_type,
+        "st": 0,
+        "at": 0,
+        "cmd": 0,
+        "ts": normalized_ts,
     })
+}
+
+fn build_seen_event_msg_infos(item: Value, id_val: &str, is_group: bool) -> Value {
+    if is_group {
+        json!({ "data": [item], "grid": id_val })
+    } else {
+        json!({ "data": [item], "senderId": id_val })
+    }
 }
 
 pub async fn send_seen_event(
@@ -2670,7 +2773,17 @@ pub async fn send_seen_event(
     msg_id: &str,
     sender_id: &str,
 ) -> Result<()> {
-    send_seen_event_with_type(session, thread_id, kind, msg_id, sender_id, "chat.text").await
+    send_seen_event_with_meta(
+        session,
+        thread_id,
+        kind,
+        msg_id,
+        None,
+        sender_id,
+        "chat.text",
+        0,
+    )
+    .await
 }
 
 pub async fn send_seen_event_with_type(
@@ -2680,6 +2793,20 @@ pub async fn send_seen_event_with_type(
     msg_id: &str,
     sender_id: &str,
     msg_type: &str,
+) -> Result<()> {
+    send_seen_event_with_meta(session, thread_id, kind, msg_id, None, sender_id, msg_type, 0).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn send_seen_event_with_meta(
+    session: &Session,
+    thread_id: &str,
+    kind: ThreadKind,
+    msg_id: &str,
+    cli_msg_id: Option<&str>,
+    sender_id: &str,
+    msg_type: &str,
+    ts: i64,
 ) -> Result<()> {
     if !session.is_authenticated() || kind == ThreadKind::Cloud || msg_id.trim().is_empty() {
         return Ok(());
@@ -2695,18 +2822,15 @@ pub async fn send_seen_event_with_type(
     } else {
         sender_id.trim()
     };
-    let item = build_seen_event_item(msg_id, sender, &id_val, msg_type);
-    let (base_host, path, msg_infos) = if is_group {
+    let item = build_seen_event_item(msg_id, cli_msg_id, sender, &id_val, is_group, msg_type, ts);
+    let msg_infos = build_seen_event_msg_infos(item, &id_val, is_group);
+    let (base_host, path) = if is_group {
         let group_host = if session.domains.group.is_empty() {
             crate::endpoints::service("group").unwrap_or("https://tt-group-wpa.chat.zalo.me")
         } else {
             session.domains.group.trim_end_matches('/')
         };
-        (
-            group_host,
-            "api/group/seenv2",
-            json!({ "data": [item], "grid": id_val }),
-        )
+        (group_host, "api/group/seenv2")
     } else {
         let chat_host = if session.domains.chat.is_empty()
             || session.domains.chat.contains("-msg-chat.")
@@ -2716,14 +2840,18 @@ pub async fn send_seen_event_with_type(
         } else {
             session.domains.chat.trim_end_matches('/')
         };
-        (chat_host, "api/message/seenv2", json!({ "data": [item] }))
+        (chat_host, "api/message/seenv2")
     };
-    let body = obj(&[
-        ("msgInfos", json!(msg_infos.to_string())),
-        ("imei", json!(session.imei)),
-    ]);
+    let body = if is_group {
+        obj(&[
+            ("msgInfos", json!(msg_infos.to_string())),
+            ("imei", json!(session.imei)),
+        ])
+    } else {
+        obj(&[("msgInfos", json!(msg_infos.to_string()))])
+    };
     let params = session.encoded_params(&body)?;
-    let url = format!("{base_host}/{path}?{}", session.common_params());
+    let url = format!("{base_host}/{path}?{}&nretry=0", session.common_params());
     let raw = session.post_form(&url, format!("params={params}")).await?;
     let dec = session.maybe_decrypt(raw, session.session_key_bytes());
     ensure_not_expired(&dec)
@@ -4315,13 +4443,59 @@ mod tests {
 
     #[test]
     fn build_seen_event_item_preserves_msg_type_with_text_fallback() {
-        let photo = build_seen_event_item("m-10", "u-1", "u-1", "chat.photo");
-        assert_eq!(photo["msgType"], "chat.photo");
-        assert_eq!(photo["cmi"], "m-10");
+        let photo = build_seen_event_item(
+            "m-10",
+            Some("c-10"),
+            "u-1",
+            "u-1",
+            false,
+            "chat.photo",
+            1_700_000_010_000,
+        );
+        assert_eq!(photo["mt"], "chat.photo");
+        assert_eq!(photo["cmi"], "c-10");
         assert_eq!(photo["gmi"], "m-10");
+        assert_eq!(photo["si"], "u-1");
+        assert_eq!(photo["di"], "0");
+        assert_eq!(photo["ts"], 1_700_000_010_000_i64);
 
-        let fallback = build_seen_event_item("m-11", "u-1", "u-1", "   ");
-        assert_eq!(fallback["msgType"], "chat.text");
+        let dm_infos = build_seen_event_msg_infos(photo, "u-1", false);
+        assert_eq!(dm_infos["senderId"], "u-1");
+        assert!(dm_infos.get("grid").is_none());
+
+        let grp = build_seen_event_item("m-11", None, "u-2", "9001", true, "   ", 0);
+        assert_eq!(grp["mt"], "chat.text");
+        assert_eq!(grp["cmi"], "m-11");
+        assert_eq!(grp["gmi"], "m-11");
+        assert_eq!(grp["si"], "u-2");
+        assert_eq!(grp["di"], "9001");
+        assert_eq!(grp["ts"], -1);
+
+        let grp_infos = build_seen_event_msg_infos(grp, "9001", true);
+        assert_eq!(grp_infos["grid"], "9001");
+        assert!(grp_infos.get("senderId").is_none());
+    }
+
+    #[test]
+    fn build_conv_unread_mark_body_matches_zalo_add_and_remove_schemas() {
+        let add_dm = build_conv_unread_mark_body("111", false, true, 1_700_000_000_000, "imei-1");
+        let add_inner: Value = serde_json::from_str(add_dm["param"].as_str().unwrap()).unwrap();
+        assert_eq!(add_inner["convsUser"][0]["id"], "111");
+        assert_eq!(add_inner["convsUser"][0]["fromUid"], "0");
+        assert_eq!(add_inner["convsUser"][0]["cliMsgId"], "1700000000000");
+        assert_eq!(add_inner["convsGroup"].as_array().unwrap().len(), 0);
+        assert_eq!(add_inner["imei"], "imei-1");
+
+        let rm_grp = build_conv_unread_mark_body("888", true, false, 1_700_000_000_123, "imei-1");
+        let rm_inner: Value = serde_json::from_str(rm_grp["param"].as_str().unwrap()).unwrap();
+        assert_eq!(rm_inner["convsGroup"], json!(["888"]));
+        assert_eq!(rm_inner["convsGroupData"][0]["id"], "888");
+        assert_eq!(rm_inner["convsGroupData"][0]["ts"], 1_700_000_000_123_i64);
+        assert_eq!(rm_inner["convsUser"].as_array().unwrap().len(), 0);
+        assert_eq!(rm_inner["convsUserData"].as_array().unwrap().len(), 0);
+
+        let seen_zero = json!({ "seenUids": "[\"0\"]" });
+        assert_eq!(extract_last_msg_read_state(&seen_zero, false, "456"), (0, true));
     }
 
     #[test]

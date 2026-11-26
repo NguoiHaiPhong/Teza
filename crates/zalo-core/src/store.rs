@@ -21,6 +21,9 @@ use crate::{data_dir, dpapi};
 const ENC_PREFIX: &str = "enc:v1:";
 const KEY_CHECK_VALUE: &str = "litechat-db-v1";
 
+/// `(msg_id, cli_msg_id, sender_id, msg_type, ts)` for `seenv2` read receipts.
+pub type IncomingSeenMeta = (String, Option<String>, String, String, i64);
+
 struct DbCipher {
     cipher: Aes256Gcm,
     mac_key: [u8; 32],
@@ -1996,17 +1999,31 @@ impl MessageStore {
         &self,
         thread_id: &str,
     ) -> Result<Option<(String, String, String)>> {
-        let row: Option<(String, String, String)> = self
+        let Some((msg_id, _cli_msg_id, sender_id, msg_type, _ts)) =
+            self.get_latest_incoming_message_for_seen(thread_id)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((msg_id, sender_id, msg_type)))
+    }
+
+    /// Returns `(msg_id, cli_msg_id, sender_id, msg_type, ts)` for the latest incoming message
+    /// in `thread_id`, so `seenv2` can send the exact server/client IDs and timestamp.
+    pub fn get_latest_incoming_message_for_seen(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<IncomingSeenMeta>> {
+        let row: Option<(String, String, String, String, i64)> = self
             .conn
             .query_row(
-                "SELECT msg_id, sender_id, msg_type FROM messages
+                "SELECT msg_id, cli_msg_id, sender_id, msg_type, ts FROM messages
                  WHERE thread_id = ?1 AND is_outgoing = 0
                  ORDER BY ts DESC, msg_id DESC LIMIT 1",
                 params![thread_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
-        let Some((msg_id, enc_sender_id, msg_type)) = row else {
+        let Some((msg_id, raw_cli_msg_id, enc_sender_id, msg_type, ts)) = row else {
             return Ok(None);
         };
         let sender_id = self
@@ -2017,7 +2034,15 @@ impl MessageStore {
         } else {
             msg_type
         };
-        Ok(Some((msg_id, sender_id, normalized_type)))
+        let cli_msg_id = {
+            let trimmed = raw_cli_msg_id.trim();
+            if trimmed.is_empty() || trimmed == "0" {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        };
+        Ok(Some((msg_id, cli_msg_id, sender_id, normalized_type, ts)))
     }
 
     pub fn set_thread_pinned(&self, thread_id: &str, pinned: bool) -> Result<()> {
@@ -6228,6 +6253,41 @@ mod tests {
                 "m4".to_string(),
                 "peer-3".to_string(),
                 "chat.text".to_string()
+            )
+        );
+
+        // `get_latest_incoming_message_for_seen` preserves `cli_msg_id` and `ts`
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "m5".into(),
+                cli_msg_id: Some("1700000050123".into()),
+                thread_id: "t-in".into(),
+                sender_id: "peer-4".into(),
+                sender_name: "Dave".into(),
+                text: "with cli id".into(),
+                msg_type: "chat.photo".into(),
+                ts: 1_700_000_050_000,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+        let seen_meta = store
+            .get_latest_incoming_message_for_seen("t-in")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            seen_meta,
+            (
+                "m5".to_string(),
+                Some("1700000050123".to_string()),
+                "peer-4".to_string(),
+                "chat.photo".to_string(),
+                1_700_000_050_000,
             )
         );
 

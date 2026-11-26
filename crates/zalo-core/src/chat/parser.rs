@@ -7,11 +7,13 @@ use crate::chat::{
     MessageDto, PollDto, PollOptionDto, QuoteRef, ReactionSummary, ThreadDto, ThreadKind,
 };
 use crate::socket::{
-    WsEvent, CMD_AUTHEN, CMD_CTRL_ACTION, CMD_CTRL_PULL_610, CMD_CTRL_PULL_CTRL,
-    CMD_CTRL_PULL_VOIP, CMD_CTRL_PUSH_CTRL, CMD_DELIVERED_1_1, CMD_DELIVERED_GROUP, CMD_GET_MSG,
-    CMD_PING, CMD_PULL_MSG_1_1, CMD_PULL_MSG_513, CMD_PULL_MSG_514, CMD_PULL_MSG_515,
-    CMD_PULL_MSG_517, CMD_PULL_MSG_518, CMD_PULL_MSG_GROUP, CMD_PUSH_MISS_MSG, CMD_PUSH_MSG_1_1,
-    CMD_PUSH_MSG_GROUP, CMD_SEEN_1_1, CMD_SEEN_GROUP,
+    WsEvent, CMD_AUTHEN, CMD_CLEAR_UNREAD_1_1, CMD_CLEAR_UNREAD_GROUP, CMD_CTRL_ACTION,
+    CMD_CTRL_PULL_610, CMD_CTRL_PULL_CTRL, CMD_CTRL_PULL_VOIP, CMD_CTRL_PUSH_CTRL,
+    CMD_DELIVERED_1_1, CMD_DELIVERED_GROUP, CMD_E2EE_DELIVER_SEEN_1_1,
+    CMD_E2EE_DELIVER_SEEN_GROUP, CMD_GET_MSG, CMD_PING, CMD_PULL_ACK_GROUP, CMD_PULL_MSG_1_1,
+    CMD_PULL_MSG_513, CMD_PULL_MSG_514, CMD_PULL_MSG_515, CMD_PULL_MSG_517, CMD_PULL_MSG_518,
+    CMD_PULL_MSG_GROUP, CMD_PUSH_MISS_MSG, CMD_PUSH_MSG_1_1, CMD_PUSH_MSG_GROUP, CMD_SEEN_1_1,
+    CMD_SEEN_GROUP,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,7 +75,11 @@ pub fn is_reaction_ws_cmd(cmd: u16) -> bool {
 pub enum WsParsedAction {
     Message(Box<MessageDto>),
     Recalled { thread_id: String, msg_id: String },
-    Read { thread_id: String, is_unread: bool },
+    Read {
+        thread_id: String,
+        is_unread: bool,
+        last_msg_id: Option<String>,
+    },
     PeerSeen {
         thread_id: String,
         seen_ts: i64,
@@ -1420,7 +1426,38 @@ pub fn parse_ws_event(ev: &WsEvent, my_uid: &str, send2me_id: &str) -> Vec<WsPar
             | CMD_GET_MSG
     ) {
         let is_group_cmd = matches!(ev.cmd, CMD_PUSH_MSG_GROUP | CMD_PULL_MSG_GROUP);
-        collect_messages_from_node(data, is_group_cmd, my_uid, send2me_id, &mut actions);
+        let unwrapped = unwrap_json_value(data);
+        collect_messages_from_node(&unwrapped, is_group_cmd, my_uid, send2me_id, &mut actions);
+        collect_clear_unreads_from_node(
+            &unwrapped,
+            is_group_cmd,
+            my_uid,
+            send2me_id,
+            &mut actions,
+        );
+    } else if matches!(ev.cmd, CMD_CLEAR_UNREAD_1_1 | CMD_CLEAR_UNREAD_GROUP) {
+        let is_group_cmd = ev.cmd == CMD_CLEAR_UNREAD_GROUP;
+        let unwrapped = unwrap_json_value(data);
+        if unwrapped.get("msgs").is_some() || unwrapped.get("groupMsgs").is_some() {
+            collect_messages_from_node(&unwrapped, is_group_cmd, my_uid, send2me_id, &mut actions);
+        }
+        collect_clear_unreads_from_node(
+            &unwrapped,
+            is_group_cmd,
+            my_uid,
+            send2me_id,
+            &mut actions,
+        );
+        if has_receipt_bucket(&unwrapped) {
+            collect_receipts_from_node(
+                &unwrapped,
+                is_group_cmd,
+                true,
+                my_uid,
+                send2me_id,
+                &mut actions,
+            );
+        }
     } else if matches!(ev.cmd, CMD_REACTION_PUSH | CMD_REACTION_PULL_GROUP) {
         collect_reactions_from_node(
             &ev.payload,
@@ -1439,11 +1476,30 @@ pub fn parse_ws_event(ev: &WsEvent, my_uid: &str, send2me_id: &str) -> Vec<WsPar
         collect_controls_from_node(&ev.payload, my_uid, send2me_id, &mut actions);
     } else if matches!(
         ev.cmd,
-        CMD_DELIVERED_1_1 | CMD_SEEN_1_1 | CMD_DELIVERED_GROUP | CMD_SEEN_GROUP
+        CMD_DELIVERED_1_1
+            | CMD_SEEN_1_1
+            | CMD_PULL_ACK_GROUP
+            | CMD_DELIVERED_GROUP
+            | CMD_SEEN_GROUP
+            | CMD_E2EE_DELIVER_SEEN_1_1
+            | CMD_E2EE_DELIVER_SEEN_GROUP
     ) {
-        let is_group_cmd = matches!(ev.cmd, CMD_DELIVERED_GROUP | CMD_SEEN_GROUP);
+        let is_group_cmd = matches!(
+            ev.cmd,
+            CMD_DELIVERED_GROUP
+                | CMD_SEEN_GROUP
+                | CMD_PULL_ACK_GROUP
+                | CMD_E2EE_DELIVER_SEEN_GROUP
+        );
         let default_seen = matches!(ev.cmd, CMD_SEEN_1_1 | CMD_SEEN_GROUP) || ev.sub_cmd == 1;
         let receipt_data = unwrap_json_value(data);
+        collect_clear_unreads_from_node(
+            &receipt_data,
+            is_group_cmd,
+            my_uid,
+            send2me_id,
+            &mut actions,
+        );
         collect_receipts_from_node(
             &receipt_data,
             is_group_cmd,
@@ -1510,6 +1566,183 @@ fn is_self_uid(uid: &str, my_uid: &str) -> bool {
     trimmed == my_uid || clean == my_uid
 }
 
+/// Returns `true` when a receipt actor UID refers to the logged-in account (either explicit `"0"`,
+/// which Zalo uses for self actions synced from mobile/desktop, or matching `my_uid`).
+fn is_self_receipt_uid(uid: &str, my_uid: &str) -> bool {
+    let clean = clean_bare_uid(uid);
+    if clean.is_empty() {
+        return false;
+    }
+    clean == "0" || (!my_uid.is_empty() && clean == my_uid)
+}
+
+fn is_peer_receipt_uid(uid: &str, my_uid: &str) -> bool {
+    let clean = clean_bare_uid(uid);
+    !clean.is_empty() && clean != "0" && (my_uid.is_empty() || clean != my_uid)
+}
+
+fn pick_receipt_last_msg_id(item: &Value) -> Option<String> {
+    pick_str(
+        item,
+        &["lastMsgId", "last_msg_id", "msgId", "globalMsgId", "realMsgId"],
+    )
+    .filter(|s| !s.is_empty() && s != "0" && !s.starts_with('-'))
+}
+
+fn has_receipt_bucket(node: &Value) -> bool {
+    [
+        "seens",
+        "seenMsgs",
+        "seen_msgs",
+        "groupSeens",
+        "group_seens",
+        "delivereds",
+        "deliverMsgs",
+        "deliver_msgs",
+        "deliveredMsgs",
+        "groupDelivereds",
+        "group_delivereds",
+    ]
+    .iter()
+    .any(|k| node.get(*k).is_some())
+}
+
+fn parse_clear_unread_item(
+    item: &Value,
+    default_group: bool,
+    my_uid: &str,
+    send2me_id: &str,
+    out: &mut Vec<WsParsedAction>,
+) {
+    // Zalo `clearUnreads` entries use `type == 0` (or omitted) for message unread clears;
+    // `type == 1` is `CLEAR_UNREAD_TYPE.REACTION`, and `type == 2` arrives with sentinel `idTo: "-1"`.
+    if let Some(raw_type) = item.get("type") {
+        let parsed_type = raw_type
+            .as_i64()
+            .or_else(|| raw_type.as_str().and_then(|s| s.trim().parse::<i64>().ok()));
+        if parsed_type.is_some_and(|t| t != 0) {
+            return;
+        }
+    }
+
+    let is_group = default_group
+        || is_group_flag(item)
+        || item.get("grid").is_some()
+        || item.get("groupId").is_some();
+
+    let raw_id = if is_group {
+        pick_str(
+            item,
+            &[
+                "idTo",
+                "grid",
+                "groupId",
+                "toid",
+                "toId",
+                "threadId",
+                "conversId",
+                "id",
+            ],
+        )
+    } else {
+        pick_str(
+            item,
+            &[
+                "idTo",
+                "toid",
+                "toId",
+                "threadId",
+                "conversId",
+                "userId",
+                "uid",
+                "id",
+            ],
+        )
+    };
+    let Some(raw_id) = raw_id else {
+        return;
+    };
+    let trimmed = raw_id.trim();
+    if trimmed.is_empty() || trimmed.starts_with('-') {
+        return;
+    }
+
+    let thread_id = if is_group
+        || trimmed.starts_with("group_")
+        || trimmed.starts_with('g')
+        || trimmed.starts_with('G')
+    {
+        clean_group_id(trimmed).to_string()
+    } else {
+        let clean = clean_bare_uid(trimmed);
+        if !send2me_id.is_empty() && (clean == "0" || (!my_uid.is_empty() && clean == my_uid)) {
+            send2me_id.to_string()
+        } else {
+            clean
+        }
+    };
+    if thread_id.is_empty()
+        || thread_id == "0"
+        || thread_id.starts_with('-')
+        || (!is_group
+            && !my_uid.is_empty()
+            && thread_id == my_uid
+            && send2me_id.is_empty())
+    {
+        return;
+    }
+
+    out.push(WsParsedAction::Read {
+        thread_id,
+        is_unread: false,
+        last_msg_id: pick_receipt_last_msg_id(item),
+    });
+}
+
+fn collect_clear_unreads_from_node(
+    node: &Value,
+    default_group: bool,
+    my_uid: &str,
+    send2me_id: &str,
+    out: &mut Vec<WsParsedAction>,
+) {
+    let mut visited = false;
+    for key in ["clearUnreads", "clear_unreads"] {
+        if let Some(raw) = node.get(key) {
+            visited = true;
+            let unwrapped = unwrap_json_value(raw);
+            if let Some(arr) = unwrapped.as_array() {
+                for item in arr {
+                    parse_clear_unread_item(item, default_group, my_uid, send2me_id, out);
+                }
+            }
+        }
+    }
+    if !visited {
+        if let Some(inner) = node.get("data") {
+            let unwrapped = unwrap_json_value(inner);
+            if unwrapped.is_object() {
+                for key in ["clearUnreads", "clear_unreads"] {
+                    if let Some(raw) = unwrapped.get(key) {
+                        let arr_val = unwrap_json_value(raw);
+                        if let Some(arr) = arr_val.as_array() {
+                            for item in arr {
+                                parse_clear_unread_item(
+                                    item,
+                                    default_group,
+                                    my_uid,
+                                    send2me_id,
+                                    out,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn extract_seen_uids(item: &Value) -> Option<Vec<String>> {
     let raw = item.get("seenUids").or_else(|| item.get("seen_uids"))?;
     let unwrapped = unwrap_json_value(raw);
@@ -1565,6 +1798,7 @@ fn parse_receipt_item(
 
     let is_self_flag = has_truthy_self_flag(item);
     let seen_uids = extract_seen_uids(item);
+    let last_msg_id = pick_receipt_last_msg_id(item);
 
     if is_group {
         let Some(raw_gid) = pick_str(
@@ -1574,23 +1808,20 @@ fn parse_receipt_item(
             return;
         };
         let thread_id = clean_group_id(&raw_gid).to_string();
-        if thread_id.is_empty() || thread_id == "0" {
+        if thread_id.is_empty() || thread_id == "0" || thread_id.starts_with('-') {
             return;
         }
 
         let (has_self, has_peer) = if let Some(ref uids) = seen_uids {
-            let self_in_list = !my_uid.is_empty() && uids.iter().any(|u| is_self_uid(u, my_uid));
-            let peer_in_list = uids.iter().any(|u| {
-                !u.is_empty() && u != "0" && (my_uid.is_empty() || !is_self_uid(u, my_uid))
-            });
+            let self_in_list = uids.iter().any(|u| is_self_receipt_uid(u, my_uid));
+            let peer_in_list = uids.iter().any(|u| is_peer_receipt_uid(u, my_uid));
             (is_self_flag || self_in_list, peer_in_list)
         } else {
             let uid_from = pick_str(item, &["uidFrom", "fromUid", "fromId"]).unwrap_or_default();
-            let self_from = !my_uid.is_empty() && is_self_uid(&uid_from, my_uid);
+            let self_from = is_self_receipt_uid(&uid_from, my_uid);
             let has_self = is_self_flag || self_from;
-            let has_peer = !has_self
-                && (uid_from.is_empty()
-                    || (uid_from != "0" && (my_uid.is_empty() || !is_self_uid(&uid_from, my_uid))));
+            let has_peer =
+                !has_self && (uid_from.is_empty() || is_peer_receipt_uid(&uid_from, my_uid));
             (has_self, has_peer)
         };
 
@@ -1598,6 +1829,7 @@ fn parse_receipt_item(
             out.push(WsParsedAction::Read {
                 thread_id: thread_id.clone(),
                 is_unread: false,
+                last_msg_id: last_msg_id.clone(),
             });
         }
         if has_peer {
@@ -1625,19 +1857,18 @@ fn parse_receipt_item(
         ]
         .iter()
         .filter_map(|k| pick_str(item, &[k]))
-        .find(|s| !s.is_empty() && s != "0" && (my_uid.is_empty() || !is_self_uid(s, my_uid)))
+        .map(|s| clean_bare_uid(&s))
+        .find(|s| is_peer_receipt_uid(s, my_uid))
         .or_else(|| extract_thread_id(item, false, my_uid, send2me_id).map(|(t, _)| t)) else {
             return;
         };
-        let has_self = is_self_flag
-            || (!my_uid.is_empty() && uids.iter().any(|u| is_self_uid(u, my_uid)));
-        let has_peer = uids
-            .iter()
-            .any(|u| !u.is_empty() && u != "0" && (my_uid.is_empty() || !is_self_uid(u, my_uid)));
+        let has_self = is_self_flag || uids.iter().any(|u| is_self_receipt_uid(u, my_uid));
+        let has_peer = uids.iter().any(|u| is_peer_receipt_uid(u, my_uid));
         if is_seen && has_self {
             out.push(WsParsedAction::Read {
                 thread_id: thread_id.clone(),
                 is_unread: false,
+                last_msg_id: last_msg_id.clone(),
             });
         }
         if has_peer {
@@ -1651,7 +1882,7 @@ fn parse_receipt_item(
     }
 
     let uid_from = pick_str(item, &["uidFrom", "fromUid", "fromId"]).unwrap_or_default();
-    let reader_is_self = is_self_flag || (!my_uid.is_empty() && is_self_uid(&uid_from, my_uid));
+    let reader_is_self = is_self_flag || is_self_receipt_uid(&uid_from, my_uid);
 
     if reader_is_self {
         if !is_seen {
@@ -1670,11 +1901,27 @@ fn parse_receipt_item(
         ]
         .iter()
         .filter_map(|k| pick_str(item, &[k]))
-        .find(|s| !s.is_empty() && s != "0" && (my_uid.is_empty() || !is_self_uid(s, my_uid)));
+        .map(|s| clean_bare_uid(&s))
+        .find(|s| is_peer_receipt_uid(s, my_uid))
+        .or_else(|| {
+            if !send2me_id.is_empty() {
+                let id_to = pick_str(item, &["idTo", "toid", "toId"])
+                    .map(|s| clean_bare_uid(&s))
+                    .unwrap_or_default();
+                if id_to == send2me_id
+                    || id_to == "0"
+                    || (!my_uid.is_empty() && id_to == my_uid)
+                {
+                    return Some(send2me_id.to_string());
+                }
+            }
+            None
+        });
         if let Some(thread_id) = target_thread {
             out.push(WsParsedAction::Read {
                 thread_id,
                 is_unread: false,
+                last_msg_id,
             });
         }
         return;
@@ -1693,7 +1940,8 @@ fn parse_receipt_item(
     ]
     .iter()
     .filter_map(|k| pick_str(item, &[k]))
-    .find(|s| !s.is_empty() && s != "0" && (my_uid.is_empty() || !is_self_uid(s, my_uid)))
+    .map(|s| clean_bare_uid(&s))
+    .find(|s| is_peer_receipt_uid(s, my_uid))
     .or_else(|| extract_thread_id(item, false, my_uid, send2me_id).map(|(t, _)| t)) else {
         return;
     };
@@ -1713,22 +1961,40 @@ fn collect_receipts_from_node(
     send2me_id: &str,
     out: &mut Vec<WsParsedAction>,
 ) {
-    let buckets = [
-        ("seenMsgs", true),
-        ("seen_msgs", true),
-        ("deliverMsgs", false),
-        ("deliver_msgs", false),
+    let buckets: &[(&str, bool, Option<bool>)] = &[
+        ("seens", true, None),
+        ("seenMsgs", true, None),
+        ("seen_msgs", true, None),
+        ("groupSeens", true, Some(true)),
+        ("group_seens", true, Some(true)),
+        ("delivereds", false, None),
+        ("deliverMsgs", false, None),
+        ("deliver_msgs", false, None),
+        ("deliveredMsgs", false, None),
+        ("groupDelivereds", false, Some(true)),
+        ("group_delivereds", false, Some(true)),
     ];
     let mut matched_bucket = false;
-    for (key, is_seen) in buckets {
-        if let Some(arr) = node.get(key).and_then(Value::as_array) {
-            matched_bucket = true;
-            for item in arr {
-                parse_receipt_item(item, is_group_cmd, is_seen, my_uid, send2me_id, out);
+    for (key, is_seen, force_group) in buckets {
+        if let Some(raw) = node.get(*key) {
+            let unwrapped = unwrap_json_value(raw);
+            if let Some(arr) = unwrapped.as_array() {
+                matched_bucket = true;
+                let bucket_group = force_group.unwrap_or(is_group_cmd);
+                for item in arr {
+                    parse_receipt_item(item, bucket_group, *is_seen, my_uid, send2me_id, out);
+                }
             }
         }
     }
     if matched_bucket {
+        return;
+    }
+    if node.get("clearUnreads").is_some()
+        || node.get("clear_unreads").is_some()
+        || node.get("msgs").is_some()
+        || node.get("groupMsgs").is_some()
+    {
         return;
     }
 
@@ -2035,6 +2301,7 @@ pub(crate) fn collect_reactions_from_node(
 
 fn has_controls_array(v: &Value) -> bool {
     v.get("controls").and_then(Value::as_array).is_some()
+        || v.get("actions").and_then(Value::as_array).is_some()
 }
 
 fn value_wraps_controls(v: &Value) -> bool {
@@ -2279,11 +2546,19 @@ fn emit_read_control_actions(
     send2me_id: &str,
     out: &mut Vec<WsParsedAction>,
 ) {
+    if !is_unread
+        && (data_node.get("clearUnreads").is_some() || data_node.get("clear_unreads").is_some())
+    {
+        let is_group = is_group_flag(data_node) || is_group_flag(outer_item);
+        collect_clear_unreads_from_node(data_node, is_group, my_uid, send2me_id, out);
+        return;
+    }
     if let Some(batch_ids) = extract_batch_thread_ids(data_node, my_uid) {
         for thread_id in batch_ids {
             out.push(WsParsedAction::Read {
                 thread_id,
                 is_unread,
+                last_msg_id: None,
             });
         }
         return;
@@ -2293,6 +2568,11 @@ fn emit_read_control_actions(
         out.push(WsParsedAction::Read {
             thread_id: tid,
             is_unread,
+            last_msg_id: if is_unread {
+                None
+            } else {
+                pick_receipt_last_msg_id(data_node)
+            },
         });
     }
 }
@@ -2474,12 +2754,21 @@ fn collect_controls_from_node(
 ) {
     let effective = unwrap_control_container(node);
     let mut items: Vec<&Value> = Vec::new();
+    let mut matched_bucket = false;
     if let Some(arr) = effective.get("controls").and_then(Value::as_array) {
+        matched_bucket = true;
         items.extend(arr.iter());
-    } else if let Some(arr) = effective.as_array() {
+    }
+    if let Some(arr) = effective.get("actions").and_then(Value::as_array) {
+        matched_bucket = true;
         items.extend(arr.iter());
-    } else if effective.is_object() {
-        items.push(effective);
+    }
+    if !matched_bucket {
+        if let Some(arr) = effective.as_array() {
+            items.extend(arr.iter());
+        } else if effective.is_object() {
+            items.push(effective);
+        }
     }
 
     for item in items {
@@ -2496,16 +2785,25 @@ fn collect_controls_from_node(
             }
             continue;
         }
-        let effective_act = if matches!(act_type.as_str(), "unread_mark" | "convers")
+        let effective_act = if matches!(act_type.as_str(), "unread_mark" | "convers" | "conv")
             && !sub_act.is_empty()
         {
             match sub_act.as_str() {
-                "remove" | "remove_unread_mark" | "remove-unread-mark" | "read" | "mark_read" => {
-                    "remove_unread_mark"
-                }
-                "add" | "add_unread_mark" | "add-unread-mark" | "unread" | "mark_unread" => {
-                    "add_unread_mark"
-                }
+                "remove"
+                | "remove_unread_mark"
+                | "remove-unread-mark"
+                | "removeunreadmark"
+                | "read"
+                | "mark_read"
+                | "clear_unread"
+                | "clearunread"
+                | "clear_unreads" => "remove_unread_mark",
+                "add"
+                | "add_unread_mark"
+                | "add-unread-mark"
+                | "addunreadmark"
+                | "unread"
+                | "mark_unread" => "add_unread_mark",
                 other => other,
             }
         } else {
@@ -2527,7 +2825,9 @@ fn collect_controls_from_node(
             parse_reaction_item(&data_node, is_group, my_uid, send2me_id, out);
         } else if matches!(effective_act, "seen_msg" | "read_receipt") {
             let is_group = is_group_flag(&data_node) || is_group_flag(item);
-            if data_node.get("seenMsgs").is_some() || data_node.get("seen_msgs").is_some() {
+            if data_node.get("clearUnreads").is_some() || data_node.get("clear_unreads").is_some() {
+                collect_clear_unreads_from_node(&data_node, is_group, my_uid, send2me_id, out);
+            } else if has_receipt_bucket(&data_node) {
                 collect_receipts_from_node(&data_node, is_group, true, my_uid, send2me_id, out);
             } else if extract_seen_uids(&data_node).is_some() {
                 parse_receipt_item(&data_node, is_group, true, my_uid, send2me_id, out);
@@ -2553,22 +2853,30 @@ fn collect_controls_from_node(
                 | "read_msg"
                 | "mark_read"
                 | "mark_as_read"
+                | "clear_unread"
+                | "clearunread"
+                | "clear_unreads"
                 | "remove_unread_mark"
                 | "remove-unread-mark"
+                | "removeunreadmark"
                 | "unread"
                 | "add_unread_mark"
                 | "add-unread-mark"
+                | "addunreadmark"
                 | "mark_unread"
                 | "mark_as_unread"
         ) {
             let is_unread = matches!(
                 effective_act,
-                "unread" | "add_unread_mark" | "add-unread-mark" | "mark_unread" | "mark_as_unread"
+                "unread"
+                    | "add_unread_mark"
+                    | "add-unread-mark"
+                    | "addunreadmark"
+                    | "mark_unread"
+                    | "mark_as_unread"
             );
             let is_group = is_group_flag(&data_node) || is_group_flag(item);
-            if effective_act == "seen"
-                && (data_node.get("seenMsgs").is_some() || data_node.get("seen_msgs").is_some())
-            {
+            if effective_act == "seen" && has_receipt_bucket(&data_node) {
                 collect_receipts_from_node(&data_node, is_group, true, my_uid, send2me_id, out);
             } else if effective_act == "seen" && extract_seen_uids(&data_node).is_some() {
                 parse_receipt_item(&data_node, is_group, true, my_uid, send2me_id, out);
@@ -2599,6 +2907,10 @@ fn collect_controls_from_node(
                     );
                 }
             }
+        } else if data_node.get("clearUnreads").is_some() || data_node.get("clear_unreads").is_some()
+        {
+            let is_group = is_group_flag(&data_node) || is_group_flag(item);
+            collect_clear_unreads_from_node(&data_node, is_group, my_uid, send2me_id, out);
         }
     }
 }
@@ -2759,11 +3071,11 @@ mod tests {
         ));
         assert!(matches!(
             &actions[1],
-            WsParsedAction::Read { thread_id, is_unread } if thread_id == "999" && !*is_unread
+            WsParsedAction::Read { thread_id, is_unread, .. } if thread_id == "999" && !*is_unread
         ));
         assert!(matches!(
             &actions[2],
-            WsParsedAction::Read { thread_id, is_unread } if thread_id == "888" && *is_unread
+            WsParsedAction::Read { thread_id, is_unread, .. } if thread_id == "888" && *is_unread
         ));
     }
 
@@ -2905,7 +3217,7 @@ mod tests {
         assert_eq!(a2.len(), 3);
         assert!(matches!(
             &a2[0],
-            WsParsedAction::Read { thread_id, is_unread }
+            WsParsedAction::Read { thread_id, is_unread, .. }
                 if thread_id == "888111" && !*is_unread
         ));
         assert!(matches!(
@@ -2915,7 +3227,7 @@ mod tests {
         ));
         assert!(matches!(
             &a2[2],
-            WsParsedAction::Read { thread_id, is_unread }
+            WsParsedAction::Read { thread_id, is_unread, .. }
                 if thread_id == "888222" && !*is_unread
         ));
 
@@ -3531,15 +3843,15 @@ mod tests {
         assert_eq!(actions.len(), 4);
         assert!(matches!(
             &actions[0],
-            WsParsedAction::Read { thread_id, is_unread } if thread_id == "999" && !*is_unread
+            WsParsedAction::Read { thread_id, is_unread, .. } if thread_id == "999" && !*is_unread
         ));
         assert!(matches!(
             &actions[1],
-            WsParsedAction::Read { thread_id, is_unread } if thread_id == "888" && !*is_unread
+            WsParsedAction::Read { thread_id, is_unread, .. } if thread_id == "888" && !*is_unread
         ));
         assert!(matches!(
             &actions[2],
-            WsParsedAction::Read { thread_id, is_unread } if thread_id == "777" && !*is_unread
+            WsParsedAction::Read { thread_id, is_unread, .. } if thread_id == "777" && !*is_unread
         ));
         assert!(matches!(
             &actions[3],
@@ -3585,7 +3897,7 @@ mod tests {
         assert_eq!(actions.len(), 7);
         assert!(matches!(
             &actions[0],
-            WsParsedAction::Read { thread_id, is_unread } if thread_id == "888111" && !*is_unread
+            WsParsedAction::Read { thread_id, is_unread, .. } if thread_id == "888111" && !*is_unread
         ));
         assert!(matches!(
             &actions[1],
@@ -3594,7 +3906,7 @@ mod tests {
         ));
         assert!(matches!(
             &actions[2],
-            WsParsedAction::Read { thread_id, is_unread } if thread_id == "888333" && !*is_unread
+            WsParsedAction::Read { thread_id, is_unread, .. } if thread_id == "888333" && !*is_unread
         ));
         assert!(matches!(
             &actions[3],
@@ -3603,11 +3915,11 @@ mod tests {
         ));
         assert!(matches!(
             &actions[4],
-            WsParsedAction::Read { thread_id, is_unread } if thread_id == "888444" && !*is_unread
+            WsParsedAction::Read { thread_id, is_unread, .. } if thread_id == "888444" && !*is_unread
         ));
         assert!(matches!(
             &actions[5],
-            WsParsedAction::Read { thread_id, is_unread } if thread_id == "888555" && !*is_unread
+            WsParsedAction::Read { thread_id, is_unread, .. } if thread_id == "888555" && !*is_unread
         ));
         assert!(matches!(
             &actions[6],
@@ -3680,11 +3992,11 @@ mod tests {
         assert_eq!(actions.len(), 12);
         assert!(matches!(
             &actions[0],
-            WsParsedAction::Read { thread_id, is_unread } if thread_id == "999" && !*is_unread
+            WsParsedAction::Read { thread_id, is_unread, .. } if thread_id == "999" && !*is_unread
         ));
         assert!(matches!(
             &actions[1],
-            WsParsedAction::Read { thread_id, is_unread } if thread_id == "888" && !*is_unread
+            WsParsedAction::Read { thread_id, is_unread, .. } if thread_id == "888" && !*is_unread
         ));
         assert!(matches!(
             &actions[2],
@@ -3693,7 +4005,7 @@ mod tests {
         ));
         assert!(matches!(
             &actions[3],
-            WsParsedAction::Read { thread_id, is_unread } if thread_id == "555111" && !*is_unread
+            WsParsedAction::Read { thread_id, is_unread, .. } if thread_id == "555111" && !*is_unread
         ));
         assert!(matches!(
             &actions[4],
@@ -3702,27 +4014,27 @@ mod tests {
         ));
         assert!(matches!(
             &actions[5],
-            WsParsedAction::Read { thread_id, is_unread } if thread_id == "101" && !*is_unread
+            WsParsedAction::Read { thread_id, is_unread, .. } if thread_id == "101" && !*is_unread
         ));
         assert!(matches!(
             &actions[6],
-            WsParsedAction::Read { thread_id, is_unread } if thread_id == "102" && !*is_unread
+            WsParsedAction::Read { thread_id, is_unread, .. } if thread_id == "102" && !*is_unread
         ));
         assert!(matches!(
             &actions[7],
-            WsParsedAction::Read { thread_id, is_unread } if thread_id == "601" && !*is_unread
+            WsParsedAction::Read { thread_id, is_unread, .. } if thread_id == "601" && !*is_unread
         ));
         assert!(matches!(
             &actions[8],
-            WsParsedAction::Read { thread_id, is_unread } if thread_id == "602" && !*is_unread
+            WsParsedAction::Read { thread_id, is_unread, .. } if thread_id == "602" && !*is_unread
         ));
         assert!(matches!(
             &actions[9],
-            WsParsedAction::Read { thread_id, is_unread } if thread_id == "201" && *is_unread
+            WsParsedAction::Read { thread_id, is_unread, .. } if thread_id == "201" && *is_unread
         ));
         assert!(matches!(
             &actions[10],
-            WsParsedAction::Read { thread_id, is_unread } if thread_id == "701" && *is_unread
+            WsParsedAction::Read { thread_id, is_unread, .. } if thread_id == "701" && *is_unread
         ));
         assert!(matches!(
             &actions[11],
@@ -4202,6 +4514,212 @@ mod tests {
                     && emoji.as_deref() == Some("❤️")
                     && !*me
                     && !*removed
+        ));
+    }
+
+    #[test]
+    fn parses_ws_504_and_524_clear_unreads_from_mobile_and_desktop() {
+        let ev_504 = WsEvent {
+            cmd: CMD_CLEAR_UNREAD_1_1,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "clearUnreads": [
+                        { "idTo": "999001", "isGroup": 0, "lastMsgId": "7451001", "ts": 0, "type": 0 },
+                        { "idTo": "999002", "isGroup": 0, "lastMsgId": "7451002", "ts": 0, "type": 1 },
+                        { "idTo": "-1", "isGroup": 0, "lastMsgId": "0", "ts": 0, "type": 2 },
+                        { "idTo": "0", "isGroup": 0, "lastMsgId": "7451003", "ts": 0, "type": 0 }
+                    ],
+                    "msgs": [],
+                    "groupMsgs": [],
+                    "more": 0
+                }
+            }),
+        };
+        let a_504 = parse_ws_event(&ev_504, "456", "cloud_456");
+        assert_eq!(a_504.len(), 2);
+        assert!(matches!(
+            &a_504[0],
+            WsParsedAction::Read { thread_id, is_unread, last_msg_id }
+                if thread_id == "999001"
+                    && !*is_unread
+                    && last_msg_id.as_deref() == Some("7451001")
+        ));
+        assert!(matches!(
+            &a_504[1],
+            WsParsedAction::Read { thread_id, is_unread, last_msg_id }
+                if thread_id == "cloud_456"
+                    && !*is_unread
+                    && last_msg_id.as_deref() == Some("7451003")
+        ));
+
+        let ev_524 = WsEvent {
+            cmd: CMD_CLEAR_UNREAD_GROUP,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "clearUnreads": [
+                        { "idTo": "g888777", "isGroup": 1, "lastMsgId": "7452001", "ts": 0, "type": 0 },
+                        { "idTo": "888778", "isGroup": 1, "lastMsgId": "7452002", "ts": 0, "type": 0 },
+                        { "idTo": "888779", "isGroup": 1, "lastMsgId": "7452003", "ts": 0, "type": 1 }
+                    ],
+                    "msgs": [],
+                    "groupMsgs": [],
+                    "more": 0
+                }
+            }),
+        };
+        let a_524 = parse_ws_event(&ev_524, "456", "");
+        assert_eq!(a_524.len(), 2);
+        assert!(matches!(
+            &a_524[0],
+            WsParsedAction::Read { thread_id, is_unread, last_msg_id }
+                if thread_id == "888777"
+                    && !*is_unread
+                    && last_msg_id.as_deref() == Some("7452001")
+        ));
+        assert!(matches!(
+            &a_524[1],
+            WsParsedAction::Read { thread_id, is_unread, last_msg_id }
+                if thread_id == "888778"
+                    && !*is_unread
+                    && last_msg_id.as_deref() == Some("7452002")
+        ));
+    }
+
+    #[test]
+    fn parses_ws_502_seens_522_group_seens_uid_zero_and_602_actions() {
+        // Real Zalo cmd 502: `seens` for peer read vs explicit `uidFrom: "0"` self read
+        let ev_502 = WsEvent {
+            cmd: CMD_DELIVERED_1_1,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "delivereds": [],
+                    "seens": [
+                        { "idTo": "999", "msgId": "5001", "realMsgId": "5001" },
+                        { "uidFrom": "0", "idTo": "888", "msgId": "5002" }
+                    ]
+                }
+            }),
+        };
+        let a_502 = parse_ws_event(&ev_502, "456", "");
+        assert_eq!(a_502.len(), 2);
+        assert!(matches!(
+            &a_502[0],
+            WsParsedAction::PeerSeen { thread_id, is_delivered_only, .. }
+                if thread_id == "999" && !*is_delivered_only
+        ));
+        assert!(matches!(
+            &a_502[1],
+            WsParsedAction::Read { thread_id, is_unread, last_msg_id }
+                if thread_id == "888" && !*is_unread && last_msg_id.as_deref() == Some("5002")
+        ));
+
+        // Real Zalo cmd 522: `groupSeens` containing own uid and `"0"`
+        let ev_522 = WsEvent {
+            cmd: CMD_DELIVERED_GROUP,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "delivereds": [],
+                    "groupSeens": [
+                        { "msgId": "6001", "groupId": "g777001", "seenUids": ["456"] },
+                        { "msgId": "6002", "groupId": "777002", "seenUids": ["0", "333"] }
+                    ]
+                }
+            }),
+        };
+        let a_522 = parse_ws_event(&ev_522, "456", "");
+        assert_eq!(a_522.len(), 3);
+        assert!(matches!(
+            &a_522[0],
+            WsParsedAction::Read { thread_id, is_unread, last_msg_id }
+                if thread_id == "777001" && !*is_unread && last_msg_id.as_deref() == Some("6001")
+        ));
+        assert!(matches!(
+            &a_522[1],
+            WsParsedAction::Read { thread_id, is_unread, last_msg_id }
+                if thread_id == "777002" && !*is_unread && last_msg_id.as_deref() == Some("6002")
+        ));
+        assert!(matches!(
+            &a_522[2],
+            WsParsedAction::PeerSeen { thread_id, is_delivered_only, .. }
+                if thread_id == "777002" && !*is_delivered_only
+        ));
+
+        // Real Zalo cmd 602: `actions` wrapper carrying unread-mark updates
+        let ev_602 = WsEvent {
+            cmd: CMD_CTRL_ACTION,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "actions": [
+                        {
+                            "act_type": "conv",
+                            "act": "removeUnreadMark",
+                            "data": "{\"convsUser\":[\"111\"],\"convsGroup\":[\"g222\"]}"
+                        },
+                        {
+                            "act_type": "conv",
+                            "act": "addUnreadMark",
+                            "data": "{\"convsUser\":[\"333\"],\"convsGroup\":[]}"
+                        }
+                    ]
+                }
+            }),
+        };
+        let a_602 = parse_ws_event(&ev_602, "456", "");
+        assert_eq!(a_602.len(), 3);
+        assert!(matches!(
+            &a_602[0],
+            WsParsedAction::Read { thread_id, is_unread, .. } if thread_id == "111" && !*is_unread
+        ));
+        assert!(matches!(
+            &a_602[1],
+            WsParsedAction::Read { thread_id, is_unread, .. } if thread_id == "222" && !*is_unread
+        ));
+        assert!(matches!(
+            &a_602[2],
+            WsParsedAction::Read { thread_id, is_unread, .. } if thread_id == "333" && *is_unread
+        ));
+
+        // Offline pull cmd 510 containing both `msgs` and `clearUnreads`: msgs emitted before clear
+        let ev_510 = WsEvent {
+            cmd: CMD_PULL_MSG_1_1,
+            sub_cmd: 1,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "msgs": [
+                        {
+                            "msgId": "7001",
+                            "cliMsgId": "1780000007001",
+                            "uidFrom": "999",
+                            "idTo": "456",
+                            "msgType": "chat.text",
+                            "content": "Already read on phone",
+                            "ts": "1780000007001"
+                        }
+                    ],
+                    "clearUnreads": [
+                        { "idTo": "999", "isGroup": 0, "lastMsgId": "7001", "ts": 0, "type": 0 }
+                    ]
+                }
+            }),
+        };
+        let a_510 = parse_ws_event(&ev_510, "456", "");
+        assert_eq!(a_510.len(), 2);
+        assert!(matches!(&a_510[0], WsParsedAction::Message(m) if m.msg_id == "7001"));
+        assert!(matches!(
+            &a_510[1],
+            WsParsedAction::Read { thread_id, is_unread, last_msg_id }
+                if thread_id == "999" && !*is_unread && last_msg_id.as_deref() == Some("7001")
         ));
     }
 }
