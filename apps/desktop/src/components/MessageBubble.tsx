@@ -58,7 +58,12 @@ import {
   parseReminderPayload,
 } from "../utils/richMessage";
 import { tokenizeMentions, type MentionCandidate } from "../utils/mentions";
-import { getDisplayBodyText, splitTextLinks } from "../utils/threadState";
+import {
+  QUICK_REACTION_EMOJIS,
+  getDisplayBodyText,
+  normalizeReactions,
+  splitTextLinks,
+} from "../utils/threadState";
 import { RelayAudio, RelayImage, RelayVideo } from "./RelayImage";
 import { ThreadAvatar } from "./ThreadAvatar";
 
@@ -71,8 +76,6 @@ export interface MessageTranslationState {
   skipped?: boolean;
   note?: string;
 }
-
-const QUICK_EMOJIS = ["👍", "❤️", "😆", "😮", "😢", "😠"];
 
 interface Props {
   msg: MessageDto;
@@ -488,6 +491,8 @@ export const MessageBubble = memo(function MessageBubble({
         Boolean(translation.error) ||
         Boolean(translation.note)),
   );
+  const visibleReactions = normalizeReactions(msg.reactions);
+  const canInteractReactions = !selectMode && !msg.is_recalled && !msg.send_status;
   const useInlineMeta = Boolean(
     displayText &&
       !isBuzz &&
@@ -495,7 +500,7 @@ export const MessageBubble = memo(function MessageBubble({
       !isRichCard &&
       !isPlainSticker &&
       !hasTranslationPanel &&
-      msg.reactions.length === 0 &&
+      visibleReactions.length === 0 &&
       !isReplaced &&
       !(replaceWithTranslation && translation?.loading) &&
       msg.send_status !== "failed" &&
@@ -695,11 +700,13 @@ export const MessageBubble = memo(function MessageBubble({
               border: "1px solid var(--border-subtle)",
             }}
           >
-            {QUICK_EMOJIS.map((emoji) => {
-              const active = msg.reactions.some((r) => r.emoji === emoji && r.me);
+            {QUICK_REACTION_EMOJIS.map((emoji) => {
+              const active = visibleReactions.some((r) => r.emoji === emoji && r.me);
               return (
                 <button
                   key={emoji}
+                  type="button"
+                  aria-pressed={active}
                   onClick={() => {
                     onReact(msg, emoji);
                     setPickerPos(null);
@@ -1396,16 +1403,30 @@ export const MessageBubble = memo(function MessageBubble({
           </span>
         ) : (
           <div className="mt-0.5 flex items-center justify-end gap-2">
-            {msg.reactions.length > 0 && (
+            {visibleReactions.length > 0 && (
               <div className="mr-auto flex flex-wrap gap-1">
-                {msg.reactions.map((r) => (
+                {visibleReactions.map((r) => (
                   <button
                     key={r.emoji}
-                    onClick={() => onReact(msg, r.emoji)}
-                    className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[13px] transition hover:opacity-85"
+                    type="button"
+                    disabled={!canInteractReactions}
+                    aria-pressed={r.me}
+                    title={
+                      r.me
+                        ? t("reactToggleRemoveTitle")
+                        : t("reactWithTitle", { emoji: r.emoji })
+                    }
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (!canInteractReactions) return;
+                      onReact(msg, r.emoji);
+                    }}
+                    className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[13px] transition hover:opacity-85 disabled:cursor-default disabled:hover:opacity-100"
                     style={{
                       background: r.me ? "var(--accent-soft)" : "var(--chip-bg)",
                       border: r.me ? "1px solid var(--accent)" : "1px solid var(--chip-border)",
+                      color: r.me ? "var(--accent)" : undefined,
+                      fontWeight: r.me ? 600 : undefined,
                     }}
                   >
                     <EmojiGlyph emoji={r.emoji} size={16} animated={false} />

@@ -56,6 +56,19 @@ impl VoipControlEvent {
     }
 }
 
+/// Zalo WebSocket command IDs that carry real-time (`612`) or pulled (`610`/`611`) message reactions.
+pub const CMD_REACTION_PULL_1_1: u16 = 610;
+pub const CMD_REACTION_PULL_GROUP: u16 = 611;
+pub const CMD_REACTION_PUSH: u16 = 612;
+
+/// Returns `true` for Zalo WebSocket command IDs carrying live or queued reaction frames.
+pub fn is_reaction_ws_cmd(cmd: u16) -> bool {
+    matches!(
+        cmd,
+        CMD_REACTION_PULL_1_1 | CMD_REACTION_PULL_GROUP | CMD_REACTION_PUSH
+    )
+}
+
 #[derive(Debug, Clone)]
 pub enum WsParsedAction {
     Message(Box<MessageDto>),
@@ -69,6 +82,8 @@ pub enum WsParsedAction {
     Reaction {
         thread_id: String,
         msg_id: String,
+        cli_msg_id: Option<String>,
+        actor_id: Option<String>,
         emoji: Option<String>,
         me: bool,
         removed: bool,
@@ -858,16 +873,124 @@ fn extract_attachment(v: &Value, msg_type: &str) -> (Option<String>, Option<Stri
 }
 
 pub fn try_reaction_code_to_emoji(code: &str) -> Option<&'static str> {
-    match code.trim() {
-        "" | "/-none" | "/-remove" | "none" => None,
-        "/-strong" | "👍" => Some("👍"),
-        "/-heart" | "❤" | "❤️" => Some("❤️"),
-        ":>" | "😆" => Some("😆"),
-        ":o" | "😮" => Some("😮"),
-        ":-((" | "😢" => Some("😢"),
-        ":-h" | "😠" => Some("😠"),
-        _ => Some("❤️"),
+    let trimmed = code.trim();
+    if trimmed.is_empty()
+        || matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "/-none" | "/-remove" | "none"
+        )
+    {
+        return None;
     }
+    match trimmed {
+        "/-strong" | "👍" => Some("👍"),
+        "/-heart" | "❤" | "❤️" | "/-loveu" => Some("❤️"),
+        ":>" | ":))" | "😆" => Some("😆"),
+        ":o" | ":-o" | "😮" => Some("😮"),
+        ":-((" | ":((" | "--b" | "p-(" | ":-<" | "😢" | "😭" => Some("😢"),
+        ":-h" | ">-|" | "😠" | "😡" => Some("😠"),
+        ":-*" | "😘" => Some("😘"),
+        ":')" | "😂" => Some("😂"),
+        "/-shit" | "💩" => Some("💩"),
+        "/-rose" | "🌹" => Some("🌹"),
+        "/-break" | "💔" => Some("💔"),
+        "/-weak" | "/-bad" | "👎" => Some("👎"),
+        ";xx" | "😍" => Some("😍"),
+        ";-/" | "😕" => Some("😕"),
+        ";-)" | "😉" => Some("😉"),
+        "/-fade" | "🥀" => Some("🥀"),
+        "/-li" | "☀" | "☀️" => Some("☀️"),
+        "/-bd" | "🎂" => Some("🎂"),
+        "/-bome" | "💣" => Some("💣"),
+        "/-ok" | "👌" => Some("👌"),
+        "/-v" | "✌" | "✌️" => Some("✌️"),
+        "/-thanks" | "_()_" | "🙏" => Some("🙏"),
+        "/-punch" | "👊" => Some("👊"),
+        "/-no" | "🙅" => Some("🙅"),
+        "x-)" | "b-)" | "😎" => Some("😎"),
+        "8-)" | "🤓" => Some("🤓"),
+        ";-d" | "😁" => Some("😁"),
+        ":--|" | "😐" => Some("😐"),
+        ":-bye" | "👋" => Some("👋"),
+        "|-)" | "😴" => Some("😴"),
+        ":handclap" | "👏" => Some("👏"),
+        ";-x" | "🤐" => Some("🤐"),
+        ";-s" | "😳" => Some("😳"),
+        ";-a" | "😨" => Some("😨"),
+        "$-)" | "🤑" => Some("🤑"),
+        "/-beer" | "🍺" => Some("🍺"),
+        _ => None,
+    }
+}
+
+pub fn reaction_type_to_emoji(r_type: i64) -> Option<&'static str> {
+    match r_type {
+        5 | 133 => Some("❤️"),
+        3 => Some("👍"),
+        0 | 62 => Some("😆"),
+        32 | 53 => Some("😮"),
+        2 | 1 | 16 | 35 | 61 => Some("😢"),
+        20 | 47 => Some("😠"),
+        8 => Some("😘"),
+        7 => Some("😂"),
+        66 => Some("💩"),
+        120 => Some("🌹"),
+        65 => Some("💔"),
+        4 | 132 => Some("👎"),
+        29 => Some("😍"),
+        51 => Some("😕"),
+        45 => Some("😉"),
+        121 => Some("🥀"),
+        67 => Some("☀️"),
+        126 => Some("🎂"),
+        127 => Some("💣"),
+        68 => Some("👌"),
+        69 => Some("✌️"),
+        70 | 73 => Some("🙏"),
+        71 => Some("👊"),
+        131 => Some("🙅"),
+        21 | 26 => Some("😎"),
+        22 => Some("🤓"),
+        23 => Some("😁"),
+        30 => Some("😐"),
+        36 => Some("👋"),
+        38 => Some("😴"),
+        46 => Some("👏"),
+        52 => Some("🤐"),
+        54 => Some("😳"),
+        60 => Some("😨"),
+        63 => Some("🤑"),
+        99 => Some("🍺"),
+        _ => None,
+    }
+}
+
+/// Normalize a Zalo wire reaction (`rIcon` + optional `rType`) into a canonical display emoji.
+/// Returns `None` for removal/unreact events (`rType == -1` or removal sentinel `rIcon`).
+/// Preserves custom Unicode emojis sent by Zalo Mobile verbatim.
+pub fn reaction_to_emoji(code: &str, r_type: Option<i64>) -> Option<String> {
+    if r_type == Some(-1) {
+        return None;
+    }
+    let trimmed = code.trim();
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "/-none" | "/-remove" | "none"
+    ) {
+        return None;
+    }
+    if let Some(mapped) = try_reaction_code_to_emoji(trimmed) {
+        return Some(mapped.to_string());
+    }
+    if !trimmed.is_empty() && !trimmed.is_ascii() {
+        return Some(trimmed.to_string());
+    }
+    r_type.and_then(reaction_type_to_emoji).map(str::to_string)
+}
+
+/// Normalize a user-supplied or wire reaction emoji/code into the canonical display emoji.
+pub fn canonicalize_reaction_emoji(input: &str) -> Option<String> {
+    reaction_to_emoji(input, None)
 }
 
 pub fn reaction_code_to_emoji(code: &str) -> &'static str {
@@ -875,8 +998,11 @@ pub fn reaction_code_to_emoji(code: &str) -> &'static str {
 }
 
 fn is_self_reaction_uid(uid: &str, my_uid: &str) -> bool {
-    let trimmed = uid.trim();
-    trimmed == "0" || (!my_uid.is_empty() && trimmed == my_uid)
+    let clean = clean_bare_uid(uid);
+    if clean.is_empty() {
+        return false;
+    }
+    clean == "0" || (!my_uid.is_empty() && clean == my_uid)
 }
 
 fn reaction_entry_is_me(r: &Value, my_uid: &str) -> bool {
@@ -915,7 +1041,7 @@ fn reaction_entry_count(r: &Value) -> u32 {
     if let Some(total) = r
         .get("total")
         .or_else(|| r.get("count"))
-        .and_then(|v| v.as_u64())
+        .and_then(|v| v.as_u64().or_else(|| v.as_str()?.trim().parse().ok()))
     {
         return (total as u32).max(1);
     }
@@ -933,32 +1059,38 @@ fn reaction_entry_count(r: &Value) -> u32 {
 }
 
 fn extract_reactions(it: &Value, my_uid: &str) -> Vec<ReactionSummary> {
-    let mut map: std::collections::BTreeMap<&'static str, (u32, bool)> =
+    let mut map: std::collections::BTreeMap<String, (u32, bool)> =
         std::collections::BTreeMap::new();
-    for key in ["reactions", "reacts"] {
-        if let Some(arr) = it.get(key).and_then(Value::as_array) {
-            for r in arr {
-                if r.get("rType").and_then(Value::as_i64) == Some(-1) {
-                    continue;
-                }
-                let code = pick_str(r, &["rIcon", "emoji", "icon"]).unwrap_or_default();
-                let Some(e) = try_reaction_code_to_emoji(&code) else {
-                    continue;
-                };
-                let count = reaction_entry_count(r);
-                let is_me = reaction_entry_is_me(r, my_uid);
-                let entry = map.entry(e).or_insert((0, false));
-                entry.0 += count;
-                entry.1 |= is_me;
+    for key in ["reactions", "reacts", "reactionList", "react"] {
+        let Some(raw) = it.get(key) else {
+            continue;
+        };
+        let unwrapped = unwrap_json_value(raw);
+        let items: Vec<&Value> = match &unwrapped {
+            Value::Array(arr) => arr.iter().collect(),
+            Value::Object(_) => vec![&unwrapped],
+            _ => Vec::new(),
+        };
+        for r in items {
+            let r_type = r
+                .get("rType")
+                .and_then(|v| v.as_i64().or_else(|| v.as_str()?.trim().parse().ok()));
+            if r_type == Some(-1) {
+                continue;
             }
+            let code = pick_str(r, &["rIcon", "emoji", "icon"]).unwrap_or_default();
+            let Some(e) = reaction_to_emoji(&code, r_type) else {
+                continue;
+            };
+            let count = reaction_entry_count(r);
+            let is_me = reaction_entry_is_me(r, my_uid);
+            let entry = map.entry(e).or_insert((0, false));
+            entry.0 += count;
+            entry.1 |= is_me;
         }
     }
     map.into_iter()
-        .map(|(emoji, (count, me))| ReactionSummary {
-            emoji: emoji.to_string(),
-            count,
-            me,
-        })
+        .map(|(emoji, (count, me))| ReactionSummary { emoji, count, me })
         .collect()
 }
 
@@ -1006,6 +1138,9 @@ pub fn parse_chat_message(
     in_group_bucket: bool,
 ) -> Option<MessageDto> {
     let mut msg_type = normalize_msg_type(it);
+    if msg_type.eq_ignore_ascii_case("chat.reaction") {
+        return None;
+    }
     let raw_content = it
         .get("content")
         .or_else(|| it.get("message").and_then(|m| m.get("content")))
@@ -1192,7 +1327,11 @@ pub fn parse_chat_message(
         };
     }
 
-    let msg_id = pick_str(it, &["msgId", "globalMsgId", "cliMsgId", "id"])?;
+    let g_msg_id = pick_str(it, &["msgId", "globalMsgId", "realMsgId", "id"])
+        .filter(|s| s != "0");
+    let cli_msg_id = pick_str(it, &["cliMsgId", "clientMsgId", "cMsgID", "cMsgId"])
+        .filter(|s| s != "0");
+    let msg_id = g_msg_id.or_else(|| cli_msg_id.clone())?;
     if text.is_empty() && attachment_url.is_none() {
         return None;
     }
@@ -1245,6 +1384,7 @@ pub fn parse_chat_message(
 
     Some(MessageDto {
         msg_id,
+        cli_msg_id,
         thread_id,
         sender_id: if is_outgoing { my_uid.to_string() } else { uid_from },
         sender_name,
@@ -1281,13 +1421,20 @@ pub fn parse_ws_event(ev: &WsEvent, my_uid: &str, send2me_id: &str) -> Vec<WsPar
     ) {
         let is_group_cmd = matches!(ev.cmd, CMD_PUSH_MSG_GROUP | CMD_PULL_MSG_GROUP);
         collect_messages_from_node(data, is_group_cmd, my_uid, send2me_id, &mut actions);
+    } else if matches!(ev.cmd, CMD_REACTION_PUSH | CMD_REACTION_PULL_GROUP) {
+        collect_reactions_from_node(
+            &ev.payload,
+            ev.cmd == CMD_REACTION_PULL_GROUP,
+            my_uid,
+            send2me_id,
+            &mut actions,
+        );
+    } else if ev.cmd == CMD_CTRL_PULL_610 {
+        collect_reactions_from_node(&ev.payload, false, my_uid, send2me_id, &mut actions);
+        collect_controls_from_node(&ev.payload, my_uid, send2me_id, &mut actions);
     } else if matches!(
         ev.cmd,
-        CMD_CTRL_PUSH_CTRL
-            | CMD_CTRL_ACTION
-            | CMD_CTRL_PULL_CTRL
-            | CMD_CTRL_PULL_VOIP
-            | CMD_CTRL_PULL_610
+        CMD_CTRL_PUSH_CTRL | CMD_CTRL_ACTION | CMD_CTRL_PULL_CTRL | CMD_CTRL_PULL_VOIP
     ) {
         collect_controls_from_node(&ev.payload, my_uid, send2me_id, &mut actions);
     } else if matches!(
@@ -1627,6 +1774,19 @@ fn collect_messages_from_node(
     }
 }
 
+fn is_reaction_message_item(item: &Value) -> bool {
+    if pick_str(item, &["msgType", "type"])
+        .is_some_and(|t| t.eq_ignore_ascii_case("chat.reaction"))
+    {
+        return true;
+    }
+    if let Some(content) = item.get("content").and_then(unwrap_json_object) {
+        return content.get("rMsg").is_some()
+            && (content.get("rIcon").is_some() || content.get("rType").is_some());
+    }
+    false
+}
+
 fn push_single_item(
     item: &Value,
     in_group_bucket: bool,
@@ -1634,6 +1794,10 @@ fn push_single_item(
     send2me_id: &str,
     out: &mut Vec<WsParsedAction>,
 ) {
+    if is_reaction_message_item(item) {
+        parse_reaction_item(item, in_group_bucket, my_uid, send2me_id, out);
+        return;
+    }
     if let Some(msg) = parse_chat_message(item, None, my_uid, send2me_id, in_group_bucket) {
         if msg.is_recalled {
             out.push(WsParsedAction::Recalled {
@@ -1643,6 +1807,229 @@ fn push_single_item(
         } else {
             out.push(WsParsedAction::Message(Box::new(msg)));
         }
+    }
+}
+
+fn unwrap_reaction_container(node: &Value) -> Value {
+    let mut cur = unwrap_json_value(node);
+    for _ in 0..3 {
+        if cur.get("reacts").is_some()
+            || cur.get("reactGroups").is_some()
+            || cur.get("rMsg").is_some()
+            || cur.get("rIcon").is_some()
+            || cur.get("content").is_some()
+            || cur.is_array()
+        {
+            break;
+        }
+        match cur.get("data") {
+            Some(inner) => {
+                let unwrapped = unwrap_json_value(inner);
+                if unwrapped.is_object() || unwrapped.is_array() {
+                    cur = unwrapped;
+                } else {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    cur
+}
+
+fn pick_raw_icon_str(v: &Value) -> Option<String> {
+    for k in ["rIcon", "icon", "emoji"] {
+        if let Some(val) = v.get(k) {
+            if let Some(s) = val.as_str() {
+                return Some(s.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn parse_reaction_item(
+    item: &Value,
+    in_group_bucket: bool,
+    my_uid: &str,
+    send2me_id: &str,
+    out: &mut Vec<WsParsedAction>,
+) {
+    let is_group = in_group_bucket
+        || is_group_flag(item)
+        || item.get("grid").is_some()
+        || item.get("groupId").is_some();
+
+    let content_obj = item.get("content").and_then(unwrap_json_object);
+    let src = content_obj.as_ref().unwrap_or(item);
+
+    let uid_from = pick_str(item, &["uidFrom", "fromUid", "fromId", "senderId"])
+        .or_else(|| {
+            content_obj
+                .as_ref()
+                .and_then(|c| pick_str(c, &["uidFrom", "fromUid", "fromId"]))
+        })
+        .map(|s| clean_bare_uid(&s))
+        .unwrap_or_default();
+    let is_self = has_truthy_self_flag(item) || is_self_reaction_uid(&uid_from, my_uid);
+    let actor_id = if is_self {
+        if !my_uid.is_empty() {
+            Some(my_uid.to_string())
+        } else {
+            Some("0".to_string())
+        }
+    } else if !uid_from.is_empty() && uid_from != "0" {
+        Some(uid_from.clone())
+    } else {
+        None
+    };
+
+    let id_to = pick_str(item, &["idTo", "toid", "toId"])
+        .map(|s| clean_bare_uid(&s))
+        .unwrap_or_default();
+
+    let thread_id = if is_group {
+        pick_str(
+            item,
+            &["grid", "groupId", "idTo", "toid", "toId", "threadId", "conversId"],
+        )
+        .filter(|s| s != "0")
+        .map(|s| clean_group_id(&s).to_string())
+    } else if !send2me_id.is_empty()
+        && (id_to == send2me_id
+            || uid_from == send2me_id
+            || (is_self && (id_to.is_empty() || id_to == "0" || id_to == my_uid)))
+    {
+        Some(send2me_id.to_string())
+    } else if is_self {
+        if !id_to.is_empty() && id_to != "0" && (my_uid.is_empty() || id_to != my_uid) {
+            Some(id_to.clone())
+        } else {
+            extract_thread_id(item, false, my_uid, send2me_id).map(|(t, _)| t)
+        }
+    } else if !uid_from.is_empty() && uid_from != "0" && (my_uid.is_empty() || uid_from != my_uid) {
+        Some(uid_from.clone())
+    } else if !id_to.is_empty() && id_to != "0" && (my_uid.is_empty() || id_to != my_uid) {
+        Some(id_to.clone())
+    } else {
+        extract_thread_id(item, false, my_uid, send2me_id).map(|(t, _)| t)
+    };
+
+    let Some(tid) = thread_id.filter(|t| !t.is_empty() && t != "0") else {
+        return;
+    };
+
+    let r_type = src
+        .get("rType")
+        .or_else(|| item.get("rType"))
+        .and_then(|v| v.as_i64().or_else(|| v.as_str()?.trim().parse().ok()));
+    let raw_icon = pick_raw_icon_str(src).or_else(|| pick_raw_icon_str(item));
+    let is_remove_icon = raw_icon.as_deref().is_some_and(|s| {
+        matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "" | "/-none" | "/-remove" | "none"
+        )
+    });
+    let removed = r_type == Some(-1) || is_remove_icon;
+    let emoji = if removed {
+        None
+    } else {
+        reaction_to_emoji(raw_icon.as_deref().unwrap_or(""), r_type)
+    };
+    if !removed && emoji.is_none() {
+        return;
+    }
+
+    if let Some(raw_r_msg) = src.get("rMsg").or_else(|| item.get("rMsg")) {
+        let unwrapped_r_msg = unwrap_json_value(raw_r_msg);
+        let entries: Vec<&Value> = match &unwrapped_r_msg {
+            Value::Array(arr) => arr.iter().collect(),
+            Value::Object(_) => vec![&unwrapped_r_msg],
+            _ => Vec::new(),
+        };
+        for entry in entries {
+            let g_id =
+                pick_str(entry, &["gMsgID", "gMsgId", "globalMsgId", "msgId"]).filter(|s| s != "0");
+            let c_id = pick_str(entry, &["cMsgID", "cMsgId", "cliMsgId", "clientMsgId"])
+                .filter(|s| s != "0");
+            let Some(primary_id) = g_id.or_else(|| c_id.clone()) else {
+                continue;
+            };
+            out.push(WsParsedAction::Reaction {
+                thread_id: tid.clone(),
+                msg_id: primary_id,
+                cli_msg_id: c_id,
+                actor_id: actor_id.clone(),
+                emoji: emoji.clone(),
+                me: is_self,
+                removed,
+            });
+        }
+        return;
+    }
+
+    // Flat legacy control reaction item without `rMsg` array
+    let g_id = pick_str(src, &["globalMsgId", "gMsgID", "gMsgId", "msgId"])
+        .or_else(|| pick_str(item, &["globalMsgId", "gMsgID", "gMsgId", "msgId"]))
+        .filter(|s| s != "0");
+    let c_id = pick_str(src, &["cMsgID", "cMsgId", "cliMsgId", "clientMsgId"])
+        .or_else(|| pick_str(item, &["cMsgID", "cMsgId", "cliMsgId", "clientMsgId"]))
+        .filter(|s| s != "0");
+    if let Some(primary_id) = g_id.or_else(|| c_id.clone()) {
+        out.push(WsParsedAction::Reaction {
+            thread_id: tid,
+            msg_id: primary_id,
+            cli_msg_id: c_id,
+            actor_id,
+            emoji,
+            me: is_self,
+            removed,
+        });
+    }
+}
+
+pub(crate) fn collect_reactions_from_node(
+    node: &Value,
+    default_group: bool,
+    my_uid: &str,
+    send2me_id: &str,
+    out: &mut Vec<WsParsedAction>,
+) {
+    let effective = unwrap_reaction_container(node);
+    let mut handled_bucket = false;
+
+    if let Some(raw_reacts) = effective.get("reacts") {
+        let unwrapped = unwrap_json_value(raw_reacts);
+        if let Some(arr) = unwrapped.as_array() {
+            handled_bucket = true;
+            for item in arr {
+                parse_reaction_item(item, false, my_uid, send2me_id, out);
+            }
+        }
+    }
+    if let Some(raw_groups) = effective.get("reactGroups") {
+        let unwrapped = unwrap_json_value(raw_groups);
+        if let Some(arr) = unwrapped.as_array() {
+            handled_bucket = true;
+            for item in arr {
+                parse_reaction_item(item, true, my_uid, send2me_id, out);
+            }
+        }
+    }
+    if handled_bucket {
+        return;
+    }
+
+    if let Some(arr) = effective.as_array() {
+        for item in arr {
+            parse_reaction_item(item, default_group, my_uid, send2me_id, out);
+        }
+    } else if effective.is_object()
+        && (effective.get("rMsg").is_some()
+            || effective.get("rIcon").is_some()
+            || is_reaction_message_item(&effective))
+    {
+        parse_reaction_item(&effective, default_group, my_uid, send2me_id, out);
     }
 }
 
@@ -2136,27 +2523,8 @@ fn collect_controls_from_node(
                 });
             }
         } else if effective_act == "reaction" {
-            if let (Some((tid, _)), Some(mid)) = (
-                extract_thread_id(&data_node, false, my_uid, send2me_id),
-                pick_str(&data_node, &["msgId", "globalMsgId", "gMsgID", "cliMsgId"]),
-            ) {
-                let r_icon = pick_str(&data_node, &["rIcon", "icon", "emoji"]).unwrap_or_default();
-                let r_type = data_node.get("rType").and_then(Value::as_i64);
-                let removed =
-                    r_type == Some(-1) || matches!(r_icon.trim(), "/-none" | "/-remove" | "none");
-                let emoji = try_reaction_code_to_emoji(&r_icon).map(str::to_string);
-                if removed || emoji.is_some() {
-                    let uid_from =
-                        pick_str(&data_node, &["uidFrom", "fromUid"]).unwrap_or_default();
-                    out.push(WsParsedAction::Reaction {
-                        thread_id: tid,
-                        msg_id: mid,
-                        emoji,
-                        me: is_self_reaction_uid(&uid_from, my_uid),
-                        removed,
-                    });
-                }
-            }
+            let is_group = is_group_flag(&data_node) || is_group_flag(item);
+            parse_reaction_item(&data_node, is_group, my_uid, send2me_id, out);
         } else if matches!(effective_act, "seen_msg" | "read_receipt") {
             let is_group = is_group_flag(&data_node) || is_group_flag(item);
             if data_node.get("seenMsgs").is_some() || data_node.get("seen_msgs").is_some() {
@@ -3536,6 +3904,304 @@ mod tests {
             &actions[7],
             WsParsedAction::SocialEvent { kind, thread_id, self_removed, .. }
                 if kind == "group_admin_changed" && thread_id.as_deref() == Some("888555") && !*self_removed
+        ));
+    }
+
+    #[test]
+    fn parses_ws_612_live_reactions_dm_group_self_peer_unreact_and_zero_gmsgid() {
+        assert!(is_reaction_ws_cmd(CMD_REACTION_PULL_1_1));
+        assert!(is_reaction_ws_cmd(CMD_REACTION_PULL_GROUP));
+        assert!(is_reaction_ws_cmd(CMD_REACTION_PUSH));
+        assert!(!is_reaction_ws_cmd(CMD_PUSH_MSG_1_1));
+        assert!(!is_reaction_ws_cmd(CMD_CTRL_PUSH_CTRL));
+
+        let ev = WsEvent {
+            cmd: CMD_REACTION_PUSH,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "reacts": [
+                        {
+                            "msgId": "9000001",
+                            "cliMsgId": "1782286280001",
+                            "msgType": "chat.reaction",
+                            "uidFrom": "0",
+                            "idTo": "999",
+                            "content": "{\"rMsg\":[{\"gMsgID\":75001,\"cMsgID\":1782286269001,\"msgType\":1}],\"rIcon\":\"/-heart\",\"rType\":5,\"source\":6}"
+                        },
+                        {
+                            "msgId": "9000002",
+                            "cliMsgId": "1782286280002",
+                            "msgType": "chat.reaction",
+                            "uidFrom": "999",
+                            "idTo": "0",
+                            "content": "{\"rMsg\":[{\"gMsgID\":\"75002\",\"cMsgID\":\"1782286269002\",\"msgType\":1}],\"rIcon\":\":>\",\"rType\":0,\"source\":0}"
+                        },
+                        {
+                            "msgId": "9000003",
+                            "cliMsgId": "1782286280003",
+                            "msgType": "chat.reaction",
+                            "uidFrom": "0",
+                            "idTo": "999",
+                            "content": "{\"rMsg\":[{\"gMsgID\":75001,\"cMsgID\":1782286269001,\"msgType\":1}],\"rIcon\":\"\",\"rType\":-1,\"source\":6}"
+                        },
+                        {
+                            "msgId": "9000004",
+                            "cliMsgId": "1782286280004",
+                            "msgType": "chat.reaction",
+                            "uidFrom": "999",
+                            "idTo": "456",
+                            "content": "{\"rMsg\":[{\"gMsgID\":75002,\"cMsgID\":1782286269002,\"msgType\":1}],\"rIcon\":\"\",\"rType\":-1,\"source\":0}"
+                        },
+                        {
+                            "msgId": "9000005",
+                            "cliMsgId": "1782286280005",
+                            "msgType": "chat.reaction",
+                            "uidFrom": "0",
+                            "idTo": "0",
+                            "content": "{\"rMsg\":[{\"gMsgID\":75003,\"cMsgID\":1782286269003,\"msgType\":1}],\"rIcon\":\"/-strong\",\"rType\":3,\"source\":0}"
+                        }
+                    ],
+                    "reactGroups": [
+                        {
+                            "actionId": "1613363535484",
+                            "msgId": "7970889894523",
+                            "cliMsgId": "1782286279460",
+                            "msgType": "chat.reaction",
+                            "uidFrom": "8780300047720658810",
+                            "idTo": "group_7560225984834507848",
+                            "content": "{\"rType\":5,\"rMsg\":[{\"cMsgID\":1782286269667,\"gMsgID\":0,\"msgType\":1}],\"source\":0,\"msgSender\":\"456\",\"rIcon\":\"/-heart\"}"
+                        },
+                        {
+                            "msgId": "7970889894524",
+                            "cliMsgId": "1782286279461",
+                            "msgType": "chat.reaction",
+                            "uidFrom": "0",
+                            "idTo": "g7560225984834507848",
+                            "content": "{\"rType\":75,\"rMsg\":[{\"cMsgID\":1782286269668,\"gMsgID\":75099,\"msgType\":32}],\"source\":0,\"rIcon\":\"🔥\"}"
+                        },
+                        {
+                            "msgId": "7970889894525",
+                            "cliMsgId": "1782286279462",
+                            "msgType": "chat.reaction",
+                            "uidFrom": "777",
+                            "idTo": "7560225984834507848",
+                            "content": "{\"rType\":32,\"rMsg\":[{\"cMsgID\":1782286269668,\"gMsgID\":75099,\"msgType\":32}],\"source\":0}"
+                        }
+                    ]
+                }
+            }),
+        };
+
+        let actions = parse_ws_event(&ev, "456", "send2me_77");
+        assert_eq!(actions.len(), 8);
+
+        // 0: Self reacted ❤️ on phone in DM
+        assert!(matches!(
+            &actions[0],
+            WsParsedAction::Reaction { thread_id, msg_id, cli_msg_id, actor_id, emoji, me, removed }
+                if thread_id == "999"
+                    && msg_id == "75001"
+                    && cli_msg_id.as_deref() == Some("1782286269001")
+                    && actor_id.as_deref() == Some("456")
+                    && emoji.as_deref() == Some("❤️")
+                    && *me
+                    && !*removed
+        ));
+        // 1: Peer reacted 😆 on phone in DM
+        assert!(matches!(
+            &actions[1],
+            WsParsedAction::Reaction { thread_id, msg_id, cli_msg_id, actor_id, emoji, me, removed }
+                if thread_id == "999"
+                    && msg_id == "75002"
+                    && cli_msg_id.as_deref() == Some("1782286269002")
+                    && actor_id.as_deref() == Some("999")
+                    && emoji.as_deref() == Some("😆")
+                    && !*me
+                    && !*removed
+        ));
+        // 2: Self unreact on phone in DM (rIcon="" + rType=-1)
+        assert!(matches!(
+            &actions[2],
+            WsParsedAction::Reaction { thread_id, msg_id, emoji, me, removed, .. }
+                if thread_id == "999" && msg_id == "75001" && emoji.is_none() && *me && *removed
+        ));
+        // 3: Peer unreact on phone in DM (rIcon="" + rType=-1)
+        assert!(matches!(
+            &actions[3],
+            WsParsedAction::Reaction { thread_id, msg_id, actor_id, emoji, me, removed, .. }
+                if thread_id == "999"
+                    && msg_id == "75002"
+                    && actor_id.as_deref() == Some("999")
+                    && emoji.is_none()
+                    && !*me
+                    && *removed
+        ));
+        // 4: Self reacted 👍 in Cloud (send2me)
+        assert!(matches!(
+            &actions[4],
+            WsParsedAction::Reaction { thread_id, msg_id, emoji, me, removed, .. }
+                if thread_id == "send2me_77"
+                    && msg_id == "75003"
+                    && emoji.as_deref() == Some("👍")
+                    && *me
+                    && !*removed
+        ));
+        // 5: Group reaction from mobile with gMsgID=0 -> falls back to cMsgID, strips group_ prefix
+        assert!(matches!(
+            &actions[5],
+            WsParsedAction::Reaction { thread_id, msg_id, cli_msg_id, actor_id, emoji, me, removed }
+                if thread_id == "7560225984834507848"
+                    && msg_id == "1782286269667"
+                    && cli_msg_id.as_deref() == Some("1782286269667")
+                    && actor_id.as_deref() == Some("8780300047720658810")
+                    && emoji.as_deref() == Some("❤️")
+                    && !*me
+                    && !*removed
+        ));
+        // 6: Group self custom Unicode emoji 🔥 preserved verbatim
+        assert!(matches!(
+            &actions[6],
+            WsParsedAction::Reaction { thread_id, msg_id, cli_msg_id, emoji, me, removed, .. }
+                if thread_id == "7560225984834507848"
+                    && msg_id == "75099"
+                    && cli_msg_id.as_deref() == Some("1782286269668")
+                    && emoji.as_deref() == Some("🔥")
+                    && *me
+                    && !*removed
+        ));
+        // 7: Missing rIcon falls back to rType=32 -> 😮
+        assert!(matches!(
+            &actions[7],
+            WsParsedAction::Reaction { thread_id, msg_id, emoji, me, removed, .. }
+                if thread_id == "7560225984834507848"
+                    && msg_id == "75099"
+                    && emoji.as_deref() == Some("😮")
+                    && !*me
+                    && !*removed
+        ));
+    }
+
+    #[test]
+    fn parses_ws_610_611_pulled_reactions_and_preserves_cli_msg_id_on_messages() {
+        // Pulled old DM reactions (cmd=610) with object content
+        let ev_610 = WsEvent {
+            cmd: CMD_REACTION_PULL_1_1,
+            sub_cmd: 1,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "reacts": [
+                        {
+                            "uidFrom": "999",
+                            "idTo": "456",
+                            "content": {
+                                "rMsg": [{ "gMsgID": "81001", "cMsgID": "1780000000001", "msgType": 1 }],
+                                "rIcon": ":-((",
+                                "rType": 2,
+                                "source": 6
+                            }
+                        }
+                    ]
+                }
+            }),
+        };
+        let a_610 = parse_ws_event(&ev_610, "456", "");
+        assert_eq!(a_610.len(), 1);
+        assert!(matches!(
+            &a_610[0],
+            WsParsedAction::Reaction { thread_id, msg_id, cli_msg_id, emoji, me, removed, .. }
+                if thread_id == "999"
+                    && msg_id == "81001"
+                    && cli_msg_id.as_deref() == Some("1780000000001")
+                    && emoji.as_deref() == Some("😢")
+                    && !*me
+                    && !*removed
+        ));
+
+        // Pulled old group reactions (cmd=611)
+        let ev_611 = WsEvent {
+            cmd: CMD_REACTION_PULL_GROUP,
+            sub_cmd: 1,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "reactGroups": [
+                        {
+                            "uidFrom": "0",
+                            "idTo": "555666",
+                            "content": {
+                                "rMsg": [{ "gMsgID": "82001", "cMsgID": "1780000000002", "msgType": 1 }],
+                                "rIcon": ":-h",
+                                "rType": 20,
+                                "source": 6
+                            }
+                        }
+                    ]
+                }
+            }),
+        };
+        let a_611 = parse_ws_event(&ev_611, "456", "");
+        assert_eq!(a_611.len(), 1);
+        assert!(matches!(
+            &a_611[0],
+            WsParsedAction::Reaction { thread_id, msg_id, emoji, me, removed, .. }
+                if thread_id == "555666"
+                    && msg_id == "82001"
+                    && emoji.as_deref() == Some("😠")
+                    && *me
+                    && !*removed
+        ));
+
+        // A chat.reaction item inside cmd=501 is parsed as Reaction (never a fake chat bubble)
+        let ev_501 = WsEvent {
+            cmd: CMD_PUSH_MSG_1_1,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "msgs": [
+                        {
+                            "msgId": "83001",
+                            "cliMsgId": "1780000000003",
+                            "uidFrom": "999",
+                            "idTo": "456",
+                            "msgType": "chat.text",
+                            "content": "Hi from phone",
+                            "ts": "1780000000450"
+                        },
+                        {
+                            "msgId": "83002",
+                            "cliMsgId": "1780000000009",
+                            "uidFrom": "999",
+                            "idTo": "456",
+                            "msgType": "chat.reaction",
+                            "content": "{\"rMsg\":[{\"gMsgID\":83001,\"cMsgID\":1780000000003,\"msgType\":1}],\"rIcon\":\"/-heart\",\"rType\":5}"
+                        }
+                    ]
+                }
+            }),
+        };
+        let a_501 = parse_ws_event(&ev_501, "456", "");
+        assert_eq!(a_501.len(), 2);
+        match &a_501[0] {
+            WsParsedAction::Message(m) => {
+                assert_eq!(m.msg_id, "83001");
+                assert_eq!(m.cli_msg_id.as_deref(), Some("1780000000003"));
+                assert_eq!(m.ts, 1_780_000_000_450);
+            }
+            other => panic!("expected Message, got {other:?}"),
+        }
+        assert!(matches!(
+            &a_501[1],
+            WsParsedAction::Reaction { thread_id, msg_id, cli_msg_id, emoji, me, removed, .. }
+                if thread_id == "999"
+                    && msg_id == "83001"
+                    && cli_msg_id.as_deref() == Some("1780000000003")
+                    && emoji.as_deref() == Some("❤️")
+                    && !*me
+                    && !*removed
         ));
     }
 }

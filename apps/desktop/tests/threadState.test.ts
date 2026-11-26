@@ -2,10 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { ChatFolderDto, MessageDto, ThreadDto } from "../src/types.ts";
 import {
+  QUICK_REACTION_EMOJIS,
+  applyOpenThreadSearchState,
+  applyOptimisticReaction,
   applyThreadReadSync,
   bumpThreadList,
   compareThreads,
   computeLayoutMode,
+  computeThreadRenderLimitForTarget,
   countFolderUnread,
   extractFirstUrl,
   filterThreadsByFolder,
@@ -13,6 +17,10 @@ import {
   getDisplayBodyText,
   looksLikePhoneQuery,
   moveArrayItem,
+  normalizeReactionEmoji,
+  normalizeReactions,
+  reconcileUpdatedMessage,
+  resolveFolderForOpenedThread,
   shouldAutoMarkReadOnFocus,
   splitTextLinks,
   upsertMsg,
@@ -535,4 +543,240 @@ test("shouldAutoMarkReadOnFocus enforces focus, visibility, auth, lock, webApp, 
     shouldAutoMarkReadOnFocus({ ...base, distFromBottom: 120, nearBottomThresholdPx: 140 }),
     true,
   );
+});
+
+test("applyOpenThreadSearchState, resolveFolderForOpenedThread, and computeThreadRenderLimitForTarget clear search and reveal opened threads", () => {
+  const threads = [
+    makeThread({ id: "dm-minh", title: "Trần Minh", kind: "direct", last_ts: 5000 }),
+    makeThread({ id: "grp-1", title: "Nhóm Kỹ thuật", kind: "group", last_ts: 4000 }),
+    makeThread({ id: "arch-1", title: "Lưu trữ", kind: "direct", last_ts: 3000, is_archived: true }),
+    makeThread({ id: "phone-new", title: "Liên hệ mới", kind: "direct", last_ts: 0 }),
+  ];
+  const folders: ChatFolderDto[] = [
+    {
+      id: "work",
+      name: "Work",
+      icon: "briefcase",
+      color: "",
+      thread_ids: ["grp-1"],
+      excluded_thread_ids: [],
+      include_kinds: [],
+      only_unread: false,
+      exclude_muted: false,
+      position: 1,
+      remote_label_id: null,
+    },
+  ];
+
+  // Clicking a search-filtered thread clears filterText and requests sidebar scroll while keeping folder
+  assert.deepEqual(
+    applyOpenThreadSearchState(
+      { filterText: "Kỹ thuật", selectedId: "dm-minh", folder: "group" },
+      "grp-1",
+      threads,
+      folders,
+    ),
+    {
+      filterText: "",
+      selectedId: "grp-1",
+      folder: "group",
+      clearedSearch: true,
+      shouldScrollSidebar: true,
+    },
+  );
+
+  // Clicking an already-selected thread while search is active still clears filterText
+  assert.deepEqual(
+    applyOpenThreadSearchState(
+      { filterText: "Minh", selectedId: "dm-minh", folder: "all" },
+      "dm-minh",
+      threads,
+      folders,
+    ),
+    {
+      filterText: "",
+      selectedId: "dm-minh",
+      folder: "all",
+      clearedSearch: true,
+      shouldScrollSidebar: true,
+    },
+  );
+
+  // Opening a direct chat from phone search while on "group" clears filterText and switches to "all"
+  assert.deepEqual(
+    applyOpenThreadSearchState(
+      { filterText: "0912345678", selectedId: "grp-1", folder: "group" },
+      "phone-new",
+      threads,
+      folders,
+    ),
+    {
+      filterText: "",
+      selectedId: "phone-new",
+      folder: "all",
+      clearedSearch: true,
+      shouldScrollSidebar: true,
+    },
+  );
+
+  // Opening an archived chat from QuickSearch switches folder to "archived" and clears active search
+  assert.deepEqual(
+    applyOpenThreadSearchState(
+      { filterText: "abc", selectedId: "dm-minh", folder: "all" },
+      "arch-1",
+      threads,
+      folders,
+    ),
+    {
+      filterText: "",
+      selectedId: "arch-1",
+      folder: "archived",
+      clearedSearch: true,
+      shouldScrollSidebar: true,
+    },
+  );
+
+  // Normal click with empty search preserves folder and avoids unnecessary scroll jump
+  assert.deepEqual(
+    applyOpenThreadSearchState(
+      { filterText: "", selectedId: "dm-minh", folder: "custom:work" },
+      "grp-1",
+      threads,
+      folders,
+    ),
+    {
+      filterText: "",
+      selectedId: "grp-1",
+      folder: "custom:work",
+      clearedSearch: false,
+      shouldScrollSidebar: false,
+    },
+  );
+
+  // resolveFolderForOpenedThread falls back cleanly for custom folder mismatch
+  assert.equal(resolveFolderForOpenedThread(threads, "dm-minh", "custom:work", folders), "all");
+  assert.equal(resolveFolderForOpenedThread(threads, "grp-1", "custom:work", folders), "custom:work");
+
+  // computeThreadRenderLimitForTarget expands pagination when target is past index 99
+  const manyThreads = Array.from({ length: 160 }, (_, idx) =>
+    makeThread({ id: `t-${idx}`, last_ts: 10_000 - idx }),
+  );
+  assert.equal(computeThreadRenderLimitForTarget(manyThreads, "t-0", 100), 100);
+  assert.equal(computeThreadRenderLimitForTarget(manyThreads, "t-99", 100), 100);
+  assert.equal(computeThreadRenderLimitForTarget(manyThreads, "t-100", 100), 200);
+  assert.equal(computeThreadRenderLimitForTarget(manyThreads, "t-142", 100), 200);
+  assert.equal(computeThreadRenderLimitForTarget(manyThreads, "missing", 100), 100);
+  assert.equal(computeThreadRenderLimitForTarget(manyThreads, null, 100), 100);
+});
+
+test("normalizeReactionEmoji and normalizeReactions align canonical palette, variants, and extended mobile emojis", () => {
+  assert.deepEqual(QUICK_REACTION_EMOJIS, ["👍", "❤️", "😆", "😮", "😢", "😠"]);
+
+  // Canonical palette & wire shortcodes
+  assert.equal(normalizeReactionEmoji("/-strong"), "👍");
+  assert.equal(normalizeReactionEmoji("/-heart"), "❤️");
+  assert.equal(normalizeReactionEmoji("❤"), "❤️");
+  assert.equal(normalizeReactionEmoji(":>"), "😆");
+  assert.equal(normalizeReactionEmoji(":o"), "😮");
+  assert.equal(normalizeReactionEmoji(":-(("), "😢");
+  assert.equal(normalizeReactionEmoji("😭"), "😢");
+  assert.equal(normalizeReactionEmoji(":-h"), "😠");
+  assert.equal(normalizeReactionEmoji("😡"), "😠");
+
+  // Removal sentinels become empty string
+  assert.equal(normalizeReactionEmoji(""), "");
+  assert.equal(normalizeReactionEmoji("/-none"), "");
+  assert.equal(normalizeReactionEmoji("NONE"), "");
+
+  // Extended & custom mobile Unicode emojis pass through verbatim (distinct from 😆)
+  assert.equal(normalizeReactionEmoji("😂"), "😂");
+  assert.equal(normalizeReactionEmoji("🔥"), "🔥");
+  assert.equal(normalizeReactionEmoji("🎉"), "🎉");
+
+  // normalizeReactions merges canonical variants, drops count<=0, and preserves distinct emojis
+  assert.deepEqual(
+    normalizeReactions([
+      { emoji: "❤", count: 1, me: false },
+      { emoji: "❤️", count: 1, me: true },
+      { emoji: "😂", count: 2, me: false },
+      { emoji: "😆", count: 1, me: false },
+      { emoji: "👍", count: 0, me: false },
+      { emoji: "/-none", count: 1, me: false },
+    ]),
+    [
+      { emoji: "❤️", count: 2, me: true },
+      { emoji: "😂", count: 2, me: false },
+      { emoji: "😆", count: 1, me: false },
+    ],
+  );
+});
+
+test("applyOptimisticReaction and reconcileUpdatedMessage handle 2-way add, switch, unreact, and pagination bounds", () => {
+  // Add first reaction
+  let reactions = applyOptimisticReaction([], "❤️");
+  assert.deepEqual(reactions, [{ emoji: "❤️", count: 1, me: true }]);
+
+  // Switch active reaction to 👍
+  reactions = applyOptimisticReaction(reactions, "👍");
+  assert.deepEqual(reactions, [{ emoji: "👍", count: 1, me: true }]);
+
+  // Toggle same emoji removes it completely
+  reactions = applyOptimisticReaction(reactions, "👍");
+  assert.deepEqual(reactions, []);
+
+  // Reacting onto an existing peer emoji increments and highlights `me`, switching preserves peer count
+  const withPeer = [{ emoji: "😮", count: 1, me: false }];
+  const joinedPeer = applyOptimisticReaction(withPeer, "😮");
+  assert.deepEqual(joinedPeer, [{ emoji: "😮", count: 2, me: true }]);
+  const switched = applyOptimisticReaction(joinedPeer, "😢");
+  assert.deepEqual(switched, [
+    { emoji: "😮", count: 1, me: false },
+    { emoji: "😢", count: 1, me: true },
+  ]);
+
+  // Removing a phone-originated variant/custom reaction by clicking it works cleanly
+  assert.deepEqual(
+    applyOptimisticReaction([{ emoji: "❤", count: 1, me: true }], "❤️"),
+    [],
+  );
+  assert.deepEqual(
+    applyOptimisticReaction([{ emoji: "🔥", count: 2, me: true }], "🔥"),
+    [{ emoji: "🔥", count: 1, me: false }],
+  );
+
+  // reconcileUpdatedMessage updates existing message in place (including removing last reaction)
+  const windowMsgs = [
+    makeMsg({ msg_id: "m10", ts: 5000, reactions: [{ emoji: "👍", count: 1, me: true }] }),
+    makeMsg({ msg_id: "m11", ts: 6000, reactions: [] }),
+  ];
+  const afterPhoneSwitch = reconcileUpdatedMessage(
+    windowMsgs,
+    makeMsg({
+      msg_id: "m10",
+      ts: 5000,
+      reactions: [
+        { emoji: "❤", count: 1, me: true },
+        { emoji: "😮", count: 1, me: false },
+      ],
+    }),
+  );
+  assert.equal(afterPhoneSwitch.length, 2);
+  assert.deepEqual(afterPhoneSwitch[0].reactions, [
+    { emoji: "❤️", count: 1, me: true },
+    { emoji: "😮", count: 1, me: false },
+  ]);
+
+  const afterPhoneRemove = reconcileUpdatedMessage(
+    afterPhoneSwitch,
+    makeMsg({ msg_id: "m10", ts: 5000, reactions: [] }),
+  );
+  assert.deepEqual(afterPhoneRemove[0].reactions, []);
+
+  // Reaction update for an older unloaded message (ts < oldest loaded) must NOT inject into window
+  const olderUnloaded = makeMsg({
+    msg_id: "m1-old",
+    ts: 1000,
+    reactions: [{ emoji: "❤️", count: 1, me: false }],
+  });
+  assert.equal(reconcileUpdatedMessage(afterPhoneRemove, olderUnloaded), afterPhoneRemove);
 });

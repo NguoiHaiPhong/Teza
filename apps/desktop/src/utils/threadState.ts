@@ -1,4 +1,4 @@
-import type { ChatFolderDto, MessageDto, ThreadDto } from "../types.ts";
+import type { ChatFolderDto, MessageDto, ReactionSummary, ThreadDto } from "../types.ts";
 import type { UiLanguage } from "../i18n/types.ts";
 import { uiLanguageToLocale } from "../i18n/types.ts";
 
@@ -384,4 +384,253 @@ export function shouldAutoMarkReadOnFocus(params: AutoMarkReadOnFocusParams): bo
   if (params.distFromBottom === null) return false;
   const threshold = params.nearBottomThresholdPx ?? 90;
   return params.distFromBottom < threshold;
+}
+
+export function resolveFolderForOpenedThread(
+  threads: ThreadDto[],
+  targetThreadId: string,
+  currentFolder: string,
+  customFolders: ChatFolderDto[],
+): string {
+  const currentlyVisible = filterThreadsByFolder(threads, currentFolder, customFolders);
+  if (currentlyVisible.some((t) => t.id === targetThreadId)) {
+    return currentFolder;
+  }
+  const target = threads.find((t) => t.id === targetThreadId);
+  if (target?.is_archived) {
+    return "archived";
+  }
+  return "all";
+}
+
+export function computeThreadRenderLimitForTarget(
+  visibleThreads: ThreadDto[],
+  targetThreadId: string | null,
+  currentLimit: number,
+  pageSize = 100,
+): number {
+  const safePageSize = Math.max(1, pageSize);
+  const safeLimit = Math.max(safePageSize, currentLimit);
+  if (!targetThreadId) return safeLimit;
+  const idx = visibleThreads.findIndex((t) => t.id === targetThreadId);
+  if (idx < 0 || idx < safeLimit) {
+    return safeLimit;
+  }
+  return Math.ceil((idx + 1) / safePageSize) * safePageSize;
+}
+
+export interface SidebarThreadSelectionState {
+  filterText: string;
+  selectedId: string | null;
+  folder: string;
+}
+
+export interface SidebarThreadSelectionResult {
+  filterText: string;
+  selectedId: string;
+  folder: string;
+  clearedSearch: boolean;
+  shouldScrollSidebar: boolean;
+}
+
+export function applyOpenThreadSearchState(
+  state: SidebarThreadSelectionState,
+  targetThreadId: string,
+  threads: ThreadDto[],
+  customFolders: ChatFolderDto[],
+): SidebarThreadSelectionResult {
+  const clearedSearch = state.filterText.length > 0;
+  const nextFolder = resolveFolderForOpenedThread(
+    threads,
+    targetThreadId,
+    state.folder,
+    customFolders,
+  );
+  return {
+    filterText: "",
+    selectedId: targetThreadId,
+    folder: nextFolder,
+    clearedSearch,
+    shouldScrollSidebar: clearedSearch || nextFolder !== state.folder,
+  };
+}
+
+export const QUICK_REACTION_EMOJIS = ["👍", "❤️", "😆", "😮", "😢", "😠"] as const;
+
+const REACTION_CODE_TO_CANONICAL: Record<string, string> = {
+  "/-strong": "👍",
+  "👍": "👍",
+  "/-heart": "❤️",
+  "/-loveu": "❤️",
+  "❤": "❤️",
+  "❤️": "❤️",
+  ":>": "😆",
+  ":))": "😆",
+  "😆": "😆",
+  ":o": "😮",
+  ":-o": "😮",
+  "😮": "😮",
+  ":-((": "😢",
+  ":((": "😢",
+  "--b": "😢",
+  "p-(": "😢",
+  ":-<": "😢",
+  "😢": "😢",
+  "😭": "😢",
+  ":-h": "😠",
+  ">-|": "😠",
+  "😠": "😠",
+  "😡": "😠",
+  ":-*": "😘",
+  "😘": "😘",
+  ":')": "😂",
+  "😂": "😂",
+  "/-shit": "💩",
+  "💩": "💩",
+  "/-rose": "🌹",
+  "🌹": "🌹",
+  "/-break": "💔",
+  "💔": "💔",
+  "/-weak": "👎",
+  "/-bad": "👎",
+  "👎": "👎",
+  ";xx": "😍",
+  "😍": "😍",
+  ";-/": "😕",
+  "😕": "😕",
+  ";-)": "😉",
+  "😉": "😉",
+  "/-fade": "🥀",
+  "🥀": "🥀",
+  "/-li": "☀️",
+  "☀": "☀️",
+  "☀️": "☀️",
+  "/-bd": "🎂",
+  "🎂": "🎂",
+  "/-bome": "💣",
+  "💣": "💣",
+  "/-ok": "👌",
+  "👌": "👌",
+  "/-v": "✌️",
+  "✌": "✌️",
+  "✌️": "✌️",
+  "/-thanks": "🙏",
+  "_()_": "🙏",
+  "🙏": "🙏",
+  "/-punch": "👊",
+  "👊": "👊",
+  "/-no": "🙅",
+  "🙅": "🙅",
+  "x-)": "😎",
+  "b-)": "😎",
+  "😎": "😎",
+  "8-)": "🤓",
+  "🤓": "🤓",
+  ";-d": "😁",
+  "😁": "😁",
+  ":--|": "😐",
+  "😐": "😐",
+  ":-bye": "👋",
+  "👋": "👋",
+  "|-)": "😴",
+  "😴": "😴",
+  ":handclap": "👏",
+  "👏": "👏",
+  ";-x": "🤐",
+  "🤐": "🤐",
+  ";-s": "😳",
+  "😳": "😳",
+  ";-a": "😨",
+  "😨": "😨",
+  "$-)": "🤑",
+  "🤑": "🤑",
+  "/-beer": "🍺",
+  "🍺": "🍺",
+};
+
+export function normalizeReactionEmoji(input: string): string {
+  const trimmed = input.trim();
+  if (!trimmed) return "";
+  const lower = trimmed.toLowerCase();
+  if (lower === "/-none" || lower === "/-remove" || lower === "none") {
+    return "";
+  }
+  return REACTION_CODE_TO_CANONICAL[trimmed] ?? REACTION_CODE_TO_CANONICAL[lower] ?? trimmed;
+}
+
+export function normalizeReactions(
+  reactions: readonly ReactionSummary[] | null | undefined,
+): ReactionSummary[] {
+  if (!reactions || reactions.length === 0) return [];
+  const merged: ReactionSummary[] = [];
+  const byEmoji = new Map<string, number>();
+  for (const item of reactions) {
+    if (!item || item.count <= 0) continue;
+    const emoji = normalizeReactionEmoji(item.emoji);
+    if (!emoji) continue;
+    const existingIdx = byEmoji.get(emoji);
+    if (existingIdx !== undefined) {
+      merged[existingIdx] = {
+        emoji,
+        count: merged[existingIdx].count + item.count,
+        me: merged[existingIdx].me || Boolean(item.me),
+      };
+    } else {
+      byEmoji.set(emoji, merged.length);
+      merged.push({
+        emoji,
+        count: item.count,
+        me: Boolean(item.me),
+      });
+    }
+  }
+  return merged;
+}
+
+export function applyOptimisticReaction(
+  reactions: readonly ReactionSummary[] | null | undefined,
+  rawEmoji: string,
+): ReactionSummary[] {
+  const list = normalizeReactions(reactions).map((r) => ({ ...r }));
+  const target = normalizeReactionEmoji(rawEmoji);
+  if (!target) return list;
+
+  const clicked = list.find((r) => r.emoji === target);
+  if (clicked?.me) {
+    clicked.me = false;
+    clicked.count = Math.max(0, clicked.count - 1);
+  } else {
+    const prevMe = list.find((r) => r.me);
+    if (prevMe) {
+      prevMe.me = false;
+      prevMe.count = Math.max(0, prevMe.count - 1);
+    }
+    if (clicked) {
+      clicked.count += 1;
+      clicked.me = true;
+    } else {
+      list.push({ emoji: target, count: 1, me: true });
+    }
+  }
+  return list.filter((r) => r.count > 0);
+}
+
+export function reconcileUpdatedMessage(
+  list: MessageDto[],
+  incoming: MessageDto,
+): MessageDto[] {
+  const normalized: MessageDto = {
+    ...incoming,
+    reactions: normalizeReactions(incoming.reactions),
+  };
+  const idx = list.findIndex((m) => m.msg_id === normalized.msg_id);
+  if (idx >= 0) {
+    const next = [...list];
+    next[idx] = normalized;
+    return next;
+  }
+  if (list.length > 0 && normalized.ts < list[0].ts) {
+    return list;
+  }
+  return upsertMsg(list, normalized);
 }

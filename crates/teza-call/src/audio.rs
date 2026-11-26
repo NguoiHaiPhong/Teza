@@ -269,60 +269,121 @@ impl OpusVoiceCodec {
     }
 }
 
+/// Execute a `cpal` host/device enumeration or selection closure on a dedicated persistent
+/// Windows STA thread so `cpal 0.15`'s global `static ENUMERATOR` (`IMMDeviceEnumerator`) is
+/// always created and accessed from the same COM apartment and `CoUninitialize()` never tears
+/// down COM / unloads `MMDevApi.dll` out from under the cached enumerator when ephemeral worker
+/// or test threads exit (which otherwise triggers `0xc0000005 STATUS_ACCESS_VIOLATION` on headless
+/// Windows CI runners and after blocking-pool thread expiry).
+#[cfg(target_os = "windows")]
+fn run_on_audio_host_thread<T, F>(f: F) -> CallResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> CallResult<T> + Send + 'static,
+{
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::{mpsc, OnceLock};
+
+    type HostJob = Box<dyn FnOnce() + Send + 'static>;
+    static HOST_TX: OnceLock<mpsc::Sender<HostJob>> = OnceLock::new();
+
+    let tx = HOST_TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<HostJob>();
+        thread::Builder::new()
+            .name("teza-wasapi-host".to_string())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    job();
+                }
+            })
+            .expect("failed to spawn teza-wasapi-host thread");
+        tx
+    });
+
+    let (res_tx, res_rx) = mpsc::sync_channel::<CallResult<T>>(1);
+    tx.send(Box::new(move || {
+        let res = match catch_unwind(AssertUnwindSafe(f)) {
+            Ok(r) => r,
+            Err(_) => Err(CallError::Audio(
+                "Lỗi nội bộ khi truy vấn thiết bị âm thanh hệ thống".to_string(),
+            )),
+        };
+        let _ = res_tx.send(res);
+    }))
+    .map_err(|_| CallError::Audio("Luồng quản lý thiết bị âm thanh đã dừng".to_string()))?;
+
+    res_rx.recv().map_err(|_| {
+        CallError::Audio("Không nhận được phản hồi từ luồng thiết bị âm thanh".to_string())
+    })?
+}
+
+#[cfg(not(target_os = "windows"))]
+fn run_on_audio_host_thread<T, F>(f: F) -> CallResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> CallResult<T> + Send + 'static,
+{
+    f()
+}
+
 /// Enumerate available microphone (input) devices on the default OS audio host.
 pub fn list_input_devices() -> CallResult<Vec<AudioDeviceInfo>> {
-    let host = cpal::default_host();
-    let default_name = host
-        .default_input_device()
-        .and_then(|d| d.name().ok())
-        .map(|s| s.trim().to_string());
-    let devices = host
-        .input_devices()
-        .map_err(|e| CallError::Audio(format!("Không liệt kê được thiết bị micro: {e}")))?;
-    let mut out = Vec::new();
-    for dev in devices {
-        if let Ok(name) = dev.name() {
-            let clean = name.trim().to_string();
-            if !clean.is_empty() {
-                let is_default = default_name.as_deref() == Some(clean.as_str());
-                let is_virtual = is_virtual_or_loopback_audio_device(&clean);
-                out.push(AudioDeviceInfo {
-                    name: clean,
-                    is_default,
-                    is_virtual,
-                });
+    run_on_audio_host_thread(|| {
+        let host = cpal::default_host();
+        let default_name = host
+            .default_input_device()
+            .and_then(|d| d.name().ok())
+            .map(|s| s.trim().to_string());
+        let devices = host
+            .input_devices()
+            .map_err(|e| CallError::Audio(format!("Không liệt kê được thiết bị micro: {e}")))?;
+        let mut out = Vec::new();
+        for dev in devices {
+            if let Ok(name) = dev.name() {
+                let clean = name.trim().to_string();
+                if !clean.is_empty() {
+                    let is_default = default_name.as_deref() == Some(clean.as_str());
+                    let is_virtual = is_virtual_or_loopback_audio_device(&clean);
+                    out.push(AudioDeviceInfo {
+                        name: clean,
+                        is_default,
+                        is_virtual,
+                    });
+                }
             }
         }
-    }
-    Ok(out)
+        Ok(out)
+    })
 }
 
 /// Enumerate available speaker (output) devices on the default OS audio host.
 pub fn list_output_devices() -> CallResult<Vec<AudioDeviceInfo>> {
-    let host = cpal::default_host();
-    let default_name = host
-        .default_output_device()
-        .and_then(|d| d.name().ok())
-        .map(|s| s.trim().to_string());
-    let devices = host
-        .output_devices()
-        .map_err(|e| CallError::Audio(format!("Không liệt kê được thiết bị loa: {e}")))?;
-    let mut out = Vec::new();
-    for dev in devices {
-        if let Ok(name) = dev.name() {
-            let clean = name.trim().to_string();
-            if !clean.is_empty() {
-                let is_default = default_name.as_deref() == Some(clean.as_str());
-                let is_virtual = is_virtual_or_loopback_audio_device(&clean);
-                out.push(AudioDeviceInfo {
-                    name: clean,
-                    is_default,
-                    is_virtual,
-                });
+    run_on_audio_host_thread(|| {
+        let host = cpal::default_host();
+        let default_name = host
+            .default_output_device()
+            .and_then(|d| d.name().ok())
+            .map(|s| s.trim().to_string());
+        let devices = host
+            .output_devices()
+            .map_err(|e| CallError::Audio(format!("Không liệt kê được thiết bị loa: {e}")))?;
+        let mut out = Vec::new();
+        for dev in devices {
+            if let Ok(name) = dev.name() {
+                let clean = name.trim().to_string();
+                if !clean.is_empty() {
+                    let is_default = default_name.as_deref() == Some(clean.as_str());
+                    let is_virtual = is_virtual_or_loopback_audio_device(&clean);
+                    out.push(AudioDeviceInfo {
+                        name: clean,
+                        is_default,
+                        is_virtual,
+                    });
+                }
             }
         }
-    }
-    Ok(out)
+        Ok(out)
+    })
 }
 
 /// Thread-safe live audio controls, meters, and transport statistics.
@@ -820,90 +881,140 @@ impl AudioStreams {
     }
 }
 
-fn select_input_device(preferred: Option<&str>) -> CallResult<(cpal::Device, String)> {
-    let host = cpal::default_host();
-    let default_dev = host.default_input_device();
-    let default_name = default_dev
-        .as_ref()
-        .and_then(|d| d.name().ok())
-        .map(|n| n.trim().to_string());
-    let listed: Vec<(String, cpal::Device)> = host
-        .input_devices()
-        .ok()
-        .map(|devs| {
-            devs.filter_map(|d| {
-                d.name()
+fn select_input_device(
+    preferred: Option<&str>,
+) -> CallResult<(cpal::Device, String, cpal::SupportedStreamConfig)> {
+    let preferred = preferred.map(str::to_string);
+    run_on_audio_host_thread(move || {
+        let host = cpal::default_host();
+        let default_dev = host.default_input_device();
+        let default_name = default_dev
+            .as_ref()
+            .and_then(|d| d.name().ok())
+            .map(|n| n.trim().to_string());
+        let listed: Vec<(String, cpal::Device)> = host
+            .input_devices()
+            .ok()
+            .map(|devs| {
+                devs.filter_map(|d| {
+                    d.name()
+                        .ok()
+                        .map(|n| n.trim().to_string())
+                        .filter(|n| !n.is_empty())
+                        .map(|n| (n, d))
+                })
+                .collect()
+            })
+            .unwrap_or_default();
+        let names: Vec<String> = listed.iter().map(|(n, _)| n.clone()).collect();
+        let (dev, name) = if let Some(chosen_name) = pick_preferred_device_name(
+            preferred.as_deref(),
+            default_name.as_deref(),
+            &names,
+            false,
+        ) {
+            if let Some((_, dev)) = listed
+                .into_iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(&chosen_name))
+            {
+                (dev, chosen_name)
+            } else {
+                let dev = default_dev.ok_or_else(|| {
+                    CallError::Audio("Không tìm thấy micro mặc định trên máy".to_string())
+                })?;
+                let fallback_name = dev
+                    .name()
                     .ok()
                     .map(|n| n.trim().to_string())
                     .filter(|n| !n.is_empty())
-                    .map(|n| (n, d))
-            })
-            .collect()
-        })
-        .unwrap_or_default();
-    let names: Vec<String> = listed.iter().map(|(n, _)| n.clone()).collect();
-    if let Some(chosen_name) =
-        pick_preferred_device_name(preferred, default_name.as_deref(), &names, false)
-    {
-        if let Some((_, dev)) = listed
-            .into_iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(&chosen_name))
-        {
-            return Ok((dev, chosen_name));
-        }
-    }
-    let dev = default_dev
-        .ok_or_else(|| CallError::Audio("Không tìm thấy micro mặc định trên máy".to_string()))?;
-    let fallback_name = dev
-        .name()
-        .ok()
-        .map(|n| n.trim().to_string())
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| "Unknown Microphone".to_string());
-    Ok((dev, fallback_name))
+                    .unwrap_or_else(|| "Unknown Microphone".to_string());
+                (dev, fallback_name)
+            }
+        } else {
+            let dev = default_dev.ok_or_else(|| {
+                CallError::Audio("Không tìm thấy micro mặc định trên máy".to_string())
+            })?;
+            let fallback_name = dev
+                .name()
+                .ok()
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "Unknown Microphone".to_string());
+            (dev, fallback_name)
+        };
+        let in_cfg = dev
+            .default_input_config()
+            .map_err(|e| CallError::Audio(format!("Không đọc được cấu hình micro: {e}")))?;
+        Ok((dev, name, in_cfg))
+    })
 }
 
-fn select_output_device(preferred: Option<&str>) -> CallResult<(cpal::Device, String)> {
-    let host = cpal::default_host();
-    let default_dev = host.default_output_device();
-    let default_name = default_dev
-        .as_ref()
-        .and_then(|d| d.name().ok())
-        .map(|n| n.trim().to_string());
-    let listed: Vec<(String, cpal::Device)> = host
-        .output_devices()
-        .ok()
-        .map(|devs| {
-            devs.filter_map(|d| {
-                d.name()
+fn select_output_device(
+    preferred: Option<&str>,
+) -> CallResult<(cpal::Device, String, cpal::SupportedStreamConfig)> {
+    let preferred = preferred.map(str::to_string);
+    run_on_audio_host_thread(move || {
+        let host = cpal::default_host();
+        let default_dev = host.default_output_device();
+        let default_name = default_dev
+            .as_ref()
+            .and_then(|d| d.name().ok())
+            .map(|n| n.trim().to_string());
+        let listed: Vec<(String, cpal::Device)> = host
+            .output_devices()
+            .ok()
+            .map(|devs| {
+                devs.filter_map(|d| {
+                    d.name()
+                        .ok()
+                        .map(|n| n.trim().to_string())
+                        .filter(|n| !n.is_empty())
+                        .map(|n| (n, d))
+                })
+                .collect()
+            })
+            .unwrap_or_default();
+        let names: Vec<String> = listed.iter().map(|(n, _)| n.clone()).collect();
+        let (dev, name) = if let Some(chosen_name) = pick_preferred_device_name(
+            preferred.as_deref(),
+            default_name.as_deref(),
+            &names,
+            true,
+        ) {
+            if let Some((_, dev)) = listed
+                .into_iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(&chosen_name))
+            {
+                (dev, chosen_name)
+            } else {
+                let dev = default_dev.ok_or_else(|| {
+                    CallError::Audio("Không tìm thấy loa mặc định trên máy".to_string())
+                })?;
+                let fallback_name = dev
+                    .name()
                     .ok()
                     .map(|n| n.trim().to_string())
                     .filter(|n| !n.is_empty())
-                    .map(|n| (n, d))
-            })
-            .collect()
-        })
-        .unwrap_or_default();
-    let names: Vec<String> = listed.iter().map(|(n, _)| n.clone()).collect();
-    if let Some(chosen_name) =
-        pick_preferred_device_name(preferred, default_name.as_deref(), &names, true)
-    {
-        if let Some((_, dev)) = listed
-            .into_iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(&chosen_name))
-        {
-            return Ok((dev, chosen_name));
-        }
-    }
-    let dev = default_dev
-        .ok_or_else(|| CallError::Audio("Không tìm thấy loa mặc định trên máy".to_string()))?;
-    let fallback_name = dev
-        .name()
-        .ok()
-        .map(|n| n.trim().to_string())
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| "Unknown Speaker".to_string());
-    Ok((dev, fallback_name))
+                    .unwrap_or_else(|| "Unknown Speaker".to_string());
+                (dev, fallback_name)
+            }
+        } else {
+            let dev = default_dev.ok_or_else(|| {
+                CallError::Audio("Không tìm thấy loa mặc định trên máy".to_string())
+            })?;
+            let fallback_name = dev
+                .name()
+                .ok()
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "Unknown Speaker".to_string());
+            (dev, fallback_name)
+        };
+        let out_cfg = dev
+            .default_output_config()
+            .map_err(|e| CallError::Audio(format!("Không đọc được cấu hình loa: {e}")))?;
+        Ok((dev, name, out_cfg))
+    })
 }
 
 fn push_captured_samples<S: Copy>(
@@ -1012,10 +1123,8 @@ fn try_open_input_stream(
     devices: &AudioDeviceSelection,
     capture_16k: &Arc<Mutex<VecDeque<f32>>>,
 ) -> CallResult<(cpal::Stream, String)> {
-    let (input_dev, input_name) = select_input_device(devices.input_device_name.as_deref())?;
-    let in_cfg = input_dev
-        .default_input_config()
-        .map_err(|e| CallError::Audio(format!("Không đọc được cấu hình micro: {e}")))?;
+    let (input_dev, input_name, in_cfg) =
+        select_input_device(devices.input_device_name.as_deref())?;
 
     let in_rate = in_cfg.sample_rate().0.max(8_000);
     let in_channels = (in_cfg.channels() as usize).max(1);
@@ -1095,11 +1204,8 @@ where
         &Arc<Mutex<VecDeque<f32>>>,
     ) -> CallResult<(cpal::Stream, String)>,
 {
-    let (output_dev, output_device_name) =
+    let (output_dev, output_device_name, out_cfg) =
         select_output_device(devices.output_device_name.as_deref())?;
-    let out_cfg = output_dev
-        .default_output_config()
-        .map_err(|e| CallError::Audio(format!("Không đọc được cấu hình loa: {e}")))?;
 
     let out_rate = out_cfg.sample_rate().0.max(8_000);
     let out_channels = (out_cfg.channels() as usize).max(1);
@@ -2573,5 +2679,31 @@ mod tests {
         );
         assert!(snap.input_is_virtual);
         assert!(!snap.output_is_virtual);
+    }
+
+    #[test]
+    fn list_devices_across_short_lived_threads_never_crashes_com() {
+        for _ in 0..3 {
+            thread::spawn(|| {
+                let _ = list_output_devices();
+                let _ = list_input_devices();
+            })
+            .join()
+            .expect("sequential audio device enumeration thread must not panic");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                thread::spawn(|| {
+                    let _ = list_output_devices();
+                    let _ = list_input_devices();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join()
+                .expect("concurrent audio device enumeration thread must not panic");
+        }
     }
 }

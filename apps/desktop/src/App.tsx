@@ -82,10 +82,13 @@ import {
   shouldNotifyMessage,
 } from "./utils/notifyPrefs";
 import {
+  applyOpenThreadSearchState,
+  applyOptimisticReaction,
   applyThreadReadSync,
   bumpThreadList,
   compareThreads,
   computeLayoutMode,
+  computeThreadRenderLimitForTarget,
   countFolderUnread,
   dayKey,
   extractFirstUrl,
@@ -95,6 +98,9 @@ import {
   formatThreadTime,
   getDisplayBodyText,
   looksLikePhoneQuery,
+  normalizeReactionEmoji,
+  normalizeReactions,
+  reconcileUpdatedMessage,
   shouldAutoMarkReadOnFocus,
   upsertMsg,
 } from "./utils/threadState";
@@ -481,7 +487,7 @@ export default function App() {
   } | null>(null);
   const [buzzCooldownUntil, setBuzzCooldownUntil] = useState<Record<string, number>>({});
   const [buzzNow, setBuzzNow] = useState(() => Date.now());
-  const [appVersion, setAppVersion] = useState("0.6.0");
+  const [appVersion, setAppVersion] = useState("0.6.1");
   const [updateModalOpen, setUpdateModalOpen] = useState(false);
   const [availableUpdate, setAvailableUpdate] = useState<AppUpdateInfo | null>(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
@@ -520,8 +526,13 @@ export default function App() {
 
   const selectedIdRef = useRef<string | null>(null);
   const folderRef = useRef<string>(folder);
+  const filterTextRef = useRef<string>(filterText);
   const threadsRef = useRef<ThreadDto[]>(threads);
   const visibleThreadsRef = useRef<ThreadDto[]>([]);
+  const sidebarListRef = useRef<HTMLDivElement | null>(null);
+  const pendingSidebarScrollIdRef = useRef<string | null>(null);
+  const reactionSeqCounterRef = useRef(0);
+  const reactionSeqByMsgRef = useRef<Map<string, number>>(new Map());
   const notifyPrefsRef = useRef<NotificationPrefs>(notifyPrefs);
   const themeRef = useRef<ThemeMode>(theme);
   const tRef = useRef(t);
@@ -596,6 +607,7 @@ export default function App() {
 
   selectedIdRef.current = selectedId;
   folderRef.current = folder;
+  filterTextRef.current = filterText;
   threadsRef.current = threads;
   notifyPrefsRef.current = notifyPrefs;
   themeRef.current = theme;
@@ -976,7 +988,13 @@ export default function App() {
   }, [selectMode, forwardMessages.length]);
 
   useEffect(() => {
-    setThreadRenderLimit(100);
+    setThreadRenderLimit(
+      computeThreadRenderLimitForTarget(
+        visibleThreadsRef.current,
+        pendingSidebarScrollIdRef.current ?? selectedIdRef.current,
+        100,
+      ),
+    );
   }, [folder, filterText]);
 
   const showError = useCallback((err: unknown) => {
@@ -2167,14 +2185,45 @@ export default function App() {
     };
   }, [tryAutoMarkReadActiveThread]);
 
+  const selectAndRevealThread = useCallback(
+    (tid: string, opts?: { forceScroll?: boolean; listOverride?: ThreadDto[] }) => {
+      const sourceThreads = opts?.listOverride ?? threadsRef.current;
+      const next = applyOpenThreadSearchState(
+        {
+          filterText: filterTextRef.current,
+          selectedId: selectedIdRef.current,
+          folder: folderRef.current,
+        },
+        tid,
+        sourceThreads,
+        customFoldersRef.current,
+      );
+      if (next.clearedSearch) {
+        filterTextRef.current = "";
+        setFilterText("");
+      }
+      if (next.folder !== folderRef.current) {
+        folderRef.current = next.folder;
+        setFolder(next.folder);
+      }
+      if (opts?.forceScroll || next.shouldScrollSidebar) {
+        pendingSidebarScrollIdRef.current = tid;
+      } else {
+        pendingSidebarScrollIdRef.current = null;
+      }
+      setSelectedId(tid);
+    },
+    [],
+  );
+
   const openThreadById = useCallback(
     (tid: string) => {
       leaveWebApps();
-      setSelectedId(tid);
+      selectAndRevealThread(tid, { forceScroll: true });
       setActiveThreadRootId(null);
       setMobilePane("chat");
     },
-    [leaveWebApps],
+    [leaveWebApps, selectAndRevealThread],
   );
 
   const triggerNotifyPopup = useCallback((payload: NotifyToastPayload) => {
@@ -2445,7 +2494,7 @@ export default function App() {
         listen<MessageDto>("core://message-updated", (ev) => {
           const msg = ev.payload;
           if (msg.thread_id === selectedIdRef.current) {
-            setMessages((prev) => upsertMsg(prev, msg));
+            setMessages((prev) => reconcileUpdatedMessage(prev, msg));
             if (msg.is_pinned || pinnedMsgIdsRef.current.has(msg.msg_id)) {
               void refreshPinnedMessages(msg.thread_id);
             }
@@ -3245,6 +3294,7 @@ export default function App() {
       leaveWebApps();
       setMobilePane("chat");
       if (hit.thread_id === selectedId) {
+        selectAndRevealThread(hit.thread_id, { forceScroll: true });
         if (messages.some((m) => m.msg_id === hit.msg_id)) {
           setTimeout(() => jumpToMsg(hit.msg_id), 40);
         } else {
@@ -3259,10 +3309,10 @@ export default function App() {
         }
       } else {
         pendingJumpRef.current = { threadId: hit.thread_id, msgId: hit.msg_id, ts: hit.ts };
-        setSelectedId(hit.thread_id);
+        selectAndRevealThread(hit.thread_id, { forceScroll: true });
       }
     },
-    [selectedId, messages, jumpToMsg, showError, leaveWebApps],
+    [selectedId, messages, jumpToMsg, showError, leaveWebApps, selectAndRevealThread],
   );
 
   const visibleThreads = useMemo(() => {
@@ -3272,6 +3322,29 @@ export default function App() {
     return base.sort(compareThreads);
   }, [threads, folder, customFolders, filterText]);
   visibleThreadsRef.current = visibleThreads;
+
+  useEffect(() => {
+    const targetId = pendingSidebarScrollIdRef.current;
+    if (!targetId || targetId !== selectedId) return;
+    const idx = visibleThreads.findIndex((item) => item.id === targetId);
+    if (idx < 0) return;
+    if (idx >= threadRenderLimit) {
+      setThreadRenderLimit((prev) =>
+        computeThreadRenderLimitForTarget(visibleThreads, targetId, prev),
+      );
+      return;
+    }
+    const container = sidebarListRef.current;
+    if (!container) return;
+    const rows = container.querySelectorAll<HTMLElement>("[data-thread-row]");
+    for (const row of rows) {
+      if (row.dataset.threadRow === targetId) {
+        pendingSidebarScrollIdRef.current = null;
+        row.scrollIntoView({ block: "nearest" });
+        break;
+      }
+    }
+  }, [selectedId, visibleThreads, threadRenderLimit]);
 
   const activeThread = useMemo(
     () => threads.find((t) => t.id === selectedId) ?? null,
@@ -3973,13 +4046,47 @@ export default function App() {
 
   const handleReactMessage = useCallback(
     (target: MessageDto, emoji: string) => {
-      if (!selectedId) return;
+      const threadId = target.thread_id || selectedIdRef.current;
+      const canonicalEmoji = normalizeReactionEmoji(emoji);
+      if (!threadId || !canonicalEmoji || target.is_recalled || target.send_status) return;
+
+      const msgKey = `${threadId}:${target.msg_id}`;
+      const seq = ++reactionSeqCounterRef.current;
+      reactionSeqByMsgRef.current.set(msgKey, seq);
+      const prevReactions = normalizeReactions(target.reactions);
+
+      setMessages((list) =>
+        list.map((m) =>
+          m.msg_id === target.msg_id
+            ? { ...m, reactions: applyOptimisticReaction(m.reactions, canonicalEmoji) }
+            : m,
+        ),
+      );
+
       void bridge
-        .reactMessage(selectedId, target.msg_id, emoji)
-        .then((updated) => setMessages((list) => upsertMsg(list, updated)))
-        .catch(showError);
+        .reactMessage(threadId, target.msg_id, canonicalEmoji)
+        .then((updated) => {
+          if (reactionSeqByMsgRef.current.get(msgKey) !== seq) return;
+          reactionSeqByMsgRef.current.delete(msgKey);
+          if (selectedIdRef.current === updated.thread_id) {
+            setMessages((list) => reconcileUpdatedMessage(list, updated));
+          }
+        })
+        .catch((err) => {
+          if (reactionSeqByMsgRef.current.get(msgKey) === seq) {
+            reactionSeqByMsgRef.current.delete(msgKey);
+            if (selectedIdRef.current === threadId) {
+              setMessages((list) =>
+                list.map((m) =>
+                  m.msg_id === target.msg_id ? { ...m, reactions: prevReactions } : m,
+                ),
+              );
+            }
+          }
+          showError(err);
+        });
     },
-    [selectedId, showError],
+    [showError],
   );
 
   const handleRecallMessage = useCallback(
@@ -4035,9 +4142,26 @@ export default function App() {
   const handleStartChatFromProfile = useCallback(
     (profile: UserProfileDto) => {
       leaveWebApps();
+      setFindUserInitialPhone("");
+      const created: ThreadDto | null = threadsRef.current.some((t) => t.id === profile.uid)
+        ? null
+        : {
+            id: profile.uid,
+            title: profile.display_name || profile.uid,
+            avatar: profile.avatar,
+            kind: "direct",
+            last_preview: "",
+            last_ts: 0,
+            unread_count: 0,
+            is_pinned: false,
+            is_muted: false,
+          };
+      const nextList = created
+        ? [created, ...threadsRef.current].sort(compareThreads)
+        : threadsRef.current;
       setThreads((prev) => {
         if (prev.some((t) => t.id === profile.uid)) return prev;
-        const created: ThreadDto = {
+        const entry: ThreadDto = created ?? {
           id: profile.uid,
           title: profile.display_name || profile.uid,
           avatar: profile.avatar,
@@ -4048,21 +4172,37 @@ export default function App() {
           is_pinned: false,
           is_muted: false,
         };
-        return [created, ...prev].sort(compareThreads);
+        return [entry, ...prev].sort(compareThreads);
       });
-      setSelectedId(profile.uid);
+      selectAndRevealThread(profile.uid, { forceScroll: true, listOverride: nextList });
       setMobilePane("chat");
     },
-    [leaveWebApps],
+    [leaveWebApps, selectAndRevealThread],
   );
 
   const handleStartChatFromFriendRequest = useCallback(
     (uid: string, name: string, avatar: string) => {
       setFriendRequestsOpen(false);
       leaveWebApps();
+      const created: ThreadDto | null = threadsRef.current.some((t) => t.id === uid)
+        ? null
+        : {
+            id: uid,
+            title: name || uid,
+            avatar: avatar || "",
+            kind: "direct",
+            last_preview: "",
+            last_ts: 0,
+            unread_count: 0,
+            is_pinned: false,
+            is_muted: false,
+          };
+      const nextList = created
+        ? [created, ...threadsRef.current].sort(compareThreads)
+        : threadsRef.current;
       setThreads((prev) => {
         if (prev.some((t) => t.id === uid)) return prev;
-        const created: ThreadDto = {
+        const entry: ThreadDto = created ?? {
           id: uid,
           title: name || uid,
           avatar: avatar || "",
@@ -4073,12 +4213,12 @@ export default function App() {
           is_pinned: false,
           is_muted: false,
         };
-        return [created, ...prev].sort(compareThreads);
+        return [entry, ...prev].sort(compareThreads);
       });
-      setSelectedId(uid);
+      selectAndRevealThread(uid, { forceScroll: true, listOverride: nextList });
       setMobilePane("chat");
     },
-    [leaveWebApps],
+    [leaveWebApps, selectAndRevealThread],
   );
 
   const handleSendSticker = useCallback(
@@ -5228,9 +5368,36 @@ export default function App() {
                 <input
                   value={filterText}
                   onChange={(e) => setFilterText(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape" && filterText.length > 0) {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setFilterText("");
+                    } else if (
+                      e.key === "Enter" &&
+                      visibleThreads.length === 0 &&
+                      looksLikePhoneQuery(filterText)
+                    ) {
+                      e.preventDefault();
+                      setFindUserInitialPhone(filterText.trim());
+                      setFindUserOpen(true);
+                    }
+                  }}
                   placeholder={t("searchThreadPlaceholder")}
                   className="w-full min-w-0 bg-transparent text-[15px] outline-none"
                 />
+                {filterText.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setFilterText("")}
+                    title={t("close")}
+                    aria-label={t("close")}
+                    className="hover-menu shrink-0 rounded-full p-0.5 transition"
+                    style={{ color: "var(--text-secondary)" }}
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                )}
               </div>
               <button
                 type="button"
@@ -5317,6 +5484,7 @@ export default function App() {
         )}
 
         <div
+          ref={sidebarListRef}
           className={`flex-1 overflow-y-auto pb-2 ${layout.mode === "compact" ? "px-1.5" : "px-2"}`}
           onScroll={(e) => {
             const el = e.currentTarget;
@@ -5462,10 +5630,11 @@ export default function App() {
                 return (
                   <button
                     key={thread.id}
+                    data-thread-row={thread.id}
                     type="button"
                     title={`${thread.title}${thread.last_preview ? ` — ${thread.last_preview}` : ""}`}
                     onClick={() => {
-                      setSelectedId(thread.id);
+                      selectAndRevealThread(thread.id);
                       if (layout.mode === "single") setMobilePane("chat");
                     }}
                     onContextMenu={(e) => {
@@ -5511,16 +5680,17 @@ export default function App() {
               return (
                 <div
                   key={thread.id}
+                  data-thread-row={thread.id}
                   role="button"
                   tabIndex={0}
                   onClick={() => {
-                    setSelectedId(thread.id);
+                    selectAndRevealThread(thread.id);
                     if (layout.mode === "single") setMobilePane("chat");
                   }}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" || e.key === " ") {
                       e.preventDefault();
-                      setSelectedId(thread.id);
+                      selectAndRevealThread(thread.id);
                       if (layout.mode === "single") setMobilePane("chat");
                     }
                   }}
@@ -5714,7 +5884,7 @@ export default function App() {
               key={buzzToast.nonce}
               type="button"
               onClick={() => {
-                setSelectedId(buzzToast.threadId);
+                selectAndRevealThread(buzzToast.threadId, { forceScroll: true });
                 setMobilePane("chat");
                 setActiveThreadRootId(null);
                 setBuzzToast(null);
@@ -7495,7 +7665,7 @@ export default function App() {
             onOpenImage={openLightboxForUrl}
             onOpenGroup={(gid) => {
               leaveWebApps();
-              setSelectedId(gid);
+              selectAndRevealThread(gid, { forceScroll: true });
               setMobilePane("chat");
             }}
             onStartChat={handleStartChatFromProfile}

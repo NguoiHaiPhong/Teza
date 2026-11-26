@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Search, UserPlus, X } from "lucide-react";
 import { bridge } from "../bridge";
 import { useI18n } from "../i18n";
@@ -38,36 +38,72 @@ export function QuickSearchModal({ open, threads, onClose, onSelectMessage, onFi
     return map;
   }, [threads]);
 
+  const resetState = useCallback(() => {
+    setQuery("");
+    setResults([]);
+    setActiveIndex(0);
+  }, []);
+
+  const handleClose = useCallback(() => {
+    resetState();
+    onClose();
+  }, [onClose, resetState]);
+
+  const handleSelectHit = useCallback(
+    (hit: MessageDto) => {
+      resetState();
+      onSelectMessage(hit);
+      onClose();
+    },
+    [onClose, onSelectMessage, resetState],
+  );
+
   useEffect(() => {
     if (!open) {
-      setQuery("");
+      resetState();
+      return;
+    }
+    let cancelled = false;
+    const trimmed = query.trim();
+    if (!trimmed) {
       setResults([]);
       setActiveIndex(0);
       return;
     }
-    const timer = setTimeout(() => {
-      if (query.trim().length > 0) {
-        void bridge
-          .searchGlobal(query)
-          .then((hits) => {
-            setResults(hits);
-            setActiveIndex(0);
-          })
-          .catch(() => setResults([]));
-      } else {
-        setResults([]);
-        setActiveIndex(0);
-      }
+    const timer = window.setTimeout(() => {
+      void bridge
+        .searchGlobal(trimmed)
+        .then((hits) => {
+          if (cancelled) return;
+          setResults(hits);
+          setActiveIndex(0);
+        })
+        .catch(() => {
+          if (cancelled) return;
+          setResults([]);
+        });
     }, 120);
-    return () => clearTimeout(timer);
-  }, [open, query]);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [open, query, resetState]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") handleClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [open, handleClose]);
 
   if (!open) return null;
 
   return (
     <div
       className="fixed inset-0 z-50 flex items-start justify-center bg-black/55 pt-20 backdrop-blur-xs"
-      onClick={onClose}
+      onClick={handleClose}
     >
       <div
         className="w-full max-w-xl overflow-hidden rounded-2xl shadow-2xl"
@@ -85,7 +121,8 @@ export function QuickSearchModal({ open, threads, onClose, onSelectMessage, onFi
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Escape") {
-                onClose();
+                e.preventDefault();
+                handleClose();
               } else if (e.key === "ArrowDown" && results.length > 0) {
                 e.preventDefault();
                 setActiveIndex((i) => (i + 1) % results.length);
@@ -94,8 +131,7 @@ export function QuickSearchModal({ open, threads, onClose, onSelectMessage, onFi
                 setActiveIndex((i) => (i - 1 + results.length) % results.length);
               } else if (e.key === "Enter" && results[activeIndex]) {
                 e.preventDefault();
-                onSelectMessage(results[activeIndex]);
-                onClose();
+                handleSelectHit(results[activeIndex]);
               }
             }}
             placeholder={t("quickSearchPlaceholder")}
@@ -103,7 +139,7 @@ export function QuickSearchModal({ open, threads, onClose, onSelectMessage, onFi
           />
           <button
             type="button"
-            onClick={onClose}
+            onClick={handleClose}
             className="hover-menu rounded p-1"
             title={t("close")}
           >
@@ -117,6 +153,7 @@ export function QuickSearchModal({ open, threads, onClose, onSelectMessage, onFi
               type="button"
               onClick={() => {
                 const phone = query.trim();
+                resetState();
                 onClose();
                 onFindPhone(phone);
               }}
@@ -145,10 +182,7 @@ export function QuickSearchModal({ open, threads, onClose, onSelectMessage, onFi
                   key={`${m.thread_id}-${m.msg_id}`}
                   type="button"
                   onMouseEnter={() => setActiveIndex(idx)}
-                  onClick={() => {
-                    onSelectMessage(m);
-                    onClose();
-                  }}
+                  onClick={() => handleSelectHit(m)}
                   className="hover-menu flex w-full flex-col gap-0.5 rounded-xl px-3 py-2 text-left transition"
                   style={{
                     background: selected ? "var(--bg-hover)" : "transparent",

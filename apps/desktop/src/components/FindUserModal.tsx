@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Ban, Check, Loader2, MessageSquare, Phone, Search, User, UserPlus, X } from "lucide-react";
 import { bridge } from "../bridge";
 import { useI18n } from "../i18n";
@@ -32,10 +32,30 @@ export function FindUserModal({
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const searchSeqRef = useRef(0);
 
-  const runSearch = async (raw: string) => {
+  const resetState = useCallback(() => {
+    searchSeqRef.current += 1;
+    setPhone("");
+    setError(null);
+    setResult(null);
+    setSearching(false);
+    setSendingRequest(false);
+    setRequestSent(false);
+    setActionError(null);
+    setActionNotice(null);
+  }, []);
+
+  const handleClose = useCallback(() => {
+    resetState();
+    onClose();
+  }, [onClose, resetState]);
+
+  const runSearch = useCallback(async (raw: string) => {
     const query = raw.trim();
+    const seq = ++searchSeqRef.current;
     if (!query) {
+      setSearching(false);
       setError("Vui lòng nhập số điện thoại cần tìm");
       setResult(null);
       return;
@@ -49,48 +69,51 @@ export function FindUserModal({
     setActionNotice(null);
     try {
       const found = await bridge.findUserByPhone(query);
+      if (searchSeqRef.current !== seq) return;
       setResult(found);
     } catch (err) {
+      if (searchSeqRef.current !== seq) return;
       setError(String(err).replace(/^Error:\s*/i, ""));
     } finally {
-      setSearching(false);
+      if (searchSeqRef.current === seq) {
+        setSearching(false);
+      }
     }
-  };
+  }, []);
 
   useEffect(() => {
     if (!open) {
-      setPhone("");
-      setError(null);
-      setResult(null);
-      setSearching(false);
-      setSendingRequest(false);
-      setRequestSent(false);
-      setActionError(null);
-      setActionNotice(null);
+      resetState();
       return;
     }
     const init = initialPhone.trim();
+    searchSeqRef.current += 1;
     setPhone(init);
     setError(null);
     setResult(null);
+    setSearching(false);
     setSendingRequest(false);
     setRequestSent(false);
     setActionError(null);
     setActionNotice(null);
-    setTimeout(() => inputRef.current?.focus(), 20);
+    const focusTimer = window.setTimeout(() => inputRef.current?.focus(), 20);
     if (init) {
       void runSearch(init);
     }
-  }, [open, initialPhone]);
+    return () => {
+      window.clearTimeout(focusTimer);
+      searchSeqRef.current += 1;
+    };
+  }, [open, initialPhone, resetState, runSearch]);
 
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") handleClose();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, onClose]);
+  }, [open, handleClose]);
 
   if (!open) return null;
 
@@ -126,7 +149,7 @@ export function FindUserModal({
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-xs"
-      onClick={onClose}
+      onClick={handleClose}
     >
       <div
         className="w-full max-w-md overflow-hidden rounded-2xl shadow-2xl"
@@ -147,7 +170,7 @@ export function FindUserModal({
           </div>
           <button
             type="button"
-            onClick={onClose}
+            onClick={handleClose}
             className="hover-menu rounded-lg p-1"
             title={t("close")}
           >
@@ -265,7 +288,9 @@ export function FindUserModal({
                 <button
                   type="button"
                   onClick={() => {
-                    onOpenProfile(result);
+                    const target = result;
+                    resetState();
+                    onOpenProfile(target);
                     onClose();
                   }}
                   className="hover-menu flex min-w-[100px] flex-1 items-center justify-center gap-1.5 rounded-xl px-3 py-2 text-[13px] font-medium transition"
@@ -303,7 +328,9 @@ export function FindUserModal({
                   <button
                     type="button"
                     onClick={() => {
-                      onStartChat(result);
+                      const target = result;
+                      resetState();
+                      onStartChat(target);
                       onClose();
                     }}
                     className="tf-btn flex min-w-[100px] flex-1 items-center justify-center gap-1.5 rounded-xl px-3 py-2 text-[13px] font-semibold"

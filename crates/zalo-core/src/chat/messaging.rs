@@ -236,6 +236,7 @@ pub async fn send_sticker(
 
     Ok(MessageDto {
         msg_id,
+        cli_msg_id: Some(client_id.to_string()),
         thread_id: thread_id.to_string(),
         sender_id: session.profile.uid.clone(),
         sender_name: "Bạn".into(),
@@ -410,6 +411,7 @@ pub async fn send_text(
 
     Ok(MessageDto {
         msg_id,
+        cli_msg_id: Some(client_id.to_string()),
         thread_id: thread_id.to_string(),
         sender_id: session.profile.uid.clone(),
         sender_name: "Bạn".into(),
@@ -457,6 +459,12 @@ pub async fn send_quote(
     } else {
         client_id.saturating_sub(1000)
     };
+    let qmsg_cli_id = quoted
+        .cli_msg_id
+        .as_deref()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(qmsg_ts);
 
     let (url, body) = if is_group {
         let grid = clean_group_id(thread_id);
@@ -467,7 +475,7 @@ pub async fn send_quote(
             ("language", json!("vi")),
             ("qmsgOwner", json!(qmsg_owner)),
             ("qmsgId", json!(qmsg_id_num)),
-            ("qmsgCliId", json!(qmsg_ts)),
+            ("qmsgCliId", json!(qmsg_cli_id)),
             ("qmsgType", json!(1)),
             ("qmsg", json!(quoted.text)),
             ("qmsgTs", json!(qmsg_ts)),
@@ -490,7 +498,7 @@ pub async fn send_quote(
             ("clientId", json!(client_id)),
             ("qmsgOwner", json!(qmsg_owner)),
             ("qmsgId", json!(qmsg_id_num)),
-            ("qmsgCliId", json!(qmsg_ts)),
+            ("qmsgCliId", json!(qmsg_cli_id)),
             ("qmsgType", json!(1)),
             ("qmsgTs", json!(qmsg_ts)),
             ("qmsg", json!(quoted.text)),
@@ -514,6 +522,7 @@ pub async fn send_quote(
 
     Ok(MessageDto {
         msg_id,
+        cli_msg_id: Some(client_id.to_string()),
         thread_id: thread_id.to_string(),
         sender_id: session.profile.uid.clone(),
         sender_name: "Bạn".into(),
@@ -534,16 +543,198 @@ pub async fn send_quote(
     })
 }
 
-pub fn reaction_code_and_type(emoji: &str) -> (&'static str, i32) {
-    match emoji.trim() {
-        "👍" | "/-strong" => ("/-strong", 3),
-        "❤️" | "❤" | "/-heart" => ("/-heart", 5),
-        "😆" | ":>" => (":>", 0),
-        "😮" | ":o" => (":o", 32),
-        "😢" | ":-(( " | ":-((" => (":-((", 2),
-        "😠" | ":-h" => (":-h", 20),
-        _ => ("/-heart", 5),
+/// Map message `msg_type` to Zalo's numeric client message type (`getClientMessageType`).
+pub fn reaction_client_msg_type(msg_type: &str) -> i32 {
+    match msg_type.trim().to_ascii_lowercase().as_str() {
+        "webchat" | "chat.text" | "1" => 1,
+        "chat.voice" | "voice" | "3" | "31" => 31,
+        "chat.photo" | "photo" | "2" | "32" => 32,
+        "chat.sticker" | "sticker" | "5" | "36" => 36,
+        "chat.doodle" | "37" => 37,
+        "chat.recommended" | "chat.link" | "link" | "38" => 38,
+        "chat.location" | "chat.location.new" | "43" => 43,
+        "chat.video.msg" | "chat.video" | "video" | "4" | "44" => 44,
+        "share.file" | "chat.file" | "file" | "19" | "46" => 46,
+        "chat.gif" | "gif" | "49" => 49,
+        _ => 1,
     }
+}
+
+fn known_reaction_code_and_type(trimmed: &str) -> Option<(&'static str, i32)> {
+    match trimmed {
+        "👍" | "/-strong" => Some(("/-strong", 3)),
+        "❤️" | "❤" | "/-heart" => Some(("/-heart", 5)),
+        "😆" | ":>" => Some((":>", 0)),
+        "😮" | ":o" => Some((":o", 32)),
+        "😢" | "😭" | ":-((" => Some((":-((", 2)),
+        "😠" | "😡" | ":-h" => Some((":-h", 20)),
+        "😘" | ":-*" => Some((":-*", 8)),
+        "😂" | ":')" => Some((":')", 7)),
+        "💩" | "/-shit" => Some(("/-shit", 66)),
+        "🌹" | "/-rose" => Some(("/-rose", 120)),
+        "💔" | "/-break" => Some(("/-break", 65)),
+        "👎" | "/-weak" => Some(("/-weak", 4)),
+        "😍" | ";xx" => Some((";xx", 29)),
+        "😕" | ";-/" => Some((";-/", 51)),
+        "😉" | ";-)" => Some((";-)", 45)),
+        "🥀" | "/-fade" => Some(("/-fade", 121)),
+        "☀️" | "☀" | "/-li" => Some(("/-li", 67)),
+        "🎂" | "/-bd" => Some(("/-bd", 126)),
+        "💣" | "/-bome" => Some(("/-bome", 127)),
+        "👌" | "/-ok" => Some(("/-ok", 68)),
+        "✌️" | "✌" | "/-v" => Some(("/-v", 69)),
+        "🙏" | "/-thanks" => Some(("/-thanks", 70)),
+        "_()_" => Some(("_()_", 73)),
+        "👊" | "/-punch" => Some(("/-punch", 71)),
+        "/-share" => Some(("/-share", 72)),
+        "🙅" | "/-no" => Some(("/-no", 131)),
+        "/-bad" => Some(("/-bad", 132)),
+        "/-loveu" => Some(("/-loveu", 133)),
+        "--b" => Some(("--b", 1)),
+        ":((" => Some((":((", 16)),
+        "x-)" => Some(("x-)", 21)),
+        "🤓" | "8-)" => Some(("8-)", 22)),
+        "😁" | ";-d" => Some((";-d", 23)),
+        "😎" | "b-)" => Some(("b-)", 26)),
+        "😐" | ":--|" => Some((":--|", 30)),
+        "p-(" => Some(("p-(", 35)),
+        "👋" | ":-bye" => Some((":-bye", 36)),
+        "😴" | "|-)" => Some(("|-)", 38)),
+        ":wipe" => Some((":wipe", 39)),
+        ":-dig" => Some((":-dig", 42)),
+        "&-(" => Some(("&-(", 44)),
+        "👏" | ":handclap" => Some((":handclap", 46)),
+        ">-|" => Some((">-|", 47)),
+        ":-f" => Some((":-f", 48)),
+        ":-l" => Some((":-l", 49)),
+        ":-r" => Some((":-r", 50)),
+        "🤐" | ";-x" => Some((";-x", 52)),
+        ":-o" => Some((":-o", 53)),
+        "😳" | ";-s" => Some((";-s", 54)),
+        "😨" | ";-a" => Some((";-a", 60)),
+        ":-<" => Some((":-<", 61)),
+        ":))" => Some((":))", 62)),
+        "🤑" | "$-)" => Some(("$-)", 63)),
+        "🍺" | "/-beer" => Some(("/-beer", 99)),
+        _ => None,
+    }
+}
+
+pub fn reaction_code_and_type(emoji: &str) -> (&'static str, i32) {
+    known_reaction_code_and_type(emoji.trim()).unwrap_or(("/-heart", 5))
+}
+
+/// Resolve `(rIcon, rType)` for the Zalo `/api/{message,group}/reaction` wire payload.
+/// Removal (`remove == true`) always sends `("", -1)` (`Reactions.NONE` in `zca-js`).
+/// Known emojis map to exact `Reactions` shortcodes + `rType`; custom Unicode emojis
+/// pass through verbatim with `rType = 75`.
+pub fn resolve_reaction_wire(emoji: &str, remove: bool) -> (String, i32) {
+    if remove {
+        return (String::new(), -1);
+    }
+    let trimmed = emoji.trim();
+    if trimmed.is_empty()
+        || matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "/-none" | "/-remove" | "none"
+        )
+    {
+        return (String::new(), -1);
+    }
+    if let Some((code, r_type)) = known_reaction_code_and_type(trimmed) {
+        return (code.to_string(), r_type);
+    }
+    if !trimmed.is_ascii() {
+        return (trimmed.to_string(), 75);
+    }
+    ("/-heart".to_string(), 5)
+}
+
+/// Build the `(endpoint_path, body_json)` for `/api/message/reaction` (DM/Cloud) or
+/// `/api/group/reaction` (Group) matching Zalo Web / `zca-js` `addReaction.ts`.
+pub fn build_reaction_request_payload(
+    thread_id: &str,
+    kind: ThreadKind,
+    msg: &MessageDto,
+    emoji: &str,
+    remove: bool,
+    imei: &str,
+    client_id: u64,
+) -> Result<(&'static str, Value)> {
+    let raw_mid = msg.msg_id.trim();
+    if raw_mid.is_empty() || raw_mid.starts_with("local-") || raw_mid.starts_with("out_") {
+        anyhow::bail!("Tin nhắn chưa đồng bộ ID máy chủ, không thể thả cảm xúc");
+    }
+    let g_msg_id = raw_mid
+        .parse::<i64>()
+        .ok()
+        .filter(|&n| n > 0)
+        .ok_or_else(|| anyhow::anyhow!("Mã tin nhắn không hợp lệ để thả cảm xúc"))?;
+
+    let c_msg_id = msg
+        .cli_msg_id
+        .as_deref()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(if msg.ts > 0 { msg.ts } else { client_id as i64 });
+
+    let wire_msg_type = reaction_client_msg_type(&msg.msg_type);
+    let (r_icon, r_type) = resolve_reaction_wire(emoji, remove);
+
+    let inner = json!({
+        "rMsg": [{
+            "gMsgID": g_msg_id,
+            "cMsgID": c_msg_id,
+            "msgType": wire_msg_type,
+        }],
+        "rIcon": r_icon,
+        "rType": r_type,
+        "source": 6,
+    })
+    .to_string();
+    let react_list = json!([{ "message": inner, "clientId": client_id }]);
+
+    if kind == ThreadKind::Group {
+        let grid = clean_group_id(thread_id);
+        if grid.is_empty() || grid == "0" {
+            anyhow::bail!("Mã nhóm không hợp lệ để thả cảm xúc");
+        }
+        Ok((
+            "/api/group/reaction",
+            obj(&[
+                ("react_list", react_list),
+                ("grid", json!(grid)),
+                ("imei", json!(imei)),
+            ]),
+        ))
+    } else {
+        let toid = thread_id.trim();
+        if toid.is_empty() || toid == "0" {
+            anyhow::bail!("Mã hội thoại không hợp lệ để thả cảm xúc");
+        }
+        Ok((
+            "/api/message/reaction",
+            obj(&[("react_list", react_list), ("toid", json!(toid))]),
+        ))
+    }
+}
+
+fn reaction_candidate_hosts(session: &Session) -> Vec<String> {
+    let mut hosts = Vec::new();
+    let push_unique = |list: &mut Vec<String>, raw: &str| {
+        let trimmed = raw.trim().trim_end_matches('/');
+        if !trimmed.is_empty() && !list.iter().any(|h| h.eq_ignore_ascii_case(trimmed)) {
+            list.push(trimmed.to_string());
+        }
+    };
+    for candidate in session.domains.candidates("reaction") {
+        push_unique(&mut hosts, &candidate);
+    }
+    if let Some(svc) = crate::endpoints::service("reaction") {
+        push_unique(&mut hosts, svc);
+    }
+    push_unique(&mut hosts, crate::endpoints::REACTION_FALLBACK);
+    hosts
 }
 
 pub async fn send_reaction(
@@ -558,53 +749,31 @@ pub async fn send_reaction(
         anyhow::bail!("Chưa đăng nhập");
     }
     let now = next_client_id();
-    let (r_icon, r_type) = if remove {
-        ("/-none", -1)
-    } else {
-        reaction_code_and_type(emoji)
-    };
-    let is_local = msg.msg_id.starts_with("local-") || msg.msg_id.starts_with("out_");
-    let g_msg_id = if is_local { "" } else { msg.msg_id.as_str() };
-    let c_msg_id = if msg.ts > 0 { msg.ts as u64 } else { now };
-
-    let inner = json!({
-        "rMsg": [{
-            "gMsgID": g_msg_id,
-            "cMsgID": c_msg_id,
-            "msgType": 1,
-        }],
-        "rIcon": r_icon,
-        "rType": r_type,
-        "source": 6,
-    })
-    .to_string();
-    let react_list = json!([{ "message": inner, "clientId": now }]);
-
-    let react_host = if session.domains.reaction.is_empty() {
-        crate::endpoints::REACTION_FALLBACK
-    } else {
-        session.domains.reaction.trim_end_matches('/')
-    };
-
-    let (url, body) = if kind == ThreadKind::Group {
-        (
-            format!("{react_host}/api/group/reaction?{}", session.common_params()),
-            obj(&[
-                ("react_list", react_list),
-                ("grid", json!(clean_group_id(thread_id))),
-                ("imei", json!(session.imei)),
-            ]),
-        )
-    } else {
-        (
-            format!("{react_host}/api/message/reaction?{}", session.common_params()),
-            obj(&[("react_list", react_list), ("toid", json!(thread_id))]),
-        )
-    };
+    let (path, body) =
+        build_reaction_request_payload(thread_id, kind, msg, emoji, remove, &session.imei, now)?;
     let params = session.encoded_params(&body)?;
-    let raw = session.post_form(&url, format!("params={params}")).await?;
-    let dec = session.maybe_decrypt(raw, session.session_key_bytes());
-    check_error_code(&dec)
+    let hosts = reaction_candidate_hosts(session);
+
+    let mut last_err = anyhow::anyhow!("Không có máy chủ phản hồi cho yêu cầu thả cảm xúc");
+    for host in &hosts {
+        let url = format!("{host}{path}?{}", session.common_params());
+        match session.post_form(&url, format!("params={params}")).await {
+            Ok(raw) => {
+                let dec = session.maybe_decrypt(raw, session.session_key_bytes());
+                if dec.is_object() {
+                    return check_error_code(&dec);
+                }
+                last_err = anyhow::anyhow!("Phản hồi không hợp lệ từ máy chủ cảm xúc");
+            }
+            Err(e) => {
+                if matches!(e.downcast_ref::<SessionError>(), Some(SessionError::Expired { .. })) {
+                    return Err(e);
+                }
+                last_err = e;
+            }
+        }
+    }
+    Err(last_err)
 }
 
 pub async fn recall_message(
@@ -617,11 +786,19 @@ pub async fn recall_message(
         anyhow::bail!("Chưa đăng nhập");
     }
     let now = next_client_id();
-    let cli_id = if msg.ts > 0 {
-        msg.ts.to_string()
-    } else {
-        now.to_string()
-    };
+    let cli_id = msg
+        .cli_msg_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "0")
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if msg.ts > 0 {
+                msg.ts.to_string()
+            } else {
+                now.to_string()
+            }
+        });
 
     let (url, body) = if kind == ThreadKind::Group {
         let body = obj(&[
@@ -879,6 +1056,7 @@ async fn send_photo_reader<R: AsyncRead + AsyncSeek + Unpin>(
 
     Ok(MessageDto {
         msg_id,
+        cli_msg_id: Some(ctx.client_id.to_string()),
         thread_id: thread_id.to_string(),
         sender_id: session.profile.uid.clone(),
         sender_name: "Bạn".into(),
@@ -986,6 +1164,7 @@ async fn send_file_reader<R: AsyncRead + Unpin>(
 
     Ok(MessageDto {
         msg_id,
+        cli_msg_id: Some(ctx.client_id.to_string()),
         thread_id: thread_id.to_string(),
         sender_id: session.profile.uid.clone(),
         sender_name: "Bạn".into(),
@@ -1186,5 +1365,149 @@ mod tests {
         assert_eq!(parsed[0].category, "Gợi ý");
         assert_eq!(parsed[1].id, 2102);
         assert_eq!(parsed[1].cate_id, 46);
+    }
+
+    #[test]
+    fn build_reaction_request_payload_matches_zca_js_for_dm_group_icons_and_unreact() {
+        let msg = MessageDto {
+            msg_id: "7970889894523".into(),
+            cli_msg_id: Some("1782286269667".into()),
+            thread_id: "999888777".into(),
+            sender_id: "999888777".into(),
+            sender_name: "Alice".into(),
+            text: "hello".into(),
+            msg_type: "chat.text".into(),
+            ts: 1_782_286_279_518,
+            is_outgoing: false,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
+            reactions: Vec::new(),
+            attachment_url: None,
+            attachment_name: None,
+        };
+
+        // 1. Verify all 6 primary palette emojis + aliases + custom emoji
+        let expected = [
+            ("❤️", "/-heart", 5),
+            ("❤", "/-heart", 5),
+            ("👍", "/-strong", 3),
+            ("😆", ":>", 0),
+            ("😮", ":o", 32),
+            ("😢", ":-((", 2),
+            ("😭", ":-((", 2),
+            ("😠", ":-h", 20),
+            ("😡", ":-h", 20),
+            ("🔥", "🔥", 75),
+        ];
+        for (emoji, exp_icon, exp_type) in expected {
+            let (path, body) = build_reaction_request_payload(
+                "999888777",
+                ThreadKind::Direct,
+                &msg,
+                emoji,
+                false,
+                "imei-1",
+                1_782_286_300_000,
+            )
+            .unwrap();
+            assert_eq!(path, "/api/message/reaction");
+            assert_eq!(body["toid"], "999888777");
+            assert!(body.get("grid").is_none());
+            let inner: Value =
+                serde_json::from_str(body["react_list"][0]["message"].as_str().unwrap()).unwrap();
+            assert_eq!(inner["rIcon"], exp_icon);
+            assert_eq!(inner["rType"], exp_type);
+            assert_eq!(inner["source"], 6);
+            assert_eq!(inner["rMsg"][0]["gMsgID"], json!(7_970_889_894_523_i64));
+            assert_eq!(inner["rMsg"][0]["cMsgID"], json!(1_782_286_269_667_i64));
+            assert!(inner["rMsg"][0]["gMsgID"].is_i64());
+            assert!(inner["rMsg"][0]["cMsgID"].is_i64());
+            assert_eq!(inner["rMsg"][0]["msgType"], 1);
+            assert_eq!(body["react_list"][0]["clientId"], 1_782_286_300_000_u64);
+        }
+
+        // 2. Group endpoint strips `group_`/`g` prefix, includes `grid` + `imei`, maps photo msgType=32
+        let mut photo_msg = msg.clone();
+        photo_msg.msg_type = "chat.photo".into();
+        let (path, body) = build_reaction_request_payload(
+            "group_7560225984834507848",
+            ThreadKind::Group,
+            &photo_msg,
+            "👍",
+            false,
+            "imei-grp",
+            1_782_286_300_001,
+        )
+        .unwrap();
+        assert_eq!(path, "/api/group/reaction");
+        assert_eq!(body["grid"], "7560225984834507848");
+        assert_eq!(body["imei"], "imei-grp");
+        assert!(body.get("toid").is_none());
+        let inner: Value =
+            serde_json::from_str(body["react_list"][0]["message"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["rMsg"][0]["msgType"], 32);
+        assert_eq!(inner["rIcon"], "/-strong");
+        assert_eq!(inner["rType"], 3);
+
+        // 3. Unreact MUST send `rIcon: ""` and `rType: -1` (zca-js Reactions.NONE)
+        let (path, body) = build_reaction_request_payload(
+            "999888777",
+            ThreadKind::Direct,
+            &msg,
+            "❤️",
+            true,
+            "imei-1",
+            1_782_286_300_002,
+        )
+        .unwrap();
+        assert_eq!(path, "/api/message/reaction");
+        let inner: Value =
+            serde_json::from_str(body["react_list"][0]["message"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["rIcon"], "");
+        assert_eq!(inner["rType"], -1);
+        assert_eq!(inner["source"], 6);
+
+        // 4. Legacy message without `cli_msg_id` falls back cleanly to `msg.ts`
+        let mut legacy = msg.clone();
+        legacy.cli_msg_id = None;
+        let (_, body) = build_reaction_request_payload(
+            "999888777",
+            ThreadKind::Cloud,
+            &legacy,
+            "❤️",
+            false,
+            "imei-1",
+            1_782_286_300_003,
+        )
+        .unwrap();
+        let inner: Value =
+            serde_json::from_str(body["react_list"][0]["message"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["rMsg"][0]["cMsgID"], json!(1_782_286_279_518_i64));
+
+        // 5. Rejects unsynced local placeholder IDs
+        let mut local = msg.clone();
+        local.msg_id = "local-1782286279518".into();
+        assert!(build_reaction_request_payload(
+            "999888777",
+            ThreadKind::Direct,
+            &local,
+            "❤️",
+            false,
+            "imei-1",
+            1_782_286_300_004,
+        )
+        .is_err());
+
+        // 6. Client message type mapping
+        assert_eq!(reaction_client_msg_type("chat.text"), 1);
+        assert_eq!(reaction_client_msg_type("chat.voice"), 31);
+        assert_eq!(reaction_client_msg_type("chat.photo"), 32);
+        assert_eq!(reaction_client_msg_type("chat.sticker"), 36);
+        assert_eq!(reaction_client_msg_type("chat.link"), 38);
+        assert_eq!(reaction_client_msg_type("chat.location.new"), 43);
+        assert_eq!(reaction_client_msg_type("chat.video"), 44);
+        assert_eq!(reaction_client_msg_type("chat.file"), 46);
+        assert_eq!(reaction_client_msg_type("chat.gif"), 49);
     }
 }

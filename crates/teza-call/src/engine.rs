@@ -6,7 +6,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1420,6 +1420,42 @@ async fn stop_aux_session_blocking(aux: Arc<dyn AuxiliaryMediaSession>) {
     let _ = tokio::task::spawn_blocking(move || aux.stop()).await;
 }
 
+/// Disarms `ZrtpRelaySession::keepalive_task`'s RTP socket receiver before `aux_media_hook` or
+/// OS audio startup begins so early video/audio RTP/RTCP packets are never swallowed before
+/// `AudioMediaSession` takes ownership of the socket.
+struct PendingMediaAttachGuard {
+    flag: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+    previous: bool,
+    handed_off: bool,
+}
+
+impl PendingMediaAttachGuard {
+    fn acquire(flag: Arc<AtomicBool>, notify: Arc<tokio::sync::Notify>) -> Self {
+        let previous = flag.swap(true, Ordering::AcqRel);
+        notify.notify_one();
+        Self {
+            flag,
+            notify,
+            previous,
+            handed_off: false,
+        }
+    }
+
+    fn hand_off(mut self) {
+        self.handed_off = true;
+    }
+}
+
+impl Drop for PendingMediaAttachGuard {
+    fn drop(&mut self) {
+        if !self.handed_off {
+            self.flag.store(self.previous, Ordering::Release);
+            self.notify.notify_one();
+        }
+    }
+}
+
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -1936,6 +1972,16 @@ impl CallEngine {
             g.as_ref()
                 .and_then(|(cid, aux)| (*cid == call_id).then(|| aux.clone()))
         };
+        if !self.config.enable_audio && existing_aux.is_none() && self.aux_media_hook.is_none() {
+            return;
+        }
+        // Disarm `keepalive_task`'s RTP socket receiver BEFORE `aux_media_hook.on_media_start`
+        // transmits or receives initial video/RTCP packets so those datagrams stay queued on the
+        // UDP socket until `AudioMediaSession` starts draining it.
+        let attach_guard =
+            PendingMediaAttachGuard::acquire(media_attached.clone(), media_attached_notify.clone());
+        tokio::task::yield_now().await;
+
         let mut created_aux = false;
         let aux_session = match existing_aux {
             Some(aux) => Some(aux),
@@ -2017,6 +2063,9 @@ impl CallEngine {
                         call_id,
                         message: msg,
                     }]);
+                    media_attached.store(true, Ordering::Release);
+                    media_attached_notify.notify_one();
+                    tokio::task::yield_now().await;
                     let pump_cfg = make_cfg();
                     let pump_res = tokio::task::spawn_blocking(move || {
                         AudioMediaSession::start_aux_pump_only(pump_cfg)
@@ -2041,6 +2090,7 @@ impl CallEngine {
 
         match start_res {
             Ok(session) => {
+                attach_guard.hand_off();
                 let telem = session.telemetry();
                 let receive_only = !pump_only && !telem.has_input_device;
                 let virtual_warn = (!pump_only)
@@ -4448,10 +4498,18 @@ mod tests {
         );
         engine.handle_voip_event(&ans).await.unwrap();
         assert_eq!(engine.phase().await, CallPhase::Connected);
-        // Immediately after switching to unacked ServerB, snapshot MUST NOT show TOKEN_A!
+        // Immediately after switching to unacked ServerB, snapshot MUST NOT show TOKEN_A
+        // (or TOKEN_A_SPURIOUS); it is either still 0 or already TOKEN_B_LATE if OS audio startup
+        // took longer than keepalive_task's 400ms InitZRTP retry.
         let snap_initial = engine.snapshot().await.unwrap();
         assert_eq!(snap_initial.rtp_ip, addr_b);
-        assert_eq!(snap_initial.relay_token, 0);
+        assert_ne!(snap_initial.relay_token, TOKEN_A);
+        assert_ne!(snap_initial.relay_token, TOKEN_A_SPURIOUS);
+        assert!(
+            snap_initial.relay_token == 0 || snap_initial.relay_token == TOKEN_B_LATE,
+            "unexpected initial ServerB relay token: 0x{:08x}",
+            snap_initial.relay_token
+        );
 
         // Wait for keepalive_task's per-server InitZRTP retry (400ms) -> ServerB acks TOKEN_B_LATE
         // -> AudioMediaSession activates 5-byte wrapping with TOKEN_B_LATE & keepalive switches to Ping!
@@ -5417,7 +5475,12 @@ mod tests {
             }),
         );
         engine.handle_voip_event(&ans).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while tokio::time::Instant::now() < deadline
+            && (rtp_rx.load(Ordering::Relaxed) == 0 || rtcp_rx.load(Ordering::Relaxed) == 0)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         assert!(engine.has_active_aux_media().await);
         assert_eq!(*seen_call_type.lock().unwrap(), Some(CallType::DirectVideo));

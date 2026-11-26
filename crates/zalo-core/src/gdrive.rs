@@ -3165,6 +3165,7 @@ mod tests {
         .unwrap();
         src.upsert_message(&MessageDto {
             msg_id: "m-101".into(),
+            cli_msg_id: None,
             thread_id: "t-eng".into(),
             sender_id: "u-alice".into(),
             sender_name: "Alice".into(),
@@ -3531,6 +3532,7 @@ mod tests {
                 guard
                     .upsert_message(&MessageDto {
                         msg_id: mid.into(),
+                        cli_msg_id: None,
                         thread_id: tid.into(),
                         sender_id: "u1".into(),
                         sender_name: "Alice".into(),
@@ -3730,6 +3732,7 @@ mod tests {
             guard
                 .upsert_message(&MessageDto {
                     msg_id: "m10".into(),
+                    cli_msg_id: None,
                     thread_id: "t2".into(),
                     sender_id: "u2".into(),
                     sender_name: "Bob".into(),

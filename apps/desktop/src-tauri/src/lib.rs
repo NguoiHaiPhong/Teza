@@ -341,6 +341,14 @@ async fn ensure_ws_worker(
     }
 }
 
+fn should_dispatch_ws_event(ev: &zalo_core::socket::WsEvent) -> bool {
+    ev.is_chat_ish()
+        || ev.is_control_ish()
+        || ev.is_receipt_ish()
+        || zalo_core::chat::parser::is_reaction_ws_cmd(ev.cmd)
+        || !zalo_core::chat::parser::extract_voip_controls(&ev.payload).is_empty()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn restart_ws_worker(
     app: AppHandle,
@@ -399,11 +407,7 @@ async fn restart_ws_worker(
                     break;
                 }
                 WsSignal::Event(ev) => {
-                    if !ev.is_chat_ish()
-                        && !ev.is_control_ish()
-                        && !ev.is_receipt_ish()
-                        && zalo_core::chat::parser::extract_voip_controls(&ev.payload).is_empty()
-                    {
+                    if !should_dispatch_ws_event(&ev) {
                         continue;
                     }
                     let mut actions = parse_ws_event(&ev, &my_uid, &send2me_id);
@@ -546,13 +550,17 @@ async fn restart_ws_worker(
                                 WsParsedAction::Reaction {
                                     thread_id,
                                     msg_id,
+                                    cli_msg_id,
+                                    actor_id,
                                     emoji,
                                     me,
                                     removed,
                                 } => {
-                                    if let Ok(Some(updated)) = store.apply_reaction(
+                                    if let Ok(Some(updated)) = store.apply_reaction_event(
                                         &thread_id,
                                         &msg_id,
+                                        cli_msg_id.as_deref(),
+                                        actor_id.as_deref(),
                                         emoji.as_deref(),
                                         me,
                                         removed,
@@ -2081,6 +2089,7 @@ async fn reminder_create(
         .to_string();
         MessageDto {
             msg_id: format!("local-rem-{now_ms}"),
+            cli_msg_id: None,
             thread_id: thread_id.clone(),
             sender_id: "me".into(),
             sender_name: "Bạn".into(),
@@ -2184,6 +2193,7 @@ async fn poll_create(
         let poll_json = serde_json::to_string(&dto).map_err(|e| e.to_string())?;
         MessageDto {
             msg_id: format!("local-poll-{now_ms}"),
+            cli_msg_id: None,
             thread_id: thread_id.clone(),
             sender_id: "me".into(),
             sender_name: "Bạn".into(),
@@ -2317,13 +2327,26 @@ struct RemoteThreadSyncCtx {
     limit: usize,
 }
 
-fn message_sync_sig(m: &MessageDto) -> (String, i64, bool, bool, usize, String, String) {
+type MessageSyncSig = (
+    String,
+    i64,
+    bool,
+    bool,
+    Vec<(String, u32, bool)>,
+    String,
+    String,
+);
+
+fn message_sync_sig(m: &MessageDto) -> MessageSyncSig {
     (
         m.msg_id.clone(),
         m.ts,
         m.is_recalled,
         m.is_pinned,
-        m.reactions.len(),
+        m.reactions
+            .iter()
+            .map(|r| (r.emoji.clone(), r.count, r.me))
+            .collect(),
         m.text.clone(),
         m.sender_name.clone(),
     )
@@ -2790,6 +2813,7 @@ async fn message_send_text(
         let now_ms = chrono_now_ms();
         MessageDto {
             msg_id: format!("local-{now_ms}"),
+            cli_msg_id: None,
             thread_id: thread_id.clone(),
             sender_id: "me".into(),
             sender_name: "Bạn".into(),
@@ -2855,6 +2879,7 @@ async fn message_send_quote(
         let now_ms = chrono_now_ms();
         MessageDto {
             msg_id: format!("local-{now_ms}"),
+            cli_msg_id: None,
             thread_id: thread_id.clone(),
             sender_id: "me".into(),
             sender_name: "Bạn".into(),
@@ -2886,27 +2911,43 @@ async fn message_react(
     msg_id: String,
     emoji: String,
 ) -> Result<MessageDto, String> {
+    let canonical_emoji = zalo_core::chat::parser::canonicalize_reaction_emoji(&emoji)
+        .unwrap_or_else(|| emoji.trim().to_string());
+    if canonical_emoji.is_empty() {
+        return Err("Biểu tượng cảm xúc không hợp lệ".to_string());
+    }
     let (kind, msg) = {
         let store = state.store.lock().await;
+        let msg = store
+            .get_message_by_ids(&thread_id, &msg_id, None)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Không tìm thấy tin nhắn".to_string())?;
         let kind = store
-            .get_thread_kind(&thread_id)
+            .get_thread_kind(&msg.thread_id)
             .ok()
             .flatten()
             .unwrap_or(ThreadKind::Direct);
-        let msg = store
-            .get_message(&thread_id, &msg_id)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "Không tìm thấy tin nhắn".to_string())?;
         (kind, msg)
     };
     let sess_snapshot = {
         let sess = state.session.lock().await;
         sess.clone_shallow()
     };
-    let remove = msg.reactions.iter().any(|r| r.emoji == emoji && r.me);
+    let remove = msg.reactions.iter().any(|r| {
+        r.me && (r.emoji == canonical_emoji
+            || zalo_core::chat::parser::canonicalize_reaction_emoji(&r.emoji).as_deref()
+                == Some(canonical_emoji.as_str()))
+    });
     if sess_snapshot.is_authenticated() {
-        if let Err(e) =
-            messaging::send_reaction(&sess_snapshot, &thread_id, kind, &msg, &emoji, remove).await
+        if let Err(e) = messaging::send_reaction(
+            &sess_snapshot,
+            &msg.thread_id,
+            kind,
+            &msg,
+            &canonical_emoji,
+            remove,
+        )
+        .await
         {
             if let Some(code) = expired_code(&e) {
                 let reason = format!("Phiên đăng nhập đã hết hạn (mã {code}). Vui lòng quét lại mã QR.");
@@ -2918,7 +2959,15 @@ async fn message_react(
     }
     let mut store = state.store.lock().await;
     let updated = store
-        .apply_reaction(&thread_id, &msg_id, Some(&emoji), true, remove)
+        .apply_reaction_event(
+            &msg.thread_id,
+            &msg.msg_id,
+            msg.cli_msg_id.as_deref(),
+            None,
+            Some(&canonical_emoji),
+            true,
+            remove,
+        )
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Không cập nhật được cảm xúc".to_string())?;
     let _ = app.emit("core://message-updated", &updated);
@@ -3120,6 +3169,7 @@ async fn message_send_sticker(
         let now_ms = chrono_now_ms();
         MessageDto {
             msg_id: format!("local-{now_ms}"),
+            cli_msg_id: None,
             thread_id: thread_id.clone(),
             sender_id: "me".into(),
             sender_name: "Bạn".into(),
@@ -3210,6 +3260,7 @@ fn local_demo_attachment_message(
     };
     MessageDto {
         msg_id: format!("local-{now_ms}"),
+        cli_msg_id: None,
         thread_id: thread_id.to_string(),
         sender_id: "me".into(),
         sender_name: "Bạn".into(),
@@ -9023,6 +9074,7 @@ mod tests {
         let mk = |msg_id: &str, sender_id: &str, msg_type: &str, ts: i64, is_outgoing: bool| {
             zalo_core::chat::MessageDto {
                 msg_id: msg_id.into(),
+                cli_msg_id: None,
                 thread_id: "peer-1".into(),
                 sender_id: sender_id.into(),
                 sender_name: sender_id.into(),
@@ -9055,6 +9107,72 @@ mod tests {
         assert_eq!(
             super::pick_latest_incoming_for_seen(&msgs),
             Some(("203".into(), "u3".into(), "share.file".into()))
+        );
+    }
+
+    #[test]
+    fn should_dispatch_ws_event_accepts_live_and_pulled_reaction_cmds() {
+        let mk_ev = |cmd: u16| zalo_core::socket::WsEvent {
+            cmd,
+            sub_cmd: 0,
+            version: 1,
+            payload: serde_json::json!({}),
+        };
+
+        assert!(super::should_dispatch_ws_event(&mk_ev(
+            zalo_core::chat::parser::CMD_REACTION_PUSH
+        )));
+        assert!(super::should_dispatch_ws_event(&mk_ev(
+            zalo_core::chat::parser::CMD_REACTION_PULL_1_1
+        )));
+        assert!(super::should_dispatch_ws_event(&mk_ev(
+            zalo_core::chat::parser::CMD_REACTION_PULL_GROUP
+        )));
+        assert!(super::should_dispatch_ws_event(&mk_ev(
+            zalo_core::socket::CMD_PUSH_MSG_1_1
+        )));
+        assert!(!super::should_dispatch_ws_event(&mk_ev(
+            zalo_core::socket::CMD_PING
+        )));
+    }
+
+    #[test]
+    fn message_sync_sig_detects_reaction_emoji_count_and_me_changes() {
+        let base = zalo_core::chat::MessageDto {
+            msg_id: "m1".into(),
+            cli_msg_id: Some("c1".into()),
+            thread_id: "t1".into(),
+            sender_id: "u1".into(),
+            sender_name: "Alice".into(),
+            text: "hi".into(),
+            msg_type: "chat.text".into(),
+            ts: 1_000,
+            is_outgoing: false,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
+            reactions: vec![zalo_core::chat::ReactionSummary {
+                emoji: "👍".into(),
+                count: 1,
+                me: false,
+            }],
+            attachment_url: None,
+            attachment_name: None,
+        };
+        let mut switched = base.clone();
+        switched.reactions[0].emoji = "❤️".into();
+        assert_ne!(
+            super::message_sync_sig(&base),
+            super::message_sync_sig(&switched),
+            "switching reaction emoji with same len must change sync sig"
+        );
+
+        let mut self_flagged = base.clone();
+        self_flagged.reactions[0].me = true;
+        assert_ne!(
+            super::message_sync_sig(&base),
+            super::message_sync_sig(&self_flagged),
+            "changing me flag with same len must change sync sig"
         );
     }
 

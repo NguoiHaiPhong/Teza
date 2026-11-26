@@ -7,10 +7,10 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use md5::{Digest, Md5};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
-use crate::chat::parser::normalize_ts_ms;
+use crate::chat::parser::{canonicalize_reaction_emoji, clean_group_id, normalize_ts_ms};
 use crate::chat::{
     strip_vi_accents, ChatFolderDto, FolderFilter, MessageDto, QuoteRef, ReactionSummary,
     ThreadDto, ThreadKind,
@@ -343,6 +343,31 @@ pub struct MessageStore {
     cipher: DbCipher,
 }
 
+fn normalize_reaction_summaries(reactions: &mut Vec<ReactionSummary>) -> bool {
+    let original = reactions.clone();
+    let mut normalized: Vec<ReactionSummary> = Vec::with_capacity(reactions.len());
+    for item in reactions.drain(..) {
+        if item.count == 0 {
+            continue;
+        }
+        let Some(canon) = canonicalize_reaction_emoji(&item.emoji) else {
+            continue;
+        };
+        if let Some(existing) = normalized.iter_mut().find(|r| r.emoji == canon) {
+            existing.count = existing.count.saturating_add(item.count);
+            existing.me |= item.me;
+        } else {
+            normalized.push(ReactionSummary {
+                emoji: canon,
+                count: item.count,
+                me: item.me,
+            });
+        }
+    }
+    *reactions = normalized;
+    *reactions != original
+}
+
 impl MessageStore {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -496,6 +521,12 @@ impl MessageStore {
         )?;
         self.ensure_column("messages", "quote_json", "TEXT")?;
         self.ensure_column("messages", "reactions_json", "TEXT NOT NULL DEFAULT '[]'")?;
+        self.ensure_column("messages", "cli_msg_id", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("messages", "reaction_actors_json", "TEXT NOT NULL DEFAULT ''")?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_thread_cli_msg_id ON messages(thread_id, cli_msg_id)",
+            [],
+        )?;
         self.ensure_column("threads", "last_read_in_ts", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("threads", "peer_read_ts", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("threads", "muted_until_ts", "INTEGER NOT NULL DEFAULT 0")?;
@@ -951,12 +982,18 @@ impl MessageStore {
         let enc_att_url = self.cipher.encrypt_opt(&aad, m.attachment_url.as_deref())?;
         let enc_att_name = self.cipher.encrypt_opt(&aad, m.attachment_name.as_deref())?;
         let ts = normalize_ts_ms(m.ts);
+        let cli_msg_id = m
+            .cli_msg_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "0")
+            .unwrap_or("");
 
         let tx = self.conn.transaction()?;
         tx.execute(
             r#"
-            INSERT INTO messages (msg_id, thread_id, sender_id, sender_name, text, text_norm, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name)
-            VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            INSERT INTO messages (msg_id, thread_id, sender_id, sender_name, text, text_norm, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id)
+            VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
             ON CONFLICT(thread_id, msg_id) DO UPDATE SET
                 text = excluded.text,
                 text_norm = '',
@@ -964,7 +1001,8 @@ impl MessageStore {
                 is_recalled = excluded.is_recalled,
                 is_pinned = MAX(messages.is_pinned, excluded.is_pinned),
                 quote_json = COALESCE(excluded.quote_json, messages.quote_json),
-                reactions_json = CASE WHEN ?15 = 1 THEN messages.reactions_json ELSE excluded.reactions_json END,
+                reactions_json = CASE WHEN ?16 = 1 THEN messages.reactions_json ELSE excluded.reactions_json END,
+                cli_msg_id = CASE WHEN excluded.cli_msg_id != '' THEN excluded.cli_msg_id ELSE messages.cli_msg_id END,
                 attachment_url = CASE
                     WHEN excluded.is_recalled = 1 OR LOWER(excluded.msg_type) IN ('chat.reminder', 'chat.poll') THEN NULL
                     WHEN LOWER(excluded.msg_type) IN ('chat.link', 'link', 'chat.location', 'chat.location.new', 'chat.recommended', 'chat.ecard') THEN excluded.attachment_url
@@ -991,6 +1029,7 @@ impl MessageStore {
                 enc_reactions,
                 enc_att_url,
                 enc_att_name,
+                cli_msg_id,
                 reactions_empty,
             ],
         )?;
@@ -1047,6 +1086,15 @@ impl MessageStore {
         let reactions_json = self.cipher.decrypt_str(&aad, &row.get::<_, String>(11)?)?;
         let attachment_url = self.cipher.decrypt_opt(&aad, row.get(12)?)?;
         let attachment_name = self.cipher.decrypt_opt(&aad, row.get(13)?)?;
+        let raw_cli_msg_id: String = row.get(14).unwrap_or_default();
+        let cli_msg_id = {
+            let trimmed = raw_cli_msg_id.trim();
+            if trimmed.is_empty() || trimmed == "0" {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        };
 
         let quote: Option<QuoteRef> = quote_json
             .as_deref()
@@ -1056,6 +1104,7 @@ impl MessageStore {
 
         Ok(MessageDto {
             msg_id,
+            cli_msg_id,
             thread_id,
             sender_id,
             sender_name,
@@ -1084,11 +1133,87 @@ impl MessageStore {
 
     pub fn get_message(&self, thread_id: &str, msg_id: &str) -> Result<Option<MessageDto>> {
         let mut msgs = self.query_messages(
-            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name
+            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id
              FROM messages WHERE thread_id = ?1 AND msg_id = ?2 LIMIT 1",
             params![thread_id, msg_id],
         )?;
         Ok(msgs.pop())
+    }
+
+    /// Look up a message in `thread_id` by server `msg_id` (`gMsgID`) and/or client `cli_msg_id` (`cMsgID`).
+    /// Also normalizes `group_`/`g`-prefixed group thread IDs and falls back to matching `ts == cMsgID`
+    /// for pre-migration rows that did not store `cli_msg_id`.
+    pub fn get_message_by_ids(
+        &self,
+        thread_id: &str,
+        msg_id: &str,
+        cli_msg_id: Option<&str>,
+    ) -> Result<Option<MessageDto>> {
+        let mut tid_candidates: Vec<&str> = Vec::with_capacity(2);
+        let raw_tid = thread_id.trim();
+        if !raw_tid.is_empty() {
+            tid_candidates.push(raw_tid);
+            let bare_tid = clean_group_id(raw_tid);
+            if !bare_tid.is_empty() && bare_tid != raw_tid {
+                tid_candidates.push(bare_tid);
+            }
+        }
+        let clean_mid = msg_id.trim();
+        let clean_cid = cli_msg_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "0");
+
+        for tid in &tid_candidates {
+            if !clean_mid.is_empty() && clean_mid != "0" {
+                if let Some(m) = self.get_message(tid, clean_mid)? {
+                    return Ok(Some(m));
+                }
+                let mut by_cli = self.query_messages(
+                    "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id
+                     FROM messages WHERE thread_id = ?1 AND cli_msg_id = ?2 LIMIT 1",
+                    params![*tid, clean_mid],
+                )?;
+                if let Some(m) = by_cli.pop() {
+                    return Ok(Some(m));
+                }
+            }
+            if let Some(cid) = clean_cid {
+                let mut by_cli = self.query_messages(
+                    "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id
+                     FROM messages WHERE thread_id = ?1 AND cli_msg_id = ?2 LIMIT 1",
+                    params![*tid, cid],
+                )?;
+                if let Some(m) = by_cli.pop() {
+                    return Ok(Some(m));
+                }
+                if cid != clean_mid {
+                    if let Some(m) = self.get_message(tid, cid)? {
+                        return Ok(Some(m));
+                    }
+                }
+            }
+        }
+
+        // Legacy fallback for rows stored before `cli_msg_id` was persisted:
+        // outgoing Teza messages originally stored `client_id` as `ts`.
+        let ts_probe = clean_cid
+            .or_else(|| (!clean_mid.is_empty() && clean_mid != "0").then_some(clean_mid))
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|&n| n >= 1_000_000_000_000);
+        if let Some(ts_val) = ts_probe {
+            for tid in &tid_candidates {
+                let mut by_ts = self.query_messages(
+                    "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id
+                     FROM messages WHERE thread_id = ?1 AND ts = ?2 AND cli_msg_id = '' LIMIT 1",
+                    params![*tid, ts_val],
+                )?;
+                if let Some(m) = by_ts.pop() {
+                    return Ok(Some(m));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     pub fn mark_recalled(&mut self, thread_id: &str, msg_id: &str) -> Result<Option<MessageDto>> {
@@ -1456,6 +1581,57 @@ impl MessageStore {
         self.get_message(thread_id, msg_id)
     }
 
+    fn load_reaction_actors(&self, thread_id: &str, msg_id: &str) -> BTreeMap<String, String> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT reaction_actors_json FROM messages WHERE thread_id = ?1 AND msg_id = ?2 LIMIT 1",
+                params![thread_id, msg_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        let Some(stored) = raw.filter(|s| !s.trim().is_empty()) else {
+            return BTreeMap::new();
+        };
+        let aad = msg_aad(thread_id, msg_id);
+        let Ok(plain) = self.cipher.decrypt_or_legacy(&aad, &stored) else {
+            return BTreeMap::new();
+        };
+        let raw_map = serde_json::from_str::<BTreeMap<String, String>>(&plain).unwrap_or_default();
+        raw_map
+            .into_iter()
+            .filter_map(|(k, v)| canonicalize_reaction_emoji(&v).map(|canon| (k, canon)))
+            .collect()
+    }
+
+    fn save_message_reactions(
+        &self,
+        thread_id: &str,
+        msg_id: &str,
+        reactions: &[ReactionSummary],
+        actors: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let aad = msg_aad(thread_id, msg_id);
+        let reactions_json =
+            serde_json::to_string(reactions).unwrap_or_else(|_| "[]".to_string());
+        let enc_reactions = self.cipher.encrypt_str(&aad, &reactions_json)?;
+        let enc_actors = if actors.is_empty() {
+            String::new()
+        } else {
+            let actors_json = serde_json::to_string(actors).unwrap_or_else(|_| "{}".to_string());
+            self.cipher.encrypt_str(&aad, &actors_json)?
+        };
+        self.conn.execute(
+            "UPDATE messages
+             SET reactions_json = ?3, reaction_actors_json = ?4
+             WHERE thread_id = ?1 AND msg_id = ?2",
+            params![thread_id, msg_id, enc_reactions, enc_actors],
+        )?;
+        Ok(())
+    }
+
     pub fn apply_reaction(
         &mut self,
         thread_id: &str,
@@ -1464,50 +1640,113 @@ impl MessageStore {
         me: bool,
         removed: bool,
     ) -> Result<Option<MessageDto>> {
-        let Some(mut msg) = self.get_message(thread_id, msg_id)? else {
+        self.apply_reaction_event(thread_id, msg_id, None, None, emoji, me, removed)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_reaction_event(
+        &mut self,
+        thread_id: &str,
+        msg_id: &str,
+        cli_msg_id: Option<&str>,
+        actor_id: Option<&str>,
+        emoji: Option<&str>,
+        me: bool,
+        removed: bool,
+    ) -> Result<Option<MessageDto>> {
+        let Some(mut msg) = self.get_message_by_ids(thread_id, msg_id, cli_msg_id)? else {
             return Ok(None);
+        };
+        let normalized_changed = normalize_reaction_summaries(&mut msg.reactions);
+        let mut actors = self.load_reaction_actors(&msg.thread_id, &msg.msg_id);
+        let canonical_emoji = emoji.and_then(canonicalize_reaction_emoji);
+        let actor_key = if me {
+            Some("__me__".to_string())
+        } else {
+            actor_id
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "0")
+                .map(|s| format!("u:{s}"))
         };
 
         if removed {
-            let changed = if me {
+            let mut changed = normalized_changed;
+            if me {
+                let prev_me = actors.remove("__me__");
+                if prev_me.is_some() {
+                    changed = true;
+                }
                 if let Some(pos) = msg.reactions.iter().position(|r| {
-                    r.me && emoji.is_none_or(|target| r.emoji == target)
+                    r.me && canonical_emoji
+                        .as_deref()
+                        .is_none_or(|target| r.emoji == target)
                 }) {
                     msg.reactions[pos].me = false;
                     msg.reactions[pos].count = msg.reactions[pos].count.saturating_sub(1);
                     if msg.reactions[pos].count == 0 {
                         msg.reactions.remove(pos);
                     }
-                    true
-                } else {
-                    false
+                    changed = true;
                 }
-            } else if let Some(target) = emoji {
-                if let Some(pos) = msg.reactions.iter().position(|r| r.emoji == target) {
+            } else {
+                let tracked_prev = actor_key.as_deref().and_then(|k| actors.remove(k));
+                if tracked_prev.is_some() {
+                    changed = true;
+                }
+                let target_opt = tracked_prev.or(canonical_emoji);
+                if let Some(target) = target_opt {
+                    if let Some(pos) = msg
+                        .reactions
+                        .iter()
+                        .position(|r| r.emoji == target && r.count > u32::from(r.me))
+                    {
+                        msg.reactions[pos].count = msg.reactions[pos].count.saturating_sub(1);
+                        if msg.reactions[pos].count == 0 {
+                            msg.reactions.remove(pos);
+                        }
+                        changed = true;
+                    }
+                } else if let Some(pos) = msg
+                    .reactions
+                    .iter()
+                    .rposition(|r| r.count > u32::from(r.me))
+                {
+                    // Peer unreact without rIcon (Zalo sends rIcon="" & rType=-1) for a reaction
+                    // that predated per-actor tracking: decrement the peer's non-self reaction.
                     msg.reactions[pos].count = msg.reactions[pos].count.saturating_sub(1);
                     if msg.reactions[pos].count == 0 {
                         msg.reactions.remove(pos);
                     }
-                    true
-                } else {
-                    false
+                    changed = true;
                 }
-            } else {
-                false
-            };
+            }
 
             if changed {
-                self.upsert_message(&msg)?;
+                self.save_message_reactions(&msg.thread_id, &msg.msg_id, &msg.reactions, &actors)?;
             }
             return Ok(Some(msg));
         }
 
-        let Some(target) = emoji.filter(|e| !e.trim().is_empty()) else {
+        let Some(target) = canonical_emoji else {
+            if normalized_changed {
+                self.save_message_reactions(&msg.thread_id, &msg.msg_id, &msg.reactions, &actors)?;
+            }
             return Ok(Some(msg));
         };
 
         if me {
             if msg.reactions.iter().any(|r| r.emoji == target && r.me) {
+                if normalized_changed
+                    || actors.get("__me__").map(String::as_str) != Some(target.as_str())
+                {
+                    actors.insert("__me__".to_string(), target);
+                    self.save_message_reactions(
+                        &msg.thread_id,
+                        &msg.msg_id,
+                        &msg.reactions,
+                        &actors,
+                    )?;
+                }
                 return Ok(Some(msg));
             }
             if let Some(prev_pos) = msg.reactions.iter().position(|r| r.me) {
@@ -1517,6 +1756,33 @@ impl MessageStore {
                     msg.reactions.remove(prev_pos);
                 }
             }
+            actors.insert("__me__".to_string(), target.clone());
+        } else if let Some(ref ak) = actor_key {
+            if actors.get(ak).map(String::as_str) == Some(target.as_str()) {
+                if normalized_changed {
+                    self.save_message_reactions(
+                        &msg.thread_id,
+                        &msg.msg_id,
+                        &msg.reactions,
+                        &actors,
+                    )?;
+                }
+                return Ok(Some(msg));
+            }
+            if let Some(prev_emoji) = actors.get(ak).cloned() {
+                if let Some(prev_pos) = msg
+                    .reactions
+                    .iter()
+                    .position(|r| r.emoji == prev_emoji && r.count > u32::from(r.me))
+                {
+                    msg.reactions[prev_pos].count =
+                        msg.reactions[prev_pos].count.saturating_sub(1);
+                    if msg.reactions[prev_pos].count == 0 {
+                        msg.reactions.remove(prev_pos);
+                    }
+                }
+            }
+            actors.insert(ak.clone(), target.clone());
         }
 
         if let Some(existing) = msg.reactions.iter_mut().find(|r| r.emoji == target) {
@@ -1526,12 +1792,12 @@ impl MessageStore {
             }
         } else {
             msg.reactions.push(ReactionSummary {
-                emoji: target.to_string(),
+                emoji: target,
                 count: 1,
                 me,
             });
         }
-        self.upsert_message(&msg)?;
+        self.save_message_reactions(&msg.thread_id, &msg.msg_id, &msg.reactions, &actors)?;
         Ok(Some(msg))
     }
 
@@ -1541,12 +1807,22 @@ impl MessageStore {
         msg_id: &str,
         emoji: &str,
     ) -> Result<Option<(MessageDto, bool)>> {
-        let Some(msg) = self.get_message(thread_id, msg_id)? else {
+        let Some(mut msg) = self.get_message_by_ids(thread_id, msg_id, None)? else {
             return Ok(None);
         };
-        let already_me = msg.reactions.iter().any(|r| r.emoji == emoji && r.me);
+        normalize_reaction_summaries(&mut msg.reactions);
+        let target = canonicalize_reaction_emoji(emoji).unwrap_or_else(|| emoji.trim().to_string());
+        let already_me = msg.reactions.iter().any(|r| r.emoji == target && r.me);
         let updated = self
-            .apply_reaction(thread_id, msg_id, Some(emoji), true, already_me)?
+            .apply_reaction_event(
+                &msg.thread_id,
+                &msg.msg_id,
+                msg.cli_msg_id.as_deref(),
+                None,
+                Some(&target),
+                true,
+                already_me,
+            )?
             .unwrap_or(msg);
         Ok(Some((updated, already_me)))
     }
@@ -1818,7 +2094,7 @@ impl MessageStore {
     ) -> Result<(Vec<MessageDto>, Vec<MessageDto>)> {
         let scan_limit = limit.saturating_mul(6).max(300) as i64;
         let rows = self.query_messages(
-            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name
+            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id
              FROM messages
              WHERE thread_id = ?1
                AND is_recalled = 0
@@ -1904,7 +2180,7 @@ impl MessageStore {
     pub fn list_thread_links(&self, thread_id: &str, limit: usize) -> Result<Vec<MessageDto>> {
         let scan_limit = limit.saturating_mul(10).max(400) as i64;
         let rows = self.query_messages(
-            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name
+            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id
              FROM messages
              WHERE thread_id = ?1 AND is_recalled = 0
              ORDER BY ts DESC, msg_id DESC
@@ -2019,7 +2295,7 @@ impl MessageStore {
     pub fn list_recent_stickers(&self, limit: usize) -> Result<Vec<(u64, u64, String)>> {
         let scan_limit = limit.saturating_mul(5).max(150) as i64;
         let rows = self.query_messages(
-            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name
+            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id
              FROM messages
              WHERE is_recalled = 0
                AND attachment_url IS NOT NULL
@@ -2073,7 +2349,7 @@ impl MessageStore {
 
     pub fn list_pinned_messages(&self, thread_id: &str, limit: usize) -> Result<Vec<MessageDto>> {
         let mut msgs = self.query_messages(
-            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name
+            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id
              FROM messages
              WHERE thread_id = ?1 AND is_pinned = 1 AND is_recalled = 0
              ORDER BY ts DESC, msg_id DESC
@@ -2094,7 +2370,7 @@ impl MessageStore {
         let cutoff_ts = before_ts.unwrap_or(i64::MAX);
         let mut msgs = match before_msg_id.filter(|s| !s.trim().is_empty()) {
             Some(cutoff_id) if before_ts.is_some() => self.query_messages(
-                "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name
+                "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id
                  FROM messages
                  WHERE thread_id = ?1 AND (ts < ?2 OR (ts = ?2 AND msg_id < ?3))
                  ORDER BY ts DESC, msg_id DESC
@@ -2102,7 +2378,7 @@ impl MessageStore {
                 params![thread_id, cutoff_ts, cutoff_id, limit as i64],
             )?,
             _ => self.query_messages(
-                "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name
+                "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id
                  FROM messages
                  WHERE thread_id = ?1 AND ts < ?2
                  ORDER BY ts DESC, msg_id DESC
@@ -2150,7 +2426,7 @@ impl MessageStore {
         max_after: usize,
     ) -> Result<Vec<MessageDto>> {
         let mut msgs = self.query_messages(
-            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name
+            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id
              FROM messages WHERE thread_id = ?1 AND ts < ?2
              ORDER BY ts DESC LIMIT ?3",
             params![thread_id, target_ts, context_before as i64],
@@ -2158,7 +2434,7 @@ impl MessageStore {
         msgs.reverse();
 
         let after = self.query_messages(
-            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name
+            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id
              FROM messages WHERE thread_id = ?1 AND ts >= ?2
              ORDER BY ts ASC LIMIT ?3",
             params![thread_id, target_ts, max_after as i64],
@@ -3248,7 +3524,7 @@ impl MessageStore {
         } else {
             let probe_limit = limit_msgs.saturating_add(1) as i64;
             let mut msgs = self.query_messages(
-                "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name
+                "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id
                  FROM messages
                  WHERE ts >= ?1
                  ORDER BY ts ASC, thread_id ASC, msg_id ASC
@@ -3265,7 +3541,7 @@ impl MessageStore {
                             .map(|m| (m.thread_id.clone(), m.msg_id.clone()))
                             .collect();
                     let tie_msgs = self.query_messages(
-                        "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name
+                        "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id
                          FROM messages
                          WHERE ts = ?1
                          ORDER BY thread_id ASC, msg_id ASC",
@@ -3683,6 +3959,7 @@ impl MessageStore {
             reactions_json: String,
             attachment_url: Option<String>,
             attachment_name: Option<String>,
+            cli_msg_id: String,
         }
         let mut applied_count = 0usize;
         let mut fts_updates: Vec<(String, String, i64, String, String)> = Vec::new();
@@ -3694,9 +3971,15 @@ impl MessageStore {
             }
             let ts = normalize_ts_ms(m.ts);
             let aad = msg_aad(&m.thread_id, &m.msg_id);
+            let incoming_cli_msg_id = m
+                .cli_msg_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "0")
+                .unwrap_or("");
             let existing: Option<ExistingMsgMeta> = tx
                 .query_row(
-                    "SELECT is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name
+                    "SELECT is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id
                      FROM messages
                      WHERE thread_id = ?1 AND msg_id = ?2
                      LIMIT 1",
@@ -3709,6 +3992,7 @@ impl MessageStore {
                             reactions_json: r.get(3)?,
                             attachment_url: r.get(4)?,
                             attachment_name: r.get(5)?,
+                            cli_msg_id: r.get(6).unwrap_or_default(),
                         })
                     },
                 )
@@ -3738,8 +4022,8 @@ impl MessageStore {
                         self.cipher.encrypt_opt(&aad, m.attachment_name.as_deref())?
                     };
                     tx.execute(
-                        "INSERT INTO messages (msg_id, thread_id, sender_id, sender_name, text, text_norm, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name)
-                         VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                        "INSERT INTO messages (msg_id, thread_id, sender_id, sender_name, text, text_norm, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                         params![
                             m.msg_id,
                             m.thread_id,
@@ -3755,6 +4039,7 @@ impl MessageStore {
                             enc_reactions,
                             enc_att_url,
                             enc_att_name,
+                            incoming_cli_msg_id,
                         ],
                     )?;
                     if !m.is_outgoing {
@@ -3809,6 +4094,8 @@ impl MessageStore {
                     let fill_att_url = cur.attachment_url.is_none() && m.attachment_url.is_some();
                     let fill_att_name =
                         cur.attachment_name.is_none() && m.attachment_name.is_some();
+                    let fill_cli_msg_id =
+                        cur.cli_msg_id.trim().is_empty() && !incoming_cli_msg_id.is_empty();
                     let cur_reactions_empty = self
                         .cipher
                         .decrypt_or_legacy(&aad, &cur.reactions_json)
@@ -3817,7 +4104,12 @@ impl MessageStore {
                         .is_none_or(|v| v.is_empty());
                     let fill_reactions = cur_reactions_empty && !m.reactions.is_empty();
 
-                    if pin_upgraded || fill_quote || fill_att_url || fill_att_name || fill_reactions
+                    if pin_upgraded
+                        || fill_quote
+                        || fill_att_url
+                        || fill_att_name
+                        || fill_reactions
+                        || fill_cli_msg_id
                     {
                         let new_pinned = (cur.is_pinned != 0 || m.is_pinned) as i64;
                         let new_quote = if fill_quote {
@@ -3847,10 +4139,15 @@ impl MessageStore {
                         } else {
                             cur.attachment_name
                         };
+                        let new_cli_msg_id = if fill_cli_msg_id {
+                            incoming_cli_msg_id.to_string()
+                        } else {
+                            cur.cli_msg_id
+                        };
                         tx.execute(
                             "UPDATE messages
                              SET is_pinned = ?3, quote_json = ?4, reactions_json = ?5,
-                                 attachment_url = ?6, attachment_name = ?7
+                                 attachment_url = ?6, attachment_name = ?7, cli_msg_id = ?8
                              WHERE thread_id = ?1 AND msg_id = ?2",
                             params![
                                 m.thread_id,
@@ -3860,6 +4157,7 @@ impl MessageStore {
                                 new_reactions,
                                 new_att_url,
                                 new_att_name,
+                                new_cli_msg_id,
                             ],
                         )?;
                         applied_count += 1;
@@ -3998,6 +4296,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "m1".into(),
+                cli_msg_id: None,
                 thread_id: "t1".into(),
                 sender_id: "u1".into(),
                 sender_name: "Nguyễn Văn An".into(),
@@ -4047,6 +4346,7 @@ mod tests {
             store
                 .upsert_message(&MessageDto {
                     msg_id: "m1".into(),
+                    cli_msg_id: None,
                     thread_id: "t1".into(),
                     sender_id: "u1".into(),
                     sender_name: "Lê Minh".into(),
@@ -4187,6 +4487,7 @@ mod tests {
             store
                 .upsert_message(&MessageDto {
                     msg_id: format!("m{i}"),
+                    cli_msg_id: None,
                     thread_id: "t1".into(),
                     sender_id: "u1".into(),
                     sender_name: "An".into(),
@@ -4230,6 +4531,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "m1".into(),
+                cli_msg_id: None,
                 thread_id: "t1".into(),
                 sender_id: "u1".into(),
                 sender_name: "An".into(),
@@ -4376,6 +4678,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "pm1".into(),
+                cli_msg_id: None,
                 thread_id: "t1".into(),
                 sender_id: "u1".into(),
                 sender_name: "An".into(),
@@ -4443,6 +4746,7 @@ mod tests {
 
         let original = MessageDto {
             msg_id: "rm1".into(),
+            cli_msg_id: None,
             thread_id: "t1".into(),
             sender_id: "u1".into(),
             sender_name: "An".into(),
@@ -4530,6 +4834,7 @@ mod tests {
             store
                 .upsert_message(&MessageDto {
                     msg_id: format!("m{i:03}"),
+                    cli_msg_id: None,
                     thread_id: "t1".into(),
                     sender_id: "u1".into(),
                     sender_name: "An".into(),
@@ -4564,6 +4869,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "file-old".into(),
+                cli_msg_id: None,
                 thread_id: "t1".into(),
                 sender_id: "u1".into(),
                 sender_name: "An".into(),
@@ -4585,6 +4891,7 @@ mod tests {
             store
                 .upsert_message(&MessageDto {
                     msg_id: format!("pic-{i:02}"),
+                    cli_msg_id: None,
                     thread_id: "t1".into(),
                     sender_id: "u1".into(),
                     sender_name: "An".into(),
@@ -4605,6 +4912,7 @@ mod tests {
             store
                 .upsert_message(&MessageDto {
                     msg_id: format!("stk-{i}"),
+                    cli_msg_id: None,
                     thread_id: "t1".into(),
                     sender_id: "u1".into(),
                     sender_name: "An".into(),
@@ -4646,6 +4954,7 @@ mod tests {
             store
                 .upsert_message(&MessageDto {
                     msg_id: id.into(),
+                    cli_msg_id: None,
                     thread_id: "t1".into(),
                     sender_id: "u1".into(),
                     sender_name: "An".into(),
@@ -4748,6 +5057,7 @@ mod tests {
             store
                 .upsert_message(&MessageDto {
                     msg_id: id.into(),
+                    cli_msg_id: None,
                     thread_id: "t1".into(),
                     sender_id: "u1".into(),
                     sender_name: "An".into(),
@@ -4808,6 +5118,7 @@ mod tests {
             store
                 .upsert_message(&MessageDto {
                     msg_id: id.into(),
+                    cli_msg_id: None,
                     thread_id: thread_id.into(),
                     sender_id: "u-1".into(),
                     sender_name: "An".into(),
@@ -4866,6 +5177,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "m1".into(),
+                cli_msg_id: None,
                 thread_id: "dm-1".into(),
                 sender_id: "dm-1".into(),
                 sender_name: "Minh".into(),
@@ -4884,6 +5196,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "m2".into(),
+                cli_msg_id: None,
                 thread_id: "dm-1".into(),
                 sender_id: "me".into(),
                 sender_name: "Bạn".into(),
@@ -4902,6 +5215,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "m3".into(),
+                cli_msg_id: None,
                 thread_id: "dm-1".into(),
                 sender_id: "dm-1".into(),
                 sender_name: "Minh".into(),
@@ -5116,6 +5430,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "stale-link".into(),
+                cli_msg_id: None,
                 thread_id: "t1".into(),
                 sender_id: "u1".into(),
                 sender_name: "An".into(),
@@ -5136,6 +5451,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "stale-ext-img".into(),
+                cli_msg_id: None,
                 thread_id: "t1".into(),
                 sender_id: "u1".into(),
                 sender_name: "An".into(),
@@ -5156,6 +5472,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "stale-ecard".into(),
+                cli_msg_id: None,
                 thread_id: "t1".into(),
                 sender_id: "u1".into(),
                 sender_name: "An".into(),
@@ -5174,6 +5491,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "stale-rec".into(),
+                cli_msg_id: None,
                 thread_id: "t1".into(),
                 sender_id: "u1".into(),
                 sender_name: "An".into(),
@@ -5194,6 +5512,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "legacy-http-file".into(),
+                cli_msg_id: None,
                 thread_id: "t1".into(),
                 sender_id: "u1".into(),
                 sender_name: "An".into(),
@@ -5212,6 +5531,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "dlfl-file".into(),
+                cli_msg_id: None,
                 thread_id: "t1".into(),
                 sender_id: "u1".into(),
                 sender_name: "An".into(),
@@ -5230,6 +5550,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "dlmd-video".into(),
+                cli_msg_id: None,
                 thread_id: "t1".into(),
                 sender_id: "u1".into(),
                 sender_name: "An".into(),
@@ -5265,6 +5586,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "stale-link".into(),
+                cli_msg_id: None,
                 thread_id: "t1".into(),
                 sender_id: "u1".into(),
                 sender_name: "An".into(),
@@ -5288,6 +5610,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "stale-ecard".into(),
+                cli_msg_id: None,
                 thread_id: "t1".into(),
                 sender_id: "u1".into(),
                 sender_name: "An".into(),
@@ -5310,6 +5633,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "stale-rec".into(),
+                cli_msg_id: None,
                 thread_id: "t1".into(),
                 sender_id: "u1".into(),
                 sender_name: "An".into(),
@@ -5361,6 +5685,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "old-in".into(),
+                cli_msg_id: None,
                 thread_id: "dm-stale".into(),
                 sender_id: "dm-stale".into(),
                 sender_name: "Lan".into(),
@@ -5551,6 +5876,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "tr-1".into(),
+                cli_msg_id: None,
                 thread_id: "t-cache".into(),
                 sender_id: "u1".into(),
                 sender_name: "An".into(),
@@ -5583,6 +5909,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "tr-2".into(),
+                cli_msg_id: None,
                 thread_id: "t-cache".into(),
                 sender_id: "u1".into(),
                 sender_name: "An".into(),
@@ -5622,6 +5949,7 @@ mod tests {
             store
                 .upsert_message(&MessageDto {
                     msg_id: format!("sm-{idx}"),
+                    cli_msg_id: None,
                     thread_id: "t-search".into(),
                     sender_id: "u1".into(),
                     sender_name: "Nguyễn Văn An".into(),
@@ -5778,6 +6106,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "m-out-only".into(),
+                cli_msg_id: None,
                 thread_id: "t-out".into(),
                 sender_id: "me".into(),
                 sender_name: "Bạn".into(),
@@ -5801,6 +6130,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "m1".into(),
+                cli_msg_id: None,
                 thread_id: "t-in".into(),
                 sender_id: "peer-1".into(),
                 sender_name: "Alice".into(),
@@ -5819,6 +6149,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "m2".into(),
+                cli_msg_id: None,
                 thread_id: "t-in".into(),
                 sender_id: "peer-2".into(),
                 sender_name: "Bob".into(),
@@ -5837,6 +6168,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "m3".into(),
+                cli_msg_id: None,
                 thread_id: "t-in".into(),
                 sender_id: "me".into(),
                 sender_name: "Bạn".into(),
@@ -5870,6 +6202,7 @@ mod tests {
         store
             .upsert_message(&MessageDto {
                 msg_id: "m4".into(),
+                cli_msg_id: None,
                 thread_id: "t-in".into(),
                 sender_id: "peer-3".into(),
                 sender_name: "Carol".into(),
@@ -6108,6 +6441,7 @@ mod tests {
             store
                 .upsert_message(&MessageDto {
                     msg_id: mid.into(),
+                    cli_msg_id: None,
                     thread_id: "t2".into(),
                     sender_id: "u1".into(),
                     sender_name: "Alice".into(),
@@ -6422,6 +6756,7 @@ mod tests {
 
         src.upsert_message(&MessageDto {
             msg_id: "m1".into(),
+            cli_msg_id: None,
             thread_id: "t1".into(),
             sender_id: "u1".into(),
             sender_name: "Minh".into(),
@@ -6624,6 +6959,7 @@ mod tests {
         for (tid, mid, ts) in items {
             src.upsert_message(&MessageDto {
                 msg_id: mid.into(),
+                cli_msg_id: None,
                 thread_id: tid.into(),
                 sender_id: "u1".into(),
                 sender_name: "Alice".into(),
@@ -6705,6 +7041,7 @@ mod tests {
 
         let make_msg = |tid: &str, mid: &str, text: &str, ts: i64| MessageDto {
             msg_id: mid.into(),
+            cli_msg_id: None,
             thread_id: tid.into(),
             sender_id: "u1".into(),
             sender_name: "Alice".into(),
@@ -6883,6 +7220,325 @@ mod tests {
         let folders = store.list_chat_folders().unwrap();
         assert_eq!(folders[0].thread_ids, vec!["grp-keep"]);
         assert!(folders[0].excluded_thread_ids.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reactions_persist_full_removal_cli_msg_id_lookup_and_peer_actor_tracking() {
+        let dir = std::env::temp_dir().join(format!(
+            "litechat-store-react-sync-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("react_sync.db");
+        let mut store = MessageStore::open(&db_path).unwrap();
+
+        // Store message with distinct server msg_id, cli_msg_id, and ts
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "7970889894523".into(),
+                cli_msg_id: Some("1782286269667".into()),
+                thread_id: "7560225984834507848".into(),
+                sender_id: "211235336".into(),
+                sender_name: "Bạn".into(),
+                text: "Tin nhan tu dien thoai".into(),
+                msg_type: "chat.text".into(),
+                ts: 1_782_286_279_518,
+                is_outgoing: true,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+
+        // Re-upserting without cli_msg_id preserves stored cli_msg_id
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "7970889894523".into(),
+                cli_msg_id: None,
+                thread_id: "7560225984834507848".into(),
+                sender_id: "211235336".into(),
+                sender_name: "Bạn".into(),
+                text: "Tin nhan tu dien thoai".into(),
+                msg_type: "chat.text".into(),
+                ts: 1_782_286_279_518,
+                is_outgoing: true,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+
+        // Lookup by gMsgID, by cMsgID (when gMsgID=0), and with group_ prefix all resolve same row
+        let by_gid = store
+            .get_message_by_ids("7560225984834507848", "7970889894523", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_gid.cli_msg_id.as_deref(), Some("1782286269667"));
+        let by_cid = store
+            .get_message_by_ids("group_7560225984834507848", "0", Some("1782286269667"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_cid.msg_id, "7970889894523");
+
+        // Peer Alice reacts 👍 via cMsgID (gMsgID == 0 capture from mobile)
+        let updated = store
+            .apply_reaction_event(
+                "7560225984834507848",
+                "1782286269667",
+                Some("1782286269667"),
+                Some("u-alice"),
+                Some("/-strong"),
+                false,
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.msg_id, "7970889894523");
+        assert_eq!(updated.reactions.len(), 1);
+        assert_eq!(updated.reactions[0].emoji, "👍");
+        assert_eq!(updated.reactions[0].count, 1);
+        assert!(!updated.reactions[0].me);
+
+        // Idempotent replay of Alice's 👍 does NOT double-count
+        let replayed = store
+            .apply_reaction_event(
+                "7560225984834507848",
+                "7970889894523",
+                Some("1782286269667"),
+                Some("u-alice"),
+                Some("👍"),
+                false,
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed.reactions[0].count, 1);
+
+        // Peer Bob reacts 👍 -> count=2; Alice switches to ❤️ -> 👍=1, ❤️=1
+        let _ = store
+            .apply_reaction_event(
+                "7560225984834507848",
+                "7970889894523",
+                None,
+                Some("u-bob"),
+                Some("👍"),
+                false,
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        let after_switch = store
+            .apply_reaction_event(
+                "7560225984834507848",
+                "7970889894523",
+                None,
+                Some("u-alice"),
+                Some("❤"),
+                false,
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_switch.reactions.iter().find(|r| r.emoji == "👍").unwrap().count,
+            1
+        );
+        let heart = after_switch.reactions.iter().find(|r| r.emoji == "❤️").unwrap();
+        assert_eq!(heart.count, 1);
+        assert!(!heart.me);
+
+        // Self adds ❤️ (from phone) -> ❤️ count=2, me=true
+        let after_self = store
+            .apply_reaction_event(
+                "7560225984834507848",
+                "7970889894523",
+                None,
+                Some("211235336"),
+                Some("❤️"),
+                true,
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        let heart = after_self.reactions.iter().find(|r| r.emoji == "❤️").unwrap();
+        assert_eq!(heart.count, 2);
+        assert!(heart.me);
+
+        // Peer Alice removes reaction (Zalo wire sends rIcon="" & rType=-1 => emoji=None!)
+        let after_alice_remove = store
+            .apply_reaction_event(
+                "7560225984834507848",
+                "7970889894523",
+                None,
+                Some("u-alice"),
+                None,
+                false,
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        let heart = after_alice_remove.reactions.iter().find(|r| r.emoji == "❤️").unwrap();
+        assert_eq!(heart.count, 1);
+        assert!(heart.me);
+
+        // Self removes ❤️ and Bob removes 👍 -> reactions become empty AND stay empty on SQLite reload!
+        let _ = store
+            .apply_reaction_event(
+                "7560225984834507848",
+                "7970889894523",
+                None,
+                Some("211235336"),
+                None,
+                true,
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        let after_all_removed = store
+            .apply_reaction_event(
+                "7560225984834507848",
+                "7970889894523",
+                None,
+                Some("u-bob"),
+                None,
+                false,
+                true,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(after_all_removed.reactions.is_empty());
+
+        // Reload from SQLite (regression guard against zombie reactions when removing last reaction!)
+        let reloaded = store
+            .get_message("7560225984834507848", "7970889894523")
+            .unwrap()
+            .unwrap();
+        assert!(reloaded.reactions.is_empty());
+
+        // Legacy row without cli_msg_id can still be resolved by ts == cMsgID fallback
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "7970889899999".into(),
+                cli_msg_id: None,
+                thread_id: "dm-legacy".into(),
+                sender_id: "me".into(),
+                sender_name: "Bạn".into(),
+                text: "Legacy".into(),
+                msg_type: "chat.text".into(),
+                ts: 1_782_286_999_111,
+                is_outgoing: true,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+        let legacy_hit = store
+            .get_message_by_ids("dm-legacy", "0", Some("1782286999111"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy_hit.msg_id, "7970889899999");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_non_canonical_reactions_unreact_toggle_and_merge_cleanly() {
+        let dir = std::env::temp_dir().join(format!(
+            "litechat-store-react-legacy-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("react_legacy.db");
+        let mut store = MessageStore::open(&db_path).unwrap();
+
+        // Pre-patch row with non-canonical emojis: "❤" (no U+FE0F, me=true), "😡" (peer), "/-heart" (peer)
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "m-legacy-1".into(),
+                cli_msg_id: Some("1782287000001".into()),
+                thread_id: "t-legacy".into(),
+                sender_id: "u1".into(),
+                sender_name: "An".into(),
+                text: "Legacy emojis".into(),
+                msg_type: "chat.text".into(),
+                ts: 1_782_287_000_001,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: vec![
+                    ReactionSummary { emoji: "❤".into(), count: 1, me: true },
+                    ReactionSummary { emoji: "/-heart".into(), count: 1, me: false },
+                    ReactionSummary { emoji: "😡".into(), count: 1, me: false },
+                ],
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+
+        // Unreacting "❤️" (canonical) must merge legacy "❤" + "/-heart" -> ❤️ (count 2, me true)
+        // and remove self's reaction -> ❤️ (count 1, me false), persisted to SQLite!
+        let after_unreact = store
+            .apply_reaction_event("t-legacy", "m-legacy-1", None, None, Some("❤️"), true, true)
+            .unwrap()
+            .unwrap();
+        let heart = after_unreact.reactions.iter().find(|r| r.emoji == "❤️").unwrap();
+        assert_eq!(heart.count, 1);
+        assert!(!heart.me);
+        assert!(!after_unreact.reactions.iter().any(|r| r.emoji == "❤" || r.emoji == "/-heart"));
+        let angry = after_unreact.reactions.iter().find(|r| r.emoji == "😠").unwrap();
+        assert_eq!(angry.count, 1);
+        assert!(!angry.me);
+
+        // Self reacting "😠" merges into normalized legacy "😡" -> count 2, me true (no duplicate!)
+        let after_merge = store
+            .apply_reaction_event("t-legacy", "m-legacy-1", None, None, Some("😠"), true, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_merge.reactions.iter().filter(|r| r.emoji == "😠" || r.emoji == "😡").count(),
+            1
+        );
+        let angry = after_merge.reactions.iter().find(|r| r.emoji == "😠").unwrap();
+        assert_eq!(angry.count, 2);
+        assert!(angry.me);
+
+        // Pre-patch row with legacy "😭" (me=true): toggle_reaction("😢") must detect already_me=true and remove cleanly
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "m-legacy-2".into(),
+                cli_msg_id: None,
+                thread_id: "t-legacy".into(),
+                sender_id: "u1".into(),
+                sender_name: "An".into(),
+                text: "Legacy cry".into(),
+                msg_type: "chat.text".into(),
+                ts: 1_782_287_000_002,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: vec![ReactionSummary { emoji: "😭".into(), count: 1, me: true }],
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+        let (toggled, removed) = store.toggle_reaction("t-legacy", "m-legacy-2", "😢").unwrap().unwrap();
+        assert!(removed);
+        assert!(toggled.reactions.is_empty());
+        let reloaded = store.get_message("t-legacy", "m-legacy-2").unwrap().unwrap();
+        assert!(reloaded.reactions.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

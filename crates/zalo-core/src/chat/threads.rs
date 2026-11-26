@@ -6,15 +6,16 @@ use anyhow::Result;
 use serde_json::{json, Map, Value};
 
 use crate::chat::parser::{
-    clean_group_id, extract_content_text, extract_thread_id, format_thread_preview,
-    is_raw_numeric_id, normalize_avatar_url, normalize_media_url, normalize_ts_ms,
-    parse_chat_message, parse_friend_thread, parse_poll_value, pick_str,
+    clean_group_id, collect_reactions_from_node, extract_content_text, extract_thread_id,
+    format_thread_preview, is_raw_numeric_id, normalize_avatar_url, normalize_media_url,
+    normalize_ts_ms, parse_chat_message, parse_friend_thread, parse_poll_value,
+    parse_reaction_item, pick_str, WsParsedAction,
 };
 use crate::chat::{
     AddGroupMembersResultDto, ChatFolderDto, FriendActionResultDto, FriendRequestItemDto,
     FriendRequestsListDto, GroupDetailsResult, KickGroupMembersResultDto, LeaveGroupResultDto,
-    MessageDto, MutualGroupDto, PollDto, PollOptionDto, ThreadDto, ThreadKind, ThreadMemberDto,
-    UserProfileDto,
+    MessageDto, MutualGroupDto, PollDto, PollOptionDto, ReactionSummary, ThreadDto, ThreadKind,
+    ThreadMemberDto, UserProfileDto,
 };
 use crate::session::{is_session_expired_code, Session, SessionError};
 
@@ -1273,8 +1274,12 @@ pub fn parse_pinned_board_response(
                 .unwrap_or(0);
             let ts = normalize_ts_ms(raw_ts);
             let is_outgoing = !self_uid.is_empty() && sender_id == self_uid;
+            let cli_msg_id = pick_str(&params_obj, &["cliMsgId", "clientMsgId"])
+                .or_else(|| pick_str(&item, &["cliMsgId", "clientMsgId"]))
+                .filter(|s| s != "0");
             MessageDto {
                 msg_id,
+                cli_msg_id,
                 thread_id: thread_id.to_string(),
                 sender_id,
                 sender_name,
@@ -1585,6 +1590,108 @@ pub fn apply_last_msgs_to_threads_with_read_state(
     remote_read_known
 }
 
+fn fold_reaction_action_into_message(
+    msg: &mut MessageDto,
+    actors: &mut HashMap<String, String>,
+    actor_id: Option<&str>,
+    emoji: Option<&str>,
+    me: bool,
+    removed: bool,
+) {
+    let actor_key = if me {
+        Some("__me__".to_string())
+    } else {
+        actor_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "0")
+            .map(|s| format!("u:{s}"))
+    };
+
+    if removed {
+        if me {
+            actors.remove("__me__");
+            if let Some(pos) = msg
+                .reactions
+                .iter()
+                .position(|r| r.me && emoji.is_none_or(|t| r.emoji == t))
+            {
+                msg.reactions[pos].me = false;
+                msg.reactions[pos].count = msg.reactions[pos].count.saturating_sub(1);
+                if msg.reactions[pos].count == 0 {
+                    msg.reactions.remove(pos);
+                }
+            }
+        } else {
+            let target = actor_key
+                .as_deref()
+                .and_then(|k| actors.remove(k))
+                .or_else(|| emoji.map(str::to_string));
+            if let Some(t) = target {
+                if let Some(pos) = msg
+                    .reactions
+                    .iter()
+                    .position(|r| r.emoji == t && r.count > u32::from(r.me))
+                {
+                    msg.reactions[pos].count = msg.reactions[pos].count.saturating_sub(1);
+                    if msg.reactions[pos].count == 0 {
+                        msg.reactions.remove(pos);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    let Some(target) = emoji.filter(|s| !s.trim().is_empty()) else {
+        return;
+    };
+
+    if me {
+        if msg.reactions.iter().any(|r| r.emoji == target && r.me) {
+            actors.insert("__me__".to_string(), target.to_string());
+            return;
+        }
+        if let Some(prev_pos) = msg.reactions.iter().position(|r| r.me) {
+            msg.reactions[prev_pos].me = false;
+            msg.reactions[prev_pos].count = msg.reactions[prev_pos].count.saturating_sub(1);
+            if msg.reactions[prev_pos].count == 0 {
+                msg.reactions.remove(prev_pos);
+            }
+        }
+        actors.insert("__me__".to_string(), target.to_string());
+    } else if let Some(ref ak) = actor_key {
+        if actors.get(ak).map(String::as_str) == Some(target) {
+            return;
+        }
+        if let Some(prev_emoji) = actors.get(ak).cloned() {
+            if let Some(prev_pos) = msg
+                .reactions
+                .iter()
+                .position(|r| r.emoji == prev_emoji && r.count > u32::from(r.me))
+            {
+                msg.reactions[prev_pos].count = msg.reactions[prev_pos].count.saturating_sub(1);
+                if msg.reactions[prev_pos].count == 0 {
+                    msg.reactions.remove(prev_pos);
+                }
+            }
+        }
+        actors.insert(ak.clone(), target.to_string());
+    }
+
+    if let Some(existing) = msg.reactions.iter_mut().find(|r| r.emoji == target) {
+        existing.count += 1;
+        if me {
+            existing.me = true;
+        }
+    } else {
+        msg.reactions.push(ReactionSummary {
+            emoji: target.to_string(),
+            count: 1,
+            me,
+        });
+    }
+}
+
 fn parse_remote_history_page(
     resp: &Value,
     thread_id: &str,
@@ -1600,15 +1707,59 @@ fn parse_remote_history_page(
     let items = extract_history_items(resp)?;
     let raw_count = items.len();
     let has_more = extract_history_has_more(resp, raw_count);
-    let mut msgs: Vec<MessageDto> = items
-        .iter()
-        .filter_map(|item| parse_chat_message(item, Some(thread_id), my_uid, send2me, is_group))
-        .filter(|msg| {
-            exclude_msg_id
-                .map(|ex| msg.msg_id != ex)
-                .unwrap_or(true)
-        })
-        .collect();
+    let mut reaction_actions: Vec<WsParsedAction> = Vec::new();
+    let mut msgs: Vec<MessageDto> = Vec::new();
+    for item in &items {
+        if pick_str(item, &["msgType", "type"])
+            .is_some_and(|t| t.eq_ignore_ascii_case("chat.reaction"))
+        {
+            parse_reaction_item(item, is_group, my_uid, send2me, &mut reaction_actions);
+            continue;
+        }
+        if let Some(msg) = parse_chat_message(item, Some(thread_id), my_uid, send2me, is_group) {
+            if exclude_msg_id.map(|ex| msg.msg_id != ex).unwrap_or(true) {
+                msgs.push(msg);
+            }
+        }
+    }
+    if let Some(data_node) = unwrap_history_data_node(resp) {
+        if data_node.get("reacts").is_some() || data_node.get("reactGroups").is_some() {
+            collect_reactions_from_node(&data_node, is_group, my_uid, send2me, &mut reaction_actions);
+        }
+    }
+    if !reaction_actions.is_empty() && !msgs.is_empty() {
+        let mut actor_maps: Vec<HashMap<String, String>> = vec![HashMap::new(); msgs.len()];
+        for act in reaction_actions {
+            if let WsParsedAction::Reaction {
+                msg_id,
+                cli_msg_id,
+                actor_id,
+                emoji,
+                me,
+                removed,
+                ..
+            } = act
+            {
+                let target_idx = msgs.iter().position(|m| {
+                    m.msg_id == msg_id
+                        || m.cli_msg_id.as_deref() == Some(msg_id.as_str())
+                        || cli_msg_id.as_deref().is_some_and(|cid| {
+                            m.cli_msg_id.as_deref() == Some(cid) || m.msg_id == cid
+                        })
+                });
+                if let Some(idx) = target_idx {
+                    fold_reaction_action_into_message(
+                        &mut msgs[idx],
+                        &mut actor_maps[idx],
+                        actor_id.as_deref(),
+                        emoji.as_deref(),
+                        me,
+                        removed,
+                    );
+                }
+            }
+        }
+    }
     msgs.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.msg_id.cmp(&b.msg_id)));
     Ok(RemoteHistoryPage {
         messages: msgs,
@@ -3477,6 +3628,7 @@ pub async fn create_reminder(
     .to_string();
     Ok(MessageDto {
         msg_id,
+        cli_msg_id: None,
         thread_id: thread_id.to_string(),
         sender_id: session.profile.uid.clone(),
         sender_name: "Bạn".to_string(),
@@ -3572,6 +3724,7 @@ pub async fn create_poll(
     let poll_json = serde_json::to_string(&poll)?;
     Ok(MessageDto {
         msg_id: format!("poll-{}", poll.poll_id),
+        cli_msg_id: None,
         thread_id: group_id.to_string(),
         sender_id: session.profile.uid.clone(),
         sender_name: "Bạn".to_string(),
@@ -4471,5 +4624,82 @@ mod tests {
         let p2 = build_user_profile_dto("7002", Some(&unblocked_bool), "1001", "Me", "", &HashMap::new());
         assert_eq!(p2.is_friend, Some(true));
         assert_eq!(p2.is_blocked, Some(false));
+    }
+
+    #[test]
+    fn parse_remote_history_page_preserves_cli_msg_id_and_folds_reactions() {
+        let resp = json!({
+            "error_code": 0,
+            "data": {
+                "hasMore": 0,
+                "groupMsgs": [
+                    {
+                        "msgId": "75001",
+                        "cliMsgId": "1782286269001",
+                        "uidFrom": "200",
+                        "idTo": "888111",
+                        "msgType": "chat.text",
+                        "content": "Tin nhan 1",
+                        "ts": 1_782_286_269_500_i64,
+                        "reactions": [
+                            { "rIcon": "/-strong", "uids": ["300"] },
+                            { "rIcon": "", "rType": -1, "uid": "400" }
+                        ]
+                    },
+                    {
+                        "msgId": "75002",
+                        "cliMsgId": "1782286269002",
+                        "uidFrom": "100",
+                        "idTo": "888111",
+                        "msgType": "chat.text",
+                        "content": "Tin nhan 2",
+                        "ts": 1_782_286_269_600_i64
+                    },
+                    {
+                        "msgId": "75009",
+                        "cliMsgId": "1782286269099",
+                        "uidFrom": "0",
+                        "idTo": "888111",
+                        "msgType": "chat.reaction",
+                        "content": "{\"rMsg\":[{\"gMsgID\":0,\"cMsgID\":1782286269001,\"msgType\":1}],\"rIcon\":\"/-heart\",\"rType\":5}"
+                    }
+                ],
+                "reactGroups": [
+                    {
+                        "uidFrom": "200",
+                        "idTo": "888111",
+                        "content": "{\"rMsg\":[{\"gMsgID\":75002,\"cMsgID\":1782286269002,\"msgType\":1}],\"rIcon\":\":>\",\"rType\":0}"
+                    },
+                    {
+                        "uidFrom": "200",
+                        "idTo": "888111",
+                        "content": "{\"rMsg\":[{\"gMsgID\":75002,\"cMsgID\":1782286269002,\"msgType\":1}],\"rIcon\":\":o\",\"rType\":32}"
+                    }
+                ]
+            }
+        });
+
+        let page = parse_remote_history_page(&resp, "888111", "100", "", true, None).unwrap();
+        assert_eq!(page.messages.len(), 2);
+
+        let m1 = &page.messages[0];
+        assert_eq!(m1.msg_id, "75001");
+        assert_eq!(m1.cli_msg_id.as_deref(), Some("1782286269001"));
+        assert_eq!(m1.reactions.len(), 2);
+        let like = m1.reactions.iter().find(|r| r.emoji == "👍").unwrap();
+        assert_eq!(like.count, 1);
+        assert!(!like.me);
+        let heart = m1.reactions.iter().find(|r| r.emoji == "❤️").unwrap();
+        assert_eq!(heart.count, 1);
+        assert!(heart.me);
+
+        // Peer switched 😆 -> 😮 in reactGroups
+        let m2 = &page.messages[1];
+        assert_eq!(m2.msg_id, "75002");
+        assert_eq!(m2.cli_msg_id.as_deref(), Some("1782286269002"));
+        assert_eq!(m2.reactions.len(), 1);
+        assert_eq!(m2.reactions[0].emoji, "😮");
+        assert_eq!(m2.reactions[0].count, 1);
+        assert!(!m2.reactions[0].me);
     }
 }

@@ -140,7 +140,7 @@ pub struct UserProfileDto {
     pub last_interaction_ts: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReactionSummary {
     pub emoji: String,
     pub count: u32,
@@ -251,6 +251,8 @@ pub struct QuoteRef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageDto {
     pub msg_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_msg_id: Option<String>,
     pub thread_id: String,
     pub sender_id: String,
     pub sender_name: String,
