@@ -74,6 +74,8 @@ async function blobUrlToDataUrl(blobUrl: string): Promise<string> {
 export interface LightboxItem {
   url: string;
   title: string;
+  threadId?: string;
+  msgId?: string;
 }
 
 interface Props {
@@ -285,7 +287,10 @@ export function MediaLightbox({
       const targetUrl = isBlobUrl(normalizedUrl)
         ? await blobUrlToDataUrl(normalizedUrl)
         : normalizedUrl;
-      await bridge.saveRemoteFile(targetUrl, current.title || "teza-image");
+      await bridge.saveRemoteFile(targetUrl, current.title || "teza-image", undefined, {
+        threadId: current.threadId,
+        msgId: current.msgId,
+      });
     } catch (err) {
       onNotify?.(String(err));
     } finally {
@@ -423,6 +428,8 @@ export function MediaLightbox({
 
         <RelayImage
           src={normalizedUrl}
+          threadId={current.threadId}
+          msgId={current.msgId}
           alt={current.title}
           referrerPolicy="no-referrer"
           draggable={false}

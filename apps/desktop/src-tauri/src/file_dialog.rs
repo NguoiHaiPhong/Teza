@@ -31,6 +31,18 @@ pub fn pick_save_file(
     }
 }
 
+pub fn pick_directory(owner_hwnd: Option<usize>) -> Result<Option<PathBuf>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        win32::run_pick_directory(owner_hwnd)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = owner_hwnd;
+        Err("Chọn thư mục bản địa hiện chỉ hỗ trợ Windows".into())
+    }
+}
+
 pub fn is_known_file_extension(ext: &str) -> bool {
     let lower = ext.trim().trim_start_matches('.').to_ascii_lowercase();
     matches!(
@@ -376,7 +388,8 @@ fn is_generic_placeholder_name(raw: &str) -> bool {
 }
 
 fn is_windows_reserved_device_name(stem: &str) -> bool {
-    let upper = stem.trim().trim_end_matches('.').to_ascii_uppercase();
+    let first_segment = stem.split('.').next().unwrap_or(stem);
+    let upper = first_segment.trim().to_ascii_uppercase();
     matches!(
         upper.as_str(),
         "CON"
@@ -579,6 +592,7 @@ pub fn is_dangerous_executable_ext(path: &Path) -> bool {
             | "msi"
             | "msp"
             | "msix"
+            | "msu"
             | "ps1"
             | "psm1"
             | "psd1"
@@ -588,12 +602,34 @@ pub fn is_dangerous_executable_ext(path: &Path) -> bool {
             | "jse"
             | "wsf"
             | "wsh"
+            | "sct"
+            | "wsc"
             | "scr"
             | "pif"
             | "hta"
             | "cpl"
             | "jar"
             | "lnk"
+            | "url"
+            | "scf"
+            | "msc"
+            | "chm"
+            | "iso"
+            | "img"
+            | "vhd"
+            | "vhdx"
+            | "appref-ms"
+            | "application"
+            | "settingcontent-ms"
+            | "library-ms"
+            | "search-ms"
+            | "searchconnector-ms"
+            | "docm"
+            | "xlsm"
+            | "pptm"
+            | "xlsb"
+            | "py"
+            | "pyw"
             | "reg"
             | "inf"
             | "dll"
@@ -659,6 +695,56 @@ pub fn open_local_file(path: &Path) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn resolve_explorer_path_from(system_root: Option<OsString>) -> PathBuf {
+    let root = system_root
+        .and_then(|v| {
+            if v.to_str().is_some_and(|s| s.trim().is_empty()) {
+                return None;
+            }
+            let p = PathBuf::from(v);
+            p.is_absolute().then_some(p)
+        })
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    root.join("explorer.exe")
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_explorer_path() -> PathBuf {
+    resolve_explorer_path_from(std::env::var_os("SystemRoot"))
+}
+
+pub fn open_url_with_shell(url: &str) -> Result<(), String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+        return Err("URL không hợp lệ".into());
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+        return Err("Chỉ hỗ trợ mở liên kết http/https".into());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        win32::shell_open_url(trimmed)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(trimmed)
+            .spawn()
+            .map_err(|e| format!("Không mở được trình duyệt: {e}"))?;
+        Ok(())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(trimmed)
+            .spawn()
+            .map_err(|e| format!("Không mở được trình duyệt: {e}"))?;
+        Ok(())
+    }
+}
+
 pub fn reveal_local_file(path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Err("Không tìm thấy tệp hoặc thư mục trên máy".into());
@@ -674,7 +760,8 @@ pub fn reveal_local_file(path: &Path) -> Result<(), String> {
         if path_str.contains('"') || path_str.contains('\0') {
             return Err("Đường dẫn tệp không hợp lệ".into());
         }
-        std::process::Command::new("explorer.exe")
+        let explorer = resolve_explorer_path();
+        std::process::Command::new(explorer)
             .raw_arg(format!("/select,\"{path_str}\""))
             .spawn()
             .map_err(|e| format!("Không thể mở thư mục chứa tệp: {e}"))?;
@@ -698,6 +785,49 @@ pub fn reveal_local_file(path: &Path) -> Result<(), String> {
             .arg(parent)
             .spawn()
             .map_err(|e| format!("Không thể mở thư mục chứa tệp: {e}"))?;
+        Ok(())
+    }
+}
+
+pub fn open_directory(path: &Path) -> Result<(), String> {
+    if !path.is_dir() {
+        return Err("Không tìm thấy thư mục trên máy".into());
+    }
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let clean = normalize_os_display_path(&resolved);
+    #[cfg(target_os = "windows")]
+    {
+        let path_str = clean
+            .to_str()
+            .ok_or_else(|| "Đường dẫn thư mục chứa ký tự không hợp lệ".to_string())?;
+        if path_str.is_empty()
+            || path_str.contains('"')
+            || path_str.contains('\0')
+            || path_str.chars().any(char::is_control)
+        {
+            return Err("Đường dẫn thư mục không hợp lệ".into());
+        }
+        let explorer = resolve_explorer_path();
+        std::process::Command::new(explorer)
+            .arg(&clean)
+            .spawn()
+            .map_err(|e| format!("Không thể mở thư mục trong Explorer: {e}"))?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&clean)
+            .spawn()
+            .map_err(|e| format!("Không thể mở thư mục: {e}"))?;
+        Ok(())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&clean)
+            .spawn()
+            .map_err(|e| format!("Không thể mở thư mục: {e}"))?;
         Ok(())
     }
 }
@@ -774,27 +904,108 @@ mod win32 {
             lp_directory: *const u16,
             n_show_cmd: i32,
         ) -> *mut c_void;
+        fn SHBrowseForFolderW(lpbi: *mut BrowseInfoW) -> *mut c_void;
+        fn SHGetPathFromIDListW(pidl: *const c_void, psz_path: *mut u16) -> i32;
     }
 
     #[link(name = "ole32")]
     extern "system" {
         fn CoInitializeEx(pv_reserved: *mut c_void, dw_co_init: u32) -> i32;
         fn CoUninitialize();
+        fn CoTaskMemFree(pv: *mut c_void);
     }
+
+    #[repr(C)]
+    struct BrowseInfoW {
+        hwnd_owner: *mut c_void,
+        pidl_root: *const c_void,
+        psz_display_name: *mut u16,
+        lpsz_title: *const u16,
+        ul_flags: u32,
+        lpfn: *mut c_void,
+        l_param: isize,
+        i_image: i32,
+    }
+
+    const BIF_RETURNONLYFSDIRS: u32 = 0x0000_0001;
+    const BIF_EDITBOX: u32 = 0x0000_0010;
+    const BIF_NEWDIALOGSTYLE: u32 = 0x0000_0040;
 
     const COINIT_APARTMENTTHREADED: u32 = 0x2;
     const COINIT_DISABLE_OLE1DDE: u32 = 0x4;
     const SW_SHOWNORMAL: i32 = 1;
 
-    pub fn shell_open_file(path: &std::path::Path) -> Result<(), String> {
-        let Some(path_str) = path.to_str() else {
-            return Err("Đường dẫn tệp chứa ký tự không hợp lệ".into());
+    pub fn run_pick_directory(owner_hwnd: Option<usize>) -> Result<Option<PathBuf>, String> {
+        let hr = unsafe {
+            CoInitializeEx(
+                null_mut(),
+                COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
+            )
         };
-        if path_str.contains('\0') {
-            return Err("Đường dẫn tệp không hợp lệ".into());
+        let mut display_buf = vec![0u16; 260];
+        let title: Vec<u16> = "Chọn thư mục lưu trữ Media cục bộ cho Teza\0"
+            .encode_utf16()
+            .collect();
+        let flags = if hr >= 0 {
+            BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX
+        } else {
+            BIF_RETURNONLYFSDIRS | BIF_EDITBOX
+        };
+        let mut bi = BrowseInfoW {
+            hwnd_owner: owner_hwnd.map(|h| h as *mut c_void).unwrap_or(null_mut()),
+            pidl_root: null(),
+            psz_display_name: display_buf.as_mut_ptr(),
+            lpsz_title: title.as_ptr(),
+            ul_flags: flags,
+            lpfn: null_mut(),
+            l_param: 0,
+            i_image: 0,
+        };
+
+        let pidl = unsafe { SHBrowseForFolderW(&mut bi) };
+        if pidl.is_null() {
+            if hr >= 0 {
+                unsafe {
+                    CoUninitialize();
+                }
+            }
+            return Ok(None);
+        }
+
+        let mut path_buf = vec![0u16; 1024];
+        let ok = unsafe { SHGetPathFromIDListW(pidl, path_buf.as_mut_ptr()) };
+        unsafe {
+            CoTaskMemFree(pidl);
+        }
+        if hr >= 0 {
+            unsafe {
+                CoUninitialize();
+            }
+        }
+        if ok == 0 {
+            return Err(
+                "Không thể đọc đường dẫn thư mục đã chọn (vui lòng chọn thư mục cục bộ hợp lệ)"
+                    .into(),
+            );
+        }
+        let end = path_buf
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(path_buf.len());
+        let path_str = String::from_utf16(&path_buf[..end]).map_err(|e| e.to_string())?;
+        let trimmed = path_str.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(PathBuf::from(trimmed)))
+    }
+
+    fn shell_execute_open(target: &str, err_prefix: &str) -> Result<(), String> {
+        if target.is_empty() || target.contains('\0') {
+            return Err(format!("{err_prefix}: mục tiêu không hợp lệ"));
         }
         let verb: Vec<u16> = "open\0".encode_utf16().collect();
-        let file: Vec<u16> = format!("{path_str}\0").encode_utf16().collect();
+        let file: Vec<u16> = format!("{target}\0").encode_utf16().collect();
         let hr = unsafe {
             CoInitializeEx(
                 null_mut(),
@@ -818,9 +1029,23 @@ mod win32 {
         }
         let code = ret as isize;
         if code <= 32 {
-            return Err(format!("Không thể mở tệp bằng ứng dụng mặc định (mã {code})"));
+            return Err(format!("{err_prefix} (mã {code})"));
         }
         Ok(())
+    }
+
+    pub fn shell_open_file(path: &std::path::Path) -> Result<(), String> {
+        let Some(path_str) = path.to_str() else {
+            return Err("Đường dẫn tệp chứa ký tự không hợp lệ".into());
+        };
+        if path_str.contains('\0') {
+            return Err("Đường dẫn tệp không hợp lệ".into());
+        }
+        shell_execute_open(path_str, "Không thể mở tệp bằng ứng dụng mặc định")
+    }
+
+    pub fn shell_open_url(url: &str) -> Result<(), String> {
+        shell_execute_open(url, "Không mở được trình duyệt")
     }
 
     const MB_YESNO: u32 = 0x0000_0004;
@@ -1160,6 +1385,34 @@ mod tests {
             "_CON.pdf"
         );
         assert_eq!(
+            sanitize_suggested_filename_preserving_ext("CON.foo.pdf", Some("pdf")),
+            "_CON.foo.pdf"
+        );
+        assert_eq!(
+            sanitize_suggested_filename_preserving_ext("nul.tar.gz", Some("gz")),
+            "_nul.tar.gz"
+        );
+        assert_eq!(
+            sanitize_suggested_filename_preserving_ext("nul.tar.gz", None),
+            "_nul.tar.gz"
+        );
+        assert_eq!(
+            sanitize_suggested_filename_preserving_ext("aux .backup.zip", Some("zip")),
+            "_aux .backup.zip"
+        );
+        assert_eq!(
+            sanitize_suggested_filename_preserving_ext("LPT9.a.b.c", Some("c")),
+            "_LPT9.a.b.c"
+        );
+        assert_eq!(
+            sanitize_suggested_filename_preserving_ext("normal.CON.pdf", Some("pdf")),
+            "normal.CON.pdf"
+        );
+        assert_eq!(
+            sanitize_suggested_filename_preserving_ext("console.foo.pdf", Some("pdf")),
+            "console.foo.pdf"
+        );
+        assert_eq!(
             sanitize_suggested_filename_preserving_ext("nul", None),
             "_nul"
         );
@@ -1201,11 +1454,98 @@ mod tests {
             "installer.msi",
             "macro.vbs",
             "payload.cmd",
+            "link.url",
+            "cmd.scf",
+            "snapin.msc",
+            "help.chm",
+            "disk.iso",
+            "image.img",
+            "drive.vhd",
+            "drive.vhdx",
+            "clickonce.appref-ms",
+            "clickonce.application",
+            "patch.msu",
+            "setting.settingcontent-ms",
+            "lib.library-ms",
+            "query.search-ms",
+            "conn.searchconnector-ms",
+            "scriptlet.sct",
+            "component.wsc",
+            "report.docm",
+            "sheet.xlsm",
+            "slides.pptm",
+            "binary.xlsb",
+            "tool.py",
+            "gui.pyw",
         ] {
             assert!(
                 is_dangerous_executable_ext(Path::new(dangerous)),
                 "expected blocked: {dangerous}"
             );
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn resolve_explorer_path_uses_system_root_with_safe_fallback() {
+        assert_eq!(
+            resolve_explorer_path_from(Some(OsString::from(r"C:\Windows"))),
+            PathBuf::from(r"C:\Windows\explorer.exe")
+        );
+        assert_eq!(
+            resolve_explorer_path_from(Some(OsString::from(r"D:\WINNT"))),
+            PathBuf::from(r"D:\WINNT\explorer.exe")
+        );
+        assert_eq!(
+            resolve_explorer_path_from(None),
+            PathBuf::from(r"C:\Windows\explorer.exe")
+        );
+        assert_eq!(
+            resolve_explorer_path_from(Some(OsString::from("   "))),
+            PathBuf::from(r"C:\Windows\explorer.exe")
+        );
+        assert_eq!(
+            resolve_explorer_path_from(Some(OsString::from(r"relative\dir"))),
+            PathBuf::from(r"C:\Windows\explorer.exe")
+        );
+    }
+
+    #[test]
+    fn open_url_with_shell_rejects_non_http_and_control_chars() {
+        for bad in [
+            "",
+            "   ",
+            "javascript:alert(1)",
+            "file:///C:/Windows/win.ini",
+            r"C:\Windows\System32\calc.exe",
+            "https://example.com\n/foo",
+            "https://example.com/\0bar",
+            "ftp://example.com/file",
+        ] {
+            assert!(
+                open_url_with_shell(bad).is_err(),
+                "expected open_url_with_shell to reject: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_directory_rejects_missing_path_and_regular_files() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("teza_open_dir_test_{stamp}"));
+        let missing = dir.join("does_not_exist");
+        assert!(open_directory(&missing).is_err());
+
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("plain.txt");
+        std::fs::write(&file, b"hi").unwrap();
+        assert!(open_directory(&file).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -13,12 +13,15 @@ use opus_pure::{Application, OpusDecoder, OpusEncoder, SoftClip, MAX_PACKET_BYTE
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CallError, CallResult};
+use crate::media_hook::AuxiliaryMediaSession;
 use crate::rtp::{
-    build_rtcp_rr, build_rtp_packet, is_rtcp_packet, parse_rtp_packet, rtcp_sr_middle_ntp,
-    JitterBuffer, JitterPop, RtpRxStats, AUDIO_FRAME_SAMPLES, AUDIO_SAMPLE_RATE, OPUS_AUDIO_PT,
+    build_rtcp_rr, build_rtp_packet, is_rtcp_packet, parse_rtp_packet, JitterBuffer, JitterPop,
+    RtpRxStats, AUDIO_FRAME_SAMPLES, AUDIO_SAMPLE_RATE, OPUS_AUDIO_PT,
 };
 use crate::zrtp::{
     parse_zrtp_init_response, unwrap_relay_media, wrap_relay_audio_rtcp, wrap_relay_audio_rtp,
+    RELAY_INCOMING_VIDEO_RTP, RELAY_WRAP_AUDIO_RTCP, RELAY_WRAP_AUDIO_RTP, RELAY_WRAP_VIDEO_RTCP,
+    RELAY_WRAP_VIDEO_RTP,
 };
 
 /// Default VoIP Opus target bitrate (24 kbps mono wideband speech).
@@ -109,7 +112,7 @@ pub(crate) fn pick_preferred_device_name(
         return Some(phys.clone());
     }
 
-    if !avoid_spdif_on_auto {
+    if avoid_spdif_on_auto {
         if let Some(phys) = candidates
             .iter()
             .find(|c| !is_virtual_or_loopback_audio_device(c))
@@ -503,6 +506,8 @@ pub struct AudioMediaConfig {
     pub udp_rtcp_sock: Option<Arc<UdpSocket>>,
     pub rtcp_inbox: Option<Arc<Mutex<VecDeque<Vec<u8>>>>>,
     pub devices: AudioDeviceSelection,
+    /// Optional video/auxiliary media receiver notified for non-Opus RTP & RTCP datagrams.
+    pub aux_session: Option<Arc<dyn AuxiliaryMediaSession>>,
 }
 
 impl AudioMediaConfig {
@@ -601,6 +606,46 @@ impl AudioMediaSession {
         fault: TestAudioFault,
     ) -> CallResult<Self> {
         Self::start_inner(cfg, fault)
+    }
+
+    /// Start a lightweight UDP RTP/RTCP RX pump without opening any OS audio hardware or Opus codec.
+    ///
+    /// Used when audio capture/playback is disabled (`--no-audio`) or unavailable so auxiliary
+    /// media sessions (e.g. `teza-video`) and late `InitZRTP` acks still receive datagrams cleanly.
+    pub fn start_aux_pump_only(cfg: AudioMediaConfig) -> CallResult<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let controls = Arc::new(AudioControls::default());
+        controls.set_mic_muted(cfg.initial_mic_muted);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<CallResult<()>>(1);
+
+        let stop_t = stop.clone();
+        let ctrl_t = controls.clone();
+        let thread = thread::Builder::new()
+            .name("teza-call-aux-pump".to_string())
+            .spawn(move || {
+                run_aux_pump_only_loop(stop_t, ctrl_t, cfg, ready_tx);
+            })
+            .map_err(|e| CallError::Audio(format!("Không tạo được luồng UDP aux pump: {e}")))?;
+
+        match ready_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(())) => Ok(Self {
+                stop,
+                controls,
+                thread: Some(thread),
+            }),
+            Ok(Err(err)) => {
+                stop.store(true, Ordering::Relaxed);
+                let _ = thread.join();
+                Err(err)
+            }
+            Err(_) => {
+                stop.store(true, Ordering::Relaxed);
+                let _ = thread.join();
+                Err(CallError::Audio(
+                    "Hết thời gian khởi tạo luồng UDP aux pump".to_string(),
+                ))
+            }
+        }
     }
 
     fn start_inner(
@@ -1263,6 +1308,40 @@ fn push_playback_pcm(
     }
 }
 
+/// Extract `(sender_ssrc, middle_32bit_ntp)` from the first RTCP Sender Report (`PT = 200`)
+/// in a single or compound RFC 3550 RTCP packet.
+fn rtcp_sr_sender_and_middle_ntp(rtcp: &[u8]) -> Option<(u32, u32)> {
+    let mut off = 0usize;
+    while off + 4 <= rtcp.len() {
+        if (rtcp[off] & 0xC0) != 0x80 {
+            break;
+        }
+        let pt = rtcp[off + 1];
+        let length_words = u16::from_be_bytes([rtcp[off + 2], rtcp[off + 3]]) as usize;
+        let pkt_len = (length_words + 1).saturating_mul(4);
+        if pt == 200 && off + 16 <= rtcp.len() {
+            let sender_ssrc = u32::from_be_bytes([
+                rtcp[off + 4],
+                rtcp[off + 5],
+                rtcp[off + 6],
+                rtcp[off + 7],
+            ]);
+            let mid_ntp = u32::from_be_bytes([
+                rtcp[off + 10],
+                rtcp[off + 11],
+                rtcp[off + 12],
+                rtcp[off + 13],
+            ]);
+            return Some((sender_ssrc, mid_ntp));
+        }
+        if pkt_len < 4 || off.checked_add(pkt_len).is_none_or(|next| next > rtcp.len()) {
+            break;
+        }
+        off += pkt_len;
+    }
+    None
+}
+
 /// Process a single raw UDP datagram from either the RTP socket or RTCP inbox:
 /// captures late `InitZRTP` tokens (only from `rtp_target` or `rtcp_target`, routing distinct
 /// RTCP tokens into `live_rtcp_relay_token` without clobbering `live_relay_token`), tracks RTCP
@@ -1280,6 +1359,7 @@ fn ingest_udp_datagram(
     jitter: &mut JitterBuffer,
     last_peer_sr: &mut Option<(u32, Instant)>,
     controls: &AudioControls,
+    aux_session: Option<&Arc<dyn AuxiliaryMediaSession>>,
 ) {
     let Some(inner) = unwrap_relay_media(raw) else {
         if let Some(init_resp) = parse_zrtp_init_response(raw) {
@@ -1307,8 +1387,26 @@ fn ingest_udp_datagram(
         return;
     };
     if is_rtcp_packet(inner) {
-        if let Some(mid_ntp) = rtcp_sr_middle_ntp(inner) {
-            *last_peer_sr = Some((mid_ntp, Instant::now()));
+        let outer = raw[0];
+        let is_video_outer = matches!(
+            outer,
+            RELAY_WRAP_VIDEO_RTCP | RELAY_WRAP_VIDEO_RTP | RELAY_INCOMING_VIDEO_RTP
+        );
+        let is_audio_outer = matches!(outer, RELAY_WRAP_AUDIO_RTCP | RELAY_WRAP_AUDIO_RTP | 0x04);
+        if !is_video_outer {
+            if let Some((sr_ssrc, mid_ntp)) = rtcp_sr_sender_and_middle_ntp(inner) {
+                let matches_audio = if is_audio_outer {
+                    *peer_ssrc == 0 || sr_ssrc == *peer_ssrc
+                } else {
+                    *peer_ssrc != 0 && sr_ssrc == *peer_ssrc
+                };
+                if matches_audio {
+                    *last_peer_sr = Some((mid_ntp, Instant::now()));
+                }
+            }
+        }
+        if let Some(aux) = aux_session {
+            aux.on_incoming_rtcp(outer, inner);
         }
         return;
     }
@@ -1326,6 +1424,72 @@ fn ingest_udp_datagram(
         rx_stats.update(rtp_pkt.sequence_number);
         controls.rx_packets.fetch_add(1, Ordering::Relaxed);
         jitter.push(rtp_pkt.sequence_number, rtp_pkt.payload.to_vec());
+    } else if let Some(aux) = aux_session {
+        aux.on_incoming_rtp(raw[0], inner);
+    }
+}
+
+fn drain_udp_datagrams(cfg: &AudioMediaConfig, rx_buf: &mut [u8]) -> Vec<(Option<SocketAddr>, Vec<u8>)> {
+    let mut incoming: Vec<(Option<SocketAddr>, Vec<u8>)> = Vec::new();
+    if let Some(ref inbox) = cfg.rtcp_inbox {
+        if let Ok(mut q) = inbox.lock() {
+            incoming.extend(q.drain(..).map(|pkt| (None, pkt)));
+        }
+    } else if let Some(ref rtcp_sock) = cfg.udp_rtcp_sock {
+        if cfg.rtcp_target.is_some_and(|rt| rt != cfg.rtp_target) {
+            for _ in 0..16 {
+                match rtcp_sock.recv_from(rx_buf) {
+                    Ok((n, peer)) => incoming.push((Some(peer), rx_buf[..n].to_vec())),
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+    for _ in 0..64 {
+        match cfg.udp_rtp_sock.recv_from(rx_buf) {
+            Ok((n, peer)) => incoming.push((Some(peer), rx_buf[..n].to_vec())),
+            Err(_) => break,
+        }
+    }
+    incoming
+}
+
+fn run_aux_pump_only_loop(
+    stop: Arc<AtomicBool>,
+    controls: Arc<AudioControls>,
+    cfg: AudioMediaConfig,
+    ready_tx: std::sync::mpsc::SyncSender<CallResult<()>>,
+) {
+    let _attached =
+        MediaAttachedGuard::acquire(cfg.media_attached.clone(), cfg.media_attached_notify.clone());
+    let _ = ready_tx.send(Ok(()));
+
+    let mut peer_ssrc: u32 = 0;
+    let mut rx_stats = RtpRxStats::default();
+    let mut jitter = JitterBuffer::voip_default();
+    let mut last_peer_sr: Option<(u32, Instant)> = None;
+    let mut rx_buf = [0u8; 4096];
+
+    while !stop.load(Ordering::Relaxed) {
+        let incoming = drain_udp_datagrams(&cfg, &mut rx_buf);
+        for (peer, raw) in incoming {
+            ingest_udp_datagram(
+                &raw,
+                peer,
+                cfg.rtp_target,
+                cfg.rtcp_target,
+                cfg.live_relay_token.as_ref(),
+                cfg.live_rtcp_relay_token.as_ref(),
+                &mut peer_ssrc,
+                &mut rx_stats,
+                &mut jitter,
+                &mut last_peer_sr,
+                &controls,
+                cfg.aux_session.as_ref(),
+            );
+        }
+        jitter.reset();
+        thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -1426,27 +1590,7 @@ fn run_udp_audio_loop(
         }
 
         // 2. UDP RX -> relay unwrap -> RTP / RTCP / late InitZRTP dispatch
-        let mut incoming: Vec<(Option<SocketAddr>, Vec<u8>)> = Vec::new();
-        if let Some(ref inbox) = cfg.rtcp_inbox {
-            if let Ok(mut q) = inbox.lock() {
-                incoming.extend(q.drain(..).map(|pkt| (None, pkt)));
-            }
-        } else if let Some(ref rtcp_sock) = cfg.udp_rtcp_sock {
-            if cfg.rtcp_target.is_some_and(|rt| rt != cfg.rtp_target) {
-                for _ in 0..16 {
-                    match rtcp_sock.recv_from(&mut rx_buf) {
-                        Ok((n, peer)) => incoming.push((Some(peer), rx_buf[..n].to_vec())),
-                        Err(_) => break,
-                    }
-                }
-            }
-        }
-        for _ in 0..64 {
-            match cfg.udp_rtp_sock.recv_from(&mut rx_buf) {
-                Ok((n, peer)) => incoming.push((Some(peer), rx_buf[..n].to_vec())),
-                Err(_) => break,
-            }
-        }
+        let incoming = drain_udp_datagrams(&cfg, &mut rx_buf);
 
         for (peer, raw) in incoming {
             ingest_udp_datagram(
@@ -1461,6 +1605,7 @@ fn run_udp_audio_loop(
                 &mut jitter,
                 &mut last_peer_sr,
                 &controls,
+                cfg.aux_session.as_ref(),
             );
         }
 
@@ -1854,6 +1999,7 @@ mod tests {
             &mut jitter,
             &mut last_sr,
             &controls,
+            None,
         );
         ingest_udp_datagram(
             &foreign_init,
@@ -1867,6 +2013,7 @@ mod tests {
             &mut jitter,
             &mut last_sr,
             &controls,
+            None,
         );
         assert_eq!(
             live_token.load(Ordering::Relaxed),
@@ -1895,6 +2042,7 @@ mod tests {
             &mut jitter,
             &mut last_sr,
             &controls,
+            None,
         );
         assert_eq!(live_token.load(Ordering::Relaxed), 0xBEEF_CAFE);
         assert_eq!(live_rtcp_token.load(Ordering::Relaxed), 0);
@@ -1920,6 +2068,7 @@ mod tests {
             &mut jitter,
             &mut last_sr,
             &controls,
+            None,
         );
         assert_eq!(
             live_token.load(Ordering::Relaxed),
@@ -1943,6 +2092,7 @@ mod tests {
             &mut jitter,
             &mut last_sr,
             &controls,
+            None,
         );
         assert_eq!(single_tok.load(Ordering::Relaxed), 0xCAFE_1234);
         ingest_udp_datagram(
@@ -1957,6 +2107,7 @@ mod tests {
             &mut jitter,
             &mut last_sr,
             &controls,
+            None,
         );
         assert_eq!(single_tok.load(Ordering::Relaxed), 0xBEEF_CAFE);
         ingest_udp_datagram(
@@ -1971,6 +2122,7 @@ mod tests {
             &mut jitter,
             &mut last_sr,
             &controls,
+            None,
         );
         assert_eq!(
             single_tok.load(Ordering::Relaxed),
@@ -1993,6 +2145,7 @@ mod tests {
                 &mut jitter,
                 &mut last_sr,
                 &controls,
+                None,
             );
         }
         assert_eq!(peer_ssrc, 0x1111_1111);
@@ -2013,6 +2166,7 @@ mod tests {
                 &mut jitter,
                 &mut last_sr,
                 &controls,
+                None,
             );
         }
         assert_eq!(peer_ssrc, 0x2222_2222);
@@ -2123,6 +2277,7 @@ mod tests {
             udp_rtcp_sock: Some(client_rtcp),
             rtcp_inbox: None,
             devices,
+            aux_session: None,
         };
 
         let sess = AudioMediaSession::start_with_fault(cfg, TestAudioFault::MissingInput)
@@ -2192,6 +2347,7 @@ mod tests {
             udp_rtcp_sock: Some(rtcp_sock),
             rtcp_inbox: None,
             devices: AudioDeviceSelection::default(),
+            aux_session: None,
         };
 
         // Before distinct RTCP port acks InitZRTP (token == 0), send from udp_rtp_sock with RTP token.
@@ -2253,7 +2409,8 @@ mod tests {
             Some("Microphone (USB Audio Device)"),
         );
 
-        // 2. When NO physical analog output exists, fall back cleanly to OS default
+        // 2. When OS default is virtual and ONLY an S/PDIF physical output exists,
+        //    auto-picker falls back to S/PDIF instead of staying on the virtual cable.
         let virtual_and_spdif_only = vec![
             "CABLE Input (VB-Audio Virtual Cable)".to_string(),
             "Realtek Digital Output (Realtek(R) Audio)".to_string(),
@@ -2263,6 +2420,22 @@ mod tests {
                 None,
                 Some("CABLE Input (VB-Audio Virtual Cable)"),
                 &virtual_and_spdif_only,
+                true,
+            )
+            .as_deref(),
+            Some("Realtek Digital Output (Realtek(R) Audio)"),
+        );
+
+        // 2b. When NO physical output exists at all, fall back cleanly to OS default.
+        let virtual_only = vec![
+            "CABLE Input (VB-Audio Virtual Cable)".to_string(),
+            "Stereo Mix (Realtek(R) Audio)".to_string(),
+        ];
+        assert_eq!(
+            pick_preferred_device_name(
+                None,
+                Some("CABLE Input (VB-Audio Virtual Cable)"),
+                &virtual_only,
                 true,
             )
             .as_deref(),
@@ -2280,6 +2453,105 @@ mod tests {
             .as_deref(),
             Some("CABLE Output (VB-Audio Virtual Cable)"),
         );
+    }
+
+    #[test]
+    fn audio_rtcp_sr_ignores_video_rtcp_and_mismatched_raw_ssrc() {
+        let make_sr = |ssrc: u32, ntp_msw: u32, ntp_lsw: u32| -> Vec<u8> {
+            let mut sr = Vec::with_capacity(28);
+            sr.extend_from_slice(&[0x80, 200, 0x00, 0x06]);
+            sr.extend_from_slice(&ssrc.to_be_bytes());
+            sr.extend_from_slice(&ntp_msw.to_be_bytes());
+            sr.extend_from_slice(&ntp_lsw.to_be_bytes());
+            sr.extend_from_slice(&[0u8; 12]);
+            sr
+        };
+
+        let rtp_target: SocketAddr = "127.0.0.1:10490".parse().unwrap();
+        let rtcp_target: SocketAddr = "127.0.0.1:12490".parse().unwrap();
+        let mut peer_ssrc: u32 = 0x1111_2222;
+        let mut rx_stats = RtpRxStats::default();
+        let mut jitter = JitterBuffer::voip_default();
+        let mut last_sr: Option<(u32, Instant)> = None;
+        let controls = AudioControls::default();
+
+        // 1. Audio RTCP SR (0x05) with matching SSRC updates audio last_peer_sr
+        let audio_sr = make_sr(0x1111_2222, 0x1234_AAAA, 0xBBBB_5678);
+        let audio_wire = wrap_relay_audio_rtcp(0xCAFE_0001, &audio_sr);
+        ingest_udp_datagram(
+            &audio_wire,
+            Some(rtcp_target),
+            rtp_target,
+            Some(rtcp_target),
+            None,
+            None,
+            &mut peer_ssrc,
+            &mut rx_stats,
+            &mut jitter,
+            &mut last_sr,
+            &controls,
+            None,
+        );
+        assert_eq!(last_sr.map(|(m, _)| m), Some(0xAAAA_BBBB));
+
+        // 2. Video RTCP SR (0x0F) — even with the SAME SSRC — must NOT overwrite audio last_peer_sr
+        let video_sr = make_sr(0x1111_2222, 0x1234_CCCC, 0xDDDD_5678);
+        let video_wire = crate::zrtp::wrap_relay_video_rtcp(0xCAFE_0001, &video_sr);
+        ingest_udp_datagram(
+            &video_wire,
+            Some(rtcp_target),
+            rtp_target,
+            Some(rtcp_target),
+            None,
+            None,
+            &mut peer_ssrc,
+            &mut rx_stats,
+            &mut jitter,
+            &mut last_sr,
+            &controls,
+            None,
+        );
+        assert_eq!(
+            last_sr.map(|(m, _)| m),
+            Some(0xAAAA_BBBB),
+            "0x0F video RTCP SR must never clobber audio last_peer_sr"
+        );
+
+        // 3. Raw (P2P) RTCP SR with mismatched video SSRC must NOT overwrite audio last_peer_sr
+        let raw_video_sr = make_sr(0x9999_8888, 0x1234_EEEE, 0xFFFF_5678);
+        ingest_udp_datagram(
+            &raw_video_sr,
+            Some(rtcp_target),
+            rtp_target,
+            Some(rtcp_target),
+            None,
+            None,
+            &mut peer_ssrc,
+            &mut rx_stats,
+            &mut jitter,
+            &mut last_sr,
+            &controls,
+            None,
+        );
+        assert_eq!(last_sr.map(|(m, _)| m), Some(0xAAAA_BBBB));
+
+        // 4. Raw (P2P) RTCP SR with matching audio SSRC updates audio last_peer_sr
+        let raw_audio_sr = make_sr(0x1111_2222, 0x1234_1357, 0x2468_5678);
+        ingest_udp_datagram(
+            &raw_audio_sr,
+            Some(rtcp_target),
+            rtp_target,
+            Some(rtcp_target),
+            None,
+            None,
+            &mut peer_ssrc,
+            &mut rx_stats,
+            &mut jitter,
+            &mut last_sr,
+            &controls,
+            None,
+        );
+        assert_eq!(last_sr.map(|(m, _)| m), Some(0x1357_2468));
     }
 
     #[test]

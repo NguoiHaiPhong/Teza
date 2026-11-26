@@ -45,12 +45,22 @@ pub struct ThreadDto {
     pub is_archived: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreadMemberDto {
     pub id: String,
     pub name: String,
     pub avatar: String,
     pub role: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupDetailsResult {
+    pub total_members: Option<u32>,
+    pub members: Vec<ThreadMemberDto>,
+    #[serde(default)]
+    pub creator_id: String,
+    #[serde(default)]
+    pub admin_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +72,10 @@ pub struct ThreadDetailsDto {
     pub file_items: Vec<MessageDto>,
     #[serde(default)]
     pub link_items: Vec<MessageDto>,
+    #[serde(default)]
+    pub creator_id: String,
+    #[serde(default)]
+    pub admin_ids: Vec<String>,
 }
 
 fn default_folder_icon() -> String {
@@ -104,6 +118,7 @@ pub struct MutualGroupDto {
 pub struct UserProfileDto {
     pub uid: String,
     pub display_name: String,
+    #[serde(rename = "account_name", alias = "zalo_name")]
     pub zalo_name: String,
     pub avatar: String,
     pub cover: String,
@@ -112,6 +127,8 @@ pub struct UserProfileDto {
     pub sdob: String,
     pub phone_number: String,
     pub is_friend: Option<bool>,
+    #[serde(default)]
+    pub is_blocked: Option<bool>,
     pub is_self: bool,
     #[serde(default)]
     pub mutual_groups: Vec<MutualGroupDto>,
@@ -136,6 +153,60 @@ pub struct AddGroupMembersResultDto {
     pub added: Vec<String>,
     #[serde(default)]
     pub pending: Vec<String>,
+    #[serde(default)]
+    pub failed: Vec<String>,
+    #[serde(default)]
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FriendRequestItemDto {
+    pub user_id: String,
+    pub display_name: String,
+    pub account_name: String,
+    pub avatar: String,
+    pub message: String,
+    pub created_ts: i64,
+    pub direction: String,
+    pub is_seen: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FriendRequestsListDto {
+    #[serde(default)]
+    pub received: Vec<FriendRequestItemDto>,
+    #[serde(default)]
+    pub sent: Vec<FriendRequestItemDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FriendActionResultDto {
+    pub ok: bool,
+    pub user_id: String,
+    pub action: String,
+    #[serde(default)]
+    pub already_friends: bool,
+    #[serde(default)]
+    pub auto_accepted: bool,
+    #[serde(default)]
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LeaveGroupResultDto {
+    pub group_id: String,
+    pub left: bool,
+    #[serde(default)]
+    pub member_error: Vec<String>,
+    #[serde(default)]
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KickGroupMembersResultDto {
+    pub group_id: String,
+    #[serde(default)]
+    pub removed: Vec<String>,
     #[serde(default)]
     pub failed: Vec<String>,
     #[serde(default)]
@@ -220,4 +291,68 @@ pub fn strip_vi_accents(input: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_profile_dto_serializes_account_name_and_accepts_legacy_alias() {
+        let dto = UserProfileDto {
+            uid: "u-1".into(),
+            display_name: "Alice".into(),
+            zalo_name: "alice_handle".into(),
+            avatar: String::new(),
+            cover: String::new(),
+            status: String::new(),
+            gender: Some(1),
+            sdob: String::new(),
+            phone_number: String::new(),
+            is_friend: Some(true),
+            is_blocked: Some(false),
+            is_self: false,
+            mutual_groups: Vec::new(),
+            local_message_count: 0,
+            local_media_count: 0,
+            last_interaction_ts: 0,
+        };
+        let json_str = serde_json::to_string(&dto).unwrap();
+        assert!(json_str.contains("\"account_name\":\"alice_handle\""));
+        assert!(!json_str.contains("\"zalo_name\""));
+
+        let from_new: UserProfileDto = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(from_new.zalo_name, "alice_handle");
+
+        let legacy_json = json_str.replace("\"account_name\"", "\"zalo_name\"");
+        let from_legacy: UserProfileDto = serde_json::from_str(&legacy_json).unwrap();
+        assert_eq!(from_legacy.zalo_name, "alice_handle");
+        assert_eq!(from_legacy.is_blocked, Some(false));
+    }
+
+    #[test]
+    fn thread_details_and_social_dtos_roundtrip_with_defaults() {
+        let minimal_details = r#"{
+            "thread_id": "grp-1",
+            "total_members": 3,
+            "members": [],
+            "media_items": [],
+            "file_items": []
+        }"#;
+        let parsed: ThreadDetailsDto = serde_json::from_str(minimal_details).unwrap();
+        assert_eq!(parsed.creator_id, "");
+        assert!(parsed.admin_ids.is_empty());
+
+        let action = FriendActionResultDto {
+            ok: true,
+            user_id: "u-9".into(),
+            action: "send_request".into(),
+            already_friends: false,
+            auto_accepted: true,
+            message: "auto".into(),
+        };
+        let encoded = serde_json::to_string(&action).unwrap();
+        let decoded: FriendActionResultDto = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, action);
+    }
 }

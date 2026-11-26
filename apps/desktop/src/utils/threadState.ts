@@ -325,3 +325,63 @@ export function findFirstUnreadMsgId(
 
   return incomingAfter[Math.max(0, incomingAfter.length - fallbackUnreadCount)].msg_id;
 }
+
+export function applyThreadReadSync(
+  threads: ThreadDto[],
+  threadId: string,
+  isUnread: boolean,
+): ThreadDto[] {
+  const idx = threads.findIndex((t) => t.id === threadId);
+  if (idx < 0) return threads;
+  const target = threads[idx];
+  const next = [...threads];
+  if (!isUnread) {
+    next[idx] = {
+      ...target,
+      unread_count: 0,
+      last_read_in_ts: Math.max(target.last_read_in_ts ?? 0, target.last_ts),
+    };
+  } else {
+    next[idx] = {
+      ...target,
+      unread_count: Math.max(1, target.unread_count),
+    };
+  }
+  return next;
+}
+
+export interface AutoMarkReadOnFocusParams {
+  authed: boolean;
+  isLocked: boolean;
+  hasActiveWebApp: boolean;
+  webAppHubOpen?: boolean;
+  windowFocused: boolean;
+  visibilityState: string;
+  selectedId: string | null;
+  pendingMarkReadId: string | null;
+  activeThreadUnread: number;
+  distFromBottom: number | null;
+  isScrollable?: boolean;
+  chatPaneVisible?: boolean;
+  initialScrollReady?: boolean;
+  nearBottomThresholdPx?: number;
+}
+
+export function shouldAutoMarkReadOnFocus(params: AutoMarkReadOnFocusParams): boolean {
+  if (!params.authed) return false;
+  if (params.isLocked) return false;
+  if (params.hasActiveWebApp || params.webAppHubOpen) return false;
+  if (params.chatPaneVisible === false) return false;
+  if (params.initialScrollReady === false) return false;
+  if (!params.windowFocused || params.visibilityState !== "visible") return false;
+  if (!params.selectedId) return false;
+
+  const hasUnread =
+    params.pendingMarkReadId === params.selectedId || params.activeThreadUnread > 0;
+  if (!hasUnread) return false;
+
+  if (params.isScrollable === false) return true;
+  if (params.distFromBottom === null) return false;
+  const threshold = params.nearBottomThresholdPx ?? 90;
+  return params.distFromBottom < threshold;
+}

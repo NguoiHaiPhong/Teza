@@ -6,12 +6,13 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex, MutexGuard};
 use tokio::task::JoinHandle;
 
 use teza_call::{
@@ -19,10 +20,15 @@ use teza_call::{
     AudioDeviceSelection, AudioLoopbackSession, CallEndReason, CallEngine, CallEngineConfig,
     CallError, CallEvent, CallPhase, CallType, CtrlPollState,
 };
+use teza_video::{InboundVideoFrame, VideoMediaHook, VideoSessionConfig};
 use zalo_core::chat::parser::VoipControlEvent;
 use zalo_core::data_dir::{write_private_atomic, StoragePaths};
 use zalo_core::session::Session;
 use zalo_core::store::MessageStore;
+
+pub const MAX_OUTBOUND_VIDEO_AU_BYTES: usize = 512 * 1024;
+const MAX_OUTBOUND_VIDEO_AU_B64_LEN: usize = MAX_OUTBOUND_VIDEO_AU_BYTES.div_ceil(3) * 4;
+const INBOUND_VIDEO_FRAME_QUEUE_CAP: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CallDevicesDto {
@@ -43,6 +49,10 @@ pub struct CallSnapshotDto {
     pub phase: CallPhase,
     pub mic_muted: bool,
     pub peer_mic_muted: bool,
+    #[serde(default)]
+    pub cam_enabled: bool,
+    #[serde(default)]
+    pub peer_cam_enabled: bool,
     pub duration_secs: u64,
 }
 
@@ -83,6 +93,34 @@ pub struct CallTelemetryDto {
     pub output_is_virtual: bool,
     #[serde(default)]
     pub tx_errors: u64,
+    #[serde(default)]
+    pub video_cam_enabled: bool,
+    #[serde(default)]
+    pub video_peer_active: bool,
+    #[serde(default)]
+    pub video_synced: bool,
+    #[serde(default)]
+    pub video_tx_frames: u64,
+    #[serde(default)]
+    pub video_rx_frames: u64,
+    #[serde(default)]
+    pub video_rx_dropped_incomplete: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CallVideoFrameDto {
+    pub call_id: i64,
+    pub ssrc: u32,
+    pub sequence_number: u16,
+    pub timestamp: u32,
+    pub is_keyframe: bool,
+    pub just_synced: bool,
+    pub data_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CallVideoKeyframeRequestDto {
+    pub call_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -217,14 +255,42 @@ async fn build_state_from_engine(
             phase: snap.phase,
             mic_muted: snap.mic_muted,
             peer_mic_muted: snap.peer_mic_muted,
+            cam_enabled: snap.cam_enabled,
+            peer_cam_enabled: snap.peer_cam_enabled,
             duration_secs: snap.duration_secs,
         }),
     }
 }
 
+fn decode_outbound_video_au(data_b64: &str) -> Result<Vec<u8>, String> {
+    let trimmed = data_b64.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    if trimmed.len() > MAX_OUTBOUND_VIDEO_AU_B64_LEN {
+        return Err(format!(
+            "Khung hình video vượt quá giới hạn kích thước ({} KiB)",
+            MAX_OUTBOUND_VIDEO_AU_BYTES / 1024
+        ));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(trimmed)
+        .map_err(|e| format!("Dữ liệu khung hình video base64 không hợp lệ: {e}"))?;
+    if bytes.len() > MAX_OUTBOUND_VIDEO_AU_BYTES {
+        return Err(format!(
+            "Khung hình video vượt quá giới hạn kích thước ({} KiB)",
+            MAX_OUTBOUND_VIDEO_AU_BYTES / 1024
+        ));
+    }
+    Ok(bytes)
+}
+
 pub struct CallManager {
+    lifecycle: Arc<Mutex<()>>,
     engine: Arc<Mutex<Option<Arc<CallEngine>>>>,
+    video_hook: Arc<Mutex<Option<Arc<VideoMediaHook>>>>,
     forwarder_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    video_frame_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     telemetry_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     lp_poll_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     devices: Arc<Mutex<AudioDeviceSelection>>,
@@ -235,8 +301,11 @@ impl CallManager {
     pub fn new(paths: StoragePaths) -> Self {
         let initial_devices = load_saved_devices(&paths.call_audio_file());
         Self {
+            lifecycle: Arc::new(Mutex::new(())),
             engine: Arc::new(Mutex::new(None)),
+            video_hook: Arc::new(Mutex::new(None)),
             forwarder_task: Arc::new(Mutex::new(None)),
+            video_frame_task: Arc::new(Mutex::new(None)),
             telemetry_task: Arc::new(Mutex::new(None)),
             lp_poll_task: Arc::new(Mutex::new(None)),
             devices: Arc::new(Mutex::new(initial_devices)),
@@ -264,11 +333,20 @@ impl CallManager {
         }
     }
 
-    pub async fn teardown(&self, app: Option<&AppHandle>, authed: bool, relay_enabled: bool) {
+    async fn teardown_locked(
+        &self,
+        _guard: &MutexGuard<'_, ()>,
+        app: Option<&AppHandle>,
+        authed: bool,
+        relay_enabled: bool,
+    ) {
         if let Some(h) = self.lp_poll_task.lock().await.take() {
             h.abort();
         }
         if let Some(h) = self.telemetry_task.lock().await.take() {
+            h.abort();
+        }
+        if let Some(h) = self.video_frame_task.lock().await.take() {
             h.abort();
         }
         if let Some(h) = self.forwarder_task.lock().await.take() {
@@ -296,6 +374,9 @@ impl CallManager {
             }
             eng.force_stop(Some(stop_reason)).await;
         }
+        if let Some(vh) = self.video_hook.lock().await.take() {
+            vh.stop_active();
+        }
 
         if let Some(app_handle) = app {
             let unavailable = build_unavailable_state(authed, relay_enabled);
@@ -321,15 +402,17 @@ impl CallManager {
         }
     }
 
-    pub async fn ensure_started(
+    async fn ensure_started_locked(
         &self,
-        app: AppHandle,
+        guard: &MutexGuard<'_, ()>,
+        app: &AppHandle,
         session: &Session,
-        store_arc: Arc<Mutex<MessageStore>>,
+        store_arc: &Arc<Mutex<MessageStore>>,
     ) -> Result<(), String> {
         if !session.is_authenticated() || session.relay.enabled {
-            self.teardown(
-                Some(&app),
+            self.teardown_locked(
+                guard,
+                Some(app),
                 session.is_authenticated(),
                 session.relay.enabled,
             )
@@ -337,29 +420,61 @@ impl CallManager {
             return Ok(());
         }
         if self.active_engine().await.is_none() {
-            return self.restart(app, session, store_arc).await;
+            return self.restart_locked(guard, app, session, store_arc).await;
         }
         Ok(())
     }
 
-    pub async fn restart(
+    async fn restart_locked(
         &self,
-        app: AppHandle,
+        guard: &MutexGuard<'_, ()>,
+        app: &AppHandle,
         session: &Session,
-        store_arc: Arc<Mutex<MessageStore>>,
+        store_arc: &Arc<Mutex<MessageStore>>,
     ) -> Result<(), String> {
-        self.teardown(None, session.is_authenticated(), session.relay.enabled)
-            .await;
-
         if !session.is_authenticated() || session.relay.enabled {
-            let _ = app.emit(
-                "core://call-availability",
-                build_unavailable_state(session.is_authenticated(), session.relay.enabled),
-            );
+            self.teardown_locked(
+                guard,
+                Some(app),
+                session.is_authenticated(),
+                session.relay.enabled,
+            )
+            .await;
             return Ok(());
         }
 
+        self.teardown_locked(guard, None, true, false).await;
+
         let selected_devices = self.devices.lock().await.clone();
+        let (video_frame_tx, mut video_frame_rx) =
+            mpsc::channel::<InboundVideoFrame>(INBOUND_VIDEO_FRAME_QUEUE_CAP);
+        let app_kf = app.clone();
+        let video_hook = Arc::new_cyclic(|weak_hook: &Weak<VideoMediaHook>| {
+            let weak_cb = weak_hook.clone();
+            VideoMediaHook::new(VideoSessionConfig {
+                send_synthetic_when_no_external_frames: false,
+                on_inbound_frame: Some(Arc::new(move |frame: InboundVideoFrame| {
+                    // Non-blocking try_send so UDP recv thread never blocks on UI/IPC backpressure.
+                    // On overflow, immediately request a remote keyframe (RTCP PLI) so the decoder
+                    // recovers cleanly instead of stalling on a broken reference chain.
+                    if let Err(mpsc::error::TrySendError::Full(dropped)) =
+                        video_frame_tx.try_send(frame)
+                    {
+                        if let Some(hook) = weak_cb.upgrade() {
+                            hook.request_remote_keyframe(Some(dropped.call_id));
+                        }
+                    }
+                })),
+                on_keyframe_requested: Some(Arc::new(move |call_id: i64| {
+                    let _ = app_kf.emit(
+                        "core://call-video-keyframe-request",
+                        CallVideoKeyframeRequestDto { call_id },
+                    );
+                })),
+                ..Default::default()
+            })
+        });
+
         let eng = Arc::new(
             CallEngine::new(
                 session.clone_shallow(),
@@ -369,10 +484,39 @@ impl CallManager {
                     trace: None,
                 },
             )
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| e.to_string())?
+            .with_aux_media_hook(video_hook.clone()),
         );
         let mut rx = eng.subscribe();
-        *self.engine.lock().await = Some(eng.clone());
+        if let Some(old_eng) = self.engine.lock().await.replace(eng.clone()) {
+            old_eng.force_stop(None).await;
+        }
+        if let Some(old_vh) = self.video_hook.lock().await.replace(video_hook.clone()) {
+            old_vh.stop_active();
+        }
+
+        // 0. Forward reassembled inbound H.264 Annex-B frames to UI without blocking UDP recv
+        let app_vf = app.clone();
+        let vf_handle = tokio::spawn(async move {
+            while let Some(frame) = video_frame_rx.recv().await {
+                let data_b64 = base64::engine::general_purpose::STANDARD.encode(&frame.annexb_au);
+                let _ = app_vf.emit(
+                    "core://call-video-frame",
+                    CallVideoFrameDto {
+                        call_id: frame.call_id,
+                        ssrc: frame.ssrc,
+                        sequence_number: frame.sequence_number,
+                        timestamp: frame.timestamp,
+                        is_keyframe: frame.is_keyframe,
+                        just_synced: frame.just_synced,
+                        data_b64,
+                    },
+                );
+            }
+        });
+        if let Some(old) = self.video_frame_task.lock().await.replace(vf_handle) {
+            old.abort();
+        }
 
         // 1. Forward `CallEvent` stream to UI with enriched CallState snapshot & partner metadata
         let app_ev = app.clone();
@@ -402,7 +546,7 @@ impl CallManager {
                         };
 
                         if matches!(ev, CallEvent::IncomingCall { .. }) {
-                            if let Some(win) = app_ev.get_webview_window("main") {
+                            if let Some(win) = app_ev.get_window("main") {
                                 if matches!(win.is_visible(), Ok(false)) {
                                     let _ = win.show();
                                     let _ = win.unminimize();
@@ -446,16 +590,27 @@ impl CallManager {
                 }
             }
         });
-        *self.forwarder_task.lock().await = Some(fwd_handle);
+        if let Some(old) = self.forwarder_task.lock().await.replace(fwd_handle) {
+            old.abort();
+        }
 
-        // 2. Throttled live audio telemetry emitter while Connected
+        // 2. Throttled live audio + video telemetry emitter while Connected
         let app_tel = app.clone();
         let eng_tel = eng.clone();
+        let video_tel = video_hook.clone();
         let tel_handle = tokio::spawn(async move {
             loop {
                 if let Some(snap) = eng_tel.snapshot().await {
                     if snap.phase == CallPhase::Connected {
-                        if let Some(t) = eng_tel.audio_telemetry().await {
+                        let audio_t = eng_tel.audio_telemetry().await;
+                        let video_t = if snap.call_type == CallType::DirectVideo {
+                            video_tel.telemetry_for_call(snap.call_id)
+                        } else {
+                            None
+                        };
+                        if audio_t.is_some() || video_t.is_some() {
+                            let t = audio_t.unwrap_or_default();
+                            let vt = video_t.unwrap_or_default();
                             let _ = app_tel.emit(
                                 "core://call-telemetry",
                                 CallTelemetryDto {
@@ -473,6 +628,12 @@ impl CallManager {
                                     input_is_virtual: t.input_is_virtual,
                                     output_is_virtual: t.output_is_virtual,
                                     tx_errors: t.tx_errors,
+                                    video_cam_enabled: vt.cam_enabled,
+                                    video_peer_active: vt.peer_video_active,
+                                    video_synced: vt.video_synced,
+                                    video_tx_frames: vt.tx_frames,
+                                    video_rx_frames: vt.rx_frames,
+                                    video_rx_dropped_incomplete: vt.rx_dropped_incomplete,
                                 },
                             );
                         }
@@ -483,7 +644,9 @@ impl CallManager {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
         });
-        *self.telemetry_task.lock().await = Some(tel_handle);
+        if let Some(old) = self.telemetry_task.lock().await.replace(tel_handle) {
+            old.abort();
+        }
 
         // 3. Resilient `lp_control` HTTP long-poll backup (direct network only; catches invites if WS reconnects)
         let sess_poll = session.clone_shallow();
@@ -518,11 +681,173 @@ impl CallManager {
                 }
             }
         });
-        *self.lp_poll_task.lock().await = Some(poll_handle);
+        if let Some(old) = self.lp_poll_task.lock().await.replace(poll_handle) {
+            old.abort();
+        }
 
-        let initial_state = build_state_from_engine(Some(&eng), true, false, &store_arc).await;
+        let initial_state = build_state_from_engine(Some(&eng), true, false, store_arc).await;
         let _ = app.emit("core://call-availability", initial_state);
         Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub async fn teardown(&self, app: Option<&AppHandle>, authed: bool, relay_enabled: bool) {
+        let guard = self.lifecycle.lock().await;
+        self.teardown_locked(&guard, app, authed, relay_enabled)
+            .await;
+    }
+
+    pub async fn teardown_for_session(
+        &self,
+        app: Option<&AppHandle>,
+        session_arc: &Arc<Mutex<Session>>,
+    ) {
+        let guard = self.lifecycle.lock().await;
+        let (authed, relay_enabled) = {
+            let sess = session_arc.lock().await;
+            (sess.is_authenticated(), sess.relay.enabled)
+        };
+        self.teardown_locked(&guard, app, authed, relay_enabled)
+            .await;
+    }
+
+    #[allow(dead_code)]
+    pub async fn ensure_started(
+        &self,
+        app: AppHandle,
+        session: &Session,
+        store_arc: Arc<Mutex<MessageStore>>,
+    ) -> Result<(), String> {
+        let guard = self.lifecycle.lock().await;
+        self.ensure_started_locked(&guard, &app, session, &store_arc)
+            .await
+    }
+
+    pub async fn ensure_started_from_session(
+        &self,
+        app: &AppHandle,
+        session_arc: &Arc<Mutex<Session>>,
+        store_arc: &Arc<Mutex<MessageStore>>,
+    ) -> CallStateDto {
+        let guard = self.lifecycle.lock().await;
+        let (authed, relay_enabled, sess_snap) = {
+            let sess = session_arc.lock().await;
+            let authed = sess.is_authenticated();
+            let relay_enabled = sess.relay.enabled;
+            let snap = (authed && !relay_enabled).then(|| sess.clone_shallow());
+            (authed, relay_enabled, snap)
+        };
+        if let Some(snap) = sess_snap {
+            if let Err(err) = self
+                .ensure_started_locked(&guard, app, &snap, store_arc)
+                .await
+            {
+                eprintln!("[teza][call] ensure_started_from_session error: {err}");
+            }
+            let eng = self.active_engine().await;
+            build_state_from_engine(eng.as_ref(), true, false, store_arc).await
+        } else {
+            self.teardown_locked(&guard, Some(app), authed, relay_enabled)
+                .await;
+            build_unavailable_state(authed, relay_enabled)
+        }
+    }
+
+    #[allow(dead_code)]
+    pub async fn restart(
+        &self,
+        app: AppHandle,
+        session: &Session,
+        store_arc: Arc<Mutex<MessageStore>>,
+    ) -> Result<(), String> {
+        let guard = self.lifecycle.lock().await;
+        self.restart_locked(&guard, &app, session, &store_arc).await
+    }
+
+    pub async fn restart_from_session(
+        &self,
+        app: &AppHandle,
+        session_arc: &Arc<Mutex<Session>>,
+        store_arc: &Arc<Mutex<MessageStore>>,
+    ) -> CallStateDto {
+        let guard = self.lifecycle.lock().await;
+        let (authed, relay_enabled, sess_snap) = {
+            let sess = session_arc.lock().await;
+            let authed = sess.is_authenticated();
+            let relay_enabled = sess.relay.enabled;
+            let snap = (authed && !relay_enabled).then(|| sess.clone_shallow());
+            (authed, relay_enabled, snap)
+        };
+        if let Some(snap) = sess_snap {
+            if let Err(err) = self.restart_locked(&guard, app, &snap, store_arc).await {
+                eprintln!("[teza][call] restart_from_session error: {err}");
+            }
+            let eng = self.active_engine().await;
+            build_state_from_engine(eng.as_ref(), true, false, store_arc).await
+        } else {
+            self.teardown_locked(&guard, Some(app), authed, relay_enabled)
+                .await;
+            build_unavailable_state(authed, relay_enabled)
+        }
+    }
+
+    pub async fn start_outgoing_call_for_session(
+        &self,
+        app: &AppHandle,
+        session_arc: &Arc<Mutex<Session>>,
+        store_arc: &Arc<Mutex<MessageStore>>,
+        partner_id: String,
+        partner_name: Option<String>,
+        video: bool,
+    ) -> Result<CallStateDto, String> {
+        let guard = self.lifecycle.lock().await;
+        let sess_snap = {
+            let sess = session_arc.lock().await;
+            let authed = sess.is_authenticated();
+            let relay_enabled = sess.relay.enabled;
+            if !authed || relay_enabled {
+                drop(sess);
+                self.teardown_locked(&guard, Some(app), authed, relay_enabled)
+                    .await;
+                return Err(if !authed {
+                    "Chưa đăng nhập".into()
+                } else {
+                    CallError::RelayUnsupported.to_string()
+                });
+            }
+            sess.clone_shallow()
+        };
+
+        self.ensure_started_locked(&guard, app, &sess_snap, store_arc)
+            .await?;
+        let eng = self
+            .active_engine()
+            .await
+            .ok_or_else(|| "Engine gọi thoại chưa sẵn sàng".to_string())?;
+        let call_type = CallType::from_video_flag(video);
+        let display_name = partner_name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| partner_id.clone());
+        eng.make_call(partner_id, display_name, call_type)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Re-verify session auth & relay state before returning in case relay was enabled mid-dial.
+        let (authed_after, relay_after) = {
+            let sess = session_arc.lock().await;
+            (sess.is_authenticated(), sess.relay.enabled)
+        };
+        if !authed_after || relay_after {
+            self.teardown_locked(&guard, Some(app), authed_after, relay_after)
+                .await;
+            return Err(if !authed_after {
+                "Chưa đăng nhập".into()
+            } else {
+                CallError::RelayUnsupported.to_string()
+            });
+        }
+        Ok(build_state_from_engine(Some(&eng), true, false, store_arc).await)
     }
 
     pub async fn list_devices(&self) -> Result<CallDevicesDto, String> {
@@ -558,6 +883,58 @@ impl CallManager {
             eng.set_devices(next).await;
         }
         self.list_devices().await
+    }
+
+    pub async fn push_outbound_video_frame_for_session(
+        &self,
+        session_arc: &Arc<Mutex<Session>>,
+        call_id: i64,
+        data_b64: &str,
+    ) -> Result<bool, String> {
+        let allowed = {
+            let sess = session_arc.lock().await;
+            sess.is_authenticated() && !sess.relay.enabled
+        };
+        if !allowed {
+            return Ok(false);
+        }
+        self.push_outbound_video_frame(call_id, data_b64).await
+    }
+
+    pub async fn request_remote_video_keyframe(&self, call_id: Option<i64>) -> bool {
+        let Some(hook) = self.video_hook.lock().await.clone() else {
+            return false;
+        };
+        hook.request_remote_keyframe(call_id)
+    }
+
+    pub async fn push_outbound_video_frame(
+        &self,
+        call_id: i64,
+        data_b64: &str,
+    ) -> Result<bool, String> {
+        let bytes = decode_outbound_video_au(data_b64)?;
+        if bytes.is_empty() {
+            return Ok(false);
+        }
+        let Some(eng) = self.active_engine().await else {
+            return Ok(false);
+        };
+        let Some(snap) = eng.snapshot().await else {
+            return Ok(false);
+        };
+        if snap.call_type != CallType::DirectVideo
+            || !matches!(snap.phase, CallPhase::Connecting | CallPhase::Connected)
+        {
+            return Ok(false);
+        }
+        if call_id > 0 && snap.call_id != call_id {
+            return Ok(false);
+        }
+        let Some(hook) = self.video_hook.lock().await.clone() else {
+            return Ok(false);
+        };
+        Ok(hook.push_outbound_au_for_call(snap.call_id, &bytes))
     }
 
     pub async fn test_audio(&self) -> Result<CallAudioTestResultDto, String> {
@@ -685,10 +1062,36 @@ mod tests {
             input_is_virtual: true,
             output_is_virtual: false,
             tx_errors: 0,
+            video_cam_enabled: true,
+            video_peer_active: true,
+            video_synced: true,
+            video_tx_frames: 150,
+            video_rx_frames: 148,
+            video_rx_dropped_incomplete: 2,
         };
         let raw_t = serde_json::to_string(&telem).unwrap();
         let dec_t: CallTelemetryDto = serde_json::from_str(&raw_t).unwrap();
         assert_eq!(dec_t, telem);
+
+        // Older telemetry JSON without video_* fields still deserializes with defaults.
+        let legacy_json = serde_json::json!({
+            "call_id": 9,
+            "duration_secs": 3,
+            "mic_muted": true,
+            "has_input_device": false,
+            "mic_level_permille": 0,
+            "remote_level_permille": 10,
+            "remote_speaking": false,
+            "tx_packets": 1,
+            "rx_packets": 2
+        });
+        let dec_legacy: CallTelemetryDto = serde_json::from_value(legacy_json).unwrap();
+        assert!(!dec_legacy.video_cam_enabled);
+        assert!(!dec_legacy.video_peer_active);
+        assert!(!dec_legacy.video_synced);
+        assert_eq!(dec_legacy.video_tx_frames, 0);
+        assert_eq!(dec_legacy.video_rx_frames, 0);
+        assert_eq!(dec_legacy.video_rx_dropped_incomplete, 0);
 
         let res = CallAudioTestResultDto {
             output_device: Some("CABLE Input (VB-Audio Virtual Cable)".to_string()),
@@ -702,5 +1105,228 @@ mod tests {
         let raw_r = serde_json::to_string(&res).unwrap();
         let dec_r: CallAudioTestResultDto = serde_json::from_str(&raw_r).unwrap();
         assert_eq!(dec_r, res);
+    }
+
+    #[test]
+    fn call_snapshot_and_video_dtos_serialize_roundtrip() {
+        let snap = CallSnapshotDto {
+            call_id: 555_001,
+            partner_id: "2000".to_string(),
+            partner_name: "Video Peer".to_string(),
+            partner_avatar: "https://cdn.example/avatar.jpg".to_string(),
+            call_type: CallType::DirectVideo,
+            is_caller: true,
+            phase: CallPhase::Connected,
+            mic_muted: false,
+            peer_mic_muted: true,
+            cam_enabled: true,
+            peer_cam_enabled: false,
+            duration_secs: 12,
+        };
+        let raw_snap = serde_json::to_string(&snap).unwrap();
+        let dec_snap: CallSnapshotDto = serde_json::from_str(&raw_snap).unwrap();
+        assert_eq!(dec_snap, snap);
+
+        // Older snapshot JSON without cam_enabled/peer_cam_enabled defaults both to false.
+        let legacy_snap = serde_json::json!({
+            "call_id": 10,
+            "partner_id": "2000",
+            "partner_name": "Peer",
+            "partner_avatar": "",
+            "call_type": "DirectVoice",
+            "is_caller": false,
+            "phase": "connected",
+            "mic_muted": false,
+            "peer_mic_muted": false,
+            "duration_secs": 1
+        });
+        let dec_legacy_snap: CallSnapshotDto = serde_json::from_value(legacy_snap).unwrap();
+        assert!(!dec_legacy_snap.cam_enabled);
+        assert!(!dec_legacy_snap.peer_cam_enabled);
+
+        let frame = CallVideoFrameDto {
+            call_id: 555_001,
+            ssrc: 0x1122_3344,
+            sequence_number: 42,
+            timestamp: 90_000,
+            is_keyframe: true,
+            just_synced: true,
+            data_b64: base64::engine::general_purpose::STANDARD.encode([0u8, 0, 0, 1, 0x65]),
+        };
+        let raw_frame = serde_json::to_string(&frame).unwrap();
+        let dec_frame: CallVideoFrameDto = serde_json::from_str(&raw_frame).unwrap();
+        assert_eq!(dec_frame, frame);
+
+        let kf_req = CallVideoKeyframeRequestDto { call_id: 555_001 };
+        let raw_kf = serde_json::to_string(&kf_req).unwrap();
+        let dec_kf: CallVideoKeyframeRequestDto = serde_json::from_str(&raw_kf).unwrap();
+        assert_eq!(dec_kf, kf_req);
+    }
+
+    #[test]
+    fn push_outbound_video_frame_validates_base64_and_size_limit() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("teza_call_video_mgr_{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mgr = CallManager::new(StoragePaths { root: dir.clone() });
+
+        tauri::async_runtime::block_on(async {
+            // Invalid base64 must return Err even when idle.
+            let invalid = mgr.push_outbound_video_frame(123, "!!!not-base64!!!").await;
+            assert!(invalid.is_err(), "expected invalid base64 error");
+
+            // Exact 512 KiB decoded payload passes validation and returns Ok(false) when idle.
+            let exact_limit = vec![0xABu8; MAX_OUTBOUND_VIDEO_AU_BYTES];
+            let exact_b64 = base64::engine::general_purpose::STANDARD.encode(&exact_limit);
+            assert_eq!(
+                mgr.push_outbound_video_frame(123, &exact_b64).await,
+                Ok(false)
+            );
+
+            // 512 KiB + 1 byte must be rejected.
+            let over_by_one = vec![0xABu8; MAX_OUTBOUND_VIDEO_AU_BYTES + 1];
+            let over_one_b64 = base64::engine::general_purpose::STANDARD.encode(&over_by_one);
+            assert!(
+                mgr.push_outbound_video_frame(123, &over_one_b64)
+                    .await
+                    .is_err(),
+                "expected 512 KiB + 1 byte payload to be rejected"
+            );
+
+            // Significantly oversized payload is rejected before decoding.
+            let huge_b64 = "A".repeat(MAX_OUTBOUND_VIDEO_AU_B64_LEN + 16);
+            assert!(
+                mgr.push_outbound_video_frame(123, &huge_b64).await.is_err(),
+                "expected oversized base64 string to be rejected"
+            );
+
+            // Empty payload returns Ok(false).
+            assert_eq!(mgr.push_outbound_video_frame(123, "   ").await, Ok(false));
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_aware_video_push_keyframe_request_and_serialized_teardown() {
+        use std::net::UdpSocket;
+        use teza_call::{AuxiliaryMediaHook, MediaTransportContext};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("teza_call_mgr_session_{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mgr = Arc::new(CallManager::new(StoragePaths { root: dir.clone() }));
+
+        tauri::async_runtime::block_on(async {
+            // 1. Unauthenticated session rejects push_outbound_video_frame_for_session cleanly
+            let unauth_sess = Arc::new(Mutex::new(Session::new().unwrap()));
+            assert_eq!(
+                mgr.push_outbound_video_frame_for_session(&unauth_sess, 123, "!!!bad!!!")
+                    .await,
+                Ok(false),
+                "unauthenticated session must short-circuit to Ok(false)"
+            );
+
+            // 2. Authenticated session with relay enabled also rejects video frame pushes
+            let mut relay_sess = Session::new().unwrap();
+            relay_sess.zpw_sek = Some("test_zpw_sek".to_string());
+            relay_sess.secret_key = Some(vec![0x11u8; 32]);
+            relay_sess.profile.uid = "1000".to_string();
+            relay_sess.relay.enabled = true;
+            assert!(relay_sess.is_authenticated());
+            let relay_sess_arc = Arc::new(Mutex::new(relay_sess));
+            assert_eq!(
+                mgr.push_outbound_video_frame_for_session(&relay_sess_arc, 123, "!!!bad!!!")
+                    .await,
+                Ok(false),
+                "relay-enabled session must short-circuit to Ok(false)"
+            );
+
+            // 3. Direct authenticated session proceeds into validation (rejecting invalid base64)
+            let mut direct_sess = Session::new().unwrap();
+            direct_sess.zpw_sek = Some("test_zpw_sek".to_string());
+            direct_sess.secret_key = Some(vec![0x11u8; 32]);
+            direct_sess.profile.uid = "1000".to_string();
+            direct_sess.relay.enabled = false;
+            assert!(direct_sess.is_authenticated());
+            let direct_sess_arc = Arc::new(Mutex::new(direct_sess));
+            assert!(
+                mgr.push_outbound_video_frame_for_session(&direct_sess_arc, 123, "!!!bad!!!")
+                    .await
+                    .is_err(),
+                "authenticated direct session must validate base64 payload"
+            );
+
+            // 4. request_remote_video_keyframe routes through active VideoMediaHook by call_id
+            assert!(!mgr.request_remote_video_keyframe(None).await);
+            let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+            let addr = sock.local_addr().unwrap();
+            let hook = Arc::new(VideoMediaHook::new(VideoSessionConfig {
+                send_synthetic_when_no_external_frames: false,
+                ..Default::default()
+            }));
+            let _aux = hook
+                .on_media_start(MediaTransportContext {
+                    call_id: 777,
+                    call_type: CallType::DirectVideo,
+                    is_caller: true,
+                    from_uid_u32: 1001,
+                    partner_uid_u32: 2002,
+                    ssrc: 1001,
+                    rtp_target: addr,
+                    rtcp_target: None,
+                    relay_token: 0,
+                    live_relay_token: None,
+                    live_rtcp_relay_token: None,
+                    udp_rtp_sock: sock,
+                    udp_rtcp_sock: None,
+                    initial_cam_enabled: false,
+                })
+                .expect("video session should start");
+            *mgr.video_hook.lock().await = Some(hook);
+
+            assert!(!mgr.request_remote_video_keyframe(Some(888)).await);
+            assert!(mgr.request_remote_video_keyframe(Some(777)).await);
+            assert!(mgr.request_remote_video_keyframe(None).await);
+
+            // 5. teardown_for_session serializes on lifecycle lock and aborts all task handles
+            let h1 = tokio::spawn(async { tokio::time::sleep(Duration::from_secs(60)).await });
+            let h2 = tokio::spawn(async { tokio::time::sleep(Duration::from_secs(60)).await });
+            let h3 = tokio::spawn(async { tokio::time::sleep(Duration::from_secs(60)).await });
+            let h4 = tokio::spawn(async { tokio::time::sleep(Duration::from_secs(60)).await });
+            *mgr.lp_poll_task.lock().await = Some(h1);
+            *mgr.telemetry_task.lock().await = Some(h2);
+            *mgr.video_frame_task.lock().await = Some(h3);
+            *mgr.forwarder_task.lock().await = Some(h4);
+
+            // Hold lifecycle lock briefly to verify teardown_for_session waits on it
+            let held = mgr.lifecycle.lock().await;
+            let mgr_td = mgr.clone();
+            let sess_td = relay_sess_arc.clone();
+            let td_handle = tokio::spawn(async move {
+                mgr_td.teardown_for_session(None, &sess_td).await;
+            });
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            assert!(
+                !td_handle.is_finished(),
+                "teardown_for_session must serialize on self.lifecycle"
+            );
+            drop(held);
+            td_handle.await.unwrap();
+
+            assert!(mgr.lp_poll_task.lock().await.is_none());
+            assert!(mgr.telemetry_task.lock().await.is_none());
+            assert!(mgr.video_frame_task.lock().await.is_none());
+            assert!(mgr.forwarder_task.lock().await.is_none());
+            assert!(!mgr.request_remote_video_keyframe(Some(777)).await);
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

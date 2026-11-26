@@ -4,10 +4,11 @@ members = [
     "crates/zalo-core",
     "crates/litechat-relay",
     "crates/teza-call",
+    "crates/teza-video",
     "apps/desktop/src-tauri",
 ]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"

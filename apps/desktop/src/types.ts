@@ -137,6 +137,8 @@ export interface ThreadMemberDto {
 export interface ThreadDetailsDto {
   thread_id: string;
   total_members: number | null;
+  creator_id?: string;
+  admin_ids?: string[];
   members: ThreadMemberDto[];
   media_items: MessageDto[];
   file_items: MessageDto[];
@@ -174,7 +176,7 @@ export interface MutualGroupDto {
 export interface UserProfileDto {
   uid: string;
   display_name: string;
-  zalo_name: string;
+  account_name: string;
   avatar: string;
   cover: string;
   status: string;
@@ -182,6 +184,7 @@ export interface UserProfileDto {
   sdob: string;
   phone_number: string;
   is_friend: boolean | null;
+  is_blocked?: boolean | null;
   is_self: boolean;
   mutual_groups?: MutualGroupDto[];
   local_message_count?: number;
@@ -363,6 +366,8 @@ export interface CallSnapshotDto {
   phase: CallPhase;
   mic_muted: boolean;
   peer_mic_muted: boolean;
+  cam_enabled: boolean;
+  peer_cam_enabled: boolean;
   duration_secs: number;
 }
 
@@ -394,6 +399,8 @@ export type CallEvent =
     }
   | { type: "media_state_changed"; call_id: number; mic_muted: boolean }
   | { type: "peer_media_changed"; call_id: number; mic_muted: boolean }
+  | { type: "camera_state_changed"; call_id: number; cam_enabled: boolean }
+  | { type: "peer_camera_changed"; call_id: number; cam_enabled: boolean }
   | { type: "media_warning"; call_id: number; message: string }
   | {
       type: "signaling_warning";
@@ -425,6 +432,26 @@ export interface CallTelemetryDto {
   input_is_virtual: boolean;
   output_is_virtual: boolean;
   tx_errors: number;
+  video_cam_enabled?: boolean;
+  video_peer_active?: boolean;
+  video_synced?: boolean;
+  video_tx_frames?: number;
+  video_rx_frames?: number;
+  video_rx_dropped_incomplete?: number;
+}
+
+export interface CallVideoFrameDto {
+  call_id: number;
+  ssrc: number;
+  sequence_number: number;
+  timestamp: number;
+  is_keyframe: boolean;
+  just_synced: boolean;
+  data_b64: string;
+}
+
+export interface CallVideoKeyframeRequestDto {
+  call_id: number;
 }
 
 export interface AudioDeviceInfoDto {
@@ -454,4 +481,189 @@ export interface CallCardPayload {
   callType: "voice" | "video";
   outcome: "completed" | "missed" | "cancelled" | "declined";
   durationSecs: number;
+}
+
+export interface WebAppAccountDto {
+  id: string;
+  app_id: string;
+  origin: string;
+  label: string;
+  username: string;
+  has_password: boolean;
+  auto_fill: boolean;
+  updated_at_ms: number;
+}
+
+export interface WebAppAccountInput {
+  id?: string | null;
+  app_id: string;
+  url: string;
+  label: string;
+  username: string;
+  password?: string | null;
+  clear_password?: boolean;
+  auto_fill: boolean;
+}
+
+export interface MediaVaultConfigDto {
+  custom_vault_dir: string | null;
+  active_vault_dir: string;
+  quota_mb: number;
+  encrypt_at_rest: boolean;
+  auto_cache_images: boolean;
+  auto_cache_voice: boolean;
+  auto_cache_video_files: boolean;
+}
+
+export interface MediaVaultStatsDto {
+  total_bytes: number;
+  object_count: number;
+  pinned_bytes: number;
+  pinned_count: number;
+  image_bytes: number;
+  video_bytes: number;
+  voice_bytes: number;
+  file_bytes: number;
+  thumb_bytes: number;
+  cloud_synced_count: number;
+  cloud_total_bytes: number;
+}
+
+export interface GDriveConfigDto {
+  client_id: string;
+  has_client_secret: boolean;
+  has_builtin_oauth: boolean;
+  token_broker_url: string;
+  has_builtin_token_broker: boolean;
+  oauth_mode: string;
+  sync_enabled: boolean;
+  sync_media: boolean;
+  sync_history: boolean;
+  auto_sync_interval_secs: number;
+}
+
+export interface GDriveConfigPatch {
+  clientId?: string | null;
+  clientSecret?: string | null;
+  tokenBrokerUrl?: string | null;
+  resetCustomOAuth?: boolean | null;
+  syncEnabled?: boolean | null;
+  syncMedia?: boolean | null;
+  syncHistory?: boolean | null;
+}
+
+export interface GDriveStatusDto {
+  relay_blocked: boolean;
+  oauth_configured: boolean;
+  connected: boolean;
+  account_email: string | null;
+  account_name: string | null;
+  vault_unlocked: boolean;
+  has_remote_manifest: boolean;
+  sync_enabled: boolean;
+  sync_media: boolean;
+  sync_history: boolean;
+  syncing: boolean;
+  phase: string;
+  progress_done: number;
+  progress_total: number;
+  pending_media_count: number;
+  pending_media_bytes: number;
+  last_sync_ts: number | null;
+  last_history_sync_ts: number | null;
+  last_error: string | null;
+}
+
+export interface GDriveQuotaDto {
+  drive_limit_bytes: number | null;
+  drive_usage_bytes: number;
+  drive_usage_in_drive_bytes: number;
+  drive_usage_in_trash_bytes: number;
+}
+
+export interface GDriveThreadUsageDto {
+  thread_id: string;
+  thread_name: string;
+  total_bytes: number;
+  object_count: number;
+}
+
+export interface GDriveCloudItemDto {
+  sha256: string;
+  cloud_file_id: string;
+  kind: string;
+  mime: string;
+  size_bytes: number;
+  original_name: string | null;
+  thread_id: string | null;
+  thread_name: string | null;
+  msg_id: string | null;
+  cloud_synced_ts: number;
+  local_state: number;
+}
+
+export interface GDriveStorageOverviewDto {
+  quota: GDriveQuotaDto | null;
+  teza_cloud_total_bytes: number;
+  teza_cloud_object_count: number;
+  images_bytes: number;
+  videos_bytes: number;
+  voice_bytes: number;
+  files_bytes: number;
+  history_bytes: number;
+  history_file_count: number;
+  by_thread: GDriveThreadUsageDto[];
+  largest_items: GDriveCloudItemDto[];
+}
+
+export interface GDrivePruneResultDto {
+  deleted_count: number;
+  freed_bytes: number;
+  failed_count: number;
+}
+
+export interface FriendRequestItemDto {
+  user_id: string;
+  display_name: string;
+  account_name: string;
+  avatar: string;
+  message: string;
+  created_ts: number;
+  direction: "received" | "sent" | string;
+  is_seen: boolean;
+}
+
+export interface FriendRequestsListDto {
+  received: FriendRequestItemDto[];
+  sent: FriendRequestItemDto[];
+}
+
+export interface FriendActionResultDto {
+  ok: boolean;
+  user_id: string;
+  action: string;
+  already_friends: boolean;
+  auto_accepted: boolean;
+  message: string;
+}
+
+export interface LeaveGroupResultDto {
+  group_id: string;
+  left: boolean;
+  member_error: string[];
+  message: string;
+}
+
+export interface KickGroupMembersResultDto {
+  group_id: string;
+  removed: string[];
+  failed: string[];
+  message: string;
+}
+
+export interface SocialWsEventDto {
+  kind: string;
+  thread_id: string | null;
+  user_id: string | null;
+  self_removed: boolean;
 }

@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="google-site-verification" content="NrV4Rs5TrcXmJXiBnpUUcR1IrAoSafbjrtyVB54d_Zw" />
+  <title>Teza Desktop — Fast, Private Messaging &amp; Encrypted Media Sync</title>
+  <meta name="description" content="Teza is a lightweight native Windows desktop messaging client with local encrypted media storage and optional end-to-end encrypted Google Drive backup." />
+  <link rel="icon" type="image/png" href="./icon.png" />
+  <style>
+    :root {
+      --bg: #0b1120;
+      --surface: #111827;
+      --surface-2: #1e293b;
+      --border: #1f2937;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --green: #10b981;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: radial-gradient(circle at top, #172554 0%, var(--bg) 52%);
+      color: var(--text);
+      line-height: 1.65;
+      min-height: 100vh;
+    }
+    a { color: #60a5fa; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .wrap { max-width: 920px; margin: 0 auto; padding: 28px 20px 64px; }
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 16px; flex-wrap: wrap; padding-bottom: 24px;
+      border-bottom: 1px solid var(--border);
+    }
+    .brand { display: flex; align-items: center; gap: 12px; font-weight: 700; font-size: 20px; color: var(--text); }
+    .brand img { width: 38px; height: 38px; border-radius: 10px; }
+    nav { display: flex; gap: 20px; font-size: 14px; }
+    .hero { padding: 48px 0 36px; text-align: center; }
+    .badge {
+      display: inline-block; padding: 5px 12px; border-radius: 999px;
+      background: rgba(59,130,246,0.16); color: #93c5fd; font-size: 12.5px; font-weight: 600;
+      margin-bottom: 16px;
+    }
+    h1 { font-size: clamp(28px, 5vw, 42px); line-height: 1.2; margin: 0 0 14px; letter-spacing: -0.02em; }
+    .subtitle { max-width: 680px; margin: 0 auto 28px; color: var(--muted); font-size: 16px; }
+    .cta-row { display: flex; justify-content: center; gap: 12px; flex-wrap: wrap; }
+    .btn {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 11px 20px; border-radius: 10px; font-weight: 600; font-size: 14.5px;
+      transition: opacity 0.15s ease;
+    }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover { background: var(--accent-hover); text-decoration: none; }
+    .btn-secondary { background: var(--surface-2); color: var(--text); border: 1px solid #334155; }
+    .btn-secondary:hover { opacity: 0.9; text-decoration: none; }
+    .grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 16px; margin-top: 28px;
+    }
+    .card {
+      background: rgba(17, 24, 39, 0.85); border: 1px solid var(--border);
+      border-radius: 14px; padding: 20px 22px;
+    }
+    .card h3 { margin: 0 0 8px; font-size: 16px; }
+    .card p { margin: 0; color: var(--muted); font-size: 14px; }
+    .notice {
+      margin-top: 32px; background: rgba(16, 185, 129, 0.08);
+      border: 1px solid rgba(16, 185, 129, 0.28); border-radius: 14px;
+      padding: 20px 24px;
+    }
+    .notice h2 { margin: 0 0 8px; font-size: 17px; color: #34d399; }
+    .notice p { margin: 0; font-size: 14px; color: #cbd5e1; }
+    footer {
+      margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--border);
+      display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px;
+      color: var(--muted); font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <a class="brand" href="./">
+        <img src="./icon.png" alt="Teza logo" />
+        <span>Teza</span>
+      </a>
+      <nav>
+        <a href="./">Home</a>
+        <a href="./privacy.html">Privacy Policy</a>
+        <a href="./terms.html">Terms of Service</a>
+        <a href="https://github.com/NguoiHaiPhong/Teza" rel="noopener">GitHub</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero">
+        <span class="badge">Native Rust + Tauri Desktop Client</span>
+        <h1>Fast, Private Desktop Messaging with Encrypted Local &amp; Cloud Vault</h1>
+        <p class="subtitle">
+          Teza is a lightweight desktop messaging application built with Rust and Tauri. It features a local AES-256-GCM media vault, instant multi-language search, voice &amp; video calls, and optional end-to-end encrypted backup to your own Google Drive.
+        </p>
+        <div class="cta-row">
+          <a class="btn btn-primary" href="https://github.com/NguoiHaiPhong/Teza/releases" rel="noopener">Download Teza for Windows</a>
+          <a class="btn btn-secondary" href="./privacy.html">Read Privacy Policy</a>
+        </div>
+      </section>
+
+      <section class="grid">
+        <article class="card">
+          <h3>Local Encrypted Media Vault</h3>
+          <p>Photos, videos, voice notes, and attachments are cached locally in 64 KiB AES-256-GCM chunks protected by Windows DPAPI with configurable storage folder and LRU quota.</p>
+        </article>
+        <article class="card">
+          <h3>Optional E2EE Google Drive Sync</h3>
+          <p>Back up your encrypted media and chat history deltas into a dedicated <code>Teza Vault</code> folder in your personal Google Drive using only the narrow <code>drive.file</code> scope.</p>
+        </article>
+        <article class="card">
+          <h3>User-Controlled Cloud Storage</h3>
+          <p>View real-time Drive quota usage, inspect storage by conversation or file size, and selectively prune old cloud backups at any time directly inside Teza Settings.</p>
+        </article>
+      </section>
+
+      <section class="notice">
+        <h2>Google Drive Permissions &amp; Transparency</h2>
+        <p>
+          Teza requests only the non-sensitive <code>https://www.googleapis.com/auth/drive.file</code> scope so the app can exclusively access files it creates inside your <code>Teza Vault</code> folder. Teza never accesses your other Google Drive files, encrypts all backups on your computer before upload using your Sync Passphrase, and operates no central servers storing your data. See our <a href="./privacy.html">Privacy Policy</a> for complete details.
+        </p>
+      </section>
+    </main>
+
+    <footer>
+      <span>&copy; 2026 Teza Desktop &middot; Contact: <a href="mailto:h2pdual@gmail.com">h2pdual@gmail.com</a></span>
+      <span>
+        <a href="./privacy.html">Privacy Policy</a> &middot;
+        <a href="./terms.html">Terms of Service</a>
+      </span>
+    </footer>
+  </div>
+</body>
+</html>

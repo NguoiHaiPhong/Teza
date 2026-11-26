@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { ChatFolderDto, MessageDto, ThreadDto } from "../src/types.ts";
 import {
+  applyThreadReadSync,
   bumpThreadList,
   compareThreads,
   computeLayoutMode,
@@ -12,6 +13,7 @@ import {
   getDisplayBodyText,
   looksLikePhoneQuery,
   moveArrayItem,
+  shouldAutoMarkReadOnFocus,
   splitTextLinks,
   upsertMsg,
 } from "../src/utils/threadState.ts";
@@ -417,4 +419,120 @@ test("filterThreadsByFolder handles excluded_thread_ids, archived view, and move
   const src = ["a", "b", "c"];
   assert.deepEqual(moveArrayItem(src, 2, 0), ["c", "a", "b"]);
   assert.deepEqual(src, ["a", "b", "c"]);
+});
+
+test("applyThreadReadSync clears unread & advances watermark on phone read, marks unread on phone unread, and leaves unknown threads untouched", () => {
+  const initial = [
+    makeThread({ id: "t1", last_ts: 5000, unread_count: 4, last_read_in_ts: 2000 }),
+    makeThread({ id: "t2", last_ts: 4000, unread_count: 0, last_read_in_ts: 4500 }),
+    makeThread({ id: "t3", last_ts: 3000, unread_count: 2 }),
+  ];
+
+  // Phone reads t1 -> unread_count becomes 0 and last_read_in_ts advances to last_ts
+  const afterReadT1 = applyThreadReadSync(initial, "t1", false);
+  assert.notEqual(afterReadT1, initial);
+  assert.equal(initial[0].unread_count, 4); // input not mutated
+  assert.equal(afterReadT1[0].unread_count, 0);
+  assert.equal(afterReadT1[0].last_read_in_ts, 5000);
+  assert.equal(afterReadT1[1], initial[1]); // unrelated threads untouched
+
+  // Phone reads t3 where last_read_in_ts was undefined -> advances from 0 to last_ts
+  const afterReadT3 = applyThreadReadSync(afterReadT1, "t3", false);
+  assert.equal(afterReadT3[2].unread_count, 0);
+  assert.equal(afterReadT3[2].last_read_in_ts, 3000);
+
+  // Phone reads t2 where last_read_in_ts (4500) > last_ts (4000) -> keeps higher watermark
+  const afterReadT2 = applyThreadReadSync(afterReadT3, "t2", false);
+  assert.equal(afterReadT2[1].unread_count, 0);
+  assert.equal(afterReadT2[1].last_read_in_ts, 4500);
+
+  // Phone marks read thread t1 as unread -> unread_count becomes at least 1
+  const afterUnreadT1 = applyThreadReadSync(afterReadT2, "t1", true);
+  assert.equal(afterUnreadT1[0].unread_count, 1);
+  assert.equal(afterUnreadT1[0].last_read_in_ts, 5000);
+
+  // Phone marks already-unread thread with count 4 -> preserves count >= 1 (keeps 4)
+  const afterUnreadExisting = applyThreadReadSync(initial, "t1", true);
+  assert.equal(afterUnreadExisting[0].unread_count, 4);
+
+  // Unknown thread returns identical list reference without throwing
+  assert.equal(applyThreadReadSync(initial, "missing-thread", false), initial);
+  assert.equal(applyThreadReadSync(initial, "missing-thread", true), initial);
+});
+
+test("shouldAutoMarkReadOnFocus enforces focus, visibility, auth, lock, webApp, unread, and near-bottom guards", () => {
+  const base = {
+    authed: true,
+    isLocked: false,
+    hasActiveWebApp: false,
+    webAppHubOpen: false,
+    windowFocused: true,
+    visibilityState: "visible",
+    selectedId: "t1",
+    pendingMarkReadId: "t1",
+    activeThreadUnread: 0,
+    distFromBottom: 20,
+    isScrollable: true,
+    chatPaneVisible: true,
+    initialScrollReady: true,
+  };
+
+  // Happy paths: pendingMarkReadId matches OR activeThreadUnread > 0, near bottom or non-scrollable
+  assert.equal(shouldAutoMarkReadOnFocus(base), true);
+  assert.equal(
+    shouldAutoMarkReadOnFocus({ ...base, pendingMarkReadId: null, activeThreadUnread: 2 }),
+    true,
+  );
+  assert.equal(shouldAutoMarkReadOnFocus({ ...base, distFromBottom: 89 }), true);
+  assert.equal(
+    shouldAutoMarkReadOnFocus({ ...base, distFromBottom: 0, isScrollable: false }),
+    true,
+  );
+  assert.equal(
+    shouldAutoMarkReadOnFocus({ ...base, distFromBottom: null, isScrollable: false }),
+    true,
+  );
+
+  // Scrolled up at or beyond 90px threshold -> must NOT auto-mark-read
+  assert.equal(shouldAutoMarkReadOnFocus({ ...base, distFromBottom: 90 }), false);
+  assert.equal(shouldAutoMarkReadOnFocus({ ...base, distFromBottom: 320 }), false);
+
+  // Unmounted scroll container (e.g. WebApp unmounting or reply sub-panel) -> must NOT mark read
+  assert.equal(
+    shouldAutoMarkReadOnFocus({ ...base, distFromBottom: null, isScrollable: undefined }),
+    false,
+  );
+  assert.equal(
+    shouldAutoMarkReadOnFocus({ ...base, distFromBottom: null, isScrollable: true }),
+    false,
+  );
+
+  // Window unfocused or hidden -> must NOT mark read
+  assert.equal(shouldAutoMarkReadOnFocus({ ...base, windowFocused: false }), false);
+  assert.equal(shouldAutoMarkReadOnFocus({ ...base, visibilityState: "hidden" }), false);
+
+  // Unauthenticated, locked, WebApp open, WebApp Hub open, or chat pane hidden -> must NOT mark read
+  assert.equal(shouldAutoMarkReadOnFocus({ ...base, authed: false }), false);
+  assert.equal(shouldAutoMarkReadOnFocus({ ...base, isLocked: true }), false);
+  assert.equal(shouldAutoMarkReadOnFocus({ ...base, hasActiveWebApp: true }), false);
+  assert.equal(shouldAutoMarkReadOnFocus({ ...base, webAppHubOpen: true }), false);
+  assert.equal(shouldAutoMarkReadOnFocus({ ...base, chatPaneVisible: false }), false);
+  assert.equal(shouldAutoMarkReadOnFocus({ ...base, initialScrollReady: false }), false);
+
+  // No selected thread or already read with no pending mark-read -> must NOT mark read
+  assert.equal(shouldAutoMarkReadOnFocus({ ...base, selectedId: null }), false);
+  assert.equal(
+    shouldAutoMarkReadOnFocus({ ...base, pendingMarkReadId: null, activeThreadUnread: 0 }),
+    false,
+  );
+  assert.equal(
+    shouldAutoMarkReadOnFocus({ ...base, pendingMarkReadId: "other", activeThreadUnread: 0 }),
+    false,
+  );
+
+  // Custom threshold works
+  assert.equal(
+    shouldAutoMarkReadOnFocus({ ...base, distFromBottom: 120, nearBottomThresholdPx: 140 }),
+    true,
+  );
 });

@@ -19,6 +19,7 @@ use tokio::sync::{RwLock, Semaphore};
 
 const DEFAULT_LISTEN: &str = "0.0.0.0:1088";
 const MAX_CONCURRENT_CONNS: usize = 512;
+const MAX_HTTP_HEADER_BYTES: usize = 8192;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const SYSTEM_DNS_TIMEOUT: Duration = Duration::from_secs(20);
@@ -55,7 +56,7 @@ const DEFAULT_ALLOWED_SUFFIXES: &[&str] = &[
     "githubusercontent.com",
 ];
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RelayServerConfig {
     pub listen: String,
@@ -66,6 +67,28 @@ pub struct RelayServerConfig {
     pub allow_private_targets: bool,
     pub dns_servers: Vec<String>,
     pub verbose: bool,
+}
+
+impl std::fmt::Debug for RelayServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayServerConfig")
+            .field("listen", &self.listen)
+            .field("username", &self.username)
+            .field(
+                "password",
+                &if self.password.is_empty() {
+                    ""
+                } else {
+                    "[REDACTED]"
+                },
+            )
+            .field("allow_all", &self.allow_all)
+            .field("extra_allowed_hosts", &self.extra_allowed_hosts)
+            .field("allow_private_targets", &self.allow_private_targets)
+            .field("dns_servers", &self.dns_servers)
+            .field("verbose", &self.verbose)
+            .finish()
+    }
 }
 
 impl Default for RelayServerConfig {
@@ -99,11 +122,11 @@ impl RelayServerConfig {
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     let max_len = a.len().max(b.len());
-    let mut diff = (a.len() ^ b.len()) as u8;
+    let mut diff: usize = a.len() ^ b.len();
     for i in 0..max_len {
         let x = *a.get(i).unwrap_or(&0);
         let y = *b.get(i).unwrap_or(&0);
-        diff |= x ^ y;
+        diff |= usize::from(x ^ y);
     }
     diff == 0
 }
@@ -111,23 +134,34 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 fn is_forbidden_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_loopback()
+            let octets = v4.octets();
+            octets[0] == 0 // "this network" 0.0.0.0/8 (RFC 1122 / RFC 6890)
+                || v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_multicast()
                 || v4.is_broadcast()
                 || v4.is_unspecified()
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64) // CGNAT 100.64.0.0/10
+                || (octets[0] == 100 && (octets[1] & 0xC0) == 64) // CGNAT 100.64.0.0/10
         }
         IpAddr::V6(v6) => {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_forbidden_ip(IpAddr::V4(v4));
             }
+            let segs = v6.segments();
+            // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052) and local-use 64:ff9b:1::/48 (RFC 8215)
+            if segs[0] == 0x0064
+                && segs[1] == 0xff9b
+                && ((segs[2] == 0 && segs[3] == 0 && segs[4] == 0 && segs[5] == 0)
+                    || segs[2] == 0x0001)
+            {
+                return true;
+            }
             v6.is_loopback()
                 || v6.is_multicast()
                 || v6.is_unspecified()
-                || ((v6.segments()[0] & 0xfe00) == 0xfc00) // ULA fc00::/7
-                || ((v6.segments()[0] & 0xffc0) == 0xfe80) // link-local fe80::/10
+                || ((segs[0] & 0xfe00) == 0xfc00) // ULA fc00::/7
+                || ((segs[0] & 0xffc0) == 0xfe80) // link-local fe80::/10
         }
     }
 }
@@ -267,7 +301,130 @@ fn skip_dns_name(pkt: &[u8], start: usize) -> Result<usize> {
     bail!("Tên miền DNS vượt quá giới hạn nhãn");
 }
 
-fn parse_dns_response(pkt: &[u8], expected_txid: u16) -> Result<(Vec<IpAddr>, u32)> {
+fn read_dns_name(pkt: &[u8], start: usize) -> Result<(String, usize)> {
+    let mut pos = start;
+    let mut next_pos: Option<usize> = None;
+    let mut labels: Vec<String> = Vec::new();
+    let mut total_len = 0usize;
+    let mut jumped = false;
+
+    for _ in 0..128 {
+        let len_byte = *pkt
+            .get(pos)
+            .context("Gói tin DNS bị cắt cụt khi đọc tên miền")?;
+        if len_byte == 0 {
+            let end = next_pos.unwrap_or(pos + 1);
+            return Ok((labels.join("."), end));
+        }
+        if (len_byte & 0xC0) == 0xC0 {
+            if pos + 1 >= pkt.len() {
+                bail!("Con trỏ nén DNS bị cắt cụt");
+            }
+            let ptr = (((len_byte & 0x3F) as usize) << 8) | (pkt[pos + 1] as usize);
+            if ptr >= pkt.len() {
+                bail!("Con trỏ nén DNS trỏ ra ngoài gói tin");
+            }
+            if !jumped {
+                next_pos = Some(pos + 2);
+                jumped = true;
+            }
+            pos = ptr;
+            continue;
+        }
+        if (len_byte & 0xC0) != 0 {
+            bail!("Cờ nhãn DNS không hợp lệ");
+        }
+        let label_len = len_byte as usize;
+        let next = pos + 1 + label_len;
+        if next > pkt.len() {
+            bail!("Nhãn tên miền DNS vượt quá kích thước gói");
+        }
+        total_len += label_len + usize::from(!labels.is_empty());
+        if total_len > 253 {
+            bail!("Tên miền DNS vượt quá độ dài tối đa 253 byte");
+        }
+        let label = std::str::from_utf8(&pkt[pos + 1..next])
+            .context("Nhãn tên miền DNS không phải UTF-8 hợp lệ")?;
+        labels.push(label.to_ascii_lowercase());
+        pos = next;
+    }
+    bail!("Tên miền DNS vượt quá giới hạn nhãn");
+}
+
+#[cfg(target_os = "windows")]
+fn os_random_u16() -> Option<u16> {
+    use std::ffi::c_void;
+    use std::ptr::null_mut;
+
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+
+    #[link(name = "bcrypt")]
+    extern "system" {
+        fn BCryptGenRandom(
+            h_algorithm: *mut c_void,
+            pb_buffer: *mut u8,
+            cb_buffer: u32,
+            dw_flags: u32,
+        ) -> i32;
+    }
+
+    let mut buf = [0u8; 2];
+    // SAFETY: `buf` is a valid 2-byte writable buffer; `h_algorithm` is NULL when
+    // `BCRYPT_USE_SYSTEM_PREFERRED_RNG` is set per Windows CNG specification.
+    let status = unsafe {
+        BCryptGenRandom(
+            null_mut(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    (status == 0).then(|| u16::from_ne_bytes(buf))
+}
+
+#[cfg(unix)]
+fn os_random_u16() -> Option<u16> {
+    use std::io::Read;
+
+    let mut f = std::fs::File::open("/dev/urandom").ok()?;
+    let mut buf = [0u8; 2];
+    f.read_exact(&mut buf).ok()?;
+    Some(u16::from_ne_bytes(buf))
+}
+
+#[cfg(not(any(target_os = "windows", unix)))]
+fn os_random_u16() -> Option<u16> {
+    None
+}
+
+fn generate_dns_txid() -> u16 {
+    if let Some(v) = os_random_u16() {
+        return v;
+    }
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let mut hasher = RandomState::new().build_hasher();
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    hasher.write_u128(now_ns);
+    hasher.write_u32(std::process::id());
+    hasher.write_u16(DNS_TXID.fetch_add(1, Ordering::Relaxed));
+    let stack_marker: u8 = 0;
+    hasher.write_usize((&stack_marker as *const u8) as usize);
+    let h = hasher.finish();
+    ((h ^ (h >> 16) ^ (h >> 32) ^ (h >> 48)) & 0xFFFF) as u16
+}
+
+fn parse_dns_response(
+    pkt: &[u8],
+    expected_txid: u16,
+    expected_host: &str,
+    expected_qtype: u16,
+) -> Result<(Vec<IpAddr>, u32)> {
     if pkt.len() < 12 {
         bail!("Gói tin phản hồi DNS quá ngắn");
     }
@@ -285,15 +442,30 @@ fn parse_dns_response(pkt: &[u8], expected_txid: u16) -> Result<(Vec<IpAddr>, u3
     }
 
     let qdcount = u16::from_be_bytes([pkt[4], pkt[5]]);
+    if qdcount != 1 {
+        bail!("Phản hồi DNS có QDCOUNT không hợp lệ ({qdcount})");
+    }
     let ancount = u16::from_be_bytes([pkt[6], pkt[7]]);
     let mut pos = 12usize;
 
-    for _ in 0..qdcount {
-        pos = skip_dns_name(pkt, pos)?;
-        if pos + 4 > pkt.len() {
-            bail!("Phần Question DNS bị cắt cụt");
-        }
-        pos += 4;
+    let (qname, after_qname) = read_dns_name(pkt, pos)?;
+    pos = after_qname;
+    if pos + 4 > pkt.len() {
+        bail!("Phần Question DNS bị cắt cụt");
+    }
+    let qtype = u16::from_be_bytes([pkt[pos], pkt[pos + 1]]);
+    let qclass = u16::from_be_bytes([pkt[pos + 2], pkt[pos + 3]]);
+    pos += 4;
+
+    let expected_norm = expected_host
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if qname != expected_norm {
+        bail!("Question QNAME DNS không khớp (nhận {qname}, mong đợi {expected_norm})");
+    }
+    if qtype != expected_qtype || qclass != 1 {
+        bail!("Question QTYPE/QCLASS DNS không khớp (qtype={qtype}, qclass={qclass})");
     }
 
     let mut ips = Vec::new();
@@ -312,7 +484,7 @@ fn parse_dns_response(pkt: &[u8], expected_txid: u16) -> Result<(Vec<IpAddr>, u3
         if pos + rdlen > pkt.len() {
             bail!("Phần dữ liệu RR DNS bị cắt cụt");
         }
-        if rclass == 1 {
+        if rclass == 1 && rtype == expected_qtype {
             if rtype == 1 && rdlen == 4 {
                 let ip = Ipv4Addr::new(pkt[pos], pkt[pos + 1], pkt[pos + 2], pkt[pos + 3]);
                 ips.push(IpAddr::V4(ip));
@@ -335,7 +507,7 @@ async fn query_udp_dns_once(
     host: &str,
     qtype: u16,
 ) -> Result<(Vec<IpAddr>, u32)> {
-    let txid = DNS_TXID.fetch_add(1, Ordering::Relaxed) ^ ((std::process::id() as u16).rotate_left(5));
+    let txid = generate_dns_txid();
     let query = build_dns_query(host, qtype, txid)?;
     let bind_addr = if server.is_ipv4() {
         "0.0.0.0:0"
@@ -349,7 +521,7 @@ async fn query_udp_dns_once(
     let n = tokio::time::timeout(UDP_DNS_TIMEOUT, sock.recv(&mut buf))
         .await
         .context("Timeout chờ phản hồi UDP DNS")??;
-    parse_dns_response(&buf[..n], txid)
+    parse_dns_response(&buf[..n], txid, host, qtype)
 }
 
 async fn resolve_via_udp_dns(host: &str, servers: &[String]) -> Result<(Vec<IpAddr>, Duration)> {
@@ -654,24 +826,113 @@ async fn handle_http_connect(
 ) -> Result<()> {
     let mut reader = BufReader::new(client);
     let (host, port, auth_header) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-        let mut request_line = String::new();
-        reader.read_line(&mut request_line).await?;
+        let mut remaining = MAX_HTTP_HEADER_BYTES;
+        let mut req_buf = Vec::with_capacity(128);
+        let req_read = (&mut reader)
+            .take(remaining as u64)
+            .read_until(b'\n', &mut req_buf)
+            .await?;
+        if req_read == 0 {
+            bail!("Kết nối đóng trước khi nhận dòng yêu cầu HTTP");
+        }
+        if !req_buf.ends_with(b"\n") {
+            if req_read >= remaining {
+                reply_and_close(
+                    reader.get_mut(),
+                    b"HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+                bail!("Dòng yêu cầu HTTP vượt quá giới hạn {MAX_HTTP_HEADER_BYTES} byte");
+            }
+            reply_and_close(
+                reader.get_mut(),
+                b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+            bail!("Dòng yêu cầu HTTP không đầy đủ");
+        }
+        remaining -= req_read;
+
+        let request_line = match std::str::from_utf8(&req_buf) {
+            Ok(s) => s,
+            Err(_) => {
+                reply_and_close(
+                    reader.get_mut(),
+                    b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+                bail!("Dòng yêu cầu HTTP không phải UTF-8 hợp lệ");
+            }
+        };
         let mut parts = request_line.split_whitespace();
         let method = parts.next().unwrap_or("");
         let target = parts.next().unwrap_or("");
 
         let mut auth_header: Option<String> = None;
         let mut header_count = 0usize;
+        let mut line_buf = Vec::with_capacity(128);
         loop {
-            let mut line = String::new();
-            let read = reader.read_line(&mut line).await?;
-            if read == 0 || line == "\r\n" || line == "\n" {
+            if remaining == 0 {
+                reply_and_close(
+                    reader.get_mut(),
+                    b"HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+                bail!("Header HTTP vượt quá giới hạn {MAX_HTTP_HEADER_BYTES} byte");
+            }
+            line_buf.clear();
+            let read = (&mut reader)
+                .take(remaining as u64)
+                .read_until(b'\n', &mut line_buf)
+                .await?;
+            if read == 0 {
+                reply_and_close(
+                    reader.get_mut(),
+                    b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+                bail!("Kết nối đóng trước khi kết thúc phần header HTTP");
+            }
+            if !line_buf.ends_with(b"\n") {
+                if read >= remaining {
+                    reply_and_close(
+                        reader.get_mut(),
+                        b"HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                    bail!("Header HTTP vượt quá giới hạn {MAX_HTTP_HEADER_BYTES} byte");
+                }
+                reply_and_close(
+                    reader.get_mut(),
+                    b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+                bail!("Dòng header HTTP không đầy đủ");
+            }
+            remaining -= read;
+            if line_buf == b"\r\n" || line_buf == b"\n" {
                 break;
             }
             header_count += 1;
             if header_count > 64 {
+                reply_and_close(
+                    reader.get_mut(),
+                    b"HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n",
+                )
+                .await;
                 bail!("Quá nhiều HTTP header");
             }
+            let line = match std::str::from_utf8(&line_buf) {
+                Ok(s) => s,
+                Err(_) => {
+                    reply_and_close(
+                        reader.get_mut(),
+                        b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                    bail!("Header HTTP không phải UTF-8 hợp lệ");
+                }
+            };
             if let Some((name, val)) = line.split_once(':') {
                 if name.trim().eq_ignore_ascii_case("Proxy-Authorization") {
                     auth_header = Some(val.trim().to_string());
@@ -739,9 +1000,56 @@ async fn handle_http_connect(
     Ok(())
 }
 
-fn load_config_from_args() -> Result<RelayServerConfig> {
+fn cli_used_pass_flag(args: &[String]) -> bool {
+    args.iter()
+        .skip(1)
+        .any(|a| a == "--pass" || a.starts_with("--pass="))
+}
+
+fn is_loopback_bind(listen: &str) -> bool {
+    let trimmed = listen.trim();
+    if let Ok(sock) = trimmed.parse::<SocketAddr>() {
+        return sock.ip().is_loopback();
+    }
+    let host = if let Some(rest) = trimmed.strip_prefix('[') {
+        rest.split_once(']').map(|(h, _)| h).unwrap_or(trimmed)
+    } else {
+        trimmed.rsplit_once(':').map(|(h, _)| h).unwrap_or(trimmed)
+    };
+    let normalized = host.trim().trim_end_matches('.');
+    normalized.eq_ignore_ascii_case("localhost")
+        || normalized
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+fn startup_security_warnings(
+    cfg: &RelayServerConfig,
+    bound_listen: &str,
+    pass_from_cli: bool,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if cfg.allow_all && !cfg.auth_required() && !is_loopback_bind(bound_listen) {
+        warnings.push(format!(
+            "[SECURITY WARNING] --allow-all is enabled on non-loopback bind ({bound_listen}) without authentication! \
+             Set LITECHAT_RELAY_USER + LITECHAT_RELAY_PASS (or bind to 127.0.0.1) to avoid running an open proxy."
+        ));
+    }
+    if pass_from_cli {
+        warnings.push(
+            "[SECURITY WARNING] Passing password via --pass exposes credentials in process listings; \
+             prefer setting the LITECHAT_RELAY_PASS environment variable or using a restricted --config file."
+                .to_string(),
+        );
+    }
+    warnings
+}
+
+fn load_config_from_args() -> Result<(RelayServerConfig, bool)> {
     let args: Vec<String> = std::env::args().collect();
-    parse_config_with(&args, |key| std::env::var(key).ok())
+    let used_pass = cli_used_pass_flag(&args);
+    let cfg = parse_config_with(&args, |key| std::env::var(key).ok())?;
+    Ok((cfg, used_pass))
 }
 
 fn parse_config_with<F>(args: &[String], env_lookup: F) -> Result<RelayServerConfig>
@@ -805,6 +1113,12 @@ where
                 cfg.password = args[i + 1].clone();
                 i += 2;
             }
+            arg if arg.starts_with("--pass=") => {
+                if let Some(val) = arg.strip_prefix("--pass=") {
+                    cfg.password = val.to_string();
+                }
+                i += 1;
+            }
             "--dns" if i + 1 < args.len() => {
                 cli_dns.extend(parse_dns_server_list(&args[i + 1]));
                 i += 2;
@@ -864,10 +1178,18 @@ pub async fn run_server(listener: TcpListener, cfg: Arc<RelayServerConfig>) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cfg = Arc::new(load_config_from_args()?);
+    let (cfg_raw, pass_from_cli) = load_config_from_args()?;
+    let cfg = Arc::new(cfg_raw);
     let listener = TcpListener::bind(&cfg.listen)
         .await
         .with_context(|| format!("Không mở được cổng relay {}", cfg.listen))?;
+    let bound_label = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| cfg.listen.clone());
+    for warning in startup_security_warnings(&cfg, &bound_label, pass_from_cli) {
+        eprintln!("{warning}");
+    }
     let dns_label = if cfg.dns_servers.is_empty() {
         "system".to_string()
     } else {
@@ -905,6 +1227,9 @@ mod tests {
         cfg.allow_all = true;
         assert!(is_allowed_target("facebook.com", 8080, &cfg));
 
+        assert!(is_forbidden_ip("0.0.0.0".parse().unwrap()));
+        assert!(is_forbidden_ip("0.0.0.1".parse().unwrap()));
+        assert!(is_forbidden_ip("0.255.255.254".parse().unwrap()));
         assert!(is_forbidden_ip("127.0.0.1".parse().unwrap()));
         assert!(is_forbidden_ip("10.7.12.233".parse().unwrap()));
         assert!(is_forbidden_ip("100.64.0.1".parse().unwrap()));
@@ -913,11 +1238,17 @@ mod tests {
         assert!(is_forbidden_ip("::1".parse().unwrap()));
         assert!(is_forbidden_ip("fd00::1".parse().unwrap()));
         assert!(is_forbidden_ip("fe80::1".parse().unwrap()));
+        assert!(is_forbidden_ip("::ffff:0.0.0.1".parse().unwrap()));
         assert!(is_forbidden_ip("::ffff:127.0.0.1".parse().unwrap()));
         assert!(is_forbidden_ip("::ffff:10.7.12.233".parse().unwrap()));
         assert!(is_forbidden_ip("::ffff:169.254.169.254".parse().unwrap()));
+        assert!(is_forbidden_ip("64:ff9b::127.0.0.1".parse().unwrap()));
+        assert!(is_forbidden_ip("64:ff9b::10.0.0.1".parse().unwrap()));
+        assert!(is_forbidden_ip("64:ff9b::1.1.1.1".parse().unwrap()));
+        assert!(is_forbidden_ip("64:ff9b:1::10.0.0.1".parse().unwrap()));
         assert!(!is_forbidden_ip("1.1.1.1".parse().unwrap()));
         assert!(!is_forbidden_ip("2606:4700:4700::1111".parse().unwrap()));
+        assert!(!is_forbidden_ip("64:ff9c::1".parse().unwrap()));
 
         assert_eq!(
             parse_connect_authority("chat.zalo.me:443"),
@@ -1166,7 +1497,7 @@ mod tests {
         resp.extend_from_slice(&4u16.to_be_bytes());
         resp.extend_from_slice(&[49, 213, 95, 137]);
 
-        let (ips, min_ttl) = parse_dns_response(&resp, 0x1234).unwrap();
+        let (ips, min_ttl) = parse_dns_response(&resp, 0x1234, "chat.zalo.me", 1).unwrap();
         assert_eq!(min_ttl, 45);
         assert_eq!(
             ips,
@@ -1175,8 +1506,84 @@ mod tests {
                 "49.213.95.137".parse::<IpAddr>().unwrap(),
             ]
         );
-        assert!(parse_dns_response(&resp, 0x9999).is_err());
-        assert!(parse_dns_response(&resp[..8], 0x1234).is_err());
+        // Case-insensitive + trailing dot QNAME still matches cleanly
+        assert!(parse_dns_response(&resp, 0x1234, "CHAT.ZALO.ME.", 1).is_ok());
+
+        // Mismatched TXID, truncated packet, mismatched QNAME, mismatched QTYPE, and bad QDCOUNT must fail
+        assert!(parse_dns_response(&resp, 0x9999, "chat.zalo.me", 1).is_err());
+        assert!(parse_dns_response(&resp[..8], 0x1234, "chat.zalo.me", 1).is_err());
+        assert!(parse_dns_response(&resp, 0x1234, "other.zalo.me", 1).is_err());
+        assert!(parse_dns_response(&resp, 0x1234, "chat.zalo.me", 28).is_err());
+
+        let mut bad_qdcount = resp.clone();
+        bad_qdcount[4..6].copy_from_slice(&0u16.to_be_bytes());
+        assert!(parse_dns_response(&bad_qdcount, 0x1234, "chat.zalo.me", 1).is_err());
+
+        let mut bad_qclass = resp.clone();
+        // QCLASS sits immediately after QNAME (offset 26) + QTYPE (2 bytes) = offset 28..30
+        bad_qclass[28..30].copy_from_slice(&3u16.to_be_bytes());
+        assert!(parse_dns_response(&bad_qclass, 0x1234, "chat.zalo.me", 1).is_err());
+    }
+
+    #[test]
+    fn dns_txid_uses_non_sequential_randomness_and_startup_warnings_work() {
+        let draws: Vec<u16> = (0..16).map(|_| generate_dns_txid()).collect();
+        let all_same = draws.windows(2).all(|w| w[0] == w[1]);
+        let all_seq = draws
+            .windows(2)
+            .all(|w| w[1] == w[0].wrapping_add(1));
+        assert!(!all_same, "DNS TXID must not be constant: {draws:?}");
+        assert!(!all_seq, "DNS TXID must not be sequential: {draws:?}");
+
+        // LITECHAT_RELAY_PASS sets auth without needing --pass CLI flag
+        let args_env = vec![
+            "litechat-relay".to_string(),
+            "--allow-all".to_string(),
+            "--listen".to_string(),
+            "0.0.0.0:1088".to_string(),
+        ];
+        assert!(!cli_used_pass_flag(&args_env));
+        let cfg_env = parse_config_with(&args_env, |k| match k {
+            "LITECHAT_RELAY_USER" => Some("relay_user".to_string()),
+            "LITECHAT_RELAY_PASS" => Some("env_secret_pw".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert!(cfg_env.auth_required());
+        assert!(cfg_env.verify_credentials("relay_user", "env_secret_pw"));
+        assert!(startup_security_warnings(&cfg_env, &cfg_env.listen, false).is_empty());
+
+        // --allow-all on non-loopback without auth triggers open-proxy warning
+        let cfg_open = parse_config_with(&args_env, |_| None).unwrap();
+        let open_warns = startup_security_warnings(&cfg_open, "0.0.0.0:1088", false);
+        assert_eq!(open_warns.len(), 1);
+        assert!(open_warns[0].contains("--allow-all"));
+        assert!(open_warns[0].contains("LITECHAT_RELAY_PASS"));
+
+        // Loopback binds do not trigger non-loopback open-proxy warning
+        assert!(is_loopback_bind("127.0.0.1:1088"));
+        assert!(is_loopback_bind("[::1]:1088"));
+        assert!(is_loopback_bind("localhost:1088"));
+        assert!(!is_loopback_bind("0.0.0.0:1088"));
+        assert!(!is_loopback_bind("[::]:1088"));
+        assert!(!is_loopback_bind("10.7.12.233:1088"));
+        assert!(startup_security_warnings(&cfg_open, "127.0.0.1:1088", false).is_empty());
+
+        // --pass CLI flag emits warning advising LITECHAT_RELAY_PASS
+        let args_cli_pass = vec![
+            "litechat-relay".to_string(),
+            "--user".to_string(),
+            "u".to_string(),
+            "--pass".to_string(),
+            "cli_pw".to_string(),
+        ];
+        assert!(cli_used_pass_flag(&args_cli_pass));
+        let cfg_cli = parse_config_with(&args_cli_pass, |_| None).unwrap();
+        assert!(cfg_cli.verify_credentials("u", "cli_pw"));
+        let pass_warns = startup_security_warnings(&cfg_cli, &cfg_cli.listen, true);
+        assert_eq!(pass_warns.len(), 1);
+        assert!(pass_warns[0].contains("--pass"));
+        assert!(pass_warns[0].contains("LITECHAT_RELAY_PASS"));
     }
 
     #[tokio::test]
@@ -1276,5 +1683,85 @@ mod tests {
         assert!(is_allowed_target("c.media.tenor.com", 443, &parsed));
         assert!(is_allowed_target("cdn.env-b.example", 443, &parsed));
         assert!(!is_allowed_target("cdn.env-b.example", 80, &parsed));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_length_mismatch_mod_256_and_debug_redacts_password() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"secret", b"secreT"));
+        assert!(!constant_time_eq(
+            b"secret",
+            &[b"secret".as_slice(), &[0u8; 256]].concat()
+        ));
+        assert!(!constant_time_eq(
+            &[b"secret".as_slice(), &[0u8; 256]].concat(),
+            b"secret"
+        ));
+
+        let cfg = RelayServerConfig {
+            username: "lite".into(),
+            password: "relay_super_secret_pw".into(),
+            ..Default::default()
+        };
+        assert!(cfg.verify_credentials("lite", "relay_super_secret_pw"));
+        let padded_pw = format!("{}{}", cfg.password, "\0".repeat(256));
+        assert!(!cfg.verify_credentials("lite", &padded_pw));
+
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("relay_super_secret_pw"));
+        assert!(dbg.contains("[REDACTED]"));
+        assert!(dbg.contains("lite"));
+    }
+
+    #[tokio::test]
+    async fn http_connect_rejects_oversized_unterminated_line_and_headers() {
+        let cfg = RelayServerConfig {
+            username: "lite".into(),
+            password: "secret".into(),
+            allow_all: false,
+            allow_private_targets: true,
+            ..Default::default()
+        };
+        let (_, relay_addr) = spawn_echo_and_relay(cfg).await;
+
+        // 1. Oversized request line without '\n' rejected before auth with 431
+        let mut s_req = TcpStream::connect(relay_addr).await.unwrap();
+        let huge_req_line = vec![b'A'; MAX_HTTP_HEADER_BYTES + 64];
+        s_req.write_all(&huge_req_line).await.unwrap();
+        let mut buf = [0u8; 256];
+        let n = tokio::time::timeout(Duration::from_secs(3), s_req.read(&mut buf))
+            .await
+            .expect("server must reject oversized request line immediately")
+            .unwrap();
+        let resp = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(resp.contains("431"), "expected 431, got: {resp}");
+
+        // 2. Valid request line followed by oversized header without '\n' rejected with 431
+        let mut s_hdr = TcpStream::connect(relay_addr).await.unwrap();
+        let mut payload = b"CONNECT chat.zalo.me:443 HTTP/1.1\r\nX-Huge: ".to_vec();
+        payload.extend(std::iter::repeat_n(b'B', MAX_HTTP_HEADER_BYTES));
+        s_hdr.write_all(&payload).await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(3), s_hdr.read(&mut buf))
+            .await
+            .expect("server must reject oversized header line immediately")
+            .unwrap();
+        let resp = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(resp.contains("431"), "expected 431, got: {resp}");
+
+        // 3. Multiple headers <= 64 count but > MAX_HTTP_HEADER_BYTES total rejected with 431
+        let mut s_multi = TcpStream::connect(relay_addr).await.unwrap();
+        let mut multi = b"CONNECT chat.zalo.me:443 HTTP/1.1\r\n".to_vec();
+        let one_hdr = format!("X-Pad: {}\r\n", "C".repeat(500));
+        for _ in 0..17 {
+            multi.extend_from_slice(one_hdr.as_bytes());
+        }
+        s_multi.write_all(&multi).await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(3), s_multi.read(&mut buf))
+            .await
+            .expect("server must reject oversized multi-header block immediately")
+            .unwrap();
+        let resp = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(resp.contains("431"), "expected 431, got: {resp}");
     }
 }

@@ -10,6 +10,7 @@ import {
   Moon,
   Settings,
   Sun,
+  UserCheck,
   UserPlus,
   X,
 } from "lucide-react";
@@ -17,7 +18,7 @@ import { useI18n } from "../i18n";
 import type { AccountProfile, AppUpdateInfo, ConnectionStatus, ThemeMode } from "../types";
 import { ThreadAvatar } from "./ThreadAvatar";
 
-interface Props {
+export interface NavDrawerProps {
   open: boolean;
   onClose: () => void;
   myProfile: AccountProfile | null;
@@ -27,10 +28,12 @@ interface Props {
   availableUpdate: AppUpdateInfo | null;
   archivedCount: number;
   hasPasscode: boolean;
+  pendingFriendRequestsCount?: number;
   onOpenMyProfile: () => void;
   onOpenSavedMessages: () => void;
   onOpenArchived: () => void;
   onOpenFindUser: () => void;
+  onOpenFriendRequests?: () => void;
   onOpenFolders: () => void;
   onLockApp: () => void;
   onOpenSettings: (
@@ -60,17 +63,19 @@ export function NavDrawer({
   availableUpdate,
   archivedCount,
   hasPasscode,
+  pendingFriendRequestsCount = 0,
   onOpenMyProfile,
   onOpenSavedMessages,
   onOpenArchived,
   onOpenFindUser,
+  onOpenFriendRequests,
   onOpenFolders,
   onLockApp,
   onOpenSettings,
   onCycleTheme,
   onOpenUpdateModal,
   onLogout,
-}: Props) {
+}: NavDrawerProps) {
   const { t } = useI18n();
   useEffect(() => {
     if (!open) return;
@@ -194,6 +199,28 @@ export function NavDrawer({
           >
             <UserPlus className="h-4 w-4 shrink-0" style={{ color: "var(--accent)" }} />
             <span>{t("findNewFriendMenu")}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              onOpenFriendRequests?.();
+              onClose();
+            }}
+            className="hover-menu flex w-full items-center justify-between gap-2 rounded-xl px-3 py-2.5 text-left font-medium transition"
+          >
+            <span className="flex items-center gap-3">
+              <UserCheck className="h-4 w-4 shrink-0" style={{ color: "var(--accent)" }} />
+              <span>{t("friendRequestsMenu")}</span>
+            </span>
+            {pendingFriendRequestsCount > 0 && (
+              <span
+                className="rounded-full px-2 py-0.5 text-[11px] font-bold"
+                style={{ background: "var(--accent)", color: "var(--text-on-accent)" }}
+              >
+                {pendingFriendRequestsCount > 99 ? "99+" : pendingFriendRequestsCount}
+              </span>
+            )}
           </button>
 
           <button
@@ -335,7 +362,7 @@ export function NavDrawer({
             color: "var(--text-secondary)",
           }}
         >
-          Teza v{appVersion || "0.5.0"}
+          Teza v{appVersion || "0.6.0"}
         </div>
       </aside>
     </div>

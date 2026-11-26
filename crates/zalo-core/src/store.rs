@@ -6,6 +6,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use md5::{Digest, Md5};
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -174,6 +175,168 @@ fn translation_aad(msg_id: &str, target_lang: &str) -> Vec<u8> {
     format!("tr:{msg_id}:{target_lang}").into_bytes()
 }
 
+fn message_media_aad(thread_id: &str, msg_id: &str, variant: &str) -> Vec<u8> {
+    format!("msg_media:{thread_id}:{msg_id}:{variant}").into_bytes()
+}
+
+pub const MEDIA_LOCAL_STATE_MISSING: i32 = 0;
+pub const MEDIA_LOCAL_STATE_LOCAL: i32 = 1;
+
+pub const MEDIA_CDN_STATUS_UNKNOWN: i32 = 0;
+pub const MEDIA_CDN_STATUS_OK: i32 = 1;
+pub const MEDIA_CDN_STATUS_EXPIRED: i32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaObjectRecord {
+    pub sha256: String,
+    pub kind: String,
+    pub mime: String,
+    pub size_bytes: u64,
+    pub thumb_sha256: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub duration_ms: Option<u64>,
+    pub local_state: i32,
+    pub local_rel_path: Option<String>,
+    pub is_encrypted: bool,
+    pub pin_count: u32,
+    pub created_ts: i64,
+    pub last_accessed_ts: i64,
+    pub cloud_provider: Option<String>,
+    pub cloud_file_id: Option<String>,
+    pub cloud_encrypted: bool,
+    pub cloud_key_ver: i32,
+    pub cloud_synced_ts: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageMediaRecord {
+    pub thread_id: String,
+    pub msg_id: String,
+    pub variant: String,
+    pub url_hash: String,
+    pub sha256: Option<String>,
+    pub original_name: Option<String>,
+    pub saved_user_path: Option<String>,
+    pub cdn_status: i32,
+    pub updated_ts: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaVaultStatsDto {
+    pub total_bytes: u64,
+    pub object_count: u64,
+    pub pinned_bytes: u64,
+    pub pinned_count: u64,
+    pub image_bytes: u64,
+    pub video_bytes: u64,
+    pub voice_bytes: u64,
+    pub file_bytes: u64,
+    pub thumb_bytes: u64,
+    pub cloud_synced_count: u64,
+    pub cloud_total_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GDriveThreadUsageDto {
+    pub thread_id: String,
+    pub thread_name: String,
+    pub total_bytes: u64,
+    pub object_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GDriveCloudItemDto {
+    pub sha256: String,
+    pub cloud_file_id: String,
+    pub kind: String,
+    pub mime: String,
+    pub size_bytes: u64,
+    pub original_name: Option<String>,
+    pub thread_id: Option<String>,
+    pub thread_name: Option<String>,
+    pub msg_id: Option<String>,
+    pub cloud_synced_ts: i64,
+    pub local_state: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudMediaBreakdown {
+    pub total_bytes: u64,
+    pub total_count: u64,
+    pub images_bytes: u64,
+    pub videos_bytes: u64,
+    pub voice_bytes: u64,
+    pub files_bytes: u64,
+    pub pending_count: u64,
+    pub pending_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryTranslationRecord {
+    pub msg_id: String,
+    pub target_lang: String,
+    pub provider: String,
+    pub translated_text: String,
+    pub detected_source_lang: Option<String>,
+    pub skipped: bool,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryCloudMediaRecord {
+    pub thread_id: String,
+    pub msg_id: String,
+    pub variant: String,
+    pub url_hash: String,
+    pub sha256: String,
+    pub kind: String,
+    pub mime: String,
+    pub size_bytes: u64,
+    pub original_name: Option<String>,
+    pub cloud_provider: String,
+    pub cloud_file_id: String,
+    pub cloud_key_ver: i32,
+    pub cloud_synced_ts: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryDeltaBatch {
+    pub version: u32,
+    pub uid: String,
+    pub device_id: String,
+    pub exported_ts: i64,
+    #[serde(default)]
+    pub threads: Vec<ThreadDto>,
+    #[serde(default)]
+    pub messages: Vec<MessageDto>,
+    #[serde(default)]
+    pub folders: Vec<ChatFolderDto>,
+    #[serde(default)]
+    pub thread_folders: Vec<(String, String)>,
+    #[serde(default)]
+    pub translations: Vec<HistoryTranslationRecord>,
+    #[serde(default)]
+    pub cloud_media: Vec<HistoryCloudMediaRecord>,
+    /// True when more messages exist strictly after `max_message_ts()` beyond `limit_msgs`.
+    #[serde(skip)]
+    pub messages_truncated: bool,
+    /// True when more cloud media links exist strictly after `max_cloud_media_cursor_ts`.
+    #[serde(skip)]
+    pub cloud_media_truncated: bool,
+    /// Maximum `MAX(cloud_synced_ts, message_media.updated_ts)` across exported `cloud_media` rows.
+    #[serde(skip)]
+    pub max_cloud_media_cursor_ts: Option<i64>,
+}
+
+impl HistoryDeltaBatch {
+    pub const CURRENT_VERSION: u32 = 1;
+
+    pub fn max_message_ts(&self) -> Option<i64> {
+        self.messages.iter().map(|m| m.ts).max()
+    }
+}
+
 pub struct MessageStore {
     conn: Connection,
     fts_conn: Connection,
@@ -280,6 +443,55 @@ impl MessageStore {
             );
             CREATE INDEX IF NOT EXISTS idx_msg_translations_msg
                 ON message_translations(msg_id);
+
+            CREATE TABLE IF NOT EXISTS media_objects (
+                sha256 TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                mime TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                thumb_sha256 TEXT,
+                width INTEGER,
+                height INTEGER,
+                duration_ms INTEGER,
+                local_state INTEGER NOT NULL DEFAULT 0,
+                local_rel_path TEXT,
+                is_encrypted INTEGER NOT NULL DEFAULT 1,
+                pin_count INTEGER NOT NULL DEFAULT 0,
+                created_ts INTEGER NOT NULL,
+                last_accessed_ts INTEGER NOT NULL,
+                cloud_provider TEXT,
+                cloud_file_id TEXT,
+                cloud_encrypted INTEGER NOT NULL DEFAULT 1,
+                cloud_key_ver INTEGER NOT NULL DEFAULT 1,
+                cloud_synced_ts INTEGER,
+                cloud_excluded INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_objects_lru
+                ON media_objects(local_state, pin_count, last_accessed_ts ASC);
+            CREATE INDEX IF NOT EXISTS idx_media_objects_cloud_pending
+                ON media_objects(local_state, cloud_file_id);
+
+            CREATE TABLE IF NOT EXISTS message_media (
+                thread_id TEXT NOT NULL,
+                msg_id TEXT NOT NULL,
+                variant TEXT NOT NULL DEFAULT 'primary',
+                url_hash TEXT NOT NULL,
+                sha256 TEXT,
+                original_name TEXT,
+                saved_user_path TEXT,
+                cdn_status INTEGER NOT NULL DEFAULT 0,
+                updated_ts INTEGER NOT NULL,
+                PRIMARY KEY (thread_id, msg_id, variant)
+            );
+            CREATE INDEX IF NOT EXISTS idx_message_media_url_hash
+                ON message_media(url_hash);
+            CREATE INDEX IF NOT EXISTS idx_message_media_sha256
+                ON message_media(sha256);
+
+            CREATE TABLE IF NOT EXISTS gdrive_applied_deltas (
+                delta_file_id TEXT PRIMARY KEY,
+                applied_ts INTEGER NOT NULL
+            );
             "#,
         )?;
         self.ensure_column("messages", "quote_json", "TEXT")?;
@@ -288,6 +500,7 @@ impl MessageStore {
         self.ensure_column("threads", "peer_read_ts", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("threads", "muted_until_ts", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("threads", "is_archived", "INTEGER NOT NULL DEFAULT 0")?;
+        self.ensure_column("media_objects", "cloud_excluded", "INTEGER NOT NULL DEFAULT 0")?;
 
         let existing_check: Option<String> = self
             .conn
@@ -540,14 +753,28 @@ impl MessageStore {
     }
 
     pub fn upsert_thread(&self, t: &ThreadDto) -> Result<()> {
-        self.upsert_thread_inner(t, false)
+        self.upsert_thread_inner(t, false, false)
     }
 
     pub fn upsert_thread_synced(&self, t: &ThreadDto) -> Result<()> {
-        self.upsert_thread_inner(t, true)
+        self.upsert_thread_inner(t, true, false)
     }
 
-    fn upsert_thread_inner(&self, t: &ThreadDto, overwrite_pinned: bool) -> Result<()> {
+    pub fn upsert_thread_synced_with_read_state(
+        &self,
+        t: &ThreadDto,
+        overwrite_pinned: bool,
+        remote_read_authoritative: bool,
+    ) -> Result<()> {
+        self.upsert_thread_inner(t, overwrite_pinned, remote_read_authoritative)
+    }
+
+    fn upsert_thread_inner(
+        &self,
+        t: &ThreadDto,
+        overwrite_pinned: bool,
+        remote_read_authoritative: bool,
+    ) -> Result<()> {
         let kind_str = match t.kind {
             ThreadKind::Direct => "direct",
             ThreadKind::Group => "group",
@@ -560,12 +787,15 @@ impl MessageStore {
         let preview_empty = t.last_preview.is_empty() as i64;
         let avatar_empty = t.avatar.is_empty() as i64;
         let title_fallback = (t.title == t.id) as i64;
-        let clear_unread = (t.unread_count == 0 && t.last_preview.starts_with("Bạn:")) as i64;
+        let clear_unread = (t.unread_count == 0
+            && (t.last_preview.starts_with("Bạn:") || remote_read_authoritative))
+            as i64;
         let last_ts = normalize_ts_ms(t.last_ts);
+        let explicit_read_in_ts = normalize_ts_ms(t.last_read_in_ts);
         let read_in_ts = if clear_unread == 1 {
-            last_ts.max(normalize_ts_ms(t.last_read_in_ts))
+            last_ts.max(explicit_read_in_ts)
         } else {
-            normalize_ts_ms(t.last_read_in_ts)
+            explicit_read_in_ts
         };
         self.conn.execute(
             r#"
@@ -590,7 +820,7 @@ impl MessageStore {
                 last_read_in_ts = CASE
                     WHEN ?13 = 1 AND excluded.last_ts >= threads.last_ts
                     THEN MAX(threads.last_read_in_ts, excluded.last_read_in_ts, excluded.last_ts)
-                    ELSE MAX(threads.last_read_in_ts, excluded.last_read_in_ts)
+                    ELSE MAX(threads.last_read_in_ts, ?19)
                 END,
                 peer_read_ts = MAX(threads.peer_read_ts, excluded.peer_read_ts),
                 muted_until_ts = MAX(threads.muted_until_ts, excluded.muted_until_ts),
@@ -615,6 +845,7 @@ impl MessageStore {
                 normalize_ts_ms(t.peer_read_ts),
                 normalize_ts_ms(t.muted_until_ts),
                 t.is_archived as i64,
+                explicit_read_in_ts,
             ],
         )?;
         Ok(())
@@ -774,6 +1005,10 @@ impl MessageStore {
                 "DELETE FROM message_translations WHERE msg_id = ?1",
                 params![m.msg_id],
             )?;
+            tx.execute(
+                "DELETE FROM message_media WHERE thread_id = ?1 AND msg_id = ?2",
+                params![m.thread_id, m.msg_id],
+            )?;
         }
         tx.commit()?;
 
@@ -878,6 +1113,10 @@ impl MessageStore {
             "DELETE FROM message_translations WHERE msg_id = ?1",
             params![msg_id],
         )?;
+        tx.execute(
+            "DELETE FROM message_media WHERE thread_id = ?1 AND msg_id = ?2",
+            params![thread_id, msg_id],
+        )?;
         tx.commit()?;
 
         self.fts_conn.execute(
@@ -885,6 +1124,187 @@ impl MessageStore {
             params![thread_id, msg_id],
         )?;
         Ok(affected > 0)
+    }
+
+    /// Atomically removes a thread and all of its local messages, translations, media links,
+    /// folder memberships, and in-memory FTS entries. Returns `local_rel_path`s of newly
+    /// orphaned media blobs so the caller can unlink them from disk outside the store mutex.
+    pub fn delete_thread(&mut self, thread_id: &str) -> Result<Vec<String>> {
+        let tid = thread_id.trim();
+        if tid.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let tx = self.conn.transaction()?;
+
+        // Delete cached translations for messages belonging exclusively to this thread.
+        tx.execute(
+            "DELETE FROM message_translations
+             WHERE msg_id IN (SELECT msg_id FROM messages WHERE thread_id = ?1)
+               AND msg_id NOT IN (SELECT msg_id FROM messages WHERE thread_id != ?1)",
+            params![tid],
+        )?;
+
+        // Collect media object hashes referenced by this thread before unlinking `message_media`.
+        let shas: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT sha256
+                 FROM message_media
+                 WHERE thread_id = ?1 AND sha256 IS NOT NULL AND sha256 != ''",
+            )?;
+            let out = stmt
+                .query_map(params![tid], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            out
+        };
+
+        tx.execute("DELETE FROM message_media WHERE thread_id = ?1", params![tid])?;
+
+        let mut orphaned_paths: Vec<String> = Vec::new();
+        let mut thumb_candidates: Vec<String> = Vec::new();
+
+        for sha in shas {
+            let still_referenced: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM message_media WHERE sha256 = ?1)
+                     OR EXISTS(SELECT 1 FROM media_objects WHERE thumb_sha256 = ?1)",
+                params![&sha],
+                |r| r.get(0),
+            )?;
+            if still_referenced {
+                continue;
+            }
+            struct OrphanMediaRow {
+                local_state: i32,
+                local_rel_path: Option<String>,
+                thumb_sha256: Option<String>,
+                cloud_file_id: Option<String>,
+            }
+            let row: Option<OrphanMediaRow> = tx
+                .query_row(
+                    "SELECT local_state, local_rel_path, thumb_sha256, cloud_file_id
+                     FROM media_objects
+                     WHERE sha256 = ?1
+                     LIMIT 1",
+                    params![&sha],
+                    |r| {
+                        Ok(OrphanMediaRow {
+                            local_state: r.get(0)?,
+                            local_rel_path: r.get(1)?,
+                            thumb_sha256: r.get(2)?,
+                            cloud_file_id: r.get(3)?,
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(OrphanMediaRow {
+                local_state,
+                local_rel_path,
+                thumb_sha256,
+                cloud_file_id,
+            }) = row
+            {
+                if local_state == MEDIA_LOCAL_STATE_LOCAL {
+                    if let Some(rel) = local_rel_path {
+                        if !orphaned_paths.contains(&rel) {
+                            orphaned_paths.push(rel);
+                        }
+                    }
+                }
+                if cloud_file_id.as_deref().is_some_and(|s| !s.is_empty()) {
+                    tx.execute(
+                        "UPDATE media_objects SET local_state = 0, local_rel_path = NULL, thumb_sha256 = NULL WHERE sha256 = ?1",
+                        params![&sha],
+                    )?;
+                } else {
+                    tx.execute("DELETE FROM media_objects WHERE sha256 = ?1", params![&sha])?;
+                }
+                if let Some(tsha) = thumb_sha256.filter(|s| !s.is_empty()) {
+                    thumb_candidates.push(tsha);
+                }
+            }
+        }
+
+        for tsha in thumb_candidates {
+            let still_referenced: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM message_media WHERE sha256 = ?1)
+                     OR EXISTS(SELECT 1 FROM media_objects WHERE thumb_sha256 = ?1)",
+                params![&tsha],
+                |r| r.get(0),
+            )?;
+            if still_referenced {
+                continue;
+            }
+            let row: Option<(i32, Option<String>, Option<String>)> = tx
+                .query_row(
+                    "SELECT local_state, local_rel_path, cloud_file_id
+                     FROM media_objects
+                     WHERE sha256 = ?1
+                     LIMIT 1",
+                    params![&tsha],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            if let Some((local_state, local_rel_path, cloud_file_id)) = row {
+                if local_state == MEDIA_LOCAL_STATE_LOCAL {
+                    if let Some(rel) = local_rel_path {
+                        if !orphaned_paths.contains(&rel) {
+                            orphaned_paths.push(rel);
+                        }
+                    }
+                }
+                if cloud_file_id.as_deref().is_some_and(|s| !s.is_empty()) {
+                    tx.execute(
+                        "UPDATE media_objects SET local_state = 0, local_rel_path = NULL WHERE sha256 = ?1",
+                        params![&tsha],
+                    )?;
+                } else {
+                    tx.execute(
+                        "DELETE FROM media_objects WHERE sha256 = ?1",
+                        params![&tsha],
+                    )?;
+                }
+            }
+        }
+
+        // Scrub thread membership from any encrypted `chat_folders` entries.
+        let folder_rows: Vec<(String, String)> = {
+            let mut stmt = tx.prepare("SELECT id, config_json FROM chat_folders")?;
+            let out = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            out
+        };
+        for (fid, enc_json) in folder_rows {
+            let aad = folder_aad(&fid);
+            if let Ok(raw_json) = self.cipher.decrypt_str(&aad, &enc_json) {
+                if let Ok(mut dto) = serde_json::from_str::<ChatFolderDto>(&raw_json) {
+                    let prev_inc = dto.thread_ids.len();
+                    let prev_exc = dto.excluded_thread_ids.len();
+                    dto.thread_ids.retain(|id| id != tid);
+                    dto.excluded_thread_ids.retain(|id| id != tid);
+                    if dto.thread_ids.len() != prev_inc || dto.excluded_thread_ids.len() != prev_exc
+                    {
+                        let updated_json = serde_json::to_string(&dto)?;
+                        let updated_enc = self.cipher.encrypt_str(&aad, &updated_json)?;
+                        tx.execute(
+                            "UPDATE chat_folders SET config_json = ?2 WHERE id = ?1",
+                            params![fid, updated_enc],
+                        )?;
+                    }
+                }
+            }
+        }
+
+        tx.execute("DELETE FROM messages WHERE thread_id = ?1", params![tid])?;
+        tx.execute("DELETE FROM threads WHERE id = ?1", params![tid])?;
+        tx.commit()?;
+
+        self.fts_conn.execute(
+            "DELETE FROM messages_fts WHERE thread_id = ?1",
+            params![tid],
+        )?;
+
+        Ok(orphaned_paths)
     }
 
     pub fn get_cached_translations(
@@ -1294,6 +1714,34 @@ impl MessageStore {
             .cipher
             .decrypt_str(&msg_aad(thread_id, &msg_id), &enc_sender_id)?;
         Ok(Some((msg_id, sender_id, ts)))
+    }
+
+    pub fn get_latest_incoming_message_with_type(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<(String, String, String)>> {
+        let row: Option<(String, String, String)> = self
+            .conn
+            .query_row(
+                "SELECT msg_id, sender_id, msg_type FROM messages
+                 WHERE thread_id = ?1 AND is_outgoing = 0
+                 ORDER BY ts DESC, msg_id DESC LIMIT 1",
+                params![thread_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((msg_id, enc_sender_id, msg_type)) = row else {
+            return Ok(None);
+        };
+        let sender_id = self
+            .cipher
+            .decrypt_str(&msg_aad(thread_id, &msg_id), &enc_sender_id)?;
+        let normalized_type = if msg_type.trim().is_empty() {
+            "chat.text".to_string()
+        } else {
+            msg_type
+        };
+        Ok(Some((msg_id, sender_id, normalized_type)))
     }
 
     pub fn set_thread_pinned(&self, thread_id: &str, pinned: bool) -> Result<()> {
@@ -1721,11 +2169,19 @@ impl MessageStore {
 
     /// Accent-insensitive full-text search across decrypted in-memory index (`Ctrl+K`).
     pub fn search_messages(&self, query: &str, limit: usize) -> Result<Vec<MessageDto>> {
+        let safe_limit = limit.clamp(1, 200) as i64;
         let clean = strip_vi_accents(query);
         let tokens: Vec<String> = clean
-            .split_whitespace()
-            .filter(|w| !w.is_empty())
-            .map(|w| format!("\"{}\"*", w.replace('"', "")))
+            .split(|c: char| c.is_whitespace() || c == '"' || c.is_control())
+            .filter_map(|w| {
+                let trimmed = w.trim_matches(|c: char| !c.is_alphanumeric());
+                if trimmed.is_empty() || !trimmed.chars().any(char::is_alphanumeric) {
+                    None
+                } else {
+                    Some(format!("\"{trimmed}\"*"))
+                }
+            })
+            .take(32)
             .collect();
         if tokens.is_empty() {
             return Ok(Vec::new());
@@ -1738,7 +2194,7 @@ impl MessageStore {
              ORDER BY CAST(ts AS INTEGER) DESC LIMIT ?2",
         )?;
         let pairs = stmt
-            .query_map(params![fts_query, limit as i64], |r| {
+            .query_map(params![fts_query, safe_limit], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1750,6 +2206,1781 @@ impl MessageStore {
             }
         }
         Ok(results)
+    }
+
+    fn decode_media_object_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MediaObjectRecord> {
+        Ok(MediaObjectRecord {
+            sha256: row.get(0)?,
+            kind: row.get(1)?,
+            mime: row.get(2)?,
+            size_bytes: row.get::<_, i64>(3)?.max(0) as u64,
+            thumb_sha256: row.get(4)?,
+            width: row
+                .get::<_, Option<i64>>(5)?
+                .and_then(|v| u32::try_from(v).ok()),
+            height: row
+                .get::<_, Option<i64>>(6)?
+                .and_then(|v| u32::try_from(v).ok()),
+            duration_ms: row.get::<_, Option<i64>>(7)?.map(|v| v.max(0) as u64),
+            local_state: row.get(8)?,
+            local_rel_path: row.get(9)?,
+            is_encrypted: row.get::<_, i64>(10)? != 0,
+            pin_count: row.get::<_, i64>(11)?.max(0) as u32,
+            created_ts: row.get(12)?,
+            last_accessed_ts: row.get(13)?,
+            cloud_provider: row.get(14)?,
+            cloud_file_id: row.get(15)?,
+            cloud_encrypted: row.get::<_, i64>(16)? != 0,
+            cloud_key_ver: row.get(17)?,
+            cloud_synced_ts: row.get(18)?,
+        })
+    }
+
+    pub fn upsert_media_object(&self, obj: &MediaObjectRecord) -> Result<()> {
+        let size_i64 = i64::try_from(obj.size_bytes).unwrap_or(i64::MAX);
+        let width_i64 = obj.width.map(i64::from);
+        let height_i64 = obj.height.map(i64::from);
+        let duration_i64 = obj
+            .duration_ms
+            .map(|v| i64::try_from(v).unwrap_or(i64::MAX));
+        self.conn.execute(
+            r#"
+            INSERT INTO media_objects (
+                sha256, kind, mime, size_bytes, thumb_sha256, width, height, duration_ms,
+                local_state, local_rel_path, is_encrypted, pin_count, created_ts, last_accessed_ts,
+                cloud_provider, cloud_file_id, cloud_encrypted, cloud_key_ver, cloud_synced_ts
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+            ON CONFLICT(sha256) DO UPDATE SET
+                kind = CASE WHEN excluded.kind != '' THEN excluded.kind ELSE media_objects.kind END,
+                mime = CASE
+                    WHEN excluded.mime != '' AND excluded.mime != 'application/octet-stream' THEN excluded.mime
+                    WHEN media_objects.mime != '' THEN media_objects.mime
+                    ELSE excluded.mime
+                END,
+                size_bytes = CASE WHEN excluded.size_bytes > 0 THEN excluded.size_bytes ELSE media_objects.size_bytes END,
+                thumb_sha256 = COALESCE(excluded.thumb_sha256, media_objects.thumb_sha256),
+                width = COALESCE(excluded.width, media_objects.width),
+                height = COALESCE(excluded.height, media_objects.height),
+                duration_ms = COALESCE(excluded.duration_ms, media_objects.duration_ms),
+                local_state = CASE
+                    WHEN excluded.local_state = 1 THEN 1
+                    ELSE media_objects.local_state
+                END,
+                local_rel_path = COALESCE(excluded.local_rel_path, media_objects.local_rel_path),
+                is_encrypted = CASE
+                    WHEN excluded.local_state = 1 THEN excluded.is_encrypted
+                    ELSE media_objects.is_encrypted
+                END,
+                pin_count = MAX(media_objects.pin_count, excluded.pin_count),
+                last_accessed_ts = MAX(media_objects.last_accessed_ts, excluded.last_accessed_ts),
+                cloud_provider = COALESCE(excluded.cloud_provider, media_objects.cloud_provider),
+                cloud_file_id = COALESCE(excluded.cloud_file_id, media_objects.cloud_file_id),
+                cloud_encrypted = excluded.cloud_encrypted,
+                cloud_key_ver = MAX(media_objects.cloud_key_ver, excluded.cloud_key_ver),
+                cloud_synced_ts = COALESCE(excluded.cloud_synced_ts, media_objects.cloud_synced_ts)
+            "#,
+            params![
+                obj.sha256,
+                obj.kind,
+                obj.mime,
+                size_i64,
+                obj.thumb_sha256.as_deref(),
+                width_i64,
+                height_i64,
+                duration_i64,
+                obj.local_state,
+                obj.local_rel_path.as_deref(),
+                obj.is_encrypted as i64,
+                i64::from(obj.pin_count),
+                obj.created_ts,
+                obj.last_accessed_ts,
+                obj.cloud_provider.as_deref(),
+                obj.cloud_file_id.as_deref(),
+                obj.cloud_encrypted as i64,
+                obj.cloud_key_ver,
+                obj.cloud_synced_ts,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_media_object(&self, sha256: &str) -> Result<Option<MediaObjectRecord>> {
+        let obj = self
+            .conn
+            .query_row(
+                "SELECT sha256, kind, mime, size_bytes, thumb_sha256, width, height, duration_ms,
+                        local_state, local_rel_path, is_encrypted, pin_count, created_ts, last_accessed_ts,
+                        cloud_provider, cloud_file_id, cloud_encrypted, cloud_key_ver, cloud_synced_ts
+                 FROM media_objects
+                 WHERE sha256 = ?1
+                 LIMIT 1",
+                params![sha256],
+                Self::decode_media_object_row,
+            )
+            .optional()?;
+        Ok(obj)
+    }
+
+    pub fn link_message_media(&self, rec: &MessageMediaRecord) -> Result<()> {
+        let variant = if rec.variant.trim().is_empty() {
+            "primary"
+        } else {
+            rec.variant.trim()
+        };
+        let aad = message_media_aad(&rec.thread_id, &rec.msg_id, variant);
+        let enc_orig_name = self.cipher.encrypt_opt(&aad, rec.original_name.as_deref())?;
+        let enc_saved_path = self
+            .cipher
+            .encrypt_opt(&aad, rec.saved_user_path.as_deref())?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            r#"
+            INSERT INTO message_media (
+                thread_id, msg_id, variant, url_hash, sha256, original_name,
+                saved_user_path, cdn_status, updated_ts
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(thread_id, msg_id, variant) DO UPDATE SET
+                url_hash = CASE WHEN excluded.url_hash != '' THEN excluded.url_hash ELSE message_media.url_hash END,
+                sha256 = COALESCE(excluded.sha256, message_media.sha256),
+                original_name = COALESCE(excluded.original_name, message_media.original_name),
+                saved_user_path = COALESCE(excluded.saved_user_path, message_media.saved_user_path),
+                cdn_status = CASE WHEN excluded.cdn_status != 0 THEN excluded.cdn_status ELSE message_media.cdn_status END,
+                updated_ts = MAX(message_media.updated_ts, excluded.updated_ts)
+            "#,
+            params![
+                rec.thread_id,
+                rec.msg_id,
+                variant,
+                rec.url_hash,
+                rec.sha256.as_deref(),
+                enc_orig_name,
+                enc_saved_path,
+                rec.cdn_status,
+                rec.updated_ts,
+            ],
+        )?;
+        if rec.thread_id != "__url__" && !rec.url_hash.is_empty() {
+            tx.execute(
+                "DELETE FROM message_media WHERE thread_id = '__url__' AND url_hash = ?1 AND variant = ?2",
+                params![rec.url_hash, variant],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_message_media_record(
+        &self,
+        thread_id: &str,
+        msg_id: &str,
+        variant: &str,
+    ) -> Result<Option<MessageMediaRecord>> {
+        let variant = if variant.trim().is_empty() {
+            "primary"
+        } else {
+            variant.trim()
+        };
+        struct RawMessageMediaRow {
+            url_hash: String,
+            sha256: Option<String>,
+            enc_name: Option<String>,
+            enc_saved: Option<String>,
+            cdn_status: i32,
+            updated_ts: i64,
+        }
+        let row: Option<RawMessageMediaRow> = self
+            .conn
+            .query_row(
+                "SELECT url_hash, sha256, original_name, saved_user_path, cdn_status, updated_ts
+                 FROM message_media
+                 WHERE thread_id = ?1 AND msg_id = ?2 AND variant = ?3
+                 LIMIT 1",
+                params![thread_id, msg_id, variant],
+                |r| {
+                    Ok(RawMessageMediaRow {
+                        url_hash: r.get(0)?,
+                        sha256: r.get(1)?,
+                        enc_name: r.get(2)?,
+                        enc_saved: r.get(3)?,
+                        cdn_status: r.get(4)?,
+                        updated_ts: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+        let Some(RawMessageMediaRow {
+            url_hash,
+            sha256,
+            enc_name,
+            enc_saved,
+            cdn_status,
+            updated_ts,
+        }) = row
+        else {
+            return Ok(None);
+        };
+        let aad = message_media_aad(thread_id, msg_id, variant);
+        let original_name = self.cipher.decrypt_opt(&aad, enc_name)?;
+        let saved_user_path = self.cipher.decrypt_opt(&aad, enc_saved)?;
+        Ok(Some(MessageMediaRecord {
+            thread_id: thread_id.to_string(),
+            msg_id: msg_id.to_string(),
+            variant: variant.to_string(),
+            url_hash,
+            sha256,
+            original_name,
+            saved_user_path,
+            cdn_status,
+            updated_ts,
+        }))
+    }
+
+    pub fn lookup_media_by_url_hash(&self, url_hash: &str) -> Result<Option<MediaObjectRecord>> {
+        if url_hash.trim().is_empty() {
+            return Ok(None);
+        }
+        let obj = self
+            .conn
+            .query_row(
+                "SELECT o.sha256, o.kind, o.mime, o.size_bytes, o.thumb_sha256, o.width, o.height, o.duration_ms,
+                        o.local_state, o.local_rel_path, o.is_encrypted, o.pin_count, o.created_ts, o.last_accessed_ts,
+                        o.cloud_provider, o.cloud_file_id, o.cloud_encrypted, o.cloud_key_ver, o.cloud_synced_ts
+                 FROM message_media mm
+                 INNER JOIN media_objects o ON o.sha256 = mm.sha256
+                 WHERE mm.url_hash = ?1 AND mm.sha256 IS NOT NULL
+                 ORDER BY o.local_state DESC, mm.updated_ts DESC
+                 LIMIT 1",
+                params![url_hash],
+                Self::decode_media_object_row,
+            )
+            .optional()?;
+        Ok(obj)
+    }
+
+    pub fn lookup_media_by_msg(
+        &self,
+        thread_id: &str,
+        msg_id: &str,
+        variant: &str,
+    ) -> Result<Option<MediaObjectRecord>> {
+        let variant = if variant.trim().is_empty() {
+            "primary"
+        } else {
+            variant.trim()
+        };
+        let obj = self
+            .conn
+            .query_row(
+                "SELECT o.sha256, o.kind, o.mime, o.size_bytes, o.thumb_sha256, o.width, o.height, o.duration_ms,
+                        o.local_state, o.local_rel_path, o.is_encrypted, o.pin_count, o.created_ts, o.last_accessed_ts,
+                        o.cloud_provider, o.cloud_file_id, o.cloud_encrypted, o.cloud_key_ver, o.cloud_synced_ts
+                 FROM message_media mm
+                 INNER JOIN media_objects o ON o.sha256 = mm.sha256
+                 WHERE mm.thread_id = ?1 AND mm.msg_id = ?2 AND mm.variant = ?3 AND mm.sha256 IS NOT NULL
+                 LIMIT 1",
+                params![thread_id, msg_id, variant],
+                Self::decode_media_object_row,
+            )
+            .optional()?;
+        Ok(obj)
+    }
+
+    pub fn batch_touch_media_access(&self, touches: &[(String, i64)]) -> Result<usize> {
+        if touches.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let mut affected = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE media_objects
+                 SET last_accessed_ts = MAX(last_accessed_ts, ?2)
+                 WHERE sha256 = ?1",
+            )?;
+            for (sha256, ts) in touches {
+                affected += stmt.execute(params![sha256, ts])?;
+            }
+        }
+        tx.commit()?;
+        Ok(affected)
+    }
+
+    pub fn select_lru_eviction_candidates(&self, limit: usize) -> Result<Vec<MediaObjectRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT sha256, kind, mime, size_bytes, thumb_sha256, width, height, duration_ms,
+                    local_state, local_rel_path, is_encrypted, pin_count, created_ts, last_accessed_ts,
+                    cloud_provider, cloud_file_id, cloud_encrypted, cloud_key_ver, cloud_synced_ts
+             FROM media_objects
+             WHERE local_state = 1 AND pin_count = 0 AND LOWER(kind) != 'thumb'
+             ORDER BY last_accessed_ts ASC, created_ts ASC
+             LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], Self::decode_media_object_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn mark_media_evicted(&self, sha256: &str) -> Result<bool> {
+        let affected = self.conn.execute(
+            "UPDATE media_objects
+             SET local_state = ?2, local_rel_path = NULL
+             WHERE sha256 = ?1",
+            params![sha256, MEDIA_LOCAL_STATE_MISSING],
+        )?;
+        Ok(affected > 0)
+    }
+
+    pub fn mark_media_cdn_status(&self, url_hash: &str, status: i32) -> Result<usize> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let affected = self.conn.execute(
+            "UPDATE message_media
+             SET cdn_status = ?2, updated_ts = ?3
+             WHERE url_hash = ?1",
+            params![url_hash, status, now],
+        )?;
+        Ok(affected)
+    }
+
+    pub fn set_media_pin(&self, sha256: &str, pinned: bool) -> Result<bool> {
+        let affected = if pinned {
+            self.conn.execute(
+                "UPDATE media_objects
+                 SET pin_count = CASE WHEN pin_count < 1 THEN 1 ELSE pin_count END
+                 WHERE sha256 = ?1",
+                params![sha256],
+            )?
+        } else {
+            self.conn.execute(
+                "UPDATE media_objects
+                 SET pin_count = 0
+                 WHERE sha256 = ?1",
+                params![sha256],
+            )?
+        };
+        Ok(affected > 0)
+    }
+
+    pub fn set_message_saved_path(&self, thread_id: &str, msg_id: &str, path: &str) -> Result<()> {
+        let variant = "primary";
+        let aad = message_media_aad(thread_id, msg_id, variant);
+        let enc_path = self.cipher.encrypt_str(&aad, path)?;
+        let now = chrono::Utc::now().timestamp_millis();
+        self.conn.execute(
+            "INSERT INTO message_media (
+                thread_id, msg_id, variant, url_hash, saved_user_path, updated_ts
+             )
+             VALUES (?1, ?2, ?3, '', ?4, ?5)
+             ON CONFLICT(thread_id, msg_id, variant) DO UPDATE SET
+                 saved_user_path = excluded.saved_user_path,
+                 updated_ts = excluded.updated_ts",
+            params![thread_id, msg_id, variant, enc_path, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_message_saved_path(
+        &self,
+        thread_id: &str,
+        msg_id: &str,
+    ) -> Result<Option<String>> {
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT variant, saved_user_path
+                 FROM message_media
+                 WHERE thread_id = ?1 AND msg_id = ?2 AND saved_user_path IS NOT NULL
+                 ORDER BY CASE WHEN variant = 'primary' THEN 0 ELSE 1 END, updated_ts DESC
+                 LIMIT 1",
+                params![thread_id, msg_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((variant, enc_path)) = row else {
+            return Ok(None);
+        };
+        let aad = message_media_aad(thread_id, msg_id, &variant);
+        let plain = self.cipher.decrypt_str(&aad, &enc_path)?;
+        Ok(Some(plain))
+    }
+
+    pub fn compute_media_stats(&self) -> Result<MediaVaultStatsDto> {
+        let stats = self.conn.query_row(
+            r#"
+            SELECT
+                COALESCE(SUM(CASE WHEN local_state = 1 THEN size_bytes ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN local_state = 1 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN local_state = 1 AND pin_count > 0 THEN size_bytes ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN local_state = 1 AND pin_count > 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN local_state = 1 AND LOWER(kind) IN ('image', 'photo', 'gif', 'sticker') THEN size_bytes ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN local_state = 1 AND LOWER(kind) = 'video' THEN size_bytes ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN local_state = 1 AND LOWER(kind) IN ('voice', 'audio') THEN size_bytes ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN local_state = 1 AND LOWER(kind) NOT IN ('image', 'photo', 'gif', 'sticker', 'video', 'voice', 'audio', 'thumb') THEN size_bytes ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN local_state = 1 AND LOWER(kind) = 'thumb' THEN size_bytes ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN cloud_file_id IS NOT NULL AND cloud_file_id != '' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN cloud_file_id IS NOT NULL AND cloud_file_id != '' THEN size_bytes ELSE 0 END), 0)
+            FROM media_objects
+            "#,
+            [],
+            |r| {
+                Ok(MediaVaultStatsDto {
+                    total_bytes: r.get::<_, i64>(0)?.max(0) as u64,
+                    object_count: r.get::<_, i64>(1)?.max(0) as u64,
+                    pinned_bytes: r.get::<_, i64>(2)?.max(0) as u64,
+                    pinned_count: r.get::<_, i64>(3)?.max(0) as u64,
+                    image_bytes: r.get::<_, i64>(4)?.max(0) as u64,
+                    video_bytes: r.get::<_, i64>(5)?.max(0) as u64,
+                    voice_bytes: r.get::<_, i64>(6)?.max(0) as u64,
+                    file_bytes: r.get::<_, i64>(7)?.max(0) as u64,
+                    thumb_bytes: r.get::<_, i64>(8)?.max(0) as u64,
+                    cloud_synced_count: r.get::<_, i64>(9)?.max(0) as u64,
+                    cloud_total_bytes: r.get::<_, i64>(10)?.max(0) as u64,
+                })
+            },
+        )?;
+        Ok(stats)
+    }
+
+    pub fn list_unpinned_local_blobs(&self, include_pinned: bool) -> Result<Vec<(String, String)>> {
+        let sql = if include_pinned {
+            "SELECT sha256, local_rel_path
+             FROM media_objects
+             WHERE local_state = 1 AND local_rel_path IS NOT NULL
+             ORDER BY last_accessed_ts ASC"
+        } else {
+            "SELECT sha256, local_rel_path
+             FROM media_objects
+             WHERE local_state = 1 AND pin_count = 0 AND local_rel_path IS NOT NULL
+             ORDER BY last_accessed_ts ASC"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Removes `message_media` rows for `(thread_id, msg_id)` and deletes/evicts any now-unreferenced
+    /// `media_objects` (plus their orphaned thumbnails), returning `local_rel_path`s to unlink outside DB lock.
+    pub fn cleanup_orphaned_media_for_msg(
+        &self,
+        thread_id: &str,
+        msg_id: &str,
+    ) -> Result<Vec<String>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let shas: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT sha256
+                 FROM message_media
+                 WHERE thread_id = ?1 AND msg_id = ?2 AND sha256 IS NOT NULL AND sha256 != ''",
+            )?;
+            let out = stmt
+                .query_map(params![thread_id, msg_id], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            out
+        };
+
+        tx.execute(
+            "DELETE FROM message_media WHERE thread_id = ?1 AND msg_id = ?2",
+            params![thread_id, msg_id],
+        )?;
+
+        let mut orphaned_paths = Vec::new();
+        let mut thumb_candidates = Vec::new();
+
+        for sha in shas {
+            let still_referenced: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM message_media WHERE sha256 = ?1)
+                     OR EXISTS(SELECT 1 FROM media_objects WHERE thumb_sha256 = ?1)",
+                params![&sha],
+                |r| r.get(0),
+            )?;
+            if still_referenced {
+                continue;
+            }
+            struct OrphanRow {
+                local_state: i32,
+                local_rel_path: Option<String>,
+                thumb_sha256: Option<String>,
+                cloud_file_id: Option<String>,
+            }
+            let row: Option<OrphanRow> = tx
+                .query_row(
+                    "SELECT local_state, local_rel_path, thumb_sha256, cloud_file_id
+                     FROM media_objects
+                     WHERE sha256 = ?1
+                     LIMIT 1",
+                    params![&sha],
+                    |r| {
+                        Ok(OrphanRow {
+                            local_state: r.get(0)?,
+                            local_rel_path: r.get(1)?,
+                            thumb_sha256: r.get(2)?,
+                            cloud_file_id: r.get(3)?,
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(OrphanRow {
+                local_state,
+                local_rel_path,
+                thumb_sha256,
+                cloud_file_id,
+            }) = row
+            {
+                if local_state == MEDIA_LOCAL_STATE_LOCAL {
+                    if let Some(rel) = local_rel_path {
+                        orphaned_paths.push(rel);
+                    }
+                }
+                if cloud_file_id.as_deref().is_some_and(|s| !s.is_empty()) {
+                    tx.execute(
+                        "UPDATE media_objects SET local_state = 0, local_rel_path = NULL, thumb_sha256 = NULL WHERE sha256 = ?1",
+                        params![&sha],
+                    )?;
+                } else {
+                    tx.execute("DELETE FROM media_objects WHERE sha256 = ?1", params![&sha])?;
+                }
+                if let Some(tsha) = thumb_sha256.filter(|s| !s.is_empty()) {
+                    thumb_candidates.push(tsha);
+                }
+            }
+        }
+
+        for tsha in thumb_candidates {
+            let still_referenced: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM message_media WHERE sha256 = ?1)
+                     OR EXISTS(SELECT 1 FROM media_objects WHERE thumb_sha256 = ?1)",
+                params![&tsha],
+                |r| r.get(0),
+            )?;
+            if still_referenced {
+                continue;
+            }
+            let row: Option<(i32, Option<String>, Option<String>)> = tx
+                .query_row(
+                    "SELECT local_state, local_rel_path, cloud_file_id
+                     FROM media_objects
+                     WHERE sha256 = ?1
+                     LIMIT 1",
+                    params![&tsha],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            if let Some((local_state, local_rel_path, cloud_file_id)) = row {
+                if local_state == MEDIA_LOCAL_STATE_LOCAL {
+                    if let Some(rel) = local_rel_path {
+                        orphaned_paths.push(rel);
+                    }
+                }
+                if cloud_file_id.as_deref().is_some_and(|s| !s.is_empty()) {
+                    tx.execute(
+                        "UPDATE media_objects SET local_state = 0, local_rel_path = NULL WHERE sha256 = ?1",
+                        params![&tsha],
+                    )?;
+                } else {
+                    tx.execute(
+                        "DELETE FROM media_objects WHERE sha256 = ?1",
+                        params![&tsha],
+                    )?;
+                }
+            }
+        }
+
+        tx.commit()?;
+        Ok(orphaned_paths)
+    }
+
+    pub fn list_pending_cloud_uploads(&self, limit: usize) -> Result<Vec<MediaObjectRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT sha256, kind, mime, size_bytes, thumb_sha256, width, height, duration_ms,
+                    local_state, local_rel_path, is_encrypted, pin_count, created_ts, last_accessed_ts,
+                    cloud_provider, cloud_file_id, cloud_encrypted, cloud_key_ver, cloud_synced_ts
+             FROM media_objects
+             WHERE local_state = 1
+               AND (cloud_file_id IS NULL OR cloud_file_id = '')
+               AND cloud_excluded = 0
+               AND LOWER(kind) != 'thumb'
+             ORDER BY created_ts ASC, size_bytes ASC
+             LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], Self::decode_media_object_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn mark_media_cloud_synced(
+        &self,
+        sha256: &str,
+        cloud_provider: &str,
+        cloud_file_id: &str,
+        key_ver: i64,
+        synced_ts: i64,
+    ) -> Result<()> {
+        let safe_ver = key_ver.clamp(1, i64::from(i32::MAX));
+        self.conn.execute(
+            "UPDATE media_objects
+             SET cloud_provider = ?2,
+                 cloud_file_id = ?3,
+                 cloud_encrypted = 1,
+                 cloud_key_ver = ?4,
+                 cloud_synced_ts = ?5,
+                 cloud_excluded = 0
+             WHERE sha256 = ?1",
+            params![sha256, cloud_provider, cloud_file_id, safe_ver, synced_ts],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_media_cloud_links(&self, sha256s: &[String]) -> Result<usize> {
+        if sha256s.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let mut affected = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE media_objects
+                 SET cloud_provider = NULL,
+                     cloud_file_id = NULL,
+                     cloud_synced_ts = NULL
+                 WHERE sha256 = ?1",
+            )?;
+            for sha in sha256s {
+                affected += stmt.execute(params![sha])?;
+            }
+        }
+        tx.commit()?;
+        Ok(affected)
+    }
+
+    /// Clears Google Drive cloud links after user-initiated Cloud Storage Manager deletion and
+    /// marks `cloud_excluded = 1` so auto-sync will not immediately re-upload the preserved local blob.
+    pub fn mark_media_cloud_pruned(&self, sha256s: &[String]) -> Result<usize> {
+        if sha256s.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let mut affected = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE media_objects
+                 SET cloud_provider = NULL,
+                     cloud_file_id = NULL,
+                     cloud_synced_ts = NULL,
+                     cloud_excluded = 1
+                 WHERE sha256 = ?1",
+            )?;
+            for sha in sha256s {
+                affected += stmt.execute(params![sha])?;
+            }
+        }
+        tx.commit()?;
+        Ok(affected)
+    }
+
+    pub fn compute_cloud_media_breakdown(&self) -> Result<CloudMediaBreakdown> {
+        let breakdown = self.conn.query_row(
+            r#"
+            SELECT
+                COALESCE(SUM(CASE WHEN cloud_file_id IS NOT NULL AND cloud_file_id != '' THEN size_bytes ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN cloud_file_id IS NOT NULL AND cloud_file_id != '' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN cloud_file_id IS NOT NULL AND cloud_file_id != '' AND LOWER(kind) IN ('image', 'photo', 'gif', 'sticker') THEN size_bytes ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN cloud_file_id IS NOT NULL AND cloud_file_id != '' AND LOWER(kind) = 'video' THEN size_bytes ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN cloud_file_id IS NOT NULL AND cloud_file_id != '' AND LOWER(kind) IN ('voice', 'audio') THEN size_bytes ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN cloud_file_id IS NOT NULL AND cloud_file_id != '' AND LOWER(kind) NOT IN ('image', 'photo', 'gif', 'sticker', 'video', 'voice', 'audio') THEN size_bytes ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN local_state = 1 AND (cloud_file_id IS NULL OR cloud_file_id = '') AND cloud_excluded = 0 AND LOWER(kind) != 'thumb' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN local_state = 1 AND (cloud_file_id IS NULL OR cloud_file_id = '') AND cloud_excluded = 0 AND LOWER(kind) != 'thumb' THEN size_bytes ELSE 0 END), 0)
+            FROM media_objects
+            "#,
+            [],
+            |r| {
+                Ok(CloudMediaBreakdown {
+                    total_bytes: r.get::<_, i64>(0)?.max(0) as u64,
+                    total_count: r.get::<_, i64>(1)?.max(0) as u64,
+                    images_bytes: r.get::<_, i64>(2)?.max(0) as u64,
+                    videos_bytes: r.get::<_, i64>(3)?.max(0) as u64,
+                    voice_bytes: r.get::<_, i64>(4)?.max(0) as u64,
+                    files_bytes: r.get::<_, i64>(5)?.max(0) as u64,
+                    pending_count: r.get::<_, i64>(6)?.max(0) as u64,
+                    pending_bytes: r.get::<_, i64>(7)?.max(0) as u64,
+                })
+            },
+        )?;
+        Ok(breakdown)
+    }
+
+    fn decrypt_thread_name_opt(&self, thread_id: &str, enc_title: Option<String>) -> String {
+        if let Some(raw) = enc_title {
+            if let Ok(plain) = self.cipher.decrypt_or_legacy(&thread_aad(thread_id), &raw) {
+                let trimmed = plain.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_string();
+                }
+            }
+        }
+        thread_id.to_string()
+    }
+
+    pub fn list_cloud_usage_by_thread(&self) -> Result<Vec<GDriveThreadUsageDto>> {
+        struct RawThreadUsageRow {
+            thread_id: String,
+            enc_title: Option<String>,
+            total_bytes: i64,
+            object_count: i64,
+        }
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT
+                sub.thread_id,
+                t.title,
+                COALESCE(SUM(sub.size_bytes), 0) AS total_bytes,
+                COUNT(*) AS object_count
+            FROM (
+                SELECT DISTINCT mm.thread_id, mo.sha256, mo.size_bytes
+                FROM message_media mm
+                INNER JOIN media_objects mo ON mo.sha256 = mm.sha256
+                WHERE mo.cloud_file_id IS NOT NULL
+                  AND mo.cloud_file_id != ''
+                  AND mm.thread_id != ''
+                  AND mm.thread_id != '__url__'
+            ) sub
+            LEFT JOIN threads t ON t.id = sub.thread_id
+            GROUP BY sub.thread_id
+            ORDER BY total_bytes DESC, object_count DESC, sub.thread_id ASC
+            "#,
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(RawThreadUsageRow {
+                    thread_id: r.get(0)?,
+                    enc_title: r.get(1)?,
+                    total_bytes: r.get(2)?,
+                    object_count: r.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let thread_name = self.decrypt_thread_name_opt(&row.thread_id, row.enc_title);
+            out.push(GDriveThreadUsageDto {
+                thread_id: row.thread_id,
+                thread_name,
+                total_bytes: row.total_bytes.max(0) as u64,
+                object_count: row.object_count.max(0) as u64,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn list_largest_cloud_items(&self, limit: usize) -> Result<Vec<GDriveCloudItemDto>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        struct RawCloudObjRow {
+            sha256: String,
+            cloud_file_id: String,
+            kind: String,
+            mime: String,
+            size_bytes: i64,
+            cloud_synced_ts: i64,
+            local_state: i64,
+        }
+        struct RawRefRow {
+            thread_id: String,
+            msg_id: String,
+            variant: String,
+            enc_orig_name: Option<String>,
+            enc_thread_title: Option<String>,
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT sha256, cloud_file_id, kind, mime, size_bytes, COALESCE(cloud_synced_ts, 0), local_state
+             FROM media_objects
+             WHERE cloud_file_id IS NOT NULL AND cloud_file_id != ''
+             ORDER BY size_bytes DESC, COALESCE(cloud_synced_ts, 0) DESC, sha256 ASC
+             LIMIT ?1",
+        )?;
+        let objs = stmt
+            .query_map(params![limit as i64], |r| {
+                Ok(RawCloudObjRow {
+                    sha256: r.get(0)?,
+                    cloud_file_id: r.get(1)?,
+                    kind: r.get(2)?,
+                    mime: r.get(3)?,
+                    size_bytes: r.get(4)?,
+                    cloud_synced_ts: r.get(5)?,
+                    local_state: r.get(6)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut ref_stmt = self.conn.prepare(
+            "SELECT mm.thread_id, mm.msg_id, mm.variant, mm.original_name, t.title
+             FROM message_media mm
+             LEFT JOIN threads t ON t.id = mm.thread_id
+             WHERE mm.sha256 = ?1
+             ORDER BY CASE WHEN mm.thread_id = '__url__' THEN 1 ELSE 0 END,
+                      CASE WHEN mm.original_name IS NOT NULL THEN 0 ELSE 1 END,
+                      mm.updated_ts DESC
+             LIMIT 1",
+        )?;
+
+        let mut out = Vec::with_capacity(objs.len());
+        for obj in objs {
+            let ref_row: Option<RawRefRow> = ref_stmt
+                .query_row(params![&obj.sha256], |r| {
+                    Ok(RawRefRow {
+                        thread_id: r.get(0)?,
+                        msg_id: r.get(1)?,
+                        variant: r.get(2)?,
+                        enc_orig_name: r.get(3)?,
+                        enc_thread_title: r.get(4)?,
+                    })
+                })
+                .optional()?;
+
+            let (original_name, thread_id, thread_name, msg_id) = match ref_row {
+                Some(r) => {
+                    let aad = message_media_aad(&r.thread_id, &r.msg_id, &r.variant);
+                    let orig_name = r
+                        .enc_orig_name
+                        .and_then(|s| self.cipher.decrypt_or_legacy(&aad, &s).ok())
+                        .filter(|s| !s.trim().is_empty());
+                    if r.thread_id == "__url__" || r.thread_id.is_empty() {
+                        (orig_name, None, None, None)
+                    } else {
+                        let tname =
+                            self.decrypt_thread_name_opt(&r.thread_id, r.enc_thread_title);
+                        (orig_name, Some(r.thread_id), Some(tname), Some(r.msg_id))
+                    }
+                }
+                None => (None, None, None, None),
+            };
+
+            out.push(GDriveCloudItemDto {
+                sha256: obj.sha256,
+                cloud_file_id: obj.cloud_file_id,
+                kind: obj.kind,
+                mime: obj.mime,
+                size_bytes: obj.size_bytes.max(0) as u64,
+                original_name,
+                thread_id,
+                thread_name,
+                msg_id,
+                cloud_synced_ts: obj.cloud_synced_ts,
+                local_state: obj.local_state,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn list_cloud_items_by_sha256s(
+        &self,
+        sha256s: &[String],
+    ) -> Result<Vec<(String, String, u64)>> {
+        if sha256s.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT sha256, cloud_file_id, size_bytes
+             FROM media_objects
+             WHERE sha256 = ?1 AND cloud_file_id IS NOT NULL AND cloud_file_id != ''
+             LIMIT 1",
+        )?;
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for sha in sha256s {
+            if !seen.insert(sha.as_str()) {
+                continue;
+            }
+            let row: Option<(String, String, i64)> = stmt
+                .query_row(params![sha], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .optional()?;
+            if let Some((s, cid, sz)) = row {
+                out.push((s, cid, sz.max(0) as u64));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn list_cloud_items_exclusive_to_thread(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<(String, String, u64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT mo.sha256, mo.cloud_file_id, mo.size_bytes
+             FROM media_objects mo
+             INNER JOIN message_media mm ON mm.sha256 = mo.sha256
+             WHERE mm.thread_id = ?1
+               AND mo.cloud_file_id IS NOT NULL
+               AND mo.cloud_file_id != ''
+               AND NOT EXISTS (
+                   SELECT 1 FROM message_media mm2
+                   WHERE mm2.sha256 = mo.sha256
+                     AND mm2.thread_id != ?1
+                     AND mm2.thread_id != '__url__'
+               )
+             ORDER BY mo.size_bytes DESC, mo.sha256 ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![thread_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?.max(0) as u64,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn list_cloud_items_older_than(
+        &self,
+        cutoff_ts_ms: i64,
+    ) -> Result<Vec<(String, String, u64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT sha256, cloud_file_id, size_bytes
+             FROM media_objects
+             WHERE cloud_file_id IS NOT NULL
+               AND cloud_file_id != ''
+               AND cloud_synced_ts IS NOT NULL
+               AND cloud_synced_ts < ?1
+             ORDER BY cloud_synced_ts ASC, sha256 ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![cutoff_ts_ms], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?.max(0) as u64,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn is_delta_applied(&self, delta_file_id: &str) -> Result<bool> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gdrive_applied_deltas WHERE delta_file_id = ?1)",
+            params![delta_file_id],
+            |r| r.get(0),
+        )?;
+        Ok(exists)
+    }
+
+    pub fn mark_delta_applied(&self, delta_file_id: &str, applied_ts: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO gdrive_applied_deltas (delta_file_id, applied_ts)
+             VALUES (?1, ?2)",
+            params![delta_file_id, applied_ts],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_gdrive_last_sync_ts(&self) -> Result<Option<i64>> {
+        let val: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT v FROM store_meta WHERE k = 'gdrive_last_sync_ts' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(val.and_then(|s| s.parse::<i64>().ok()))
+    }
+
+    pub fn set_gdrive_last_sync_ts(&self, ts: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO store_meta (k, v) VALUES ('gdrive_last_sync_ts', ?1)",
+            params![ts.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_gdrive_last_history_sync_ts(&self) -> Result<Option<i64>> {
+        let val: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT v FROM store_meta WHERE k = 'gdrive_last_history_sync_ts' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(val.and_then(|s| s.parse::<i64>().ok()))
+    }
+
+    pub fn set_gdrive_last_history_sync_ts(&self, ts: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO store_meta (k, v) VALUES ('gdrive_last_history_sync_ts', ?1)",
+            params![ts.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn export_history_delta_since(
+        &self,
+        uid: &str,
+        device_id: &str,
+        since_ts: i64,
+        limit_msgs: usize,
+    ) -> Result<HistoryDeltaBatch> {
+        const HISTORY_CLOUD_MEDIA_BATCH_LIMIT: usize = 2000;
+
+        let exported_ts = chrono::Utc::now().timestamp_millis();
+        let (messages, messages_truncated) = if limit_msgs == 0 {
+            let has_any: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE ts >= ?1)",
+                params![since_ts],
+                |r| r.get(0),
+            )?;
+            (Vec::new(), has_any)
+        } else {
+            let probe_limit = limit_msgs.saturating_add(1) as i64;
+            let mut msgs = self.query_messages(
+                "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name
+                 FROM messages
+                 WHERE ts >= ?1
+                 ORDER BY ts ASC, thread_id ASC, msg_id ASC
+                 LIMIT ?2",
+                params![since_ts, probe_limit],
+            )?;
+            let hit_limit = msgs.len() > limit_msgs;
+            if hit_limit {
+                msgs.truncate(limit_msgs);
+                if let Some(boundary_ts) = msgs.last().map(|m| m.ts) {
+                    let mut existing_at_boundary: std::collections::HashSet<(String, String)> =
+                        msgs.iter()
+                            .filter(|m| m.ts == boundary_ts)
+                            .map(|m| (m.thread_id.clone(), m.msg_id.clone()))
+                            .collect();
+                    let tie_msgs = self.query_messages(
+                        "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name
+                         FROM messages
+                         WHERE ts = ?1
+                         ORDER BY thread_id ASC, msg_id ASC",
+                        params![boundary_ts],
+                    )?;
+                    for tm in tie_msgs {
+                        if existing_at_boundary.insert((tm.thread_id.clone(), tm.msg_id.clone())) {
+                            msgs.push(tm);
+                        }
+                    }
+                    let has_more_after_boundary: bool = self.conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM messages WHERE ts > ?1)",
+                        params![boundary_ts],
+                        |r| r.get(0),
+                    )?;
+                    (msgs, has_more_after_boundary)
+                } else {
+                    (msgs, false)
+                }
+            } else {
+                (msgs, false)
+            }
+        };
+
+        let msg_thread_ids: std::collections::HashSet<&str> =
+            messages.iter().map(|m| m.thread_id.as_str()).collect();
+        let all_threads = self.list_threads(FolderFilter::All)?;
+        let threads = if since_ts <= 0 {
+            all_threads
+        } else {
+            all_threads
+                .into_iter()
+                .filter(|t| {
+                    t.last_ts >= since_ts
+                        || t.last_read_in_ts >= since_ts
+                        || t.peer_read_ts >= since_ts
+                        || msg_thread_ids.contains(t.id.as_str())
+                })
+                .collect()
+        };
+
+        let folders = self.list_chat_folders()?;
+        let mut thread_folders = Vec::new();
+        for f in &folders {
+            for tid in &f.thread_ids {
+                thread_folders.push((f.id.clone(), tid.clone()));
+            }
+        }
+
+        // Export cached translations for exported messages (re-encrypted on target device)
+        let mut translations = Vec::new();
+        if !messages.is_empty() {
+            struct RawTrRow {
+                target_lang: String,
+                provider: String,
+                enc_translated: String,
+                detected_source_lang: Option<String>,
+                skipped: i64,
+                updated_at: i64,
+            }
+            let mut tr_stmt = self.conn.prepare(
+                "SELECT target_lang, provider, translated_text, detected_source_lang, skipped, updated_at
+                 FROM message_translations
+                 WHERE msg_id = ?1",
+            )?;
+            let mut seen_msg_ids = std::collections::HashSet::new();
+            for m in &messages {
+                if m.is_recalled || !seen_msg_ids.insert(m.msg_id.as_str()) {
+                    continue;
+                }
+                let rows = tr_stmt
+                    .query_map(params![&m.msg_id], |r| {
+                        Ok(RawTrRow {
+                            target_lang: r.get(0)?,
+                            provider: r.get(1)?,
+                            enc_translated: r.get(2)?,
+                            detected_source_lang: r.get(3)?,
+                            skipped: r.get(4)?,
+                            updated_at: r.get(5)?,
+                        })
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for r in rows {
+                    if let Ok(plain) = self
+                        .cipher
+                        .decrypt_str(&translation_aad(&m.msg_id, &r.target_lang), &r.enc_translated)
+                    {
+                        translations.push(HistoryTranslationRecord {
+                            msg_id: m.msg_id.clone(),
+                            target_lang: r.target_lang,
+                            provider: r.provider,
+                            translated_text: plain,
+                            detected_source_lang: r.detected_source_lang,
+                            skipped: r.skipped != 0,
+                            updated_at: r.updated_at,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Export cloud-synced media links ordered deterministically by MAX(cloud_synced_ts, updated_ts),
+        // including sibling tie rows at the boundary millisecond whenever hitting the batch cap.
+        struct RawCloudLinkRow {
+            thread_id: String,
+            msg_id: String,
+            variant: String,
+            url_hash: String,
+            sha256: String,
+            enc_orig_name: Option<String>,
+            kind: String,
+            mime: String,
+            size_bytes: i64,
+            cloud_provider: Option<String>,
+            cloud_file_id: String,
+            cloud_key_ver: i32,
+            cloud_synced_ts: i64,
+            cursor_ts: i64,
+        }
+        let decode_cm_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<RawCloudLinkRow> {
+            Ok(RawCloudLinkRow {
+                thread_id: r.get(0)?,
+                msg_id: r.get(1)?,
+                variant: r.get(2)?,
+                url_hash: r.get(3)?,
+                sha256: r.get(4)?,
+                enc_orig_name: r.get(5)?,
+                kind: r.get(6)?,
+                mime: r.get(7)?,
+                size_bytes: r.get(8)?,
+                cloud_provider: r.get(9)?,
+                cloud_file_id: r.get(10)?,
+                cloud_key_ver: r.get(11)?,
+                cloud_synced_ts: r.get(12)?,
+                cursor_ts: r.get(13)?,
+            })
+        };
+        let mut cm_stmt = self.conn.prepare(
+            "SELECT mm.thread_id, mm.msg_id, mm.variant, mm.url_hash, mo.sha256, mm.original_name,
+                    mo.kind, mo.mime, mo.size_bytes, mo.cloud_provider, mo.cloud_file_id,
+                    mo.cloud_key_ver, COALESCE(mo.cloud_synced_ts, 0),
+                    MAX(COALESCE(mo.cloud_synced_ts, 0), mm.updated_ts) AS cursor_ts
+             FROM message_media mm
+             INNER JOIN media_objects mo ON mo.sha256 = mm.sha256
+             WHERE mo.cloud_file_id IS NOT NULL
+               AND mo.cloud_file_id != ''
+               AND MAX(COALESCE(mo.cloud_synced_ts, 0), mm.updated_ts) >= ?1
+             ORDER BY cursor_ts ASC, mm.thread_id ASC, mm.msg_id ASC, mm.variant ASC
+             LIMIT ?2",
+        )?;
+        let mut cm_rows = cm_stmt
+            .query_map(
+                params![since_ts, (HISTORY_CLOUD_MEDIA_BATCH_LIMIT + 1) as i64],
+                decode_cm_row,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut cloud_media_truncated = false;
+        if cm_rows.len() > HISTORY_CLOUD_MEDIA_BATCH_LIMIT {
+            cm_rows.truncate(HISTORY_CLOUD_MEDIA_BATCH_LIMIT);
+            if let Some(boundary_cm_ts) = cm_rows.last().map(|r| r.cursor_ts) {
+                let mut existing_cm: std::collections::HashSet<(String, String, String)> = cm_rows
+                    .iter()
+                    .filter(|r| r.cursor_ts == boundary_cm_ts)
+                    .map(|r| (r.thread_id.clone(), r.msg_id.clone(), r.variant.clone()))
+                    .collect();
+                let mut tie_stmt = self.conn.prepare(
+                    "SELECT mm.thread_id, mm.msg_id, mm.variant, mm.url_hash, mo.sha256, mm.original_name,
+                            mo.kind, mo.mime, mo.size_bytes, mo.cloud_provider, mo.cloud_file_id,
+                            mo.cloud_key_ver, COALESCE(mo.cloud_synced_ts, 0),
+                            MAX(COALESCE(mo.cloud_synced_ts, 0), mm.updated_ts) AS cursor_ts
+                     FROM message_media mm
+                     INNER JOIN media_objects mo ON mo.sha256 = mm.sha256
+                     WHERE mo.cloud_file_id IS NOT NULL
+                       AND mo.cloud_file_id != ''
+                       AND MAX(COALESCE(mo.cloud_synced_ts, 0), mm.updated_ts) = ?1
+                     ORDER BY mm.thread_id ASC, mm.msg_id ASC, mm.variant ASC",
+                )?;
+                let tie_rows = tie_stmt
+                    .query_map(params![boundary_cm_ts], decode_cm_row)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for tr in tie_rows {
+                    if existing_cm.insert((
+                        tr.thread_id.clone(),
+                        tr.msg_id.clone(),
+                        tr.variant.clone(),
+                    )) {
+                        cm_rows.push(tr);
+                    }
+                }
+                cloud_media_truncated = self.conn.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1
+                         FROM message_media mm
+                         INNER JOIN media_objects mo ON mo.sha256 = mm.sha256
+                         WHERE mo.cloud_file_id IS NOT NULL
+                           AND mo.cloud_file_id != ''
+                           AND MAX(COALESCE(mo.cloud_synced_ts, 0), mm.updated_ts) > ?1
+                     )",
+                    params![boundary_cm_ts],
+                    |r| r.get(0),
+                )?;
+            }
+        }
+
+        let max_cloud_media_cursor_ts = cm_rows.iter().map(|r| r.cursor_ts).max();
+        let mut cloud_media = Vec::with_capacity(cm_rows.len());
+        for r in cm_rows {
+            let aad = message_media_aad(&r.thread_id, &r.msg_id, &r.variant);
+            let original_name = r
+                .enc_orig_name
+                .and_then(|s| self.cipher.decrypt_or_legacy(&aad, &s).ok());
+            cloud_media.push(HistoryCloudMediaRecord {
+                thread_id: r.thread_id,
+                msg_id: r.msg_id,
+                variant: r.variant,
+                url_hash: r.url_hash,
+                sha256: r.sha256,
+                kind: r.kind,
+                mime: r.mime,
+                size_bytes: r.size_bytes.max(0) as u64,
+                original_name,
+                cloud_provider: r.cloud_provider.unwrap_or_else(|| "gdrive".to_string()),
+                cloud_file_id: r.cloud_file_id,
+                cloud_key_ver: r.cloud_key_ver,
+                cloud_synced_ts: r.cloud_synced_ts,
+            });
+        }
+
+        Ok(HistoryDeltaBatch {
+            version: HistoryDeltaBatch::CURRENT_VERSION,
+            uid: uid.to_string(),
+            device_id: device_id.to_string(),
+            exported_ts,
+            threads,
+            messages,
+            folders,
+            thread_folders,
+            translations,
+            cloud_media,
+            messages_truncated,
+            cloud_media_truncated,
+            max_cloud_media_cursor_ts,
+        })
+    }
+
+    pub fn import_history_delta_idempotent(&self, batch: &HistoryDeltaBatch) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        // 1. Upsert threads without regressing newer local timestamps, previews, or read watermarks.
+        for t in &batch.threads {
+            let kind_str = match t.kind {
+                ThreadKind::Direct => "direct",
+                ThreadKind::Group => "group",
+                ThreadKind::Cloud => "cloud",
+            };
+            let aad = thread_aad(&t.id);
+            let enc_title = self.cipher.encrypt_str(&aad, &t.title)?;
+            let enc_avatar = self.cipher.encrypt_str(&aad, &t.avatar)?;
+            let enc_preview = self.cipher.encrypt_str(&aad, &t.last_preview)?;
+            let title_fallback = (t.title.trim().is_empty() || t.title == t.id) as i64;
+            let avatar_empty = t.avatar.is_empty() as i64;
+            let preview_empty = t.last_preview.is_empty() as i64;
+            let last_ts = normalize_ts_ms(t.last_ts);
+            let last_read_in_ts = normalize_ts_ms(t.last_read_in_ts);
+            let peer_read_ts = normalize_ts_ms(t.peer_read_ts);
+            let muted_until_ts = normalize_ts_ms(t.muted_until_ts);
+
+            tx.execute(
+                r#"
+                INSERT INTO threads (id, title, title_norm, avatar, kind, last_preview, last_ts, unread_count, is_pinned, is_muted, last_read_in_ts, peer_read_ts, muted_until_ts, is_archived)
+                VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                ON CONFLICT(id) DO UPDATE SET
+                    title = CASE WHEN ?14 = 1 THEN threads.title ELSE excluded.title END,
+                    title_norm = '',
+                    avatar = CASE WHEN ?15 = 1 THEN threads.avatar ELSE excluded.avatar END,
+                    kind = excluded.kind,
+                    last_preview = CASE
+                        WHEN ?16 = 0 AND excluded.last_ts >= threads.last_ts THEN excluded.last_preview
+                        ELSE threads.last_preview
+                    END,
+                    last_ts = MAX(threads.last_ts, excluded.last_ts),
+                    unread_count = CASE
+                        WHEN excluded.last_ts > threads.last_ts THEN excluded.unread_count
+                        WHEN excluded.last_read_in_ts >= threads.last_ts AND threads.last_ts > 0 THEN 0
+                        ELSE threads.unread_count
+                    END,
+                    is_pinned = MAX(threads.is_pinned, excluded.is_pinned),
+                    is_muted = MAX(threads.is_muted, excluded.is_muted),
+                    last_read_in_ts = MAX(threads.last_read_in_ts, excluded.last_read_in_ts),
+                    peer_read_ts = MAX(threads.peer_read_ts, excluded.peer_read_ts),
+                    muted_until_ts = MAX(threads.muted_until_ts, excluded.muted_until_ts),
+                    is_archived = MAX(threads.is_archived, excluded.is_archived)
+                "#,
+                params![
+                    t.id,
+                    enc_title,
+                    enc_avatar,
+                    kind_str,
+                    enc_preview,
+                    last_ts,
+                    t.unread_count,
+                    t.is_pinned as i64,
+                    t.is_muted as i64,
+                    last_read_in_ts,
+                    peer_read_ts,
+                    muted_until_ts,
+                    t.is_archived as i64,
+                    title_fallback,
+                    avatar_empty,
+                    preview_empty,
+                ],
+            )?;
+        }
+
+        // 2. Idempotently merge folders + thread_folders without discarding existing local thread_ids.
+        if !batch.folders.is_empty() || !batch.thread_folders.is_empty() {
+            let mut extra_links: HashMap<&str, Vec<&str>> = HashMap::new();
+            for (fid, tid) in &batch.thread_folders {
+                extra_links.entry(fid.as_str()).or_default().push(tid.as_str());
+            }
+
+            let mut existing_folders: HashMap<String, ChatFolderDto> = HashMap::new();
+            {
+                let mut fstmt = tx.prepare("SELECT id, config_json FROM chat_folders")?;
+                let rows = fstmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (id, enc_json) in rows {
+                    if let Ok(raw) = self.cipher.decrypt_str(&folder_aad(&id), &enc_json) {
+                        if let Ok(dto) = serde_json::from_str::<ChatFolderDto>(&raw) {
+                            existing_folders.insert(id, dto);
+                        }
+                    }
+                }
+            }
+
+            let mut touched_folder_ids = std::collections::HashSet::new();
+            for incoming in &batch.folders {
+                let mut merged = match existing_folders.get(&incoming.id) {
+                    Some(local) => {
+                        let mut m = incoming.clone();
+                        for tid in &local.thread_ids {
+                            if !m.thread_ids.iter().any(|x| x == tid) {
+                                m.thread_ids.push(tid.clone());
+                            }
+                        }
+                        for tid in &local.excluded_thread_ids {
+                            if !m.excluded_thread_ids.iter().any(|x| x == tid) {
+                                m.excluded_thread_ids.push(tid.clone());
+                            }
+                        }
+                        if m.remote_label_id.is_none() {
+                            m.remote_label_id = local.remote_label_id.clone();
+                        }
+                        m
+                    }
+                    None => incoming.clone(),
+                };
+                if let Some(tids) = extra_links.get(merged.id.as_str()) {
+                    for &tid in tids {
+                        if !merged.thread_ids.iter().any(|x| x == tid) {
+                            merged.thread_ids.push(tid.to_string());
+                        }
+                    }
+                }
+                let aad = folder_aad(&merged.id);
+                let enc_name = self.cipher.encrypt_str(&aad, &merged.name)?;
+                let raw_json = serde_json::to_string(&merged)?;
+                let enc_json = self.cipher.encrypt_str(&aad, &raw_json)?;
+                tx.execute(
+                    "INSERT INTO chat_folders (id, name, icon, config_json, position)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(id) DO UPDATE SET
+                         name = excluded.name,
+                         icon = excluded.icon,
+                         config_json = excluded.config_json,
+                         position = excluded.position",
+                    params![merged.id, enc_name, merged.icon, enc_json, merged.position],
+                )?;
+                touched_folder_ids.insert(merged.id.clone());
+                existing_folders.insert(merged.id.clone(), merged);
+            }
+
+            for (fid, tids) in extra_links {
+                if touched_folder_ids.contains(fid) {
+                    continue;
+                }
+                if let Some(local) = existing_folders.get_mut(fid) {
+                    let mut changed = false;
+                    for tid in tids {
+                        if !local.thread_ids.iter().any(|x| x == tid) {
+                            local.thread_ids.push(tid.to_string());
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        let aad = folder_aad(&local.id);
+                        let enc_name = self.cipher.encrypt_str(&aad, &local.name)?;
+                        let raw_json = serde_json::to_string(local)?;
+                        let enc_json = self.cipher.encrypt_str(&aad, &raw_json)?;
+                        tx.execute(
+                            "UPDATE chat_folders SET name = ?2, config_json = ?3 WHERE id = ?1",
+                            params![local.id, enc_name, enc_json],
+                        )?;
+                    }
+                }
+            }
+        }
+
+        // 3. Idempotently merge messages without un-recalling or duplicating.
+        struct ExistingMsgMeta {
+            is_recalled: i64,
+            is_pinned: i64,
+            quote_json: Option<String>,
+            reactions_json: String,
+            attachment_url: Option<String>,
+            attachment_name: Option<String>,
+        }
+        let mut applied_count = 0usize;
+        let mut fts_updates: Vec<(String, String, i64, String, String)> = Vec::new();
+        let mut msg_text_map: HashMap<&str, &str> = HashMap::new();
+
+        for m in &batch.messages {
+            if !m.is_recalled {
+                msg_text_map.insert(m.msg_id.as_str(), m.text.as_str());
+            }
+            let ts = normalize_ts_ms(m.ts);
+            let aad = msg_aad(&m.thread_id, &m.msg_id);
+            let existing: Option<ExistingMsgMeta> = tx
+                .query_row(
+                    "SELECT is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name
+                     FROM messages
+                     WHERE thread_id = ?1 AND msg_id = ?2
+                     LIMIT 1",
+                    params![&m.thread_id, &m.msg_id],
+                    |r| {
+                        Ok(ExistingMsgMeta {
+                            is_recalled: r.get(0)?,
+                            is_pinned: r.get(1)?,
+                            quote_json: r.get(2)?,
+                            reactions_json: r.get(3)?,
+                            attachment_url: r.get(4)?,
+                            attachment_name: r.get(5)?,
+                        })
+                    },
+                )
+                .optional()?;
+
+            match existing {
+                None => {
+                    let quote_json = m
+                        .quote
+                        .as_ref()
+                        .and_then(|q| serde_json::to_string(q).ok());
+                    let reactions_json =
+                        serde_json::to_string(&m.reactions).unwrap_or_else(|_| "[]".to_string());
+                    let enc_sender_id = self.cipher.encrypt_str(&aad, &m.sender_id)?;
+                    let enc_sender_name = self.cipher.encrypt_str(&aad, &m.sender_name)?;
+                    let enc_text = self.cipher.encrypt_str(&aad, &m.text)?;
+                    let enc_quote = self.cipher.encrypt_opt(&aad, quote_json.as_deref())?;
+                    let enc_reactions = self.cipher.encrypt_str(&aad, &reactions_json)?;
+                    let enc_att_url = if m.is_recalled {
+                        None
+                    } else {
+                        self.cipher.encrypt_opt(&aad, m.attachment_url.as_deref())?
+                    };
+                    let enc_att_name = if m.is_recalled {
+                        None
+                    } else {
+                        self.cipher.encrypt_opt(&aad, m.attachment_name.as_deref())?
+                    };
+                    tx.execute(
+                        "INSERT INTO messages (msg_id, thread_id, sender_id, sender_name, text, text_norm, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name)
+                         VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                        params![
+                            m.msg_id,
+                            m.thread_id,
+                            enc_sender_id,
+                            enc_sender_name,
+                            enc_text,
+                            m.msg_type,
+                            ts,
+                            m.is_outgoing as i64,
+                            m.is_recalled as i64,
+                            m.is_pinned as i64,
+                            enc_quote,
+                            enc_reactions,
+                            enc_att_url,
+                            enc_att_name,
+                        ],
+                    )?;
+                    if !m.is_outgoing {
+                        tx.execute(
+                            "UPDATE threads SET peer_read_ts = MAX(peer_read_ts, ?2) WHERE id = ?1",
+                            params![m.thread_id, ts],
+                        )?;
+                    }
+                    fts_updates.push((
+                        m.msg_id.clone(),
+                        m.thread_id.clone(),
+                        ts,
+                        strip_vi_accents(&m.sender_name),
+                        strip_vi_accents(&m.text),
+                    ));
+                    applied_count += 1;
+                }
+                Some(cur) => {
+                    if cur.is_recalled != 0 {
+                        // Never un-recall a locally recalled message.
+                        continue;
+                    }
+                    if m.is_recalled {
+                        let enc_text = self.cipher.encrypt_str(&aad, &m.text)?;
+                        tx.execute(
+                            "UPDATE messages
+                             SET is_recalled = 1, text = ?3, attachment_url = NULL, attachment_name = NULL
+                             WHERE thread_id = ?1 AND msg_id = ?2",
+                            params![m.thread_id, m.msg_id, enc_text],
+                        )?;
+                        tx.execute(
+                            "DELETE FROM message_translations WHERE msg_id = ?1",
+                            params![m.msg_id],
+                        )?;
+                        tx.execute(
+                            "DELETE FROM message_media WHERE thread_id = ?1 AND msg_id = ?2",
+                            params![m.thread_id, m.msg_id],
+                        )?;
+                        fts_updates.push((
+                            m.msg_id.clone(),
+                            m.thread_id.clone(),
+                            ts,
+                            strip_vi_accents(&m.sender_name),
+                            strip_vi_accents(&m.text),
+                        ));
+                        applied_count += 1;
+                        continue;
+                    }
+
+                    let pin_upgraded = m.is_pinned && cur.is_pinned == 0;
+                    let fill_quote = cur.quote_json.is_none() && m.quote.is_some();
+                    let fill_att_url = cur.attachment_url.is_none() && m.attachment_url.is_some();
+                    let fill_att_name =
+                        cur.attachment_name.is_none() && m.attachment_name.is_some();
+                    let cur_reactions_empty = self
+                        .cipher
+                        .decrypt_or_legacy(&aad, &cur.reactions_json)
+                        .ok()
+                        .and_then(|s| serde_json::from_str::<Vec<ReactionSummary>>(&s).ok())
+                        .is_none_or(|v| v.is_empty());
+                    let fill_reactions = cur_reactions_empty && !m.reactions.is_empty();
+
+                    if pin_upgraded || fill_quote || fill_att_url || fill_att_name || fill_reactions
+                    {
+                        let new_pinned = (cur.is_pinned != 0 || m.is_pinned) as i64;
+                        let new_quote = if fill_quote {
+                            let qj = m
+                                .quote
+                                .as_ref()
+                                .and_then(|q| serde_json::to_string(q).ok());
+                            self.cipher.encrypt_opt(&aad, qj.as_deref())?
+                        } else {
+                            cur.quote_json
+                        };
+                        let new_reactions = if fill_reactions {
+                            let rj = serde_json::to_string(&m.reactions)
+                                .unwrap_or_else(|_| "[]".to_string());
+                            self.cipher.encrypt_str(&aad, &rj)?
+                        } else {
+                            cur.reactions_json
+                        };
+                        let new_att_url = if fill_att_url {
+                            self.cipher.encrypt_opt(&aad, m.attachment_url.as_deref())?
+                        } else {
+                            cur.attachment_url
+                        };
+                        let new_att_name = if fill_att_name {
+                            self.cipher
+                                .encrypt_opt(&aad, m.attachment_name.as_deref())?
+                        } else {
+                            cur.attachment_name
+                        };
+                        tx.execute(
+                            "UPDATE messages
+                             SET is_pinned = ?3, quote_json = ?4, reactions_json = ?5,
+                                 attachment_url = ?6, attachment_name = ?7
+                             WHERE thread_id = ?1 AND msg_id = ?2",
+                            params![
+                                m.thread_id,
+                                m.msg_id,
+                                new_pinned,
+                                new_quote,
+                                new_reactions,
+                                new_att_url,
+                                new_att_name,
+                            ],
+                        )?;
+                        applied_count += 1;
+                    }
+                }
+            }
+        }
+
+        // 4. Import translations (re-computing keyed MAC with local DB cipher)
+        for tr in &batch.translations {
+            let lang = tr.target_lang.trim().to_ascii_uppercase();
+            if lang.is_empty() {
+                continue;
+            }
+            let Some(&orig_text) = msg_text_map.get(tr.msg_id.as_str()) else {
+                continue;
+            };
+            let text_hash = self.cipher.keyed_translation_mac(&tr.msg_id, orig_text);
+            let enc_text = self
+                .cipher
+                .encrypt_str(&translation_aad(&tr.msg_id, &lang), &tr.translated_text)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO message_translations
+                 (msg_id, target_lang, text_hash, provider, translated_text, detected_source_lang, skipped, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    tr.msg_id,
+                    lang,
+                    text_hash,
+                    tr.provider,
+                    enc_text,
+                    tr.detected_source_lang.as_deref(),
+                    tr.skipped as i64,
+                    tr.updated_at,
+                ],
+            )?;
+        }
+
+        // 5. Import cloud media metadata (local_state = 0 if absent; preserves local_state = 1 if already local)
+        for cm in &batch.cloud_media {
+            if cm.sha256.is_empty() || cm.cloud_file_id.is_empty() {
+                continue;
+            }
+            let size_i64 = i64::try_from(cm.size_bytes).unwrap_or(i64::MAX);
+            tx.execute(
+                r#"
+                INSERT INTO media_objects (
+                    sha256, kind, mime, size_bytes, local_state, is_encrypted, pin_count,
+                    created_ts, last_accessed_ts, cloud_provider, cloud_file_id, cloud_encrypted,
+                    cloud_key_ver, cloud_synced_ts
+                )
+                VALUES (?1, ?2, ?3, ?4, 0, 1, 0, ?5, ?5, ?6, ?7, 1, ?8, ?9)
+                ON CONFLICT(sha256) DO UPDATE SET
+                    cloud_provider = COALESCE(media_objects.cloud_provider, excluded.cloud_provider),
+                    cloud_file_id = COALESCE(media_objects.cloud_file_id, excluded.cloud_file_id),
+                    cloud_key_ver = MAX(media_objects.cloud_key_ver, excluded.cloud_key_ver),
+                    cloud_synced_ts = COALESCE(media_objects.cloud_synced_ts, excluded.cloud_synced_ts)
+                "#,
+                params![
+                    cm.sha256,
+                    cm.kind,
+                    cm.mime,
+                    size_i64,
+                    cm.cloud_synced_ts,
+                    cm.cloud_provider,
+                    cm.cloud_file_id,
+                    cm.cloud_key_ver,
+                    cm.cloud_synced_ts,
+                ],
+            )?;
+            let variant = if cm.variant.trim().is_empty() {
+                "primary"
+            } else {
+                cm.variant.trim()
+            };
+            let aad = message_media_aad(&cm.thread_id, &cm.msg_id, variant);
+            let enc_orig_name = self.cipher.encrypt_opt(&aad, cm.original_name.as_deref())?;
+            tx.execute(
+                r#"
+                INSERT INTO message_media (
+                    thread_id, msg_id, variant, url_hash, sha256, original_name,
+                    saved_user_path, cdn_status, updated_ts
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 0, ?7)
+                ON CONFLICT(thread_id, msg_id, variant) DO UPDATE SET
+                    url_hash = CASE WHEN message_media.url_hash = '' THEN excluded.url_hash ELSE message_media.url_hash END,
+                    sha256 = COALESCE(message_media.sha256, excluded.sha256),
+                    original_name = COALESCE(message_media.original_name, excluded.original_name),
+                    updated_ts = MAX(message_media.updated_ts, excluded.updated_ts)
+                "#,
+                params![
+                    cm.thread_id,
+                    cm.msg_id,
+                    variant,
+                    cm.url_hash,
+                    cm.sha256,
+                    enc_orig_name,
+                    cm.cloud_synced_ts,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+
+        if !fts_updates.is_empty() {
+            let fts_tx = self.fts_conn.unchecked_transaction()?;
+            for (mid, tid, ts, sender_norm, text_norm) in fts_updates {
+                fts_tx.execute(
+                    "DELETE FROM messages_fts WHERE thread_id = ?1 AND msg_id = ?2",
+                    params![tid, mid],
+                )?;
+                fts_tx.execute(
+                    "INSERT INTO messages_fts (msg_id, thread_id, ts, sender_name, text_norm)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![mid, tid, ts, sender_norm, text_norm],
+                )?;
+            }
+            fts_tx.commit()?;
+        }
+
+        Ok(applied_count)
     }
 }
 
@@ -3376,6 +5607,1282 @@ mod tests {
         // clear_cached_translations removes remaining entries (tr-same)
         let cleared = store.clear_cached_translations(None, None).unwrap();
         assert_eq!(cleared, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_messages_skips_empty_quote_punctuation_tokens_and_clamps_limit() {
+        let dir = std::env::temp_dir().join(format!("litechat-store-search-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("search.db");
+        let mut store = MessageStore::open(&db_path).unwrap();
+
+        for idx in 0..205usize {
+            store
+                .upsert_message(&MessageDto {
+                    msg_id: format!("sm-{idx}"),
+                    thread_id: "t-search".into(),
+                    sender_id: "u1".into(),
+                    sender_name: "Nguyễn Văn An".into(),
+                    text: format!("Báo cáo tổng kết quý {idx}"),
+                    msg_type: "chat.text".into(),
+                    ts: 1_700_000_000 + idx as i64,
+                    is_outgoing: false,
+                    is_recalled: false,
+                    is_pinned: false,
+                    quote: None,
+                    reactions: Vec::new(),
+                    attachment_url: None,
+                    attachment_name: None,
+                })
+                .unwrap();
+        }
+
+        // Empty, whitespace, quote-only, punctuation-only, and control-char queries must not fail FTS5
+        for empty_query in [
+            "",
+            "   ",
+            "\"\"",
+            "\"\"\"\" \"\"",
+            "--- *** ??? () []",
+            "\0\r\n\t",
+            "\"---\" \"...\"",
+        ] {
+            let hits = store.search_messages(empty_query, 20).unwrap();
+            assert!(
+                hits.is_empty(),
+                "expected empty result for sanitized query {empty_query:?}"
+            );
+        }
+
+        // Mixed quotes/punctuation around real tokens still match cleanly
+        let mixed = store
+            .search_messages("\"\" \"tong\" ??? ket! \"\"", 10)
+            .unwrap();
+        assert_eq!(mixed.len(), 10);
+
+        // Limit clamps safely into 1..=200 (never errors or overflows i64)
+        let min_clamped = store.search_messages("tong ket", 0).unwrap();
+        assert_eq!(min_clamped.len(), 1);
+        let max_clamped = store.search_messages("tong ket", 500).unwrap();
+        assert_eq!(max_clamped.len(), 200);
+        let huge_clamped = store.search_messages("tong ket", usize::MAX).unwrap();
+        assert_eq!(huge_clamped.len(), 200);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upsert_thread_synced_with_read_state_clears_offline_read_and_protects_newer_ws() {
+        let dir = std::env::temp_dir().join(format!(
+            "litechat-store-sync-read-state-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("sync_read.db");
+        let store = MessageStore::open(&db_path).unwrap();
+
+        let initial = ThreadDto {
+            id: "dm-1".into(),
+            title: "Alice".into(),
+            avatar: String::new(),
+            kind: ThreadKind::Direct,
+            last_preview: "Bạn có đó không?".into(),
+            last_ts: 1_700_000_020_000,
+            unread_count: 3,
+            is_pinned: false,
+            is_muted: false,
+            last_read_in_ts: 1_700_000_010_000,
+            peer_read_ts: 0,
+            muted_until_ts: 0,
+            is_archived: false,
+        };
+        store.upsert_thread(&initial).unwrap();
+
+        // 1. Non-authoritative sync with unread_count=0 on incoming preview MUST preserve local unread
+        let non_auth = ThreadDto {
+            unread_count: 0,
+            last_read_in_ts: 0,
+            ..initial.clone()
+        };
+        store
+            .upsert_thread_synced_with_read_state(&non_auth, true, false)
+            .unwrap();
+        let after_non_auth = store.list_threads(FolderFilter::All).unwrap();
+        assert_eq!(after_non_auth[0].unread_count, 3);
+        assert_eq!(after_non_auth[0].last_read_in_ts, 1_700_000_010_000);
+
+        // 2. Stale authoritative snapshot (excluded.last_ts < threads.last_ts) MUST preserve newer local WS unread
+        let stale_auth = ThreadDto {
+            last_ts: 1_700_000_015_000,
+            unread_count: 0,
+            last_read_in_ts: 0,
+            ..initial.clone()
+        };
+        store
+            .upsert_thread_synced_with_read_state(&stale_auth, true, true)
+            .unwrap();
+        let after_stale = store.list_threads(FolderFilter::All).unwrap();
+        assert_eq!(after_stale[0].unread_count, 3);
+        assert_eq!(after_stale[0].last_ts, 1_700_000_020_000);
+        assert_eq!(after_stale[0].last_read_in_ts, 1_700_000_010_000);
+
+        // 3. Authoritative sync when phone read offline (excluded.last_ts >= threads.last_ts, unread=0)
+        //    clears local unread_count to 0 and advances last_read_in_ts
+        let phone_read = ThreadDto {
+            last_ts: 1_700_000_025_000,
+            unread_count: 0,
+            last_read_in_ts: 0,
+            ..initial.clone()
+        };
+        store
+            .upsert_thread_synced_with_read_state(&phone_read, true, true)
+            .unwrap();
+        let after_phone_read = store.list_threads(FolderFilter::All).unwrap();
+        assert_eq!(after_phone_read[0].unread_count, 0);
+        assert_eq!(after_phone_read[0].last_ts, 1_700_000_025_000);
+        assert_eq!(after_phone_read[0].last_read_in_ts, 1_700_000_025_000);
+
+        // 4. Authoritative remote unread mark (unread_count=1) marks thread unread again
+        let phone_marked_unread = ThreadDto {
+            last_ts: 1_700_000_025_000,
+            unread_count: 1,
+            last_read_in_ts: 0,
+            ..initial
+        };
+        store
+            .upsert_thread_synced_with_read_state(&phone_marked_unread, true, true)
+            .unwrap();
+        let after_mark_unread = store.list_threads(FolderFilter::All).unwrap();
+        assert_eq!(after_mark_unread[0].unread_count, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn get_latest_incoming_message_with_type_returns_actual_msg_type_and_skips_outgoing() {
+        let dir = std::env::temp_dir().join(format!(
+            "litechat-store-latest-in-type-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("latest_in_type.db");
+        let mut store = MessageStore::open(&db_path).unwrap();
+
+        assert!(store
+            .get_latest_incoming_message_with_type("t-in")
+            .unwrap()
+            .is_none());
+
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "m-out-only".into(),
+                thread_id: "t-out".into(),
+                sender_id: "me".into(),
+                sender_name: "Bạn".into(),
+                text: "out".into(),
+                msg_type: "chat.text".into(),
+                ts: 1_700_000_001_000,
+                is_outgoing: true,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+        assert!(store
+            .get_latest_incoming_message_with_type("t-out")
+            .unwrap()
+            .is_none());
+
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "m1".into(),
+                thread_id: "t-in".into(),
+                sender_id: "peer-1".into(),
+                sender_name: "Alice".into(),
+                text: "[Hình ảnh]".into(),
+                msg_type: "chat.photo".into(),
+                ts: 1_700_000_010_000,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "m2".into(),
+                thread_id: "t-in".into(),
+                sender_id: "peer-2".into(),
+                sender_name: "Bob".into(),
+                text: "[Nhãn dán]".into(),
+                msg_type: "chat.sticker".into(),
+                ts: 1_700_000_020_000,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "m3".into(),
+                thread_id: "t-in".into(),
+                sender_id: "me".into(),
+                sender_name: "Bạn".into(),
+                text: "reply".into(),
+                msg_type: "chat.text".into(),
+                ts: 1_700_000_030_000,
+                is_outgoing: true,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+
+        let latest = store
+            .get_latest_incoming_message_with_type("t-in")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            latest,
+            (
+                "m2".to_string(),
+                "peer-2".to_string(),
+                "chat.sticker".to_string()
+            )
+        );
+
+        // Empty msg_type normalizes to "chat.text"
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "m4".into(),
+                thread_id: "t-in".into(),
+                sender_id: "peer-3".into(),
+                sender_name: "Carol".into(),
+                text: "plain".into(),
+                msg_type: "".into(),
+                ts: 1_700_000_040_000,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+        let latest2 = store
+            .get_latest_incoming_message_with_type("t-in")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            latest2,
+            (
+                "m4".to_string(),
+                "peer-3".to_string(),
+                "chat.text".to_string()
+            )
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn media_vault_schema_has_no_blobs_encrypts_paths_and_handles_crud_orphans_and_recalls() {
+        let dir = std::env::temp_dir().join(format!("teza-store-media-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("media_idx.db");
+        let mut store = MessageStore::open(&db_path).unwrap();
+
+        // Confirm zero BLOB columns in media_objects and message_media
+        for table in ["media_objects", "message_media"] {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            let types: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(2))
+                .unwrap()
+                .map(|r| r.unwrap().to_ascii_uppercase())
+                .collect();
+            assert!(!types.is_empty(), "table {table} must exist");
+            assert!(
+                !types.iter().any(|t| t.contains("BLOB")),
+                "table {table} must not have BLOB columns: {types:?}"
+            );
+        }
+
+        // Insert thumb + main media + cloud-only evicted object
+        let thumb_obj = MediaObjectRecord {
+            sha256: "t".repeat(64),
+            kind: "thumb".into(),
+            mime: "image/webp".into(),
+            size_bytes: 5_000,
+            thumb_sha256: None,
+            width: Some(320),
+            height: Some(240),
+            duration_ms: None,
+            local_state: MEDIA_LOCAL_STATE_LOCAL,
+            local_rel_path: Some(format!("thumbs/tt/tt/{}.enc", "t".repeat(64))),
+            is_encrypted: true,
+            pin_count: 0,
+            created_ts: 1000,
+            last_accessed_ts: 1000,
+            cloud_provider: None,
+            cloud_file_id: None,
+            cloud_encrypted: true,
+            cloud_key_ver: 1,
+            cloud_synced_ts: None,
+        };
+        let main_obj = MediaObjectRecord {
+            sha256: "a".repeat(64),
+            kind: "video".into(),
+            mime: "video/mp4".into(),
+            size_bytes: 200_000,
+            thumb_sha256: Some(thumb_obj.sha256.clone()),
+            width: Some(1920),
+            height: Some(1080),
+            duration_ms: Some(15_000),
+            local_state: MEDIA_LOCAL_STATE_LOCAL,
+            local_rel_path: Some(format!("blobs/aa/aa/{}.enc", "a".repeat(64))),
+            is_encrypted: true,
+            pin_count: 0,
+            created_ts: 1100,
+            last_accessed_ts: 1100,
+            cloud_provider: Some("gdrive".into()),
+            cloud_file_id: Some("drv-file-1".into()),
+            cloud_encrypted: true,
+            cloud_key_ver: 1,
+            cloud_synced_ts: Some(1200),
+        };
+        let voice_obj = MediaObjectRecord {
+            sha256: "b".repeat(64),
+            kind: "voice".into(),
+            mime: "audio/aac".into(),
+            size_bytes: 30_000,
+            thumb_sha256: None,
+            width: None,
+            height: None,
+            duration_ms: Some(4_500),
+            local_state: MEDIA_LOCAL_STATE_LOCAL,
+            local_rel_path: Some(format!("blobs/bb/bb/{}.enc", "b".repeat(64))),
+            is_encrypted: true,
+            pin_count: 0,
+            created_ts: 1200,
+            last_accessed_ts: 1200,
+            cloud_provider: None,
+            cloud_file_id: None,
+            cloud_encrypted: true,
+            cloud_key_ver: 1,
+            cloud_synced_ts: None,
+        };
+        store.upsert_media_object(&thumb_obj).unwrap();
+        store.upsert_media_object(&main_obj).unwrap();
+        store.upsert_media_object(&voice_obj).unwrap();
+
+        store
+            .link_message_media(&MessageMediaRecord {
+                thread_id: "t1".into(),
+                msg_id: "m1".into(),
+                variant: "primary".into(),
+                url_hash: "u1".into(),
+                sha256: Some(main_obj.sha256.clone()),
+                original_name: Some("Báo cáo mật 2026.mp4".into()),
+                saved_user_path: None,
+                cdn_status: MEDIA_CDN_STATUS_OK,
+                updated_ts: 1500,
+            })
+            .unwrap();
+        store
+            .set_message_saved_path("t1", "m1", "E:\\Exports\\BaoCaoMat.mp4")
+            .unwrap();
+        assert_eq!(
+            store.get_message_saved_path("t1", "m1").unwrap().as_deref(),
+            Some("E:\\Exports\\BaoCaoMat.mp4")
+        );
+
+        // Verify raw SQLite stores ciphertext (no plaintext filename/user path on disk)
+        {
+            let raw = Connection::open(&db_path).unwrap();
+            let (raw_name, raw_saved): (String, String) = raw
+                .query_row(
+                    "SELECT original_name, saved_user_path FROM message_media WHERE thread_id='t1' AND msg_id='m1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert!(raw_name.starts_with(ENC_PREFIX));
+            assert!(!raw_name.contains("Báo cáo"));
+            assert!(raw_saved.starts_with(ENC_PREFIX));
+            assert!(!raw_saved.contains("BaoCaoMat"));
+        }
+
+        // Lookup by URL hash and by message
+        assert_eq!(
+            store.lookup_media_by_url_hash("u1").unwrap().unwrap().sha256,
+            main_obj.sha256
+        );
+        assert_eq!(
+            store.lookup_media_by_msg("t1", "m1", "primary").unwrap().unwrap().sha256,
+            main_obj.sha256
+        );
+
+        // Pin voice_obj -> excluded from LRU candidates; thumb_obj is also excluded from LRU
+        assert!(store.set_media_pin(&voice_obj.sha256, true).unwrap());
+        let candidates = store.select_lru_eviction_candidates(10).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].sha256, main_obj.sha256);
+
+        // Stats accurately break down kinds, pinned, and cloud_synced
+        let stats = store.compute_media_stats().unwrap();
+        assert_eq!(stats.object_count, 3);
+        assert_eq!(stats.total_bytes, 235_000);
+        assert_eq!(stats.pinned_count, 1);
+        assert_eq!(stats.pinned_bytes, 30_000);
+        assert_eq!(stats.video_bytes, 200_000);
+        assert_eq!(stats.voice_bytes, 30_000);
+        assert_eq!(stats.thumb_bytes, 5_000);
+        assert_eq!(stats.cloud_synced_count, 1);
+        assert_eq!(stats.cloud_total_bytes, 200_000);
+
+        // Touch & CDN expiry update
+        store
+            .batch_touch_media_access(&[(main_obj.sha256.clone(), 9_999)])
+            .unwrap();
+        assert_eq!(
+            store.get_media_object(&main_obj.sha256).unwrap().unwrap().last_accessed_ts,
+            9_999
+        );
+        assert_eq!(store.mark_media_cdn_status("u1", MEDIA_CDN_STATUS_EXPIRED).unwrap(), 1);
+        assert_eq!(
+            store
+                .get_message_media_record("t1", "m1", "primary")
+                .unwrap()
+                .unwrap()
+                .cdn_status,
+            MEDIA_CDN_STATUS_EXPIRED
+        );
+
+        // Orphan cleanup: shared blob stays until last referencing message is removed; thumb also cleaned up
+        store
+            .link_message_media(&MessageMediaRecord {
+                thread_id: "t1".into(),
+                msg_id: "m2".into(),
+                variant: "primary".into(),
+                url_hash: "u2".into(),
+                sha256: Some(main_obj.sha256.clone()),
+                original_name: None,
+                saved_user_path: None,
+                cdn_status: MEDIA_CDN_STATUS_OK,
+                updated_ts: 1600,
+            })
+            .unwrap();
+        let orphan_1 = store.cleanup_orphaned_media_for_msg("t1", "m1").unwrap();
+        assert!(orphan_1.is_empty(), "m2 still references main_obj");
+
+        let orphan_2 = store.cleanup_orphaned_media_for_msg("t1", "m2").unwrap();
+        assert_eq!(orphan_2.len(), 2, "both main_obj and its thumb become orphaned");
+        // main_obj had cloud_file_id so row is preserved as evicted (local_state=0); thumb had no cloud so deleted
+        assert_eq!(
+            store.get_media_object(&main_obj.sha256).unwrap().unwrap().local_state,
+            MEDIA_LOCAL_STATE_MISSING
+        );
+        assert!(store.get_media_object(&thumb_obj.sha256).unwrap().is_none());
+
+        // mark_recalled and delete_message remove message_media rows
+        for mid in ["m_rec", "m_del"] {
+            store
+                .upsert_message(&MessageDto {
+                    msg_id: mid.into(),
+                    thread_id: "t2".into(),
+                    sender_id: "u1".into(),
+                    sender_name: "Alice".into(),
+                    text: "[Voice]".into(),
+                    msg_type: "chat.voice".into(),
+                    ts: 2000,
+                    is_outgoing: false,
+                    is_recalled: false,
+                    is_pinned: false,
+                    quote: None,
+                    reactions: Vec::new(),
+                    attachment_url: Some("https://f10-zpc.zdn.vn/v.aac".into()),
+                    attachment_name: None,
+                })
+                .unwrap();
+            store
+                .link_message_media(&MessageMediaRecord {
+                    thread_id: "t2".into(),
+                    msg_id: mid.into(),
+                    variant: "primary".into(),
+                    url_hash: format!("uh_{mid}"),
+                    sha256: Some(voice_obj.sha256.clone()),
+                    original_name: None,
+                    saved_user_path: None,
+                    cdn_status: MEDIA_CDN_STATUS_OK,
+                    updated_ts: 2000,
+                })
+                .unwrap();
+        }
+        store.mark_recalled("t2", "m_rec").unwrap();
+        assert!(store.get_message_media_record("t2", "m_rec", "primary").unwrap().is_none());
+        assert!(store.delete_message("t2", "m_del").unwrap());
+        assert!(store.get_message_media_record("t2", "m_del", "primary").unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cloud_storage_manager_queries_breakdown_thread_usage_exclusive_prune_and_clear_links() {
+        let dir = std::env::temp_dir().join(format!(
+            "teza-store-cloud-mgr-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("cloud_mgr.db");
+        let store = MessageStore::open(&db_path).unwrap();
+
+        for (id, title) in [("t1", "Nhóm Thiết Kế"), ("t2", "Khách Hàng VIP")] {
+            store
+                .upsert_thread(&ThreadDto {
+                    id: id.into(),
+                    title: title.into(),
+                    avatar: String::new(),
+                    kind: ThreadKind::Group,
+                    last_preview: "hi".into(),
+                    last_ts: 1_700_000_000_000,
+                    unread_count: 0,
+                    is_pinned: false,
+                    is_muted: false,
+                    last_read_in_ts: 0,
+                    peer_read_ts: 0,
+                    muted_until_ts: 0,
+                    is_archived: false,
+                })
+                .unwrap();
+        }
+
+        let sha_img = "1".repeat(64);
+        let sha_vid = "2".repeat(64);
+        let sha_shared = "3".repeat(64);
+        let sha_pending = "4".repeat(64);
+        let sha_thumb = "5".repeat(64);
+
+        for (sha, kind, mime, size, local_state, rel, created_ts) in [
+            (
+                &sha_img,
+                "image",
+                "image/jpeg",
+                100_000u64,
+                MEDIA_LOCAL_STATE_LOCAL,
+                Some(format!("blobs/11/11/{sha_img}.enc")),
+                1_000i64,
+            ),
+            (
+                &sha_vid,
+                "video",
+                "video/mp4",
+                500_000u64,
+                MEDIA_LOCAL_STATE_MISSING,
+                None,
+                2_000i64,
+            ),
+            (
+                &sha_shared,
+                "file",
+                "application/pdf",
+                250_000u64,
+                MEDIA_LOCAL_STATE_LOCAL,
+                Some(format!("blobs/33/33/{sha_shared}.enc")),
+                3_000i64,
+            ),
+            (
+                &sha_pending,
+                "voice",
+                "audio/aac",
+                40_000u64,
+                MEDIA_LOCAL_STATE_LOCAL,
+                Some(format!("blobs/44/44/{sha_pending}.enc")),
+                4_000i64,
+            ),
+            (
+                &sha_thumb,
+                "thumb",
+                "image/webp",
+                5_000u64,
+                MEDIA_LOCAL_STATE_LOCAL,
+                Some(format!("thumbs/55/55/{sha_thumb}.enc")),
+                5_000i64,
+            ),
+        ] {
+            store
+                .upsert_media_object(&MediaObjectRecord {
+                    sha256: sha.clone(),
+                    kind: kind.into(),
+                    mime: mime.into(),
+                    size_bytes: size,
+                    thumb_sha256: None,
+                    width: None,
+                    height: None,
+                    duration_ms: None,
+                    local_state,
+                    local_rel_path: rel,
+                    is_encrypted: true,
+                    pin_count: 0,
+                    created_ts,
+                    last_accessed_ts: created_ts,
+                    cloud_provider: None,
+                    cloud_file_id: None,
+                    cloud_encrypted: true,
+                    cloud_key_ver: 1,
+                    cloud_synced_ts: None,
+                })
+                .unwrap();
+        }
+
+        // Before marking synced: pending uploads include local non-thumbs only (excludes vid local_state=0 and thumb)
+        let pending_before = store.list_pending_cloud_uploads(10).unwrap();
+        let pending_shas: Vec<&str> = pending_before.iter().map(|o| o.sha256.as_str()).collect();
+        assert_eq!(
+            pending_shas,
+            vec![sha_img.as_str(), sha_shared.as_str(), sha_pending.as_str()]
+        );
+
+        // Mark img (old), vid (mid), shared (new) as cloud synced
+        store
+            .mark_media_cloud_synced(&sha_img, "gdrive", "drv-img", 1, 10_000)
+            .unwrap();
+        store
+            .mark_media_cloud_synced(&sha_vid, "gdrive", "drv-vid", 1, 20_000)
+            .unwrap();
+        store
+            .mark_media_cloud_synced(&sha_shared, "gdrive", "drv-shared", 1, 30_000)
+            .unwrap();
+
+        // Pending now has only sha_pending
+        let pending_after = store.list_pending_cloud_uploads(10).unwrap();
+        assert_eq!(pending_after.len(), 1);
+        assert_eq!(pending_after[0].sha256, sha_pending);
+
+        // Link media to threads:
+        // t1 has img (linked twice -> deduplicated!), vid, and shared
+        // t2 has shared (so shared is NOT exclusive to t1!)
+        for (tid, mid, uh, sha, name) in [
+            ("t1", "m1", "u1", &sha_img, Some("anh_du_an.jpg")),
+            ("t1", "m1b", "u1b", &sha_img, Some("anh_du_an_dup.jpg")),
+            ("t1", "m2", "u2", &sha_vid, Some("demo_4k.mp4")),
+            ("t1", "m3", "u3", &sha_shared, Some("hop_dong.pdf")),
+            ("t2", "m4", "u4", &sha_shared, Some("hop_dong.pdf")),
+        ] {
+            store
+                .link_message_media(&MessageMediaRecord {
+                    thread_id: tid.into(),
+                    msg_id: mid.into(),
+                    variant: "primary".into(),
+                    url_hash: uh.into(),
+                    sha256: Some(sha.clone()),
+                    original_name: name.map(str::to_string),
+                    saved_user_path: None,
+                    cdn_status: MEDIA_CDN_STATUS_OK,
+                    updated_ts: 50_000,
+                })
+                .unwrap();
+        }
+
+        let bd = store.compute_cloud_media_breakdown().unwrap();
+        assert_eq!(bd.total_bytes, 850_000);
+        assert_eq!(bd.total_count, 3);
+        assert_eq!(bd.images_bytes, 100_000);
+        assert_eq!(bd.videos_bytes, 500_000);
+        assert_eq!(bd.voice_bytes, 0);
+        assert_eq!(bd.files_bytes, 250_000);
+        assert_eq!(bd.pending_count, 1);
+        assert_eq!(bd.pending_bytes, 40_000);
+
+        let by_thread = store.list_cloud_usage_by_thread().unwrap();
+        assert_eq!(by_thread.len(), 2);
+        assert_eq!(by_thread[0].thread_id, "t1");
+        assert_eq!(by_thread[0].thread_name, "Nhóm Thiết Kế");
+        assert_eq!(by_thread[0].object_count, 3); // deduplicated sha_img!
+        assert_eq!(by_thread[0].total_bytes, 850_000);
+        assert_eq!(by_thread[1].thread_id, "t2");
+        assert_eq!(by_thread[1].thread_name, "Khách Hàng VIP");
+        assert_eq!(by_thread[1].object_count, 1);
+        assert_eq!(by_thread[1].total_bytes, 250_000);
+
+        let largest = store.list_largest_cloud_items(2).unwrap();
+        assert_eq!(largest.len(), 2);
+        assert_eq!(largest[0].sha256, sha_vid);
+        assert_eq!(largest[0].cloud_file_id, "drv-vid");
+        assert_eq!(largest[0].original_name.as_deref(), Some("demo_4k.mp4"));
+        assert_eq!(largest[0].thread_name.as_deref(), Some("Nhóm Thiết Kế"));
+        assert_eq!(largest[0].local_state, 0);
+        assert_eq!(largest[1].sha256, sha_shared);
+        assert_eq!(largest[1].local_state, 1);
+
+        // Exclusive to t1 MUST skip sha_shared because t2 also references it!
+        let excl_t1 = store.list_cloud_items_exclusive_to_thread("t1").unwrap();
+        assert_eq!(
+            excl_t1,
+            vec![
+                (sha_vid.clone(), "drv-vid".to_string(), 500_000),
+                (sha_img.clone(), "drv-img".to_string(), 100_000),
+            ]
+        );
+        assert!(store.list_cloud_items_exclusive_to_thread("t2").unwrap().is_empty());
+
+        // Older than 25_000 -> img (10k) and vid (20k), skipping shared (30k)
+        let older = store.list_cloud_items_older_than(25_000).unwrap();
+        assert_eq!(
+            older,
+            vec![
+                (sha_img.clone(), "drv-img".to_string(), 100_000),
+                (sha_vid.clone(), "drv-vid".to_string(), 500_000),
+            ]
+        );
+
+        // Lookup by explicit sha256s deduplicates input and skips unsynced blobs
+        let by_shas = store
+            .list_cloud_items_by_sha256s(&[
+                sha_img.clone(),
+                sha_img.clone(),
+                sha_pending.clone(),
+            ])
+            .unwrap();
+        assert_eq!(by_shas, vec![(sha_img.clone(), "drv-img".to_string(), 100_000)]);
+
+        // Clear cloud links preserves local_state & local_rel_path!
+        let cleared = store
+            .clear_media_cloud_links(std::slice::from_ref(&sha_img))
+            .unwrap();
+        assert_eq!(cleared, 1);
+        let reloaded_img = store.get_media_object(&sha_img).unwrap().unwrap();
+        assert!(reloaded_img.cloud_file_id.is_none());
+        assert!(reloaded_img.cloud_provider.is_none());
+        assert!(reloaded_img.cloud_synced_ts.is_none());
+        assert_eq!(reloaded_img.local_state, MEDIA_LOCAL_STATE_LOCAL);
+        assert!(reloaded_img.local_rel_path.is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_delta_export_and_idempotent_import_preserve_state_and_avoid_regressions() {
+        let dir = std::env::temp_dir().join(format!(
+            "teza-store-delta-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut src = MessageStore::open(&dir.join("src.db")).unwrap();
+
+        src.upsert_thread(&ThreadDto {
+            id: "t1".into(),
+            title: "Phòng Kỹ Thuật".into(),
+            avatar: "https://s.zalo.me/t1.jpg".into(),
+            kind: ThreadKind::Group,
+            last_preview: "Đã xong bản build".into(),
+            last_ts: 1_700_000_200_000,
+            unread_count: 0,
+            is_pinned: true,
+            is_muted: false,
+            last_read_in_ts: 1_700_000_200_000,
+            peer_read_ts: 1_700_000_190_000,
+            muted_until_ts: 0,
+            is_archived: false,
+        })
+        .unwrap();
+
+        src.save_chat_folder(&ChatFolderDto {
+            id: "f-dev".into(),
+            name: "Dev".into(),
+            icon: "code".into(),
+            color: "#3b82f6".into(),
+            thread_ids: vec!["t1".into()],
+            excluded_thread_ids: Vec::new(),
+            include_kinds: vec![ThreadKind::Group],
+            only_unread: false,
+            exclude_muted: false,
+            position: 1,
+            remote_label_id: None,
+        })
+        .unwrap();
+
+        src.upsert_message(&MessageDto {
+            msg_id: "m1".into(),
+            thread_id: "t1".into(),
+            sender_id: "u1".into(),
+            sender_name: "Minh".into(),
+            text: "Deploy bản cập nhật nhé".into(),
+            msg_type: "chat.text".into(),
+            ts: 1_700_000_100_000,
+            is_outgoing: false,
+            is_recalled: false,
+            is_pinned: true,
+            quote: None,
+            reactions: vec![ReactionSummary {
+                emoji: "👍".into(),
+                count: 2,
+                me: true,
+            }],
+            attachment_url: None,
+            attachment_name: None,
+        })
+        .unwrap();
+
+        src.upsert_cached_translations(
+            &[(
+                "m1".into(),
+                "Deploy bản cập nhật nhé".into(),
+                TranslationResult {
+                    msg_id: "m1".into(),
+                    translated_text: "Let's deploy the update".into(),
+                    detected_source_lang: Some("VI".into()),
+                    skipped: false,
+                },
+            )],
+            "EN",
+            "deepl",
+        )
+        .unwrap();
+
+        let batch = src
+            .export_history_delta_since("uid-1", "dev-A", 0, 500)
+            .unwrap();
+        assert_eq!(batch.version, HistoryDeltaBatch::CURRENT_VERSION);
+        assert_eq!(batch.threads.len(), 1);
+        assert_eq!(batch.messages.len(), 1);
+        assert_eq!(batch.folders.len(), 1);
+        assert_eq!(batch.thread_folders, vec![("f-dev".into(), "t1".into())]);
+        assert_eq!(batch.translations.len(), 1);
+
+        // Import into a brand-new DB (different DbCipher key!)
+        let mut dst = MessageStore::open(&dir.join("dst.db")).unwrap();
+        assert!(!dst.is_delta_applied("delta-file-1").unwrap());
+        let first_applied = dst.import_history_delta_idempotent(&batch).unwrap();
+        assert_eq!(first_applied, 1);
+        dst.mark_delta_applied("delta-file-1", 1_700_000_300_000)
+            .unwrap();
+        assert!(dst.is_delta_applied("delta-file-1").unwrap());
+
+        // Verify thread, folder, pinned message, FTS search, and translation all imported!
+        let dst_threads = dst.list_threads(FolderFilter::All).unwrap();
+        assert_eq!(dst_threads.len(), 1);
+        assert_eq!(dst_threads[0].title, "Phòng Kỹ Thuật");
+        assert!(dst_threads[0].is_pinned);
+        assert_eq!(dst_threads[0].last_read_in_ts, 1_700_000_200_000);
+
+        let dst_folders = dst.list_chat_folders().unwrap();
+        assert_eq!(dst_folders.len(), 1);
+        assert_eq!(dst_folders[0].thread_ids, vec!["t1".to_string()]);
+
+        let dst_msg = dst.get_message("t1", "m1").unwrap().unwrap();
+        assert!(dst_msg.is_pinned);
+        assert_eq!(dst_msg.reactions.len(), 1);
+        assert_eq!(dst.search_messages("ban cap nhat", 10).unwrap().len(), 1);
+
+        let dst_tr = dst
+            .get_cached_translations(&[("m1".into(), "Deploy bản cập nhật nhé".into())], "EN")
+            .unwrap();
+        assert_eq!(dst_tr["m1"].translated_text, "Let's deploy the update");
+
+        // Re-applying identical delta is a clean 0-change no-op
+        assert_eq!(dst.import_history_delta_idempotent(&batch).unwrap(), 0);
+
+        // Local advances last_ts & recalls m1 -> re-applying older delta MUST NOT regress or un-recall!
+        dst.update_thread_preview("t1", "Tin mới nhất cục bộ", 1_700_000_999_000, false)
+            .unwrap();
+        dst.mark_thread_read("t1").unwrap();
+        dst.mark_recalled("t1", "m1").unwrap();
+
+        assert_eq!(dst.import_history_delta_idempotent(&batch).unwrap(), 0);
+        let after_old = dst.list_threads(FolderFilter::All).unwrap();
+        assert_eq!(after_old[0].last_ts, 1_700_000_999_000);
+        assert_eq!(after_old[0].last_read_in_ts, 1_700_000_999_000);
+        assert_eq!(after_old[0].last_preview, "Tin mới nhất cục bộ");
+        assert!(dst.get_message("t1", "m1").unwrap().unwrap().is_recalled);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mark_media_cloud_pruned_excludes_local_blob_from_pending_reupload() {
+        let dir = std::env::temp_dir().join(format!(
+            "teza-store-cloud-pruned-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = MessageStore::open(&dir.join("pruned.db")).unwrap();
+
+        let sha_keep = "c".repeat(64);
+        let sha_prune = "d".repeat(64);
+        for (sha, size, ts) in [(&sha_keep, 10_000u64, 1_000i64), (&sha_prune, 80_000u64, 2_000i64)]
+        {
+            store
+                .upsert_media_object(&MediaObjectRecord {
+                    sha256: sha.clone(),
+                    kind: "video".into(),
+                    mime: "video/mp4".into(),
+                    size_bytes: size,
+                    thumb_sha256: None,
+                    width: None,
+                    height: None,
+                    duration_ms: None,
+                    local_state: MEDIA_LOCAL_STATE_LOCAL,
+                    local_rel_path: Some(format!("blobs/cc/cc/{sha}.enc")),
+                    is_encrypted: true,
+                    pin_count: 0,
+                    created_ts: ts,
+                    last_accessed_ts: ts,
+                    cloud_provider: None,
+                    cloud_file_id: None,
+                    cloud_encrypted: true,
+                    cloud_key_ver: 1,
+                    cloud_synced_ts: None,
+                })
+                .unwrap();
+        }
+        store
+            .mark_media_cloud_synced(&sha_prune, "gdrive", "drv-prune-1", 1, 5_000)
+            .unwrap();
+
+        // Before prune: sha_keep is pending (10_000), sha_prune is synced (80_000)
+        let bd_before = store.compute_cloud_media_breakdown().unwrap();
+        assert_eq!(bd_before.total_count, 1);
+        assert_eq!(bd_before.pending_count, 1);
+        assert_eq!(bd_before.pending_bytes, 10_000);
+
+        // User prunes sha_prune via Cloud Storage Manager
+        let pruned = store
+            .mark_media_cloud_pruned(std::slice::from_ref(&sha_prune))
+            .unwrap();
+        assert_eq!(pruned, 1);
+
+        // Local blob stays intact on disk, cloud link is gone, and it MUST NOT re-enter pending queue!
+        let rec = store.get_media_object(&sha_prune).unwrap().unwrap();
+        assert_eq!(rec.local_state, MEDIA_LOCAL_STATE_LOCAL);
+        assert!(rec.local_rel_path.is_some());
+        assert!(rec.cloud_file_id.is_none());
+
+        let pending = store.list_pending_cloud_uploads(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].sha256, sha_keep);
+
+        let bd_after = store.compute_cloud_media_breakdown().unwrap();
+        assert_eq!(bd_after.total_count, 0);
+        assert_eq!(bd_after.pending_count, 1);
+        assert_eq!(bd_after.pending_bytes, 10_000);
+
+        // Explicit re-sync resets cloud_excluded = 0 cleanly
+        store
+            .mark_media_cloud_synced(&sha_prune, "gdrive", "drv-resync", 1, 9_000)
+            .unwrap();
+        // And non-prune clear_media_cloud_links (e.g., Drive 404) allows re-queueing again
+        store
+            .clear_media_cloud_links(std::slice::from_ref(&sha_prune))
+            .unwrap();
+        let pending_re = store.list_pending_cloud_uploads(10).unwrap();
+        assert_eq!(pending_re.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_history_delta_includes_boundary_ties_and_paginates_without_loss() {
+        let dir = std::env::temp_dir().join(format!(
+            "teza-store-delta-page-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut src = MessageStore::open(&dir.join("src_page.db")).unwrap();
+
+        // 10 messages across timestamps with 4 siblings sharing boundary ts = 2000!
+        let items = [
+            ("t1", "m01", 1_000i64),
+            ("t1", "m02", 1_500),
+            ("t1", "m03", 2_000),
+            ("t1", "m04", 2_000),
+            ("t2", "m04", 2_000), // same msg_id in different thread at identical ms!
+            ("t2", "m05", 2_000),
+            ("t1", "m06", 2_500),
+            ("t1", "m07", 3_000),
+            ("t1", "m08", 3_000),
+            ("t1", "m09", 4_000),
+        ];
+        for (tid, mid, ts) in items {
+            src.upsert_message(&MessageDto {
+                msg_id: mid.into(),
+                thread_id: tid.into(),
+                sender_id: "u1".into(),
+                sender_name: "Alice".into(),
+                text: format!("msg {tid}/{mid}"),
+                msg_type: "chat.text".into(),
+                ts,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+        }
+
+        // Paginate with tiny limit_msgs = 3 -> page 1 hits boundary ts = 2000 and must include ALL 4 siblings!
+        let dst = MessageStore::open(&dir.join("dst_page.db")).unwrap();
+        let mut cursor = 0i64;
+        let mut pages = 0usize;
+        let mut total_imported = 0usize;
+        loop {
+            let batch = src
+                .export_history_delta_since("u1", "dev-1", cursor, 3)
+                .unwrap();
+            pages += 1;
+            if pages == 1 {
+                // m01 (1000), m02 (1500), plus ALL 4 messages at boundary ts = 2000!
+                assert_eq!(batch.messages.len(), 6);
+                assert!(batch.messages_truncated);
+                assert_eq!(batch.max_message_ts(), Some(2_000));
+            }
+            total_imported += dst.import_history_delta_idempotent(&batch).unwrap();
+            if !batch.messages_truncated {
+                break;
+            }
+            cursor = batch.max_message_ts().unwrap() + 1;
+            assert!(pages < 10, "pagination must terminate");
+        }
+        assert!(pages >= 2);
+        assert_eq!(total_imported, items.len());
+        for (tid, mid, _) in items {
+            assert!(
+                dst.get_message(tid, mid).unwrap().is_some(),
+                "missing {tid}/{mid}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_thread_cleans_messages_fts_translations_folders_and_orphans_without_touching_others() {
+        let dir = std::env::temp_dir().join(format!(
+            "teza-store-delete-thread-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = MessageStore::open(&dir.join("delete_thread.db")).unwrap();
+
+        let make_thread = |id: &str, title: &str| ThreadDto {
+            id: id.into(),
+            title: title.into(),
+            avatar: String::new(),
+            kind: ThreadKind::Group,
+            last_preview: String::new(),
+            last_ts: 1_700_000_000_000,
+            unread_count: 0,
+            is_pinned: false,
+            is_muted: false,
+            last_read_in_ts: 0,
+            peer_read_ts: 0,
+            muted_until_ts: 0,
+            is_archived: false,
+        };
+        store.upsert_thread(&make_thread("grp-del", "Nhóm Rời")).unwrap();
+        store.upsert_thread(&make_thread("grp-keep", "Nhóm Giữ")).unwrap();
+
+        let make_msg = |tid: &str, mid: &str, text: &str, ts: i64| MessageDto {
+            msg_id: mid.into(),
+            thread_id: tid.into(),
+            sender_id: "u1".into(),
+            sender_name: "Alice".into(),
+            text: text.into(),
+            msg_type: "chat.text".into(),
+            ts,
+            is_outgoing: false,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
+            reactions: Vec::new(),
+            attachment_url: None,
+            attachment_name: None,
+        };
+        store.upsert_message(&make_msg("grp-del", "m-del-1", "Bí mật nhóm rời", 1_700_000_010_000)).unwrap();
+        store.upsert_message(&make_msg("grp-del", "m-shared-id", "Tin trùng id", 1_700_000_015_000)).unwrap();
+        store.upsert_message(&make_msg("grp-keep", "m-keep-1", "Thông tin nhóm giữ", 1_700_000_020_000)).unwrap();
+        store.upsert_message(&make_msg("grp-keep", "m-shared-id", "Tin trùng id", 1_700_000_025_000)).unwrap();
+
+        // Cached translations: exclusive to grp-del, exclusive to grp-keep, and shared msg_id
+        store
+            .upsert_cached_translations(
+                &[
+                    (
+                        "m-del-1".into(),
+                        "Bí mật nhóm rời".into(),
+                        TranslationResult {
+                            msg_id: "m-del-1".into(),
+                            translated_text: "Secret deleted group".into(),
+                            detected_source_lang: Some("VI".into()),
+                            skipped: false,
+                        },
+                    ),
+                    (
+                        "m-keep-1".into(),
+                        "Thông tin nhóm giữ".into(),
+                        TranslationResult {
+                            msg_id: "m-keep-1".into(),
+                            translated_text: "Kept group info".into(),
+                            detected_source_lang: Some("VI".into()),
+                            skipped: false,
+                        },
+                    ),
+                    (
+                        "m-shared-id".into(),
+                        "Tin trùng id".into(),
+                        TranslationResult {
+                            msg_id: "m-shared-id".into(),
+                            translated_text: "Shared id msg".into(),
+                            detected_source_lang: Some("VI".into()),
+                            skipped: false,
+                        },
+                    ),
+                ],
+                "EN",
+                "deepl",
+            )
+            .unwrap();
+
+        // Media objects:
+        // 1) local-only orphan with thumbnail (both must be deleted & returned)
+        // 2) cloud-backed orphan (local_state -> 0, local_rel_path returned, cloud row kept)
+        // 3) shared media referenced by BOTH grp-del and grp-keep (must stay intact!)
+        let sha_orphan = "1".repeat(64);
+        let sha_thumb = "2".repeat(64);
+        let sha_cloud = "3".repeat(64);
+        let sha_shared = "4".repeat(64);
+
+        let make_media_obj = |sha: &str, kind: &str, rel: &str, thumb: Option<String>, cloud_id: Option<String>| {
+            MediaObjectRecord {
+                sha256: sha.into(),
+                kind: kind.into(),
+                mime: "image/jpeg".into(),
+                size_bytes: 1024,
+                thumb_sha256: thumb,
+                width: None,
+                height: None,
+                duration_ms: None,
+                local_state: MEDIA_LOCAL_STATE_LOCAL,
+                local_rel_path: Some(rel.into()),
+                is_encrypted: true,
+                pin_count: 0,
+                created_ts: 1_000,
+                last_accessed_ts: 1_000,
+                cloud_provider: cloud_id.as_ref().map(|_| "gdrive".into()),
+                cloud_file_id: cloud_id,
+                cloud_encrypted: true,
+                cloud_key_ver: 1,
+                cloud_synced_ts: None,
+            }
+        };
+
+        store.upsert_media_object(&make_media_obj(&sha_thumb, "thumb", "blobs/thumb.enc", None, None)).unwrap();
+        store.upsert_media_object(&make_media_obj(&sha_orphan, "image", "blobs/orphan.enc", Some(sha_thumb.clone()), None)).unwrap();
+        store.upsert_media_object(&make_media_obj(&sha_cloud, "image", "blobs/cloud.enc", None, Some("drv-99".into()))).unwrap();
+        store.upsert_media_object(&make_media_obj(&sha_shared, "image", "blobs/shared.enc", None, None)).unwrap();
+
+        let make_link = |tid: &str, mid: &str, variant: &str, sha: &str| MessageMediaRecord {
+            thread_id: tid.into(),
+            msg_id: mid.into(),
+            variant: variant.into(),
+            url_hash: format!("uh-{tid}-{mid}-{variant}"),
+            sha256: Some(sha.into()),
+            original_name: None,
+            saved_user_path: None,
+            cdn_status: MEDIA_CDN_STATUS_OK,
+            updated_ts: 2_000,
+        };
+        store.link_message_media(&make_link("grp-del", "m-del-1", "primary", &sha_orphan)).unwrap();
+        store.link_message_media(&make_link("grp-del", "m-del-1", "cloud", &sha_cloud)).unwrap();
+        store.link_message_media(&make_link("grp-del", "m-shared-id", "primary", &sha_shared)).unwrap();
+        store.link_message_media(&make_link("grp-keep", "m-keep-1", "primary", &sha_shared)).unwrap();
+
+        // Chat folder referencing both grp-del and grp-keep
+        store
+            .save_chat_folder(&ChatFolderDto {
+                id: "f-work".into(),
+                name: "Công việc".into(),
+                icon: "folder".into(),
+                color: String::new(),
+                thread_ids: vec!["grp-del".into(), "grp-keep".into()],
+                excluded_thread_ids: vec!["grp-del".into()],
+                include_kinds: Vec::new(),
+                only_unread: false,
+                exclude_muted: false,
+                position: 1,
+                remote_label_id: None,
+            })
+            .unwrap();
+
+        let mut orphans = store.delete_thread("grp-del").unwrap();
+        orphans.sort();
+        assert_eq!(
+            orphans,
+            vec!["blobs/cloud.enc", "blobs/orphan.enc", "blobs/thumb.enc"]
+        );
+
+        // Deleted thread & its messages & FTS entries are gone
+        let remaining_threads = store.list_threads(FolderFilter::All).unwrap();
+        assert_eq!(remaining_threads.len(), 1);
+        assert_eq!(remaining_threads[0].id, "grp-keep");
+        assert!(store.load_messages("grp-del", None, 50).unwrap().is_empty());
+        assert!(store.search_messages("bi mat nhom roi", 10).unwrap().is_empty());
+
+        // Kept thread's messages & FTS remain intact
+        assert_eq!(store.load_messages("grp-keep", None, 50).unwrap().len(), 2);
+        assert_eq!(store.search_messages("thong tin nhom giu", 10).unwrap().len(), 1);
+
+        // Exclusive translation removed; kept & shared translations preserved
+        let trs = store
+            .get_cached_translations(
+                &[
+                    ("m-del-1".into(), "Bí mật nhóm rời".into()),
+                    ("m-keep-1".into(), "Thông tin nhóm giữ".into()),
+                    ("m-shared-id".into(), "Tin trùng id".into()),
+                ],
+                "EN",
+            )
+            .unwrap();
+        assert!(!trs.contains_key("m-del-1"));
+        assert_eq!(trs["m-keep-1"].translated_text, "Kept group info");
+        assert_eq!(trs["m-shared-id"].translated_text, "Shared id msg");
+
+        // Orphaned local-only media & thumb removed; cloud-backed evicted locally; shared preserved
+        assert!(store.get_media_object(&sha_orphan).unwrap().is_none());
+        assert!(store.get_media_object(&sha_thumb).unwrap().is_none());
+        let cloud_after = store.get_media_object(&sha_cloud).unwrap().unwrap();
+        assert_eq!(cloud_after.local_state, MEDIA_LOCAL_STATE_MISSING);
+        assert!(cloud_after.local_rel_path.is_none());
+        assert_eq!(cloud_after.cloud_file_id.as_deref(), Some("drv-99"));
+        let shared_after = store.get_media_object(&sha_shared).unwrap().unwrap();
+        assert_eq!(shared_after.local_state, MEDIA_LOCAL_STATE_LOCAL);
+        assert_eq!(shared_after.local_rel_path.as_deref(), Some("blobs/shared.enc"));
+
+        // Chat folder scrubbed of grp-del while retaining grp-keep
+        let folders = store.list_chat_folders().unwrap();
+        assert_eq!(folders[0].thread_ids, vec!["grp-keep"]);
+        assert!(folders[0].excluded_thread_ids.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

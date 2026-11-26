@@ -9,17 +9,22 @@ import {
   isRemoteMediaUrl,
   normalizeMediaRequestUrl,
   useResolvedMediaUrl,
+  type TezaMediaKind,
 } from "../utils/mediaCache";
 
 function useRelayElement(
   src: string,
+  kind: TezaMediaKind,
   forceRelay: boolean,
+  threadId?: string,
+  msgId?: string,
   onFallbackFail?: () => void,
 ) {
   const normalizedSrc = normalizeMediaRequestUrl(src);
   const { src: resolvedSrc, failed, requestFallback } = useResolvedMediaUrl(
     normalizedSrc,
     forceRelay,
+    { kind, threadId, msgId },
   );
   const onFallbackFailRef = useRef(onFallbackFail);
   onFallbackFailRef.current = onFallbackFail;
@@ -31,7 +36,7 @@ function useRelayElement(
   }, [failed, normalizedSrc]);
 
   const triggerErrorFallback = () => {
-    if (resolvedSrc === normalizedSrc && isRemoteMediaUrl(normalizedSrc) && requestFallback()) {
+    if (isRemoteMediaUrl(normalizedSrc) && requestFallback()) {
       return true;
     }
     onFallbackFailRef.current?.();
@@ -44,17 +49,28 @@ function useRelayElement(
 interface Props extends Omit<ImgHTMLAttributes<HTMLImageElement>, "src"> {
   src: string;
   forceRelay?: boolean;
+  threadId?: string;
+  msgId?: string;
   onFallbackFail?: () => void;
 }
 
 export function RelayImage({
   src,
   forceRelay = false,
+  threadId,
+  msgId,
   onFallbackFail,
   onError,
   ...rest
 }: Props) {
-  const { resolvedSrc, triggerErrorFallback } = useRelayElement(src, forceRelay, onFallbackFail);
+  const { resolvedSrc, triggerErrorFallback } = useRelayElement(
+    src,
+    "image",
+    forceRelay,
+    threadId,
+    msgId,
+    onFallbackFail,
+  );
   if (!resolvedSrc) return null;
 
   return (
@@ -71,17 +87,28 @@ export function RelayImage({
 interface AudioProps extends Omit<AudioHTMLAttributes<HTMLAudioElement>, "src"> {
   src: string;
   forceRelay?: boolean;
+  threadId?: string;
+  msgId?: string;
   onFallbackFail?: () => void;
 }
 
 export function RelayAudio({
   src,
   forceRelay = false,
+  threadId,
+  msgId,
   onFallbackFail,
   onError,
   ...rest
 }: AudioProps) {
-  const { resolvedSrc, triggerErrorFallback } = useRelayElement(src, forceRelay, onFallbackFail);
+  const { resolvedSrc, triggerErrorFallback } = useRelayElement(
+    src,
+    "audio",
+    forceRelay,
+    threadId,
+    msgId,
+    onFallbackFail,
+  );
   if (!resolvedSrc) return null;
 
   return (
@@ -98,17 +125,28 @@ export function RelayAudio({
 interface VideoProps extends Omit<VideoHTMLAttributes<HTMLVideoElement>, "src"> {
   src: string;
   forceRelay?: boolean;
+  threadId?: string;
+  msgId?: string;
   onFallbackFail?: () => void;
 }
 
 export function RelayVideo({
   src,
   forceRelay = false,
+  threadId,
+  msgId,
   onFallbackFail,
   onError,
   ...rest
 }: VideoProps) {
-  const { resolvedSrc, triggerErrorFallback } = useRelayElement(src, forceRelay, onFallbackFail);
+  const { resolvedSrc, triggerErrorFallback } = useRelayElement(
+    src,
+    "video",
+    forceRelay,
+    threadId,
+    msgId,
+    onFallbackFail,
+  );
   if (!resolvedSrc) return null;
 
   return (

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { Suspense, lazy, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   ArrowDownToLine,
@@ -6,11 +6,17 @@ import {
   Bell,
   Bookmark,
   CheckCircle2,
+  Cloud,
   ExternalLink,
   Eye,
+  FileText,
+  Film,
   FolderKanban,
+  FolderOpen,
   Globe,
+  HardDrive,
   Headphones,
+  Image,
   Keyboard,
   Languages,
   Loader2,
@@ -24,7 +30,9 @@ import {
   Phone,
   Plus,
   RefreshCw,
+  RotateCcw,
   Send,
+  Shield,
   SlidersHorizontal,
   Sparkles,
   Trash2,
@@ -45,6 +53,8 @@ import type {
   CallAudioTestResultDto,
   CallDevicesDto,
   ConnectionStatus,
+  MediaVaultConfigDto,
+  MediaVaultStatsDto,
   NotificationPrefs,
   NotifyBadgeMode,
   NotifyPosition,
@@ -68,6 +78,8 @@ import {
 import { ThreadAvatar } from "./ThreadAvatar";
 import { WEBAPP_ICON_OPTIONS, renderWebAppIcon } from "./WebAppWorkspace";
 
+const CloudStoragePanel = lazy(() => import("./CloudStoragePanel"));
+
 export type FontSizeScale = "sm" | "md" | "lg";
 export type DensityMode = "comfortable" | "compact";
 export type SettingsTab =
@@ -78,6 +90,7 @@ export type SettingsTab =
   | "webapps"
   | "calls"
   | "translate"
+  | "storage"
   | "network"
   | "system";
 
@@ -124,7 +137,10 @@ interface Props {
   callDevices: CallDevicesDto | null;
   callDevicesLoading: boolean;
   onRefreshCallDevices: () => void;
-  onSelectCallDevices: (input: string | null, output: string | null) => Promise<void> | void;
+  onSelectCallDevices: (
+    input: string | null,
+    output: string | null,
+  ) => Promise<boolean | void> | boolean | void;
   appVersion: string;
   availableUpdate: AppUpdateInfo | null;
   onOpenUpdateModal: () => void;
@@ -145,10 +161,27 @@ const NAV_TABS: { id: SettingsTab; labelKey: TranslationKey; icon: typeof Bell }
   { id: "webapps", labelKey: "tabWebApps", icon: Globe },
   { id: "calls", labelKey: "tabCalls", icon: Phone },
   { id: "translate", labelKey: "tabTranslate", icon: Languages },
+  { id: "storage", labelKey: "settingsTabStorage", icon: HardDrive },
   { id: "network", labelKey: "tabNetwork", icon: Network },
   { id: "account", labelKey: "tabAccount", icon: User },
   { id: "system", labelKey: "tabSystem", icon: SlidersHorizontal },
 ];
+
+const STORAGE_QUOTA_OPTIONS: { mb: number; label: string | null }[] = [
+  { mb: 500, label: "500 MB" },
+  { mb: 1024, label: "1 GB" },
+  { mb: 2048, label: "2 GB" },
+  { mb: 5120, label: "5 GB" },
+  { mb: 0, label: null },
+];
+
+function formatStorageBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
 
 const POSITION_CORNERS: { id: NotifyPosition; labelKey: TranslationKey }[] = [
   { id: "top-left", labelKey: "posTopLeft" },
@@ -164,6 +197,7 @@ function ToggleRow({
   checked,
   onChange,
   action,
+  disabled = false,
 }: {
   icon: React.ReactNode;
   label: string;
@@ -171,10 +205,15 @@ function ToggleRow({
   checked: boolean;
   onChange: (v: boolean) => void;
   action?: React.ReactNode;
+  disabled?: boolean;
 }) {
   return (
     <div className="flex items-center justify-between gap-3 rounded-xl px-3 py-2.5 transition hover:bg-black/10">
-      <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2.5">
+      <label
+        className={`flex min-w-0 flex-1 items-center gap-2.5 ${
+          disabled ? "cursor-not-allowed opacity-60" : "cursor-pointer"
+        }`}
+      >
         <span className="shrink-0" style={{ color: "var(--accent)" }}>
           {icon}
         </span>
@@ -189,8 +228,9 @@ function ToggleRow({
         <input
           type="checkbox"
           checked={checked}
+          disabled={disabled}
           onChange={(e) => onChange(e.target.checked)}
-          className="h-4 w-4 shrink-0 cursor-pointer accent-[var(--accent)]"
+          className="h-4 w-4 shrink-0 cursor-pointer accent-[var(--accent)] disabled:cursor-not-allowed"
         />
       </label>
       {action}
@@ -281,21 +321,37 @@ export function SettingsModal({
   const [waIcon, setWaIcon] = useState("globe");
   const [waMode, setWaMode] = useState<WebAppOpenMode>("embedded");
   const [waError, setWaError] = useState<string | null>(null);
+  const [storageConfig, setStorageConfig] = useState<MediaVaultConfigDto | null>(null);
+  const [storageStats, setStorageStats] = useState<MediaVaultStatsDto | null>(null);
+  const [storageLoading, setStorageLoading] = useState(false);
+  const [storageSaving, setStorageSaving] = useState(false);
+  const [storageClearing, setStorageClearing] = useState(false);
+  const [storagePickingDir, setStoragePickingDir] = useState(false);
+  const [storageFeedback, setStorageFeedback] = useState<{ ok: boolean; text: string } | null>(
+    null,
+  );
+  const mountedRef = useRef(true);
+  const storageReqSeqRef = useRef(0);
+  const storageConfigRef = useRef<MediaVaultConfigDto | null>(null);
+  storageConfigRef.current = storageConfig;
 
   useEffect(() => {
-    if (!open) return;
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!open) {
+      storageReqSeqRef.current += 1;
+      setStorageLoading(false);
+      return;
+    }
     setActiveTab(focusRelay ? "network" : initialTab);
     setCallDevicesSaved(false);
     setCallAudioTesting(false);
     setCallAudioTestResult(null);
-    setRelayEnabled(relayCfg?.enabled ?? false);
-    setRelayMode(relayCfg?.mode ?? "socks5");
-    setRelayHost(relayCfg?.host ?? "");
-    setRelayPort(String(relayCfg?.port || 1088));
-    setRelayUser(relayCfg?.username ?? "");
-    setRelayPassword("");
-    setClearRelayPw(false);
-    setRouteMedia(relayCfg?.route_webview_media ?? true);
     setRelayFeedback(null);
     setCurrentPin("");
     setNewPin("");
@@ -307,12 +363,26 @@ export function SettingsModal({
     setWaIcon("globe");
     setWaMode("embedded");
     setWaError(null);
+    setStorageFeedback(null);
     if (focusRelay) {
-      setTimeout(() => {
+      const timer = window.setTimeout(() => {
         relaySectionRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
       }, 40);
+      return () => window.clearTimeout(timer);
     }
-  }, [open, relayCfg, focusRelay, initialTab]);
+  }, [open, focusRelay, initialTab]);
+
+  useEffect(() => {
+    if (!open) return;
+    setRelayEnabled(relayCfg?.enabled ?? false);
+    setRelayMode(relayCfg?.mode ?? "socks5");
+    setRelayHost(relayCfg?.host ?? "");
+    setRelayPort(String(relayCfg?.port || 1088));
+    setRelayUser(relayCfg?.username ?? "");
+    setRelayPassword("");
+    setClearRelayPw(false);
+    setRouteMedia(relayCfg?.route_webview_media ?? true);
+  }, [open, relayCfg]);
 
   useEffect(() => {
     if (open && activeTab === "calls") {
@@ -321,9 +391,39 @@ export function SettingsModal({
   }, [open, activeTab, onRefreshCallDevices]);
 
   useEffect(() => {
+    if (!open || activeTab !== "storage") return;
+    let cancelled = false;
+    const seq = ++storageReqSeqRef.current;
+    setStorageLoading(true);
+    void Promise.all([bridge.mediaGetConfig(), bridge.mediaGetStats()])
+      .then(([cfg, stats]) => {
+        if (cancelled || !mountedRef.current || seq !== storageReqSeqRef.current) return;
+        setStorageConfig(cfg);
+        setStorageStats(stats);
+      })
+      .catch((err) => {
+        if (cancelled || !mountedRef.current || seq !== storageReqSeqRef.current) return;
+        setStorageFeedback({
+          ok: false,
+          text: err instanceof Error ? err.message : String(err),
+        });
+      })
+      .finally(() => {
+        if (cancelled || !mountedRef.current || seq !== storageReqSeqRef.current) return;
+        setStorageLoading(false);
+      });
+    return () => {
+      cancelled = true;
+      setStorageLoading(false);
+    };
+  }, [open, activeTab]);
+
+  useEffect(() => {
     if (!open) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.defaultPrevented || e.key !== "Escape") return;
+      e.preventDefault();
+      onClose();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -387,6 +487,117 @@ export function SettingsModal({
       setRelaySaving(false);
     }
   };
+
+  const handleRefreshStorageStats = async () => {
+    const seq = ++storageReqSeqRef.current;
+    setStorageLoading(true);
+    setStorageFeedback(null);
+    try {
+      const [cfg, stats] = await Promise.all([bridge.mediaGetConfig(), bridge.mediaGetStats()]);
+      if (!mountedRef.current || seq !== storageReqSeqRef.current) return;
+      setStorageConfig(cfg);
+      setStorageStats(stats);
+    } catch (err) {
+      if (!mountedRef.current || seq !== storageReqSeqRef.current) return;
+      setStorageFeedback({
+        ok: false,
+        text: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      if (mountedRef.current) {
+        setStorageLoading(false);
+      }
+    }
+  };
+
+  const handleSaveStorageConfig = async (patch: Partial<MediaVaultConfigDto>) => {
+    const base = storageConfigRef.current;
+    if (!base) return;
+    const seq = ++storageReqSeqRef.current;
+    setStorageSaving(true);
+    setStorageFeedback(null);
+    try {
+      const saved = await bridge.mediaSaveConfig({ ...base, ...patch });
+      if (!mountedRef.current || seq !== storageReqSeqRef.current) return;
+      setStorageConfig(saved);
+      const stats = await bridge.mediaGetStats();
+      if (!mountedRef.current || seq !== storageReqSeqRef.current) return;
+      setStorageStats(stats);
+      setStorageFeedback({ ok: true, text: t("storageSavedNotice") });
+    } catch (err) {
+      if (!mountedRef.current || seq !== storageReqSeqRef.current) return;
+      setStorageFeedback({
+        ok: false,
+        text: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      if (mountedRef.current) {
+        setStorageSaving(false);
+      }
+    }
+  };
+
+  const handlePickVaultDir = async () => {
+    if (!storageConfigRef.current) return;
+    setStoragePickingDir(true);
+    setStorageFeedback(null);
+    try {
+      const picked = await bridge.mediaPickVaultDir();
+      if (!mountedRef.current || !picked) return;
+      await handleSaveStorageConfig({ custom_vault_dir: picked });
+    } catch (err) {
+      if (!mountedRef.current) return;
+      setStorageFeedback({
+        ok: false,
+        text: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      if (mountedRef.current) {
+        setStoragePickingDir(false);
+      }
+    }
+  };
+
+  const handleOpenVaultDir = async () => {
+    setStorageFeedback(null);
+    try {
+      await bridge.mediaOpenVaultDir();
+    } catch (err) {
+      if (!mountedRef.current) return;
+      setStorageFeedback({
+        ok: false,
+        text: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+
+  const handleClearMediaCache = async () => {
+    const seq = ++storageReqSeqRef.current;
+    setStorageClearing(true);
+    setStorageFeedback(null);
+    try {
+      const nextStats = await bridge.mediaClearCache(false);
+      if (!mountedRef.current || seq !== storageReqSeqRef.current) return;
+      setStorageStats(nextStats);
+      setStorageFeedback({ ok: true, text: t("storageClearedNotice") });
+    } catch (err) {
+      if (!mountedRef.current || seq !== storageReqSeqRef.current) return;
+      setStorageFeedback({
+        ok: false,
+        text: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      if (mountedRef.current) {
+        setStorageClearing(false);
+      }
+    }
+  };
+
+  const storageBusy = storageLoading || storageSaving || storageClearing || storagePickingDir;
+  const storageQuotaPercent =
+    storageConfig && storageConfig.quota_mb > 0 && storageStats
+      ? Math.min(100, Math.round((storageStats.total_bytes / (storageConfig.quota_mb * 1024 * 1024)) * 100))
+      : null;
 
   const activeTitleKey = NAV_TABS.find((tab) => tab.id === activeTab)?.labelKey;
   const activeTitle = activeTitleKey ? t(activeTitleKey) : t("settingsTeza");
@@ -884,13 +1095,13 @@ export function SettingsModal({
                     className="text-xs font-semibold uppercase tracking-wider"
                     style={{ color: "var(--text-secondary)" }}
                   >
-                    Hiệu ứng & Soạn thảo
+                    {t("effectsComposerHeading")}
                   </h4>
                   <div className="space-y-2 rounded-xl p-2" style={{ background: "var(--bg-surface)" }}>
                     <ToggleRow
                       icon={<Sparkles className="h-4 w-4" />}
-                      label="Hiệu ứng Tiên Sáng"
-                      desc="Ánh sáng con trỏ và hạt bụi vàng"
+                      label={t("fxLabel")}
+                      desc={t("fxDesc")}
                       checked={fxEnabled}
                       onChange={onFxChange}
                     />
@@ -951,44 +1162,16 @@ export function SettingsModal({
                       </div>
                     </div>
                     <div
-                      className="border-t px-2 pt-2.5"
+                      className="border-t pt-1.5"
                       style={{ borderColor: "var(--border-subtle)" }}
                     >
-                      <div className="mb-1.5 flex items-center gap-2 text-xs font-medium">
-                        <Send className="h-3.5 w-3.5" style={{ color: "var(--accent)" }} />
-                        <span>Phím gửi tin nhắn</span>
-                      </div>
-                      <div
-                        className="grid grid-cols-2 gap-1 rounded-xl p-1"
-                        style={{ background: "var(--bg-sidebar)" }}
-                      >
-                        <button
-                          type="button"
-                          onClick={() => onSendOnEnterChange(true)}
-                          className="rounded-lg px-2 py-1.5 text-xs font-medium transition"
-                          style={{
-                            background: sendOnEnter ? "var(--accent)" : "transparent",
-                            color: sendOnEnter
-                              ? "var(--text-on-accent)"
-                              : "var(--text-secondary)",
-                          }}
-                        >
-                          Enter để gửi (Shift+Enter xuống dòng)
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => onSendOnEnterChange(false)}
-                          className="rounded-lg px-2 py-1.5 text-xs font-medium transition"
-                          style={{
-                            background: !sendOnEnter ? "var(--accent)" : "transparent",
-                            color: !sendOnEnter
-                              ? "var(--text-on-accent)"
-                              : "var(--text-secondary)",
-                          }}
-                        >
-                          Ctrl+Enter để gửi (Enter xuống dòng)
-                        </button>
-                      </div>
+                      <ToggleRow
+                        icon={<Send className="h-4 w-4" />}
+                        label={t("sendOnEnterLabel")}
+                        desc={t("sendOnEnterDesc")}
+                        checked={sendOnEnter}
+                        onChange={onSendOnEnterChange}
+                      />
                     </div>
                   </div>
                 </section>
@@ -1521,7 +1704,11 @@ export function SettingsModal({
                             e.target.value || null,
                             callDevices?.selected_output ?? null,
                           ),
-                        ).then(() => setCallDevicesSaved(true));
+                        )
+                          .then((ok) => {
+                            if (ok !== false) setCallDevicesSaved(true);
+                          })
+                          .catch(() => setCallDevicesSaved(false));
                       }}
                       className="w-full rounded-lg px-2.5 py-1.5 text-[13.5px] outline-none"
                       style={{
@@ -1563,7 +1750,11 @@ export function SettingsModal({
                             callDevices?.selected_input ?? null,
                             e.target.value || null,
                           ),
-                        ).then(() => setCallDevicesSaved(true));
+                        )
+                          .then((ok) => {
+                            if (ok !== false) setCallDevicesSaved(true);
+                          })
+                          .catch(() => setCallDevicesSaved(false));
                       }}
                       className="w-full rounded-lg px-2.5 py-1.5 text-[13.5px] outline-none"
                       style={{
@@ -1674,6 +1865,452 @@ export function SettingsModal({
                   </button>
                 </div>
               </section>
+            )}
+
+            {activeTab === "storage" && (
+              <div className="space-y-4">
+                <div className="space-y-1">
+                  <h4
+                    className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider"
+                    style={{ color: "var(--text-secondary)" }}
+                  >
+                    <HardDrive className="h-3.5 w-3.5" />
+                    {t("storageHeading")}
+                  </h4>
+                  <p className="text-xs leading-relaxed" style={{ color: "var(--text-secondary)" }}>
+                    {t("storageDesc")}
+                  </p>
+                </div>
+
+                {storageFeedback && (
+                  <div
+                    className="flex items-start gap-2 rounded-xl px-3 py-2 text-xs"
+                    style={{
+                      background: storageFeedback.ok ? "rgba(16,185,129,0.12)" : "var(--danger-bg)",
+                      color: storageFeedback.ok ? "#34d399" : "var(--danger-text)",
+                    }}
+                  >
+                    {storageFeedback.ok ? (
+                      <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    ) : (
+                      <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    )}
+                    <span>{storageFeedback.text}</span>
+                  </div>
+                )}
+
+                {storageLoading && !storageConfig && !storageStats ? (
+                  <div
+                    className="flex items-center justify-center gap-2 rounded-xl p-6 text-xs"
+                    style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
+                  >
+                    <Loader2 className="h-4 w-4 animate-spin" style={{ color: "var(--accent)" }} />
+                    <span>{t("storageLoading")}</span>
+                  </div>
+                ) : (
+                  <>
+                    {/* Local Vault Usage */}
+                    <section className="space-y-2">
+                      <h5
+                        className="text-xs font-semibold uppercase tracking-wider"
+                        style={{ color: "var(--text-secondary)" }}
+                      >
+                        {t("storageVaultUsage")}
+                      </h5>
+                      <div
+                        className="space-y-3 rounded-xl p-3.5"
+                        style={{ background: "var(--bg-surface)" }}
+                      >
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div className="min-w-0 space-y-1">
+                            <div
+                              className="text-xs font-medium"
+                              style={{ color: "var(--text-secondary)" }}
+                            >
+                              {t("storageTotalCached")}
+                            </div>
+                            <div className="flex flex-wrap items-baseline gap-2">
+                              <span className="text-xl font-bold tracking-tight">
+                                {formatStorageBytes(storageStats?.total_bytes ?? 0)}
+                              </span>
+                              <span
+                                className="rounded-full px-2 py-0.5 text-[11px] font-semibold"
+                                style={{
+                                  background: "var(--accent-soft)",
+                                  color: "var(--accent)",
+                                }}
+                              >
+                                {t("storageObjectCount", {
+                                  count: storageStats?.object_count ?? 0,
+                                })}
+                              </span>
+                            </div>
+                            {(storageStats?.pinned_count ?? 0) > 0 && (
+                              <div
+                                className="text-[11.5px]"
+                                style={{ color: "var(--text-secondary)" }}
+                              >
+                                {t("storagePinnedSummary", {
+                                  count: storageStats?.pinned_count ?? 0,
+                                  size: formatStorageBytes(storageStats?.pinned_bytes ?? 0),
+                                })}
+                              </div>
+                            )}
+                          </div>
+                          <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+                            <button
+                              type="button"
+                              disabled={storageBusy}
+                              onClick={() => void handleRefreshStorageStats()}
+                              title={t("storageRefreshStats")}
+                              className="hover-menu inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium disabled:opacity-50"
+                              style={{
+                                background: "var(--bg-sidebar)",
+                                border: "1px solid var(--border-subtle)",
+                                color: "var(--text-primary)",
+                              }}
+                            >
+                              <RefreshCw
+                                className={`h-3.5 w-3.5 ${storageLoading ? "animate-spin" : ""}`}
+                              />
+                              <span className="sr-only">{t("storageRefreshStats")}</span>
+                            </button>
+                            <button
+                              type="button"
+                              disabled={storageBusy}
+                              onClick={() => void handleClearMediaCache()}
+                              className="inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition hover:opacity-90 disabled:opacity-50"
+                              style={{
+                                background: "var(--danger-bg)",
+                                color: "var(--danger-text)",
+                              }}
+                            >
+                              {storageClearing ? (
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              ) : (
+                                <Trash2 className="h-3.5 w-3.5" />
+                              )}
+                              <span>
+                                {storageClearing
+                                  ? t("storageClearingCache")
+                                  : t("storageClearCache")}
+                              </span>
+                            </button>
+                          </div>
+                        </div>
+
+                        {storageQuotaPercent !== null && storageConfig && (
+                          <div className="space-y-1">
+                            <div
+                              className="h-1.5 w-full overflow-hidden rounded-full"
+                              style={{ background: "var(--bg-sidebar)" }}
+                            >
+                              <div
+                                className="h-full rounded-full transition-all"
+                                style={{
+                                  width: `${storageQuotaPercent}%`,
+                                  background:
+                                    storageQuotaPercent >= 90 ? "#f59e0b" : "var(--accent)",
+                                }}
+                              />
+                            </div>
+                          </div>
+                        )}
+
+                        <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-5">
+                          {(
+                            [
+                              {
+                                id: "images",
+                                label: t("storageBreakdownImages"),
+                                bytes: storageStats?.image_bytes ?? 0,
+                                icon: <Image className="h-3.5 w-3.5" />,
+                              },
+                              {
+                                id: "videos",
+                                label: t("storageBreakdownVideos"),
+                                bytes: storageStats?.video_bytes ?? 0,
+                                icon: <Film className="h-3.5 w-3.5" />,
+                              },
+                              {
+                                id: "voice",
+                                label: t("storageBreakdownVoice"),
+                                bytes: storageStats?.voice_bytes ?? 0,
+                                icon: <Mic className="h-3.5 w-3.5" />,
+                              },
+                              {
+                                id: "files",
+                                label: t("storageBreakdownFiles"),
+                                bytes: storageStats?.file_bytes ?? 0,
+                                icon: <FileText className="h-3.5 w-3.5" />,
+                              },
+                              {
+                                id: "thumbs",
+                                label: t("storageBreakdownThumbs"),
+                                bytes: storageStats?.thumb_bytes ?? 0,
+                                icon: <Eye className="h-3.5 w-3.5" />,
+                              },
+                            ] as const
+                          ).map((item) => (
+                            <div
+                              key={item.id}
+                              className="rounded-lg px-2.5 py-2"
+                              style={{
+                                background: "var(--bg-sidebar)",
+                                border: "1px solid var(--border-subtle)",
+                              }}
+                            >
+                              <div
+                                className="flex items-center gap-1 text-[11px]"
+                                style={{ color: "var(--text-secondary)" }}
+                              >
+                                <span style={{ color: "var(--accent)" }}>{item.icon}</span>
+                                <span className="truncate">{item.label}</span>
+                              </div>
+                              <div className="mt-0.5 truncate text-xs font-semibold">
+                                {formatStorageBytes(item.bytes)}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </section>
+
+                    {/* Vault Location */}
+                    <section className="space-y-2">
+                      <h5
+                        className="text-xs font-semibold uppercase tracking-wider"
+                        style={{ color: "var(--text-secondary)" }}
+                      >
+                        {t("storageVaultFolderLabel")}
+                      </h5>
+                      <div
+                        className="space-y-2.5 rounded-xl p-3.5"
+                        style={{ background: "var(--bg-surface)" }}
+                      >
+                        <p className="text-xs" style={{ color: "var(--text-secondary)" }}>
+                          {t("storageVaultFolderDesc")}
+                        </p>
+                        <div
+                          className="flex items-center justify-between gap-2 rounded-lg px-3 py-2"
+                          style={{
+                            background: "var(--bg-sidebar)",
+                            border: "1px solid var(--border-subtle)",
+                          }}
+                        >
+                          <span
+                            className="min-w-0 flex-1 truncate font-mono text-xs"
+                            title={storageConfig?.active_vault_dir || ""}
+                          >
+                            {storageConfig?.active_vault_dir || t("storageVaultDefaultPath")}
+                          </span>
+                          {!storageConfig?.custom_vault_dir && storageConfig?.active_vault_dir && (
+                            <span
+                              className="shrink-0 rounded-full px-2 py-0.5 text-[10.5px] font-medium"
+                              style={{
+                                background: "var(--accent-soft)",
+                                color: "var(--accent)",
+                              }}
+                            >
+                              {t("storageVaultDefaultPath")}
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button
+                            type="button"
+                            disabled={storageBusy || !storageConfig}
+                            onClick={() => void handlePickVaultDir()}
+                            className="tf-btn inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold disabled:opacity-50"
+                          >
+                            {storagePickingDir ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <FolderOpen className="h-3.5 w-3.5" />
+                            )}
+                            <span>{t("storagePickFolder")}</span>
+                          </button>
+                          <button
+                            type="button"
+                            disabled={storageBusy}
+                            onClick={() => void handleOpenVaultDir()}
+                            className="hover-menu inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium disabled:opacity-50"
+                            style={{
+                              background: "var(--bg-sidebar)",
+                              border: "1px solid var(--border-subtle)",
+                            }}
+                          >
+                            <ExternalLink className="h-3.5 w-3.5" />
+                            <span>{t("storageOpenFolder")}</span>
+                          </button>
+                          {storageConfig?.custom_vault_dir && (
+                            <button
+                              type="button"
+                              disabled={storageBusy}
+                              onClick={() =>
+                                void handleSaveStorageConfig({ custom_vault_dir: null })
+                              }
+                              className="hover-menu inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium disabled:opacity-50"
+                              style={{
+                                background: "var(--bg-sidebar)",
+                                border: "1px solid var(--border-subtle)",
+                                color: "var(--text-secondary)",
+                              }}
+                            >
+                              <RotateCcw className="h-3.5 w-3.5" />
+                              <span>{t("storageResetFolder")}</span>
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    </section>
+
+                    {/* LRU Quota */}
+                    <section className="space-y-2">
+                      <h5
+                        className="text-xs font-semibold uppercase tracking-wider"
+                        style={{ color: "var(--text-secondary)" }}
+                      >
+                        {t("storageQuotaLabel")}
+                      </h5>
+                      <div
+                        className="space-y-2.5 rounded-xl p-3.5"
+                        style={{ background: "var(--bg-surface)" }}
+                      >
+                        <p className="text-xs" style={{ color: "var(--text-secondary)" }}>
+                          {t("storageQuotaDesc")}
+                        </p>
+                        <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-5">
+                          {STORAGE_QUOTA_OPTIONS.map((opt) => {
+                            const active = (storageConfig?.quota_mb ?? 1024) === opt.mb;
+                            return (
+                              <button
+                                key={opt.mb}
+                                type="button"
+                                disabled={storageBusy || !storageConfig}
+                                onClick={() => void handleSaveStorageConfig({ quota_mb: opt.mb })}
+                                className="rounded-lg px-2 py-2 text-xs font-semibold transition disabled:opacity-50"
+                                style={{
+                                  background: active ? "var(--accent)" : "var(--bg-sidebar)",
+                                  color: active
+                                    ? "var(--text-on-accent)"
+                                    : "var(--text-secondary)",
+                                  border: active
+                                    ? "1px solid var(--accent)"
+                                    : "1px solid var(--border-subtle)",
+                                }}
+                              >
+                                {opt.label ?? t("storageQuotaUnlimited")}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </section>
+
+                    {/* Encryption & Auto-Cache */}
+                    <section className="space-y-2">
+                      <div
+                        className="space-y-1 rounded-xl p-2"
+                        style={{ background: "var(--bg-surface)" }}
+                      >
+                        <ToggleRow
+                          icon={<Shield className="h-4 w-4" />}
+                          label={t("storageEncryptLabel")}
+                          desc={t("storageEncryptDesc")}
+                          checked={storageConfig?.encrypt_at_rest ?? true}
+                          disabled={storageBusy || !storageConfig}
+                          onChange={(encrypt_at_rest) =>
+                            void handleSaveStorageConfig({ encrypt_at_rest })
+                          }
+                        />
+                        <div
+                          className="border-t px-3 pt-2.5 pb-1 text-xs font-semibold uppercase tracking-wider"
+                          style={{
+                            borderColor: "var(--border-subtle)",
+                            color: "var(--text-secondary)",
+                          }}
+                        >
+                          {t("storageAutoCacheLabel")}
+                        </div>
+                        <ToggleRow
+                          icon={<Image className="h-4 w-4" />}
+                          label={t("storageAutoCacheImages")}
+                          checked={storageConfig?.auto_cache_images ?? true}
+                          disabled={storageBusy || !storageConfig}
+                          onChange={(auto_cache_images) =>
+                            void handleSaveStorageConfig({ auto_cache_images })
+                          }
+                        />
+                        <ToggleRow
+                          icon={<Mic className="h-4 w-4" />}
+                          label={t("storageAutoCacheVoice")}
+                          checked={storageConfig?.auto_cache_voice ?? true}
+                          disabled={storageBusy || !storageConfig}
+                          onChange={(auto_cache_voice) =>
+                            void handleSaveStorageConfig({ auto_cache_voice })
+                          }
+                        />
+                        <ToggleRow
+                          icon={<Film className="h-4 w-4" />}
+                          label={t("storageAutoCacheVideoFiles")}
+                          checked={storageConfig?.auto_cache_video_files ?? false}
+                          disabled={storageBusy || !storageConfig}
+                          onChange={(auto_cache_video_files) =>
+                            void handleSaveStorageConfig({ auto_cache_video_files })
+                          }
+                        />
+                        <div
+                          className="mx-2 mb-1 flex items-center gap-2 rounded-lg px-2.5 py-2 text-[11.5px]"
+                          style={{
+                            background: "var(--bg-sidebar)",
+                            color: "var(--text-secondary)",
+                          }}
+                        >
+                          <Sparkles
+                            className="h-3.5 w-3.5 shrink-0"
+                            style={{ color: "var(--accent)" }}
+                          />
+                          <span>{t("storageNoFileCapNote")}</span>
+                        </div>
+                      </div>
+                    </section>
+
+                    {/* Cloud Storage (Google Drive E2EE) */}
+                    <section className="space-y-2">
+                      <h5
+                        className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider"
+                        style={{ color: "var(--text-secondary)" }}
+                      >
+                        <Cloud className="h-3.5 w-3.5" />
+                        {t("storageCloudSectionTitle")}
+                      </h5>
+                      <Suspense
+                        fallback={
+                          <div
+                            className="flex items-center justify-center gap-2 rounded-xl p-5 text-xs"
+                            style={{
+                              background: "var(--bg-surface)",
+                              color: "var(--text-secondary)",
+                            }}
+                          >
+                            <Loader2
+                              className="h-4 w-4 animate-spin"
+                              style={{ color: "var(--accent)" }}
+                            />
+                            <span>{t("storageLoading")}</span>
+                          </div>
+                        }
+                      >
+                        <CloudStoragePanel
+                          relayEnabled={Boolean(relayCfg?.enabled)}
+                          onOpenNetworkTab={() => setActiveTab("network")}
+                        />
+                      </Suspense>
+                    </section>
+                  </>
+                )}
+              </div>
             )}
 
             {activeTab === "network" && (
@@ -2197,6 +2834,7 @@ export function SettingsModal({
                                   setConfirmPin("");
                                   setPinFeedback({ ok: true, text: t("passcodeDisabledMsg") });
                                 })
+                                .catch((e) => setPinFeedback({ ok: false, text: String(e) }))
                                 .finally(() => setPinBusy(false));
                             }}
                             className="rounded-lg bg-rose-500/15 px-3 py-1.5 text-xs font-medium text-rose-300 hover:bg-rose-500/25 disabled:opacity-50"
@@ -2242,7 +2880,7 @@ export function SettingsModal({
                     >
                       <div>
                         <div className="text-[13.5px] font-medium">
-                          {t("appVersionTitle", { version: appVersion || "0.5.0" })}
+                          {t("appVersionTitle", { version: appVersion || "0.6.0" })}
                         </div>
                         <div className="text-xs" style={{ color: "var(--text-secondary)" }}>
                           {availableUpdate

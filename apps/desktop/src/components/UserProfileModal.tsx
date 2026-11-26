@@ -1,15 +1,22 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
+  Ban,
   Calendar,
   Check,
   Clock,
   Copy,
   Image as ImageIcon,
+  Loader2,
   MessageCircle,
   MessageSquare,
   Phone,
   RefreshCw,
+  Send,
+  ShieldCheck,
+  Undo2,
   User,
+  UserMinus,
+  UserPlus,
   Users,
   X,
 } from "lucide-react";
@@ -21,13 +28,21 @@ import { formatThreadTime } from "../utils/threadState";
 import { RelayImage } from "./RelayImage";
 import { ThreadAvatar } from "./ThreadAvatar";
 
-interface Props {
+export interface UserProfileModalProps {
   userId: string | null;
   initialProfile?: UserProfileDto | null;
   onClose: () => void;
   onStartChat: (profile: UserProfileDto) => void;
   onOpenGroup?: (groupId: string) => void;
   onOpenImage: (url: string, title: string) => void;
+  onRelationshipChanged?: () => void;
+}
+
+type PendingRequestState = { kind: "received" | "sent"; message: string } | null;
+type ConfirmAction = "unfriend" | "block" | null;
+
+function cleanError(err: unknown): string {
+  return String(err).replace(/^Error:\s*/i, "").trim() || String(err);
 }
 
 export function UserProfileModal({
@@ -37,29 +52,74 @@ export function UserProfileModal({
   onStartChat,
   onOpenGroup,
   onOpenImage,
-}: Props) {
+  onRelationshipChanged,
+}: UserProfileModalProps) {
   const { lang, t } = useI18n();
   const [profile, setProfile] = useState<UserProfileDto | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [copiedPhone, setCopiedPhone] = useState(false);
+  const [pendingRequest, setPendingRequest] = useState<PendingRequestState>(null);
+  const [confirmAction, setConfirmAction] = useState<ConfirmAction>(null);
+  const [addFormOpen, setAddFormOpen] = useState(false);
+  const [greetingText, setGreetingText] = useState("");
+  const [actionBusy, setActionBusy] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
+  const copiedTimerRef = useRef<number | null>(null);
+  const copiedPhoneTimerRef = useRef<number | null>(null);
+  const relationshipMutatedRef = useRef(false);
+
+  useEffect(() => {
+    return () => {
+      if (copiedTimerRef.current !== null) {
+        window.clearTimeout(copiedTimerRef.current);
+        copiedTimerRef.current = null;
+      }
+      if (copiedPhoneTimerRef.current !== null) {
+        window.clearTimeout(copiedPhoneTimerRef.current);
+        copiedPhoneTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!userId) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [userId, onClose]);
 
   useEffect(() => {
     if (!userId) {
       setProfile(null);
       setError(null);
+      setPendingRequest(null);
+      setConfirmAction(null);
+      setAddFormOpen(false);
+      setGreetingText("");
+      setActionBusy(false);
+      setActionError(null);
+      setActionNotice(null);
+      relationshipMutatedRef.current = false;
       return;
     }
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKeyDown);
 
     let cancelled = false;
+    relationshipMutatedRef.current = false;
     setError(null);
     setCopied(false);
     setCopiedPhone(false);
+    setPendingRequest(null);
+    setConfirmAction(null);
+    setAddFormOpen(false);
+    setGreetingText("");
+    setActionBusy(false);
+    setActionError(null);
+    setActionNotice(null);
 
     const hasInitial = Boolean(initialProfile && initialProfile.uid === userId);
     if (hasInitial && initialProfile) {
@@ -73,7 +133,17 @@ export function UserProfileModal({
     void bridge
       .getUserProfile(userId)
       .then((res) => {
-        if (!cancelled) setProfile(res);
+        if (cancelled) return;
+        setProfile((prev) => {
+          if (relationshipMutatedRef.current && prev && prev.uid === res.uid) {
+            return {
+              ...res,
+              is_friend: prev.is_friend,
+              is_blocked: prev.is_blocked,
+            };
+          }
+          return res;
+        });
       })
       .catch((err) => {
         if (!cancelled && !hasInitial) setError(String(err));
@@ -82,11 +152,32 @@ export function UserProfileModal({
         if (!cancelled) setLoading(false);
       });
 
+    if (!(hasInitial && initialProfile?.is_self)) {
+      void bridge
+        .friendListRequests()
+        .then((list) => {
+          if (cancelled || relationshipMutatedRef.current) return;
+          const incoming = list.received.find((r) => r.user_id === userId);
+          if (incoming) {
+            setPendingRequest({ kind: "received", message: incoming.message || "" });
+            return;
+          }
+          const outgoing = list.sent.find((r) => r.user_id === userId);
+          if (outgoing) {
+            setPendingRequest({ kind: "sent", message: outgoing.message || "" });
+            return;
+          }
+          setPendingRequest(null);
+        })
+        .catch(() => {
+          // Best-effort pending request status lookup
+        });
+    }
+
     return () => {
       cancelled = true;
-      window.removeEventListener("keydown", onKeyDown);
     };
-  }, [userId, initialProfile, onClose]);
+  }, [userId, initialProfile]);
 
   if (!userId) return null;
 
@@ -97,19 +188,202 @@ export function UserProfileModal({
     const uid = profile?.uid || userId;
     void copyTextReliable(uid).catch(() => undefined);
     setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
+    if (copiedTimerRef.current !== null) {
+      window.clearTimeout(copiedTimerRef.current);
+    }
+    copiedTimerRef.current = window.setTimeout(() => {
+      copiedTimerRef.current = null;
+      setCopied(false);
+    }, 1500);
   };
 
   const handleCopyPhone = (phone: string) => {
     void copyTextReliable(phone).catch(() => undefined);
     setCopiedPhone(true);
-    setTimeout(() => setCopiedPhone(false), 1500);
+    if (copiedPhoneTimerRef.current !== null) {
+      window.clearTimeout(copiedPhoneTimerRef.current);
+    }
+    copiedPhoneTimerRef.current = window.setTimeout(() => {
+      copiedPhoneTimerRef.current = null;
+      setCopiedPhone(false);
+    }, 1500);
   };
 
   const mutualGroups = profile?.mutual_groups ?? [];
   const msgCount = profile?.local_message_count ?? 0;
   const mediaCount = profile?.local_media_count ?? 0;
   const lastInteractionTs = profile?.last_interaction_ts ?? 0;
+
+  const handleSendFriendRequest = async () => {
+    if (!profile || profile.is_self || actionBusy) return;
+    const msg = greetingText.trim() || t("friendRequestDefaultGreeting");
+    setActionBusy(true);
+    setActionError(null);
+    setActionNotice(null);
+    try {
+      const res = await bridge.friendSendRequest(profile.uid, msg);
+      if (!res.ok) {
+        setActionError(res.message || t("friendRequestSendBtn"));
+        return;
+      }
+      relationshipMutatedRef.current = true;
+      setAddFormOpen(false);
+      if (res.already_friends) {
+        setProfile((prev) => (prev ? { ...prev, is_friend: true } : prev));
+        setPendingRequest(null);
+        setActionNotice(t("friendAlreadyFriends"));
+      } else if (res.auto_accepted) {
+        setProfile((prev) => (prev ? { ...prev, is_friend: true } : prev));
+        setPendingRequest(null);
+        setActionNotice(t("friendRequestAutoAccepted"));
+      } else {
+        setPendingRequest({ kind: "sent", message: msg });
+        setActionNotice(t("friendRequestSentSuccess"));
+      }
+      onRelationshipChanged?.();
+    } catch (err) {
+      setActionError(cleanError(err));
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const handleAcceptRequest = async () => {
+    if (!profile || profile.is_self || actionBusy) return;
+    setActionBusy(true);
+    setActionError(null);
+    setActionNotice(null);
+    try {
+      const res = await bridge.friendAcceptRequest(profile.uid);
+      if (!res.ok) {
+        setActionError(res.message || t("friendRequestAcceptBtn"));
+        return;
+      }
+      relationshipMutatedRef.current = true;
+      setProfile((prev) => (prev ? { ...prev, is_friend: true } : prev));
+      setPendingRequest(null);
+      setActionNotice(t("friendAcceptedSuccess", { name: profile.display_name }));
+      onRelationshipChanged?.();
+    } catch (err) {
+      setActionError(cleanError(err));
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const handleRejectRequest = async () => {
+    if (!profile || profile.is_self || actionBusy) return;
+    setActionBusy(true);
+    setActionError(null);
+    setActionNotice(null);
+    try {
+      const res = await bridge.friendRejectRequest(profile.uid);
+      if (!res.ok) {
+        setActionError(res.message || t("friendRequestRejectBtn"));
+        return;
+      }
+      relationshipMutatedRef.current = true;
+      setPendingRequest(null);
+      setActionNotice(t("friendRejectedSuccess"));
+      onRelationshipChanged?.();
+    } catch (err) {
+      setActionError(cleanError(err));
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const handleUndoRequest = async () => {
+    if (!profile || profile.is_self || actionBusy) return;
+    setActionBusy(true);
+    setActionError(null);
+    setActionNotice(null);
+    try {
+      const res = await bridge.friendUndoRequest(profile.uid);
+      if (!res.ok) {
+        setActionError(res.message || t("friendRequestUndoBtn"));
+        return;
+      }
+      relationshipMutatedRef.current = true;
+      setPendingRequest(null);
+      setActionNotice(t("friendUndoneSuccess"));
+      onRelationshipChanged?.();
+    } catch (err) {
+      setActionError(cleanError(err));
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const handleConfirmUnfriend = async () => {
+    if (!profile || profile.is_self || actionBusy) return;
+    setActionBusy(true);
+    setActionError(null);
+    setActionNotice(null);
+    try {
+      const res = await bridge.friendRemove(profile.uid);
+      if (!res.ok) {
+        setActionError(res.message || t("friendUnfriendBtn"));
+        return;
+      }
+      relationshipMutatedRef.current = true;
+      setProfile((prev) => (prev ? { ...prev, is_friend: false } : prev));
+      setPendingRequest(null);
+      setConfirmAction(null);
+      setActionNotice(t("friendUnfriendSuccess", { name: profile.display_name }));
+      onRelationshipChanged?.();
+    } catch (err) {
+      setActionError(cleanError(err));
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const handleConfirmBlock = async () => {
+    if (!profile || profile.is_self || actionBusy) return;
+    setActionBusy(true);
+    setActionError(null);
+    setActionNotice(null);
+    try {
+      const res = await bridge.friendBlockUser(profile.uid);
+      if (!res.ok) {
+        setActionError(res.message || t("friendBlockBtn"));
+        return;
+      }
+      relationshipMutatedRef.current = true;
+      setProfile((prev) => (prev ? { ...prev, is_blocked: true } : prev));
+      setConfirmAction(null);
+      setActionNotice(t("friendBlockedSuccess", { name: profile.display_name }));
+      onRelationshipChanged?.();
+    } catch (err) {
+      setActionError(cleanError(err));
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const handleUnblock = async () => {
+    if (!profile || profile.is_self || actionBusy) return;
+    setActionBusy(true);
+    setActionError(null);
+    setActionNotice(null);
+    try {
+      const res = await bridge.friendUnblockUser(profile.uid);
+      if (!res.ok) {
+        setActionError(res.message || t("friendUnblockBtn"));
+        return;
+      }
+      relationshipMutatedRef.current = true;
+      setProfile((prev) => (prev ? { ...prev, is_blocked: false } : prev));
+      setConfirmAction(null);
+      setActionNotice(t("friendUnblockedSuccess", { name: profile.display_name }));
+      onRelationshipChanged?.();
+    } catch (err) {
+      setActionError(cleanError(err));
+    } finally {
+      setActionBusy(false);
+    }
+  };
 
   return (
     <div
@@ -180,25 +454,55 @@ export function UserProfileModal({
             </button>
 
             {profile && (
-              <span
-                className="relative z-10 mb-1 rounded-full px-2.5 py-0.5 text-[11px] font-medium"
-                style={{
-                  background: "var(--bg-surface)",
-                  color: profile.is_self
-                    ? "var(--accent)"
-                    : profile.is_friend
-                      ? "#34d399"
-                      : "var(--text-secondary)",
-                }}
-              >
-                {profile.is_self
-                  ? t("badgeSelfAccount")
-                  : profile.is_friend === true
-                    ? t("badgeFriend")
-                    : profile.is_friend === false
-                      ? t("badgeStranger")
-                      : t("badgeAccount")}
-              </span>
+              <div className="relative z-10 mb-1 flex flex-wrap items-center justify-end gap-1.5">
+                {!profile.is_self && profile.is_blocked === true && (
+                  <span
+                    className="inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] font-semibold"
+                    style={{
+                      background: "var(--danger-bg)",
+                      color: "var(--danger-text)",
+                    }}
+                  >
+                    <Ban className="h-3 w-3" />
+                    <span>{t("friendBlockedBadge")}</span>
+                  </span>
+                )}
+                {!profile.is_self && !profile.is_friend && pendingRequest?.kind === "received" && (
+                  <span
+                    className="rounded-full px-2.5 py-0.5 text-[11px] font-medium"
+                    style={{
+                      background: "var(--accent-soft)",
+                      color: "var(--accent)",
+                    }}
+                  >
+                    {t("friendRequestReceivedBadge")}
+                  </span>
+                )}
+                {!profile.is_self && !profile.is_friend && pendingRequest?.kind === "sent" && (
+                  <span className="rounded-full bg-emerald-500/15 px-2.5 py-0.5 text-[11px] font-medium text-emerald-400">
+                    {t("friendRequestSentBadge")}
+                  </span>
+                )}
+                <span
+                  className="rounded-full px-2.5 py-0.5 text-[11px] font-medium"
+                  style={{
+                    background: "var(--bg-surface)",
+                    color: profile.is_self
+                      ? "var(--accent)"
+                      : profile.is_friend
+                        ? "#34d399"
+                        : "var(--text-secondary)",
+                  }}
+                >
+                  {profile.is_self
+                    ? t("badgeSelfAccount")
+                    : profile.is_friend === true
+                      ? t("badgeFriend")
+                      : profile.is_friend === false
+                        ? t("badgeStranger")
+                        : t("badgeAccount")}
+                </span>
+              </div>
             )}
           </div>
 
@@ -219,9 +523,9 @@ export function UserProfileModal({
               <>
                 <div className="mt-3">
                   <h3 className="selectable-text text-[17px] font-bold">{profile.display_name}</h3>
-                  {profile.zalo_name && profile.zalo_name !== profile.display_name && (
+                  {profile.account_name && profile.account_name !== profile.display_name && (
                     <div className="selectable-text text-[13px]" style={{ color: "var(--text-secondary)" }}>
-                      {t("originalNameLabel", { name: profile.zalo_name })}
+                      {t("originalNameLabel", { name: profile.account_name })}
                     </div>
                   )}
                   {profile.status && (
@@ -374,16 +678,306 @@ export function UserProfileModal({
                 )}
 
                 {!profile.is_self && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onStartChat(profile);
-                      onClose();
-                    }}
-                    className="tf-btn mt-4 flex w-full items-center justify-center gap-2 rounded-xl py-2.5 text-[14px] font-semibold"
-                  >
-                    <MessageSquare className="h-4 w-4" /> {t("startChatNowBtn")}
-                  </button>
+                  <div className="mt-4 space-y-2.5">
+                    {actionError && (
+                      <div
+                        role="alert"
+                        className="rounded-xl px-3 py-2 text-xs"
+                        style={{ background: "var(--danger-bg)", color: "var(--danger-text)" }}
+                      >
+                        {actionError}
+                      </div>
+                    )}
+
+                    {actionNotice && (
+                      <div className="rounded-xl bg-emerald-500/15 px-3 py-2 text-xs text-emerald-400">
+                        {actionNotice}
+                      </div>
+                    )}
+
+                    {!profile.is_friend && pendingRequest?.kind === "received" && (
+                      <div
+                        className="space-y-2 rounded-xl p-3"
+                        style={{
+                          background: "var(--bg-surface)",
+                          border: "1px solid var(--border-subtle)",
+                        }}
+                      >
+                        <div className="text-xs font-semibold" style={{ color: "var(--accent)" }}>
+                          {t("friendRequestReceivedBadge")}
+                        </div>
+                        {pendingRequest.message.trim() && (
+                          <p
+                            className="selectable-text wrap-anywhere rounded-lg px-2.5 py-1.5 text-xs"
+                            style={{
+                              background: "var(--bg-sidebar)",
+                              color: "var(--text-secondary)",
+                            }}
+                          >
+                            {pendingRequest.message.trim()}
+                          </p>
+                        )}
+                        <div className="grid grid-cols-2 gap-2">
+                          <button
+                            type="button"
+                            disabled={actionBusy}
+                            onClick={() => void handleAcceptRequest()}
+                            className="tf-btn flex items-center justify-center gap-1.5 rounded-xl px-3 py-2 text-xs font-semibold disabled:opacity-50"
+                          >
+                            {actionBusy ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <Check className="h-3.5 w-3.5" />
+                            )}
+                            <span>{t("friendRequestAcceptBtn")}</span>
+                          </button>
+                          <button
+                            type="button"
+                            disabled={actionBusy}
+                            onClick={() => void handleRejectRequest()}
+                            className="hover-menu flex items-center justify-center gap-1.5 rounded-xl px-3 py-2 text-xs font-medium transition disabled:opacity-50"
+                            style={{
+                              background: "var(--bg-sidebar)",
+                              border: "1px solid var(--border-subtle)",
+                              color: "var(--danger-text)",
+                            }}
+                          >
+                            <X className="h-3.5 w-3.5" />
+                            <span>{t("friendRequestRejectBtn")}</span>
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onStartChat(profile);
+                        onClose();
+                      }}
+                      className="tf-btn flex w-full items-center justify-center gap-2 rounded-xl py-2.5 text-[14px] font-semibold"
+                    >
+                      <MessageSquare className="h-4 w-4" /> {t("startChatNowBtn")}
+                    </button>
+
+                    <div
+                      className={
+                        !profile.is_friend && pendingRequest?.kind === "received"
+                          ? "grid grid-cols-1 gap-2"
+                          : "grid grid-cols-2 gap-2"
+                      }
+                    >
+                      {profile.is_friend === true ? (
+                        <button
+                          type="button"
+                          disabled={actionBusy}
+                          onClick={() => {
+                            setAddFormOpen(false);
+                            setActionError(null);
+                            setConfirmAction((prev) => (prev === "unfriend" ? null : "unfriend"));
+                          }}
+                          className="hover-menu flex items-center justify-center gap-1.5 rounded-xl px-3 py-2 text-xs font-semibold transition disabled:opacity-50"
+                          style={{
+                            background:
+                              confirmAction === "unfriend"
+                                ? "var(--danger-bg)"
+                                : "var(--bg-surface)",
+                            border: "1px solid var(--border-subtle)",
+                            color: "var(--danger-text)",
+                          }}
+                        >
+                          <UserMinus className="h-3.5 w-3.5" />
+                          <span>{t("friendUnfriendBtn")}</span>
+                        </button>
+                      ) : pendingRequest?.kind === "sent" ? (
+                        <button
+                          type="button"
+                          disabled={actionBusy}
+                          onClick={() => void handleUndoRequest()}
+                          className="hover-menu flex items-center justify-center gap-1.5 rounded-xl px-3 py-2 text-xs font-semibold transition disabled:opacity-50"
+                          style={{
+                            background: "var(--bg-surface)",
+                            border: "1px solid var(--border-subtle)",
+                            color: "var(--text-primary)",
+                          }}
+                        >
+                          {actionBusy ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <Undo2 className="h-3.5 w-3.5" />
+                          )}
+                          <span>{t("friendRequestUndoBtn")}</span>
+                        </button>
+                      ) : pendingRequest?.kind === "received" ? null : (
+                        <button
+                          type="button"
+                          disabled={actionBusy}
+                          onClick={() => {
+                            setConfirmAction(null);
+                            setActionError(null);
+                            setAddFormOpen((prev) => {
+                              const next = !prev;
+                              if (next && !greetingText.trim()) {
+                                setGreetingText(t("friendRequestDefaultGreeting"));
+                              }
+                              return next;
+                            });
+                          }}
+                          className="hover-menu flex items-center justify-center gap-1.5 rounded-xl px-3 py-2 text-xs font-semibold transition disabled:opacity-50"
+                          style={{
+                            background: addFormOpen ? "var(--accent-soft)" : "var(--bg-surface)",
+                            border: "1px solid var(--border-subtle)",
+                            color: "var(--accent)",
+                          }}
+                        >
+                          <UserPlus className="h-3.5 w-3.5" />
+                          <span>{t("friendAddBtn")}</span>
+                        </button>
+                      )}
+
+                      {profile.is_blocked === true ? (
+                        <button
+                          type="button"
+                          disabled={actionBusy}
+                          onClick={() => void handleUnblock()}
+                          className="hover-menu flex items-center justify-center gap-1.5 rounded-xl px-3 py-2 text-xs font-semibold transition disabled:opacity-50"
+                          style={{
+                            background: "var(--bg-surface)",
+                            border: "1px solid var(--border-subtle)",
+                            color: "#34d399",
+                          }}
+                        >
+                          {actionBusy ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <ShieldCheck className="h-3.5 w-3.5" />
+                          )}
+                          <span>{t("friendUnblockBtn")}</span>
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          disabled={actionBusy}
+                          onClick={() => {
+                            setAddFormOpen(false);
+                            setActionError(null);
+                            setConfirmAction((prev) => (prev === "block" ? null : "block"));
+                          }}
+                          className="hover-menu flex items-center justify-center gap-1.5 rounded-xl px-3 py-2 text-xs font-semibold transition disabled:opacity-50"
+                          style={{
+                            background:
+                              confirmAction === "block"
+                                ? "var(--danger-bg)"
+                                : "var(--bg-surface)",
+                            border: "1px solid var(--border-subtle)",
+                            color: "var(--danger-text)",
+                          }}
+                        >
+                          <Ban className="h-3.5 w-3.5" />
+                          <span>{t("friendBlockBtn")}</span>
+                        </button>
+                      )}
+                    </div>
+
+                    {addFormOpen && !profile.is_friend && (
+                      <div
+                        className="space-y-2 rounded-xl p-3"
+                        style={{
+                          background: "var(--bg-surface)",
+                          border: "1px solid var(--border-subtle)",
+                        }}
+                      >
+                        <textarea
+                          rows={2}
+                          maxLength={150}
+                          value={greetingText}
+                          onChange={(e) => setGreetingText(e.target.value)}
+                          placeholder={t("friendRequestMessagePlaceholder")}
+                          className="w-full resize-none rounded-xl px-3 py-2 text-xs outline-none"
+                          style={{
+                            background: "var(--bg-sidebar)",
+                            border: "1px solid var(--border-subtle)",
+                            color: "var(--text-primary)",
+                          }}
+                        />
+                        <div className="flex items-center justify-end gap-2">
+                          <button
+                            type="button"
+                            disabled={actionBusy}
+                            onClick={() => setAddFormOpen(false)}
+                            className="hover-menu rounded-xl px-3 py-1.5 text-xs font-medium"
+                            style={{ background: "var(--bg-sidebar)" }}
+                          >
+                            {t("socialCancelBtn")}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={actionBusy}
+                            onClick={() => void handleSendFriendRequest()}
+                            className="tf-btn flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-semibold disabled:opacity-50"
+                          >
+                            {actionBusy ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <Send className="h-3.5 w-3.5" />
+                            )}
+                            <span>{t("friendRequestSendBtn")}</span>
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {confirmAction && (
+                      <div
+                        className="space-y-2.5 rounded-xl p-3"
+                        style={{
+                          background: "var(--danger-bg)",
+                          border: "1px solid rgba(239, 68, 68, 0.35)",
+                        }}
+                      >
+                        <div
+                          className="text-xs font-semibold"
+                          style={{ color: "var(--danger-text)" }}
+                        >
+                          {confirmAction === "unfriend"
+                            ? t("friendUnfriendConfirmTitle")
+                            : t("friendBlockConfirmTitle")}
+                        </div>
+                        <p className="text-xs leading-relaxed" style={{ color: "var(--text-primary)" }}>
+                          {confirmAction === "unfriend"
+                            ? t("friendUnfriendConfirmDesc", { name: profile.display_name })
+                            : t("friendBlockConfirmDesc", { name: profile.display_name })}
+                        </p>
+                        <div className="flex items-center justify-end gap-2">
+                          <button
+                            type="button"
+                            disabled={actionBusy}
+                            onClick={() => setConfirmAction(null)}
+                            className="hover-menu rounded-xl px-3 py-1.5 text-xs font-medium"
+                            style={{
+                              background: "var(--bg-sidebar)",
+                              color: "var(--text-primary)",
+                            }}
+                          >
+                            {t("socialCancelBtn")}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={actionBusy}
+                            onClick={() =>
+                              void (confirmAction === "unfriend"
+                                ? handleConfirmUnfriend()
+                                : handleConfirmBlock())
+                            }
+                            className="flex items-center gap-1.5 rounded-xl bg-rose-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-rose-500 disabled:opacity-50"
+                          >
+                            {actionBusy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                            <span>{t("socialConfirmActionBtn")}</span>
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 )}
               </>
             )

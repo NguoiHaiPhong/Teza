@@ -13,6 +13,7 @@
 pub mod audio;
 pub mod engine;
 pub mod error;
+pub mod media_hook;
 pub mod rtp;
 pub mod signaling;
 pub mod trace;
@@ -28,9 +29,11 @@ pub use engine::{
     CallStateMachine, TransitionOutput,
 };
 pub use error::{ensure_callable_session, ensure_direct_network, CallError, CallResult};
+pub use media_hook::{AuxiliaryMediaHook, AuxiliaryMediaSession, MediaTransportContext};
 pub use rtp::{
-    build_rtcp_rr, build_rtp_packet, is_rtcp_packet, parse_rtp_packet, JitterBuffer, JitterPop,
-    JitterStats, RtpPacket, RtpRxStats, AUDIO_FRAME_SAMPLES, AUDIO_SAMPLE_RATE, OPUS_AUDIO_PT,
+    build_rtcp_rr, build_rtp_packet, is_rtcp_packet, parse_rtp_packet, rtcp_sr_middle_ntp,
+    JitterBuffer, JitterPop, JitterStats, RtpPacket, RtpRxStats, AUDIO_FRAME_SAMPLES,
+    AUDIO_SAMPLE_RATE, OPUS_AUDIO_PT,
 };
 pub use signaling::{
     build_callee_extend_data, build_caller_invite_fields, generate_call_session,
@@ -45,6 +48,8 @@ pub use zrtp::{
     build_zrtp_echo_packet, build_zrtp_end_packet, build_zrtp_init_packet, build_zrtp_ping_packet,
     collect_relay_servers, parse_zrtp_echo_response, parse_zrtp_init_response, probe_udp_echo,
     uid_str_to_u32, unwrap_relay_media, wrap_relay_audio_rtcp, wrap_relay_audio_rtp,
-    wrap_relay_media, EchoProbeSummary, RelayServer, ZrtpInitResponse, ZrtpProbeConfig,
-    ZrtpProbeResult, ZrtpRelaySession,
+    wrap_relay_media, wrap_relay_video_rtcp, wrap_relay_video_rtp, EchoProbeSummary, RelayServer,
+    ZrtpInitResponse, ZrtpProbeConfig, ZrtpProbeResult, ZrtpRelaySession,
+    RELAY_INCOMING_VIDEO_RTP, RELAY_WRAP_AUDIO_RTCP, RELAY_WRAP_AUDIO_RTP, RELAY_WRAP_VIDEO_RTCP,
+    RELAY_WRAP_VIDEO_RTP,
 };

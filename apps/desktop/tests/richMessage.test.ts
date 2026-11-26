@@ -69,6 +69,9 @@ test("parseReminderPayload parses metadata and rescues legacy reminder cached as
   assert.equal(isReminderMessage(ecardLegacy), true);
   const parsedEcard = parseReminderPayload(ecardLegacy);
   assert.ok(parsedEcard);
+  if (!parsedEcard) {
+    throw new Error("Expected parsedEcard reminder payload");
+  }
   assert.equal(parsedEcard.title, "uống nước để lấy năng lượng...");
   assert.equal(parsedEcard.scheduleText, "Thứ Bảy, 21 tháng 11 lúc 15:00");
   assert.equal(new Date(parsedEcard.startTime).getDate(), 21);
@@ -88,6 +91,9 @@ test("parsePollPayload parses structured poll metadata cleanly", () => {
   assert.equal(isPollMessage(pollMsg), true);
   const poll = parsePollPayload(pollMsg);
   assert.ok(poll);
+  if (!poll) {
+    throw new Error("Expected parsed poll payload");
+  }
   assert.equal(poll.poll_id, 42);
   assert.equal(poll.allow_multi, true);
   assert.equal(poll.options.length, 1);

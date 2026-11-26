@@ -46,6 +46,8 @@ pub const ZRTP_ECHO_MAGIC_CALL_ID: u32 = 0x012F_833C;
 pub const RELAY_WRAP_AUDIO_RTP: u8 = 0x03;
 pub const RELAY_WRAP_AUDIO_RTCP: u8 = 0x05;
 pub const RELAY_WRAP_VIDEO_RTP: u8 = 0x0D;
+/// Server-to-client 1-byte incoming video RTP relay header (`[0x0E][inner_rtp]`).
+pub const RELAY_INCOMING_VIDEO_RTP: u8 = 0x0E;
 pub const RELAY_WRAP_VIDEO_RTCP: u8 = 0x0F;
 
 const RTCP_INBOX_MAX: usize = 512;
@@ -296,6 +298,16 @@ pub fn wrap_relay_audio_rtp(token: u32, rtp: &[u8]) -> Vec<u8> {
 /// Wrap an audio RTCP packet for a Zalo UDP relay (`0x05 + token LE + rtcp`).
 pub fn wrap_relay_audio_rtcp(token: u32, rtcp: &[u8]) -> Vec<u8> {
     wrap_relay_media(RELAY_WRAP_AUDIO_RTCP, token, rtcp)
+}
+
+/// Wrap a video RTP packet for a Zalo UDP relay (`0x0D + token LE + rtp`).
+pub fn wrap_relay_video_rtp(token: u32, rtp: &[u8]) -> Vec<u8> {
+    wrap_relay_media(RELAY_WRAP_VIDEO_RTP, token, rtp)
+}
+
+/// Wrap a video RTCP packet for a Zalo UDP relay (`0x0F + token LE + rtcp`).
+pub fn wrap_relay_video_rtcp(token: u32, rtcp: &[u8]) -> Vec<u8> {
+    wrap_relay_media(RELAY_WRAP_VIDEO_RTCP, token, rtcp)
 }
 
 /// Unwrap a Zalo UDP relay media packet into its inner RFC 3550 RTP/RTCP v2 slice.
@@ -634,6 +646,14 @@ impl ZrtpRelaySession {
             cfg.sub_cmd,
             sess_id,
         );
+        let pkt_rtcp_init = build_zrtp_init_packet(
+            is_caller,
+            from_uid,
+            partner_uid,
+            call_id,
+            cfg.sub_cmd | 4,
+            sess_id,
+        );
         let ts_now = unix_secs_string();
 
         let t_start = Instant::now();
@@ -643,9 +663,10 @@ impl ZrtpRelaySession {
             for srv in &servers {
                 let _ = rtp_sock.send_to(&pkt_init, srv.rtp.as_str()).await;
                 // Only send InitZRTP from `rtcp_sock` when the relay has a distinct RTCP port so
-                // a single-port relay never overwrites the `rtp_sock` NAT mapping.
+                // a single-port relay never overwrites the `rtp_sock` NAT mapping. Per `libzrtc.so`
+                // `initZRTPPacketRequestInitCall`, RTCP socket probes OR in bit 2 (`sub_cmd | 4`).
                 if srv.has_distinct_rtcp() {
-                    let _ = rtcp_sock.send_to(&pkt_init, srv.rtcp.as_str()).await;
+                    let _ = rtcp_sock.send_to(&pkt_rtcp_init, srv.rtcp.as_str()).await;
                 }
                 for _ in 0..cfg.echoes_per_burst {
                     let seq_this = echo_seq;
@@ -869,17 +890,17 @@ impl ZrtpRelaySession {
                             if distinct_rtcp_exists && srv.has_distinct_rtcp() {
                                 let rtcp_tok = load_server_token(&token_handles_loop, &srv.rtcp);
                                 if rtcp_tok == 0 {
-                                    let pkt_retry = pkt_retry_cache.get_or_insert_with(|| {
-                                        build_zrtp_init_packet(
-                                            is_caller,
-                                            from_uid,
-                                            partner_uid,
-                                            call_id,
-                                            sub_cmd,
-                                            &sess_owned,
-                                        )
-                                    });
-                                    let _ = rtcp_loop.send_to(pkt_retry, srv.rtcp.as_str()).await;
+                                    let pkt_rtcp_retry = build_zrtp_init_packet(
+                                        is_caller,
+                                        from_uid,
+                                        partner_uid,
+                                        call_id,
+                                        sub_cmd | 4,
+                                        &sess_owned,
+                                    );
+                                    let _ = rtcp_loop
+                                        .send_to(&pkt_rtcp_retry, srv.rtcp.as_str())
+                                        .await;
                                 } else {
                                     let pkt_rp =
                                         build_zrtp_ping_packet(from_uid, rtcp_tok, &sess_owned);
@@ -1051,9 +1072,17 @@ impl ZrtpRelaySession {
                 let _ = self.rtp_sock.send_to(&pkt_init, server.rtp.as_str()).await;
             }
             if need_rtcp_init {
+                let pkt_rtcp_init = build_zrtp_init_packet(
+                    self.is_caller,
+                    self.from_uid,
+                    self.partner_uid,
+                    self.call_id,
+                    self.sub_cmd | 4,
+                    &self.sess_id,
+                );
                 let _ = self
                     .rtcp_sock
-                    .send_to(&pkt_init, server.rtcp.as_str())
+                    .send_to(&pkt_rtcp_init, server.rtcp.as_str())
                     .await;
             }
         }
@@ -1501,6 +1530,11 @@ mod tests {
                         let cmd = u16::from_le_bytes([b2[18], b2[19]]);
                         match cmd {
                             ZRTP_CMD_INIT_CALLER | ZRTP_CMD_INIT_CALLEE => {
+                                assert_eq!(
+                                    b2[20],
+                                    ZRTP_SUB_INIT_V3 | 4,
+                                    "distinct RTCP InitZRTP must set bit 2 (sub_cmd | 4)"
+                                );
                                 c_rtcp_init.fetch_add(1, Ordering::Relaxed);
                                 let call_id = u32::from_le_bytes(b2[21..25].try_into().unwrap());
                                 let reply = encode_zrtp_init_response(

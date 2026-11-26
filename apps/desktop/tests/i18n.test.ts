@@ -7,15 +7,32 @@ import {
 } from "../src/i18n/types.ts";
 import { vi, type TranslationKey } from "../src/i18n/vi.ts";
 
-test("all i18n dictionaries (vi, en, ko) contain identical non-empty keys", () => {
-  const keys = Object.keys(vi) as TranslationKey[];
-  assert.ok(keys.length > 80);
+function extractPlaceholders(template: string): string[] {
+  const names = new Set<string>();
+  for (const match of template.matchAll(/\{([a-zA-Z0-9_]+)\}/g)) {
+    names.add(match[1]);
+  }
+  return [...names].sort();
+}
+
+test("all i18n dictionaries (vi, en, ko) have exact bidirectional key parity and matching {placeholder} sets", () => {
+  const viKeys = (Object.keys(vi) as TranslationKey[]).sort();
+  assert.ok(viKeys.length > 80);
 
   for (const lang of ["vi", "en", "ko"] as const) {
     const dict = dictionaries[lang];
-    for (const key of keys) {
-      assert.equal(typeof dict[key], "string", `${lang}.${key} must exist`);
-      assert.ok(dict[key].trim().length > 0, `${lang}.${key} must be non-empty`);
+    const langKeys = Object.keys(dict).sort();
+    assert.deepEqual(langKeys, viKeys, `${lang} dictionary keys must match vi exactly (no missing or extra keys)`);
+
+    for (const key of viKeys) {
+      const val = dict[key];
+      assert.equal(typeof val, "string", `${lang}.${key} must exist`);
+      assert.ok(val.trim().length > 0, `${lang}.${key} must be non-empty`);
+      assert.deepEqual(
+        extractPlaceholders(val),
+        extractPlaceholders(vi[key]),
+        `${lang}.${key} placeholders must match vi.${key}`,
+      );
     }
   }
 });

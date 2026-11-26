@@ -28,9 +28,11 @@ interface Props {
   onClose: () => void;
   onJumpToMsgInMainChat: (msgId: string) => void;
   onSendThreadReply: (text: string, quoteTarget: MessageDto) => Promise<boolean | void>;
-  onSendThreadAttachment: (att: PendingAttachment, caption: string, rootMsgId: string) => Promise<void>;
+  onSendThreadAttachment: (att: PendingAttachment, caption: string, rootMsgId: string) => Promise<boolean>;
   onBuzz: () => Promise<void>;
   buzzCooldownSec: number;
+  sendOnEnter?: boolean;
+  hasBlockingOverlay?: boolean;
   getSenderAvatar?: (senderId: string) => string | undefined;
   onSaveFile?: (url: string, name: string) => void;
   onRetrySend?: (msg: MessageDto) => void;
@@ -68,6 +70,8 @@ export function ReplyThreadPanel({
   onSendThreadAttachment,
   onBuzz,
   buzzCooldownSec,
+  sendOnEnter = true,
+  hasBlockingOverlay = false,
   getSenderAvatar,
   onSaveFile,
   onRetrySend,
@@ -93,6 +97,16 @@ export function ReplyThreadPanel({
   const listContainerRef = useRef<HTMLDivElement | null>(null);
   const listBottomRef = useRef<HTMLDivElement | null>(null);
   const prevCountRef = useRef(replies.length);
+  const highlightTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (highlightTimerRef.current !== null) {
+        window.clearTimeout(highlightTimerRef.current);
+        highlightTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const handleJumpSmart = (msgId: string) => {
     if (replies.some((r) => r.msg_id === msgId) && listContainerRef.current) {
@@ -100,7 +114,13 @@ export function ReplyThreadPanel({
       if (el) {
         el.scrollIntoView({ behavior: "smooth", block: "center" });
         setThreadHighlightId(msgId);
-        setTimeout(() => setThreadHighlightId(null), 1600);
+        if (highlightTimerRef.current !== null) {
+          window.clearTimeout(highlightTimerRef.current);
+        }
+        highlightTimerRef.current = window.setTimeout(() => {
+          highlightTimerRef.current = null;
+          setThreadHighlightId(null);
+        }, 1600);
         return;
       }
     }
@@ -117,13 +137,14 @@ export function ReplyThreadPanel({
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        onClose();
-      }
+      if (e.key !== "Escape" || e.defaultPrevented || hasBlockingOverlay) return;
+      if (document.querySelector("[data-teza-floating-popup]")) return;
+      e.preventDefault();
+      onClose();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
+  }, [onClose, hasBlockingOverlay]);
 
   useEffect(() => {
     if (replies.length > prevCountRef.current) {
@@ -354,6 +375,7 @@ export function ReplyThreadPanel({
 
       {/* Full Composer inside Thread (text + emoji/stickers + images/files + @mention + buzz) */}
       <Composer
+        threadKey={rootMessage.msg_id}
         replyTo={replyTarget.msg_id !== rootMessage.msg_id ? replyTarget : null}
         focusSignal={replyFocusSeq}
         pendingAttachment={pendingAttachment}
@@ -362,14 +384,18 @@ export function ReplyThreadPanel({
         onSendSticker={onSendSticker}
         onCancelReply={() => setReplyTarget(rootMessage)}
         onSendText={async (text) => {
-          await onSendThreadReply(text, replyTarget);
-          setReplyTarget(rootMessage);
+          const ok = await onSendThreadReply(text, replyTarget);
+          if (ok !== false) {
+            setReplyTarget(rootMessage);
+          }
+          return ok;
         }}
         onSendAttachment={async (att, cap) => {
-          await onSendThreadAttachment(att, cap, rootMessage.msg_id);
+          return await onSendThreadAttachment(att, cap, rootMessage.msg_id);
         }}
         onBuzz={onBuzz}
         buzzCooldownSec={buzzCooldownSec}
+        sendOnEnter={sendOnEnter}
         placeholder={t("replyInThreadPlaceholder", { name: replyTarget.sender_name })}
         onError={onError}
       />

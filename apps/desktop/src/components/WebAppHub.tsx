@@ -163,7 +163,7 @@ export function WebAppHub({
         <div className="flex items-center gap-2">
           <button
             type="button"
-            onClick={() => (formOpen ? resetForm() : openAddForm())}
+            onClick={() => (formOpen && !editingId ? resetForm() : openAddForm())}
             className="tf-btn flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-semibold"
           >
             <Plus className="h-4 w-4" />
@@ -430,6 +430,7 @@ export function WebAppHub({
                       <div
                         className="flex shrink-0 items-center gap-0.5 opacity-75 transition group-hover:opacity-100"
                         onClick={(e) => e.stopPropagation()}
+                        onKeyDown={(e) => e.stopPropagation()}
                       >
                         <button
                           type="button"

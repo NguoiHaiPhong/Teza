@@ -6,6 +6,7 @@ import type {
   NotifyPreviewMode,
   ThreadDto,
 } from "../types.ts";
+import { tokenizeMentions } from "./mentions.ts";
 
 const PREFS_STORAGE_KEY = "teza.notifyPrefs";
 
@@ -126,23 +127,27 @@ export function isThreadCurrentlyMuted(
 
 export function isMessageMentioningMe(
   msg: MessageDto,
-  _myUid: string,
+  myUid: string,
   myName: string,
 ): boolean {
-  const textLower = (msg.text || "").toLowerCase();
+  const normalizedUid = myUid.trim();
+  const cleanName = myName.trim();
+  const candidates =
+    normalizedUid && cleanName ? [{ id: normalizedUid, name: cleanName }] : [];
+  const tokens = tokenizeMentions(msg.text || "", candidates);
+  for (const tok of tokens) {
+    if (tok.kind !== "mention") continue;
+    if (tok.isAll) return true;
+    if (normalizedUid && tok.userId === normalizedUid) return true;
+  }
+  const quotedSender = (msg.quote?.sender_name || "").normalize("NFC").trim().toLowerCase();
+  const cleanNameLower = cleanName.normalize("NFC").toLowerCase();
   if (
-    textLower.includes("@all") ||
-    textLower.includes("@mọi người") ||
-    textLower.includes("@moi nguoi")
+    quotedSender &&
+    (quotedSender === "bạn" ||
+      quotedSender === "you" ||
+      (cleanNameLower && quotedSender === cleanNameLower))
   ) {
-    return true;
-  }
-  const cleanName = myName.trim().toLowerCase();
-  if (cleanName && textLower.includes(`@${cleanName}`)) {
-    return true;
-  }
-  const quotedSender = (msg.quote?.sender_name || "").trim().toLowerCase();
-  if (quotedSender && (quotedSender === "bạn" || (cleanName && quotedSender === cleanName))) {
     return true;
   }
   return false;

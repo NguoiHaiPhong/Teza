@@ -1,0 +1,23 @@
+[package]
+name = "teza-video"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Isolated pure-Rust 1-1 H.264/RTP/ZFrag/RTCP video pipeline and video_lab CLI for Teza"
+
+[features]
+default = []
+lab = ["dep:serde_json", "dep:tokio", "dep:zalo-core"]
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", optional = true }
+teza-call = { path = "../teza-call" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal"], optional = true }
+zalo-core = { path = "../zalo-core", optional = true }
+
+[[bin]]
+name = "video_lab"
+path = "src/bin/video_lab.rs"
+required-features = ["lab"]

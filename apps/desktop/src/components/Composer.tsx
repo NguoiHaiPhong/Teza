@@ -1,5 +1,5 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { BarChart3, CalendarClock, CornerUpLeft, FileText, Image as ImageIcon, Loader2, Paperclip, Pencil, Scissors, Search, Send, Smile, X, Zap } from "lucide-react";
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { BarChart3, CalendarClock, CornerUpLeft, FileText, Image as ImageIcon, Loader2, Paperclip, Pencil, Scissors, Search, Send, Smile, Users, X, Zap } from "lucide-react";
 import { bridge, isTauri, MAX_ATTACHMENT_BYTES } from "../bridge";
 import { useI18n, type TranslationKey } from "../i18n";
 import type { MessageDto, PendingAttachment, StickerItem, ThreadMemberDto } from "../types";
@@ -7,6 +7,13 @@ import { extFromMime, extractAttachmentFromClipboard } from "../utils/clipboardP
 import { shouldFocusComposerOnReply } from "../utils/downloadState";
 import { EMOJI_CATEGORIES, searchEmojis } from "../utils/emojiCatalog";
 import { useEmojiStyle } from "../utils/emojiStyleContext";
+import {
+  filterMentionCandidates,
+  findActiveMentionQuery,
+  isMentionAllMember,
+  reconcileCompletedMentions,
+  type CompletedMentionSpan,
+} from "../utils/mentions";
 import {
   convertRetroShortcutsToEmoji,
   RETRO_EMOTICONS,
@@ -139,7 +146,11 @@ export function Composer({
       }
       threadKeyRef.current = threadKey;
       lastHeightRef.current = 0;
-      setLocalDraft(controlledDraft ?? "");
+      const nextDraft = controlledDraft ?? "";
+      setLocalDraft(nextDraft);
+      setCursorPos(0);
+      setMentionDismissedAt(null);
+      setCompletedMentions([]);
       return;
     }
     if (
@@ -147,7 +158,17 @@ export function Composer({
       controlledDraft !== draftRef.current &&
       draftTimerRef.current === null
     ) {
+      const prevVal = draftRef.current;
       setLocalDraft(controlledDraft);
+      if (!controlledDraft) {
+        setCursorPos(0);
+        setMentionDismissedAt(null);
+        setCompletedMentions([]);
+      } else {
+        setCompletedMentions((prev) =>
+          reconcileCompletedMentions(prev, prevVal, controlledDraft),
+        );
+      }
     }
   }, [threadKey, controlledDraft]);
 
@@ -162,9 +183,11 @@ export function Composer({
   }, []);
 
   const setDraft = (next: string | ((prev: string) => string)) => {
-    const val = typeof next === "function" ? next(draftRef.current) : next;
+    const prevVal = draftRef.current;
+    const val = typeof next === "function" ? next(prevVal) : next;
     setLocalDraft(val);
     draftRef.current = val;
+    setCompletedMentions((prev) => reconcileCompletedMentions(prev, prevVal, val));
     if (draftTimerRef.current !== null) {
       window.clearTimeout(draftTimerRef.current);
       draftTimerRef.current = null;
@@ -213,7 +236,9 @@ export function Composer({
   const [cursorPos, setCursorPos] = useState(0);
   const [mentionIndex, setMentionIndex] = useState(0);
   const [mentionDismissedAt, setMentionDismissedAt] = useState<number | null>(null);
+  const [completedMentions, setCompletedMentions] = useState<CompletedMentionSpan[]>([]);
   const isComposingRef = useRef(false);
+  const mentionItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const prevReplyIdRef = useRef<string | null>(replyTo?.msg_id ?? null);
@@ -236,6 +261,7 @@ export function Composer({
       el.focus();
       const len = el.value.length;
       el.setSelectionRange(len, len);
+      setCursorPos(len);
     });
     return () => window.cancelAnimationFrame(rafId);
   }, [replyTo?.msg_id, focusSignal]);
@@ -243,7 +269,8 @@ export function Composer({
   useEffect(() => {
     if (!emojiOpen) return;
     const onWindowKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
+      if (event.key === "Escape" && !event.defaultPrevented) {
+        event.preventDefault();
         setEmojiOpen(false);
       }
     };
@@ -352,44 +379,89 @@ export function Composer({
     });
   };
 
-  const mentionMatch = useMemo(() => {
+  const rawMentionMatch = useMemo(() => {
     if (mentionMembers.length === 0) return null;
-    const bounded = Math.min(cursorPos, draft.length);
-    const before = draft.slice(0, bounded);
-    const m = before.match(/(?:^|\s)(@([^\s@]*))$/);
-    if (!m) return null;
-    const start = before.length - m[1].length;
-    if (mentionDismissedAt === start) return null;
-    return { start, query: m[2] };
-  }, [draft, cursorPos, mentionMembers.length, mentionDismissedAt]);
+    return findActiveMentionQuery(draft, cursorPos);
+  }, [draft, cursorPos, mentionMembers.length]);
+
+  const mentionMatch = useMemo(() => {
+    if (!rawMentionMatch) return null;
+    if (mentionDismissedAt === rawMentionMatch.start) return null;
+    const isCompleted = completedMentions.some(
+      (span) =>
+        span.start === rawMentionMatch.start &&
+        cursorPos >= span.start + span.text.length &&
+        draft.slice(span.start, span.start + span.text.length) === span.text,
+    );
+    if (isCompleted) {
+      return null;
+    }
+    return rawMentionMatch;
+  }, [rawMentionMatch, mentionDismissedAt, completedMentions, cursorPos, draft]);
 
   const mentionMatches = useMemo(() => {
     if (!mentionMatch) return [];
-    const q = mentionMatch.query.trim().toLowerCase();
-    return mentionMembers
-      .filter((m) => !q || m.name.toLowerCase().includes(q))
-      .slice(0, 8);
+    return filterMentionCandidates(mentionMembers, mentionMatch.query, 8);
   }, [mentionMatch, mentionMembers]);
 
+  const mentionListboxId = useId();
+  const mentionOpen = mentionMatches.length > 0 && Boolean(mentionMatch);
+  const safeMentionIndex = mentionOpen
+    ? Math.max(0, Math.min(mentionIndex, mentionMatches.length - 1))
+    : -1;
+  const activeMentionOptionId =
+    safeMentionIndex >= 0 ? `${mentionListboxId}-opt-${safeMentionIndex}` : undefined;
+
   useEffect(() => {
-    if (!mentionMatch && mentionDismissedAt !== null) {
+    if (mentionMatch && mentionMatches.length > 0) {
+      setEmojiOpen(false);
+    }
+  }, [mentionMatch, mentionMatches.length]);
+
+  useEffect(() => {
+    if (!rawMentionMatch) {
+      if (mentionDismissedAt !== null) setMentionDismissedAt(null);
+      return;
+    }
+    if (mentionDismissedAt !== null && rawMentionMatch.start !== mentionDismissedAt) {
       setMentionDismissedAt(null);
     }
-  }, [mentionMatch, mentionDismissedAt]);
+  }, [rawMentionMatch, mentionDismissedAt]);
 
   useEffect(() => {
     setMentionIndex(0);
-  }, [mentionMatch?.query, mentionMatches.length]);
+  }, [mentionMatch?.start, mentionMatch?.query, mentionMatches.length]);
+
+  useEffect(() => {
+    if (!mentionMatch || mentionMatches.length === 0) return;
+    const activeEl = mentionItemRefs.current[mentionIndex];
+    activeEl?.scrollIntoView({ block: "nearest" });
+  }, [mentionIndex, mentionMatch, mentionMatches.length]);
+
+  const syncCursorFromEl = (el: HTMLTextAreaElement) => {
+    const pos = typeof el.selectionStart === "number" ? el.selectionStart : el.value.length;
+    setCursorPos(pos);
+  };
 
   const insertMention = (member: ThreadMemberDto) => {
     if (!mentionMatch) return;
-    const end = Math.min(cursorPos, draft.length);
-    const inserted = `@${member.name} `;
-    const nextText = `${draft.slice(0, mentionMatch.start)}${inserted}${draft.slice(end)}`;
-    const nextCursor = mentionMatch.start + inserted.length;
+    const currentDraft = draftRef.current;
+    let end = Math.max(mentionMatch.start, Math.min(cursorPos, currentDraft.length));
+    const tailWord = currentDraft.slice(end).match(/^[\p{L}\p{N}\p{M}_]+/u);
+    if (tailWord) {
+      end += tailWord[0].length;
+    }
+    const hasTrailingSpace = end < currentDraft.length && currentDraft[end] === " ";
+    const inserted = `@${member.name}${hasTrailingSpace ? "" : " "}`;
+    const nextText = `${currentDraft.slice(0, mentionMatch.start)}${inserted}${currentDraft.slice(end)}`;
+    const nextCursor = mentionMatch.start + inserted.length + (hasTrailingSpace ? 1 : 0);
     setDraft(nextText);
     setCursorPos(nextCursor);
     setMentionDismissedAt(null);
+    setCompletedMentions((prev) => [
+      ...prev.filter((span) => span.start !== mentionMatch.start),
+      { start: mentionMatch.start, text: `@${member.name} ` },
+    ]);
     requestAnimationFrame(() => {
       const el = textareaRef.current;
       if (el) {
@@ -436,14 +508,6 @@ export function Composer({
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
-
-  useEffect(() => {
-    const previewUrl =
-      pendingAttachment?.kind === "raw" ? pendingAttachment.previewUrl : null;
-    return () => {
-      if (previewUrl) URL.revokeObjectURL(previewUrl);
-    };
-  }, [pendingAttachment]);
 
   const attachRawFile = (file: File) => {
     if (!onPendingAttachmentChange || !onSendAttachment) return;
@@ -538,6 +602,9 @@ export function Composer({
         if (ok !== false && ok !== null) {
           onPendingAttachmentChange?.(null);
           setDraft("");
+          setCursorPos(0);
+          setMentionDismissedAt(null);
+          setCompletedMentions([]);
         }
       } catch {
         // Keep pendingAttachment and draft intact so user can retry cleanly
@@ -552,6 +619,9 @@ export function Composer({
     const rawText = draft;
     const text = emojiStyle === "retro" ? convertRetroShortcutsToEmoji(rawText) : rawText;
     setDraft("");
+    setCursorPos(0);
+    setMentionDismissedAt(null);
+    setCompletedMentions([]);
     try {
       const ok = await onSendText(text);
       if (ok === false) {
@@ -656,9 +726,12 @@ export function Composer({
       )}
 
       <div className="relative flex items-end gap-2 px-4 py-3">
-        {mentionMatches.length > 0 && mentionMatch && (
+        {mentionOpen && (
           <div
-            className="absolute bottom-full left-12 z-30 mb-2 max-h-56 w-72 overflow-y-auto rounded-2xl p-1.5 shadow-2xl"
+            id={mentionListboxId}
+            role="listbox"
+            aria-label={t("mentionMembersHeader")}
+            className="absolute bottom-full left-4 z-30 mb-2 max-h-60 w-72 max-w-[calc(100%-2rem)] overflow-y-auto rounded-2xl p-1.5 shadow-2xl"
             style={{ background: "var(--bg-sidebar)", border: "1px solid var(--border-subtle)" }}
           >
             <div
@@ -667,38 +740,64 @@ export function Composer({
             >
               {t("mentionMembersHeader")}
             </div>
-            {mentionMatches.map((m, idx) => (
-              <button
-                key={m.id || `${m.name}-${idx}`}
-                type="button"
-                onMouseDown={(e) => {
-                  e.preventDefault();
-                  insertMention(m);
-                }}
-                className="flex w-full items-center gap-2.5 rounded-xl px-2.5 py-1.5 text-left transition"
-                style={{
-                  background: idx === mentionIndex ? "var(--bg-hover)" : "transparent",
-                }}
-              >
-                <ThreadAvatar avatar={m.avatar} title={m.name} kind="direct" size="xs" />
-                <span className="min-w-0 flex-1 truncate text-[13.5px] font-medium">
-                  {m.name}
-                </span>
-                {m.role && (
-                  <span
-                    className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold"
-                    style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
-                  >
-                    {m.role}
+            {mentionMatches.map((m, idx) => {
+              const isAll = isMentionAllMember(m);
+              const showRole = Boolean(m.role && m.role !== "Thành viên");
+              return (
+                <button
+                  key={m.id || `${m.name}-${idx}`}
+                  id={`${mentionListboxId}-opt-${idx}`}
+                  ref={(el) => {
+                    mentionItemRefs.current[idx] = el;
+                  }}
+                  type="button"
+                  role="option"
+                  aria-selected={idx === safeMentionIndex}
+                  onMouseEnter={() => setMentionIndex(idx)}
+                  onMouseDown={(e) => {
+                    if (e.button !== 0) return;
+                    e.preventDefault();
+                    if (isComposingRef.current) {
+                      isComposingRef.current = false;
+                      textareaRef.current?.blur();
+                    }
+                    insertMention(m);
+                  }}
+                  className="flex w-full items-center gap-2.5 rounded-xl px-2.5 py-1.5 text-left transition"
+                  style={{
+                    background: idx === safeMentionIndex ? "var(--bg-hover)" : "transparent",
+                  }}
+                >
+                  {isAll ? (
+                    <div
+                      className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full"
+                      style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
+                    >
+                      <Users className="h-3.5 w-3.5" />
+                    </div>
+                  ) : (
+                    <ThreadAvatar avatar={m.avatar} title={m.name} kind="direct" size="xs" />
+                  )}
+                  <span className="min-w-0 flex-1 truncate text-[13.5px] font-medium">
+                    {isAll ? `@${m.name}` : m.name}
                   </span>
-                )}
-              </button>
-            ))}
+                  {showRole && (
+                    <span
+                      className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold"
+                      style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
+                    >
+                      {m.role}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
           </div>
         )}
 
         {emojiOpen && (
           <div
+            data-teza-floating-popup="true"
             className="absolute bottom-full left-4 z-30 mb-2 w-[360px] max-w-[calc(100vw-2rem)] rounded-2xl p-3 shadow-2xl"
             style={{ background: "var(--bg-sidebar)", border: "1px solid var(--border-subtle)" }}
           >
@@ -1101,7 +1200,15 @@ export function Composer({
 
         <button
           type="button"
-          onClick={() => setEmojiOpen((v) => !v)}
+          onClick={() =>
+            setEmojiOpen((v) => {
+              const next = !v;
+              if (next && mentionMatch) {
+                setMentionDismissedAt(mentionMatch.start);
+              }
+              return next;
+            })
+          }
           title={t("composerEmojiTitle")}
           className="hover-surface rounded-lg p-2 transition"
           style={{ color: emojiOpen ? "var(--accent)" : "var(--text-secondary)" }}
@@ -1168,22 +1275,29 @@ export function Composer({
           ref={textareaRef}
           rows={1}
           value={draft}
+          role="combobox"
+          aria-multiline="true"
+          aria-autocomplete="list"
+          aria-haspopup="listbox"
+          aria-expanded={mentionOpen}
+          aria-controls={mentionOpen ? mentionListboxId : undefined}
+          aria-activedescendant={activeMentionOptionId}
           onChange={(e) => {
             const val = e.target.value;
             setDraft(val);
-            if (mentionMembers.length > 0 && (val.includes("@") || mentionMatch !== null)) {
-              setCursorPos(e.currentTarget.selectionStart ?? val.length);
-            }
+            syncCursorFromEl(e.currentTarget);
+          }}
+          onFocus={(e) => {
+            syncCursorFromEl(e.currentTarget);
           }}
           onClick={(e) => {
-            if (mentionMembers.length > 0 && e.currentTarget.value.includes("@")) {
-              setCursorPos(e.currentTarget.selectionStart ?? e.currentTarget.value.length);
-            }
+            syncCursorFromEl(e.currentTarget);
           }}
           onKeyUp={(e) => {
-            if (mentionMembers.length > 0 && (e.currentTarget.value.includes("@") || mentionMatch !== null)) {
-              setCursorPos(e.currentTarget.selectionStart ?? e.currentTarget.value.length);
-            }
+            syncCursorFromEl(e.currentTarget);
+          }}
+          onSelect={(e) => {
+            syncCursorFromEl(e.currentTarget);
           }}
           onPaste={(e) => {
             const pastedFile = extractAttachmentFromClipboard(e.clipboardData);
@@ -1195,10 +1309,24 @@ export function Composer({
           onCompositionStart={() => {
             isComposingRef.current = true;
           }}
-          onCompositionEnd={() => {
+          onCompositionUpdate={(e) => {
+            isComposingRef.current = true;
+            syncCursorFromEl(e.currentTarget);
+          }}
+          onCompositionEnd={(e) => {
             isComposingRef.current = false;
+            const val = e.currentTarget.value;
+            if (val !== draftRef.current) {
+              setDraft(val);
+            }
+            syncCursorFromEl(e.currentTarget);
           }}
           onKeyDown={(e) => {
+            const isComposing =
+              isComposingRef.current || e.nativeEvent.isComposing || e.keyCode === 229;
+            if (isComposing) {
+              return;
+            }
             if (mentionMatches.length > 0 && mentionMatch) {
               if (e.key === "ArrowDown") {
                 e.preventDefault();
@@ -1212,10 +1340,7 @@ export function Composer({
               }
               if (
                 e.key === "Tab" ||
-                (e.key === "Enter" &&
-                  !e.shiftKey &&
-                  !isComposingRef.current &&
-                  !e.nativeEvent.isComposing)
+                (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey)
               ) {
                 e.preventDefault();
                 insertMention(mentionMatches[mentionIndex] ?? mentionMatches[0]);
@@ -1223,6 +1348,7 @@ export function Composer({
               }
               if (e.key === "Escape") {
                 e.preventDefault();
+                e.stopPropagation();
                 setMentionDismissedAt(mentionMatch.start);
                 return;
               }
@@ -1230,7 +1356,7 @@ export function Composer({
             const shouldSubmit = sendOnEnter
               ? e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey
               : e.key === "Enter" && (e.ctrlKey || e.metaKey);
-            if (shouldSubmit && !isComposingRef.current && !e.nativeEvent.isComposing) {
+            if (shouldSubmit) {
               e.preventDefault();
               setEmojiOpen(false);
               void handleSubmit();

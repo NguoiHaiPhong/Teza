@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type {
   AccountProfile,
   AddGroupMembersResultDto,
@@ -9,6 +10,20 @@ import type {
   CallStateDto,
   ChatFolderDto,
   FolderFilter,
+  FriendActionResultDto,
+  FriendRequestItemDto,
+  FriendRequestsListDto,
+  GDriveCloudItemDto,
+  GDriveConfigDto,
+  GDriveConfigPatch,
+  GDrivePruneResultDto,
+  GDriveStatusDto,
+  GDriveStorageOverviewDto,
+  GDriveThreadUsageDto,
+  KickGroupMembersResultDto,
+  LeaveGroupResultDto,
+  MediaVaultConfigDto,
+  MediaVaultStatsDto,
   MessageDto,
   NotifyToastPayload,
   PollDto,
@@ -17,15 +32,20 @@ import type {
   RelayTestResult,
   SavedFileResultDto,
   ScreenCaptureDto,
+  SocialWsEventDto,
   StickerItem,
   ThreadDetailsDto,
   ThreadDto,
+  ThreadMemberDto,
   TranslateConfigSummary,
   TranslateConfigUpdate,
   TranslateProvider,
   TranslationResult,
   UserProfileDto,
+  WebAppAccountDto,
+  WebAppAccountInput,
 } from "./types";
+import { filterDemoWebAppAccounts, upsertDemoWebAppAccount } from "./utils/webappAccounts.ts";
 
 export const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -152,6 +172,244 @@ const DEMO_MESSAGES: Record<string, MessageDto[]> = {
   ],
 };
 
+let DEMO_WEBAPP_ACCOUNTS: WebAppAccountDto[] = [];
+
+let DEMO_MEDIA_VAULT_CONFIG: MediaVaultConfigDto = {
+  custom_vault_dir: null,
+  active_vault_dir: "LocalAppData/Teza/media/demo",
+  quota_mb: 1024,
+  encrypt_at_rest: true,
+  auto_cache_images: true,
+  auto_cache_voice: true,
+  auto_cache_video_files: false,
+};
+
+let DEMO_MEDIA_VAULT_STATS: MediaVaultStatsDto = {
+  total_bytes: 0,
+  object_count: 0,
+  pinned_bytes: 0,
+  pinned_count: 0,
+  image_bytes: 0,
+  video_bytes: 0,
+  voice_bytes: 0,
+  file_bytes: 0,
+  thumb_bytes: 0,
+  cloud_synced_count: 0,
+  cloud_total_bytes: 0,
+};
+
+let DEMO_GDRIVE_CONFIG: GDriveConfigDto = {
+  client_id: "",
+  has_client_secret: false,
+  has_builtin_oauth: true,
+  token_broker_url: "",
+  has_builtin_token_broker: true,
+  oauth_mode: "builtin_broker",
+  sync_enabled: true,
+  sync_media: true,
+  sync_history: true,
+  auto_sync_interval_secs: 300,
+};
+
+let DEMO_GDRIVE_STATUS: GDriveStatusDto = {
+  relay_blocked: false,
+  oauth_configured: true,
+  connected: false,
+  account_email: null,
+  account_name: null,
+  vault_unlocked: false,
+  has_remote_manifest: false,
+  sync_enabled: true,
+  sync_media: true,
+  sync_history: true,
+  syncing: false,
+  phase: "idle",
+  progress_done: 0,
+  progress_total: 0,
+  pending_media_count: 2,
+  pending_media_bytes: 18_432_000,
+  last_sync_ts: null,
+  last_history_sync_ts: null,
+  last_error: null,
+};
+
+const DEMO_GDRIVE_HISTORY_BYTES = 1_245_184;
+const DEMO_GDRIVE_HISTORY_FILE_COUNT = 3;
+
+let DEMO_GDRIVE_CLOUD_ITEMS: GDriveCloudItemDto[] = [
+  {
+    sha256: "demo-sha256-video-01",
+    cloud_file_id: "gd-demo-file-01",
+    kind: "video",
+    mime: "video/mp4",
+    size_bytes: 48_234_496,
+    original_name: "sprint-demo-recording.mp4",
+    thread_id: "grp-rust-vn",
+    thread_name: "Nhóm Kỹ thuật Desktop",
+    msg_id: "d-vid-1",
+    cloud_synced_ts: Date.now() - 120 * 86_400_000,
+    local_state: 0,
+  },
+  {
+    sha256: "demo-sha256-file-02",
+    cloud_file_id: "gd-demo-file-02",
+    kind: "file",
+    mime: "application/pdf",
+    size_bytes: 14_680_064,
+    original_name: "architecture-spec-v2.pdf",
+    thread_id: "grp-rust-vn",
+    thread_name: "Nhóm Kỹ thuật Desktop",
+    msg_id: "d-file-2",
+    cloud_synced_ts: Date.now() - 45 * 86_400_000,
+    local_state: 1,
+  },
+  {
+    sha256: "demo-sha256-image-03",
+    cloud_file_id: "gd-demo-file-03",
+    kind: "image",
+    mime: "image/png",
+    size_bytes: 4_194_304,
+    original_name: "ui-wireframe-final.png",
+    thread_id: "dm-minh",
+    thread_name: "Trần Minh",
+    msg_id: "d-img-3",
+    cloud_synced_ts: Date.now() - 10 * 86_400_000,
+    local_state: 1,
+  },
+  {
+    sha256: "demo-sha256-voice-04",
+    cloud_file_id: "gd-demo-file-04",
+    kind: "voice",
+    mime: "audio/ogg",
+    size_bytes: 1_572_864,
+    original_name: "voice-note-01.ogg",
+    thread_id: "cloud-me",
+    thread_name: "Saved Messages",
+    msg_id: "d-voice-4",
+    cloud_synced_ts: Date.now() - 200 * 86_400_000,
+    local_state: 1,
+  },
+];
+
+const DEMO_GDRIVE_LISTENERS = new Set<(status: GDriveStatusDto) => void>();
+
+const DEMO_FRIENDS = new Set<string>(["dm-minh"]);
+const DEMO_BLOCKED = new Set<string>();
+let DEMO_FRIEND_REQUESTS_RECEIVED: FriendRequestItemDto[] = [
+  {
+    user_id: "u-linh",
+    display_name: "Nguyễn Linh",
+    account_name: "Nguyễn Linh",
+    avatar: "",
+    message: "Xin chào, kết bạn với mình nhé!",
+    created_ts: Date.now() - 1_800_000,
+    direction: "received",
+    is_seen: false,
+  },
+];
+let DEMO_FRIEND_REQUESTS_SENT: FriendRequestItemDto[] = [
+  {
+    user_id: "u-huy",
+    display_name: "Phạm Huy",
+    account_name: "Phạm Huy",
+    avatar: "",
+    message: "Chào bạn, mình kết bạn trên Teza nhé!",
+    created_ts: Date.now() - 3_600_000,
+    direction: "sent",
+    is_seen: true,
+  },
+];
+const DEMO_GROUP_MEMBERS: Record<
+  string,
+  { creator_id: string; admin_ids: string[]; members: ThreadMemberDto[] }
+> = {
+  "grp-rust-vn": {
+    creator_id: "me",
+    admin_ids: ["u2"],
+    members: [
+      { id: "me", name: "Bạn", avatar: "", role: "Trưởng nhóm" },
+      { id: "u2", name: "An", avatar: "", role: "Phó nhóm" },
+      { id: "dm-minh", name: "Trần Minh", avatar: "", role: "Thành viên" },
+    ],
+  },
+};
+const DEMO_SOCIAL_LISTENERS = new Set<(ev: SocialWsEventDto) => void>();
+
+function emitDemoSocialEvent(ev: SocialWsEventDto): void {
+  const snapshot: SocialWsEventDto = { ...ev };
+  for (const listener of DEMO_SOCIAL_LISTENERS) {
+    listener(snapshot);
+  }
+}
+
+function emitDemoGDriveStatus(): GDriveStatusDto {
+  const snapshot: GDriveStatusDto = { ...DEMO_GDRIVE_STATUS };
+  for (const listener of DEMO_GDRIVE_LISTENERS) {
+    listener(snapshot);
+  }
+  return snapshot;
+}
+
+function buildDemoGDriveOverview(limit = 50): GDriveStorageOverviewDto {
+  let imagesBytes = 0;
+  let videosBytes = 0;
+  let voiceBytes = 0;
+  let filesBytes = 0;
+  const threadMap = new Map<string, GDriveThreadUsageDto>();
+
+  for (const item of DEMO_GDRIVE_CLOUD_ITEMS) {
+    if (item.kind === "image" || item.kind === "sticker") {
+      imagesBytes += item.size_bytes;
+    } else if (item.kind === "video") {
+      videosBytes += item.size_bytes;
+    } else if (item.kind === "voice" || item.kind === "audio") {
+      voiceBytes += item.size_bytes;
+    } else {
+      filesBytes += item.size_bytes;
+    }
+
+    const tid = item.thread_id ?? "unknown";
+    const existing = threadMap.get(tid);
+    if (existing) {
+      existing.total_bytes += item.size_bytes;
+      existing.object_count += 1;
+    } else {
+      threadMap.set(tid, {
+        thread_id: tid,
+        thread_name: item.thread_name ?? tid,
+        total_bytes: item.size_bytes,
+        object_count: 1,
+      });
+    }
+  }
+
+  const mediaTotalBytes = imagesBytes + videosBytes + voiceBytes + filesBytes;
+  const tezaTotalBytes = mediaTotalBytes + DEMO_GDRIVE_HISTORY_BYTES;
+  const byThread = [...threadMap.values()].sort((a, b) => b.total_bytes - a.total_bytes);
+  const largestItems = [...DEMO_GDRIVE_CLOUD_ITEMS]
+    .sort((a, b) => b.size_bytes - a.size_bytes)
+    .slice(0, Math.max(1, limit));
+
+  return {
+    quota: {
+      drive_limit_bytes: 15 * 1024 * 1024 * 1024,
+      drive_usage_bytes: 2_684_354_560 + tezaTotalBytes,
+      drive_usage_in_drive_bytes: 2_516_582_400 + tezaTotalBytes,
+      drive_usage_in_trash_bytes: 167_772_160,
+    },
+    teza_cloud_total_bytes: tezaTotalBytes,
+    teza_cloud_object_count: DEMO_GDRIVE_CLOUD_ITEMS.length,
+    images_bytes: imagesBytes,
+    videos_bytes: videosBytes,
+    voice_bytes: voiceBytes,
+    files_bytes: filesBytes,
+    history_bytes: DEMO_GDRIVE_HISTORY_BYTES,
+    history_file_count: DEMO_GDRIVE_HISTORY_FILE_COUNT,
+    by_thread: byThread,
+    largest_items: largestItems,
+  };
+}
+
 function touchDemoThread(threadId: string, preview: string, ts: number) {
   const thread = DEMO_THREADS.find((t) => t.id === threadId);
   if (thread) {
@@ -272,10 +530,13 @@ export const bridge = {
   async getThreadDetails(threadId: string): Promise<ThreadDetailsDto> {
     if (!isTauri()) {
       const msgs = DEMO_MESSAGES[threadId] ?? [];
+      const group = DEMO_GROUP_MEMBERS[threadId];
       return {
         thread_id: threadId,
-        total_members: null,
-        members: [],
+        total_members: group ? group.members.length : null,
+        creator_id: group?.creator_id ?? "",
+        admin_ids: group ? [...group.admin_ids] : [],
+        members: group ? group.members.map((m) => ({ ...m })) : [],
         media_items: msgs.filter((m) => !!m.attachment_url && m.msg_type.includes("photo")),
         file_items: msgs.filter((m) => !!m.attachment_url && !m.msg_type.includes("photo")),
         link_items: msgs.filter((m) => /https?:\/\//i.test(m.text)),
@@ -323,23 +584,28 @@ export const bridge = {
   async getUserProfile(userId: string): Promise<UserProfileDto> {
     if (!isTauri()) {
       const t = DEMO_THREADS.find((x) => x.id === userId);
+      const req =
+        DEMO_FRIEND_REQUESTS_RECEIVED.find((x) => x.user_id === userId) ??
+        DEMO_FRIEND_REQUESTS_SENT.find((x) => x.user_id === userId);
+      const name = t?.title ?? req?.display_name ?? `Người dùng ${userId}`;
       return {
         uid: userId,
-        display_name: t?.title ?? `Người dùng ${userId}`,
-        zalo_name: t?.title ?? `Người dùng ${userId}`,
-        avatar: t?.avatar ?? "",
+        display_name: name,
+        account_name: req?.account_name ?? name,
+        avatar: t?.avatar ?? req?.avatar ?? "",
         cover: "",
         status: "Đang hoạt động trên Teza (Chế độ xem trước)",
         gender: null,
         sdob: "",
         phone_number: "",
-        is_friend: t ? true : false,
+        is_friend: DEMO_FRIENDS.has(userId),
+        is_blocked: DEMO_BLOCKED.has(userId),
         is_self: userId === "cloud-me" || userId === "me",
         mutual_groups: DEMO_THREADS.filter((g) => g.kind === "group").map((g) => ({
           id: g.id,
           title: g.title,
           avatar: g.avatar,
-          total_members: 12,
+          total_members: DEMO_GROUP_MEMBERS[g.id]?.members.length ?? 12,
         })),
         local_message_count: (DEMO_MESSAGES[userId] ?? []).length,
         local_media_count: 0,
@@ -355,17 +621,19 @@ export const bridge = {
         throw new Error("Số điện thoại không hợp lệ");
       }
       const norm = cleaned.startsWith("0") ? `84${cleaned.slice(1)}` : cleaned;
+      const uid = `phone-${norm}`;
       return {
-        uid: `phone-${norm}`,
+        uid,
         display_name: `Liên hệ ${norm}`,
-        zalo_name: `Liên hệ ${norm}`,
+        account_name: `Liên hệ ${norm}`,
         avatar: "",
         cover: "",
         status: "Tìm kiếm qua số điện thoại (Chế độ xem trước)",
         gender: null,
         sdob: "",
         phone_number: norm,
-        is_friend: false,
+        is_friend: DEMO_FRIENDS.has(uid),
+        is_blocked: DEMO_BLOCKED.has(uid),
         is_self: false,
         mutual_groups: [],
         local_message_count: 0,
@@ -692,6 +960,7 @@ export const bridge = {
     url: string,
     suggestedName: string,
     downloadId?: string,
+    opts?: { threadId?: string; msgId?: string },
   ): Promise<SavedFileResultDto | null> {
     const trimmed = url.trim();
     const targetUrl =
@@ -713,6 +982,8 @@ export const bridge = {
       url: targetUrl,
       suggestedName,
       downloadId: downloadId ?? null,
+      ...(opts?.threadId ? { threadId: opts.threadId } : {}),
+      ...(opts?.msgId ? { msgId: opts.msgId } : {}),
     });
   },
   async openSavedFile(path: string): Promise<void> {
@@ -895,6 +1166,42 @@ export const bridge = {
       id,
       action,
       url: url ?? null,
+    });
+  },
+  async listWebAppAccounts(appId?: string, origin?: string): Promise<WebAppAccountDto[]> {
+    if (!isTauri()) {
+      return filterDemoWebAppAccounts(DEMO_WEBAPP_ACCOUNTS, appId, origin);
+    }
+    return invoke<WebAppAccountDto[]>("webapp_accounts_list", {
+      appId: appId ?? null,
+      origin: origin ?? null,
+    });
+  },
+  async saveWebAppAccount(input: WebAppAccountInput): Promise<WebAppAccountDto> {
+    if (!isTauri()) {
+      const { next, saved } = upsertDemoWebAppAccount(DEMO_WEBAPP_ACCOUNTS, input);
+      DEMO_WEBAPP_ACCOUNTS = next;
+      return saved;
+    }
+    return invoke<WebAppAccountDto>("webapp_accounts_save", { input });
+  },
+  async deleteWebAppAccount(id: string): Promise<void> {
+    if (!isTauri()) {
+      DEMO_WEBAPP_ACCOUNTS = DEMO_WEBAPP_ACCOUNTS.filter((acc) => acc.id !== id);
+      return;
+    }
+    return invoke("webapp_accounts_delete", { id });
+  },
+  async fillWebAppAccount(
+    appId: string,
+    accountId: string,
+    submit?: boolean,
+  ): Promise<void> {
+    if (!isTauri()) return;
+    return invoke("webapp_account_fill", {
+      appId,
+      accountId,
+      submit: submit ?? false,
     });
   },
   async openExternalUrl(url: string): Promise<void> {
@@ -1142,6 +1449,15 @@ export const bridge = {
       partnerName: partnerName ?? null,
     });
   },
+  async callStartVideo(partnerId: string, partnerName?: string): Promise<CallStateDto> {
+    if (!isTauri()) {
+      throw new Error("Tính năng gọi video chỉ khả dụng trên ứng dụng desktop");
+    }
+    return invoke<CallStateDto>("call_start_video", {
+      partnerId,
+      partnerName: partnerName ?? null,
+    });
+  },
   async callAnswer(callId?: number): Promise<CallStateDto> {
     if (!isTauri()) {
       return {
@@ -1185,5 +1501,663 @@ export const bridge = {
       };
     }
     return invoke<CallStateDto>("call_set_mute", { muted });
+  },
+  async callSetCamera(enabled: boolean): Promise<CallStateDto> {
+    if (!isTauri()) {
+      return {
+        available: false,
+        unavailable_reason: "desktop_only",
+        phase: "idle",
+        active: null,
+      };
+    }
+    return invoke<CallStateDto>("call_set_camera", { enabled });
+  },
+  async callPushVideoFrame(callId: number, dataB64: string): Promise<boolean> {
+    if (!isTauri()) {
+      return false;
+    }
+    return invoke<boolean>("call_push_video_frame", { callId, dataB64 });
+  },
+  async callRequestVideoKeyframe(callId?: number): Promise<boolean> {
+    if (!isTauri()) {
+      return false;
+    }
+    return invoke<boolean>("call_request_video_keyframe", {
+      callId: callId ?? null,
+    });
+  },
+  async mediaGetProtocolToken(): Promise<string> {
+    if (!isTauri()) return "";
+    return invoke<string>("media_get_protocol_token");
+  },
+  async mediaGetConfig(): Promise<MediaVaultConfigDto> {
+    if (!isTauri()) {
+      return { ...DEMO_MEDIA_VAULT_CONFIG };
+    }
+    return invoke<MediaVaultConfigDto>("media_get_config");
+  },
+  async mediaSaveConfig(config: MediaVaultConfigDto): Promise<MediaVaultConfigDto> {
+    if (!isTauri()) {
+      const customDir = config.custom_vault_dir?.trim() || null;
+      DEMO_MEDIA_VAULT_CONFIG = {
+        ...config,
+        custom_vault_dir: customDir,
+        active_vault_dir: customDir ?? "LocalAppData/Teza/media/demo",
+      };
+      return { ...DEMO_MEDIA_VAULT_CONFIG };
+    }
+    return invoke<MediaVaultConfigDto>("media_save_config", { config });
+  },
+  async mediaGetStats(): Promise<MediaVaultStatsDto> {
+    if (!isTauri()) {
+      return { ...DEMO_MEDIA_VAULT_STATS };
+    }
+    return invoke<MediaVaultStatsDto>("media_get_stats");
+  },
+  async mediaClearCache(includePinned?: boolean): Promise<MediaVaultStatsDto> {
+    if (!isTauri()) {
+      if (includePinned) {
+        DEMO_MEDIA_VAULT_STATS = {
+          total_bytes: 0,
+          object_count: 0,
+          pinned_bytes: 0,
+          pinned_count: 0,
+          image_bytes: 0,
+          video_bytes: 0,
+          voice_bytes: 0,
+          file_bytes: 0,
+          thumb_bytes: 0,
+          cloud_synced_count: 0,
+          cloud_total_bytes: 0,
+        };
+      } else {
+        DEMO_MEDIA_VAULT_STATS = {
+          ...DEMO_MEDIA_VAULT_STATS,
+          total_bytes: DEMO_MEDIA_VAULT_STATS.pinned_bytes,
+          object_count: DEMO_MEDIA_VAULT_STATS.pinned_count,
+          image_bytes: 0,
+          video_bytes: 0,
+          voice_bytes: 0,
+          file_bytes: 0,
+          thumb_bytes: 0,
+        };
+      }
+      return { ...DEMO_MEDIA_VAULT_STATS };
+    }
+    return invoke<MediaVaultStatsDto>("media_clear_cache", {
+      includePinned: includePinned ?? false,
+    });
+  },
+  async mediaPickVaultDir(): Promise<string | null> {
+    if (!isTauri()) return null;
+    return invoke<string | null>("media_pick_vault_dir");
+  },
+  async mediaSetPin(sha256: string, pinned: boolean): Promise<void> {
+    if (!isTauri()) return;
+    return invoke<void>("media_set_pin", { sha256, pinned });
+  },
+  async mediaOpenVaultDir(): Promise<void> {
+    if (!isTauri()) return;
+    return invoke<void>("media_open_vault_dir");
+  },
+  async gdriveGetConfig(): Promise<GDriveConfigDto> {
+    if (!isTauri()) {
+      return { ...DEMO_GDRIVE_CONFIG };
+    }
+    return invoke<GDriveConfigDto>("gdrive_get_config");
+  },
+  async gdriveSaveConfig(patch: GDriveConfigPatch): Promise<GDriveConfigDto> {
+    if (!isTauri()) {
+      if (patch.resetCustomOAuth) {
+        DEMO_GDRIVE_CONFIG.client_id = "";
+        DEMO_GDRIVE_CONFIG.has_client_secret = false;
+        DEMO_GDRIVE_CONFIG.token_broker_url = "";
+      } else {
+        if (patch.clientId !== undefined && patch.clientId !== null) {
+          DEMO_GDRIVE_CONFIG.client_id = patch.clientId.trim();
+        }
+        if (patch.clientSecret !== undefined && patch.clientSecret !== null) {
+          DEMO_GDRIVE_CONFIG.has_client_secret = patch.clientSecret.trim().length > 0;
+        }
+        if (patch.tokenBrokerUrl !== undefined && patch.tokenBrokerUrl !== null) {
+          DEMO_GDRIVE_CONFIG.token_broker_url = patch.tokenBrokerUrl.trim().replace(/\/+$/, "");
+        }
+      }
+      if (typeof patch.syncEnabled === "boolean") {
+        DEMO_GDRIVE_CONFIG.sync_enabled = patch.syncEnabled;
+      }
+      if (typeof patch.syncMedia === "boolean") {
+        DEMO_GDRIVE_CONFIG.sync_media = patch.syncMedia;
+      }
+      if (typeof patch.syncHistory === "boolean") {
+        DEMO_GDRIVE_CONFIG.sync_history = patch.syncHistory;
+      }
+      DEMO_GDRIVE_CONFIG.oauth_mode = DEMO_GDRIVE_CONFIG.client_id
+        ? DEMO_GDRIVE_CONFIG.token_broker_url
+          ? "custom_broker"
+          : "custom_direct"
+        : DEMO_GDRIVE_CONFIG.has_builtin_oauth
+          ? DEMO_GDRIVE_CONFIG.has_builtin_token_broker
+            ? "builtin_broker"
+            : "builtin_direct"
+          : "unconfigured";
+      DEMO_GDRIVE_STATUS = {
+        ...DEMO_GDRIVE_STATUS,
+        oauth_configured:
+          DEMO_GDRIVE_CONFIG.has_builtin_oauth || DEMO_GDRIVE_CONFIG.client_id.length > 0,
+        sync_enabled: DEMO_GDRIVE_CONFIG.sync_enabled,
+        sync_media: DEMO_GDRIVE_CONFIG.sync_media,
+        sync_history: DEMO_GDRIVE_CONFIG.sync_history,
+      };
+      emitDemoGDriveStatus();
+      return { ...DEMO_GDRIVE_CONFIG };
+    }
+    return invoke<GDriveConfigDto>("gdrive_save_config", {
+      clientId: patch.clientId ?? null,
+      clientSecret: patch.clientSecret ?? null,
+      tokenBrokerUrl: patch.tokenBrokerUrl ?? null,
+      resetCustomOAuth: patch.resetCustomOAuth ?? null,
+      syncEnabled: patch.syncEnabled ?? null,
+      syncMedia: patch.syncMedia ?? null,
+      syncHistory: patch.syncHistory ?? null,
+    });
+  },
+  async gdriveGetStatus(): Promise<GDriveStatusDto> {
+    if (!isTauri()) {
+      return { ...DEMO_GDRIVE_STATUS };
+    }
+    return invoke<GDriveStatusDto>("gdrive_get_status");
+  },
+  async gdriveConnectStart(): Promise<GDriveStatusDto> {
+    if (!isTauri()) {
+      DEMO_GDRIVE_STATUS = {
+        ...DEMO_GDRIVE_STATUS,
+        connected: true,
+        account_email: "demo@teza.app",
+        account_name: "Teza Preview",
+        phase: "idle",
+        last_error: null,
+      };
+      return emitDemoGDriveStatus();
+    }
+    return invoke<GDriveStatusDto>("gdrive_connect_start");
+  },
+  async gdriveConnectCancel(): Promise<GDriveStatusDto> {
+    if (!isTauri()) {
+      DEMO_GDRIVE_STATUS = {
+        ...DEMO_GDRIVE_STATUS,
+        phase: "idle",
+        last_error: null,
+      };
+      return emitDemoGDriveStatus();
+    }
+    return invoke<GDriveStatusDto>("gdrive_connect_cancel");
+  },
+  async gdriveDisconnect(): Promise<GDriveStatusDto> {
+    if (!isTauri()) {
+      DEMO_GDRIVE_STATUS = {
+        ...DEMO_GDRIVE_STATUS,
+        connected: false,
+        account_email: null,
+        account_name: null,
+        vault_unlocked: false,
+        syncing: false,
+        phase: "idle",
+        progress_done: 0,
+        progress_total: 0,
+        last_error: null,
+      };
+      return emitDemoGDriveStatus();
+    }
+    return invoke<GDriveStatusDto>("gdrive_disconnect");
+  },
+  async gdriveUnlockVault(passphrase: string): Promise<GDriveStatusDto> {
+    if (!isTauri()) {
+      if (passphrase.trim().length < 8) {
+        throw new Error("Passphrase must be at least 8 characters long.");
+      }
+      DEMO_GDRIVE_STATUS = {
+        ...DEMO_GDRIVE_STATUS,
+        vault_unlocked: true,
+        has_remote_manifest: true,
+        phase: "idle",
+        last_error: null,
+      };
+      return emitDemoGDriveStatus();
+    }
+    return invoke<GDriveStatusDto>("gdrive_unlock_vault", { passphrase });
+  },
+  async gdriveSyncNow(): Promise<GDriveStatusDto> {
+    if (!isTauri()) {
+      const now = Date.now();
+      DEMO_GDRIVE_STATUS = {
+        ...DEMO_GDRIVE_STATUS,
+        syncing: false,
+        phase: "idle",
+        progress_done: 0,
+        progress_total: 0,
+        pending_media_count: 0,
+        pending_media_bytes: 0,
+        last_sync_ts: now,
+        last_history_sync_ts: DEMO_GDRIVE_CONFIG.sync_history
+          ? now
+          : DEMO_GDRIVE_STATUS.last_history_sync_ts,
+        last_error: null,
+      };
+      return emitDemoGDriveStatus();
+    }
+    return invoke<GDriveStatusDto>("gdrive_sync_now");
+  },
+  async gdriveGetStorageOverview(limit?: number): Promise<GDriveStorageOverviewDto> {
+    if (!isTauri()) {
+      return buildDemoGDriveOverview(limit ?? 50);
+    }
+    return invoke<GDriveStorageOverviewDto>("gdrive_get_storage_overview", {
+      limit: limit ?? 50,
+    });
+  },
+  async gdriveDeleteCloudItems(sha256s: string[]): Promise<GDrivePruneResultDto> {
+    if (!isTauri()) {
+      const targets = new Set(sha256s);
+      let deletedCount = 0;
+      let freedBytes = 0;
+      const remaining: GDriveCloudItemDto[] = [];
+      for (const item of DEMO_GDRIVE_CLOUD_ITEMS) {
+        if (targets.has(item.sha256)) {
+          deletedCount += 1;
+          freedBytes += item.size_bytes;
+        } else {
+          remaining.push(item);
+        }
+      }
+      DEMO_GDRIVE_CLOUD_ITEMS = remaining;
+      emitDemoGDriveStatus();
+      return {
+        deleted_count: deletedCount,
+        freed_bytes: freedBytes,
+        failed_count: 0,
+      };
+    }
+    return invoke<GDrivePruneResultDto>("gdrive_delete_cloud_items", { sha256s });
+  },
+  async gdriveDeleteCloudByThread(threadId: string): Promise<GDrivePruneResultDto> {
+    if (!isTauri()) {
+      let deletedCount = 0;
+      let freedBytes = 0;
+      const remaining: GDriveCloudItemDto[] = [];
+      for (const item of DEMO_GDRIVE_CLOUD_ITEMS) {
+        if (item.thread_id === threadId) {
+          deletedCount += 1;
+          freedBytes += item.size_bytes;
+        } else {
+          remaining.push(item);
+        }
+      }
+      DEMO_GDRIVE_CLOUD_ITEMS = remaining;
+      emitDemoGDriveStatus();
+      return {
+        deleted_count: deletedCount,
+        freed_bytes: freedBytes,
+        failed_count: 0,
+      };
+    }
+    return invoke<GDrivePruneResultDto>("gdrive_delete_cloud_by_thread", { threadId });
+  },
+  async gdrivePruneCloudOlderThan(olderThanDays: number): Promise<GDrivePruneResultDto> {
+    if (!isTauri()) {
+      const cutoff = Date.now() - Math.max(0, olderThanDays) * 86_400_000;
+      let deletedCount = 0;
+      let freedBytes = 0;
+      const remaining: GDriveCloudItemDto[] = [];
+      for (const item of DEMO_GDRIVE_CLOUD_ITEMS) {
+        if (item.cloud_synced_ts < cutoff) {
+          deletedCount += 1;
+          freedBytes += item.size_bytes;
+        } else {
+          remaining.push(item);
+        }
+      }
+      DEMO_GDRIVE_CLOUD_ITEMS = remaining;
+      emitDemoGDriveStatus();
+      return {
+        deleted_count: deletedCount,
+        freed_bytes: freedBytes,
+        failed_count: 0,
+      };
+    }
+    return invoke<GDrivePruneResultDto>("gdrive_prune_cloud_older_than", { olderThanDays });
+  },
+  async onGDriveSyncStatus(handler: (status: GDriveStatusDto) => void): Promise<() => void> {
+    if (!isTauri()) {
+      DEMO_GDRIVE_LISTENERS.add(handler);
+      return () => {
+        DEMO_GDRIVE_LISTENERS.delete(handler);
+      };
+    }
+    return listen<GDriveStatusDto>("core://gdrive-sync-status", (event) => {
+      handler(event.payload);
+    });
+  },
+  async friendRemove(userId: string): Promise<FriendActionResultDto> {
+    if (!isTauri()) {
+      DEMO_FRIENDS.delete(userId);
+      emitDemoSocialEvent({
+        kind: "friend_removed",
+        thread_id: userId,
+        user_id: userId,
+        self_removed: false,
+      });
+      return {
+        ok: true,
+        user_id: userId,
+        action: "remove",
+        already_friends: false,
+        auto_accepted: false,
+        message: "",
+      };
+    }
+    return invoke<FriendActionResultDto>("friend_remove", { userId });
+  },
+  async friendSendRequest(
+    userId: string,
+    message?: string | null,
+  ): Promise<FriendActionResultDto> {
+    if (!isTauri()) {
+      if (DEMO_FRIENDS.has(userId)) {
+        return {
+          ok: true,
+          user_id: userId,
+          action: "send_request",
+          already_friends: true,
+          auto_accepted: false,
+          message: "",
+        };
+      }
+      const incomingIdx = DEMO_FRIEND_REQUESTS_RECEIVED.findIndex((r) => r.user_id === userId);
+      if (incomingIdx >= 0) {
+        const [incoming] = DEMO_FRIEND_REQUESTS_RECEIVED.splice(incomingIdx, 1);
+        DEMO_FRIENDS.add(userId);
+        if (!DEMO_THREADS.some((t) => t.id === userId)) {
+          DEMO_THREADS.push({
+            id: userId,
+            title: incoming.display_name,
+            avatar: incoming.avatar,
+            kind: "direct",
+            last_preview: "Hai bạn đã trở thành bạn bè",
+            last_ts: Date.now(),
+            unread_count: 0,
+            is_pinned: false,
+            is_muted: false,
+            last_read_in_ts: 0,
+            peer_read_ts: 0,
+            muted_until_ts: 0,
+            is_archived: false,
+          });
+        }
+        emitDemoSocialEvent({
+          kind: "friend_added",
+          thread_id: userId,
+          user_id: userId,
+          self_removed: false,
+        });
+        return {
+          ok: true,
+          user_id: userId,
+          action: "send_request",
+          already_friends: false,
+          auto_accepted: true,
+          message: "",
+        };
+      }
+      const existingSent = DEMO_FRIEND_REQUESTS_SENT.find((r) => r.user_id === userId);
+      const greeting = message?.trim() ?? "";
+      if (existingSent) {
+        existingSent.message = greeting || existingSent.message;
+        existingSent.created_ts = Date.now();
+      } else {
+        const thread = DEMO_THREADS.find((t) => t.id === userId);
+        const name = thread?.title ?? `Người dùng ${userId}`;
+        DEMO_FRIEND_REQUESTS_SENT = [
+          {
+            user_id: userId,
+            display_name: name,
+            account_name: name,
+            avatar: thread?.avatar ?? "",
+            message: greeting,
+            created_ts: Date.now(),
+            direction: "sent",
+            is_seen: false,
+          },
+          ...DEMO_FRIEND_REQUESTS_SENT,
+        ];
+      }
+      emitDemoSocialEvent({
+        kind: "friend_request_sent",
+        thread_id: userId,
+        user_id: userId,
+        self_removed: false,
+      });
+      return {
+        ok: true,
+        user_id: userId,
+        action: "send_request",
+        already_friends: false,
+        auto_accepted: false,
+        message: "",
+      };
+    }
+    return invoke<FriendActionResultDto>("friend_send_request", {
+      userId,
+      message: message ?? null,
+    });
+  },
+  async friendAcceptRequest(userId: string): Promise<FriendActionResultDto> {
+    if (!isTauri()) {
+      const incomingIdx = DEMO_FRIEND_REQUESTS_RECEIVED.findIndex((r) => r.user_id === userId);
+      const incoming =
+        incomingIdx >= 0 ? DEMO_FRIEND_REQUESTS_RECEIVED.splice(incomingIdx, 1)[0] : null;
+      DEMO_FRIEND_REQUESTS_SENT = DEMO_FRIEND_REQUESTS_SENT.filter((r) => r.user_id !== userId);
+      DEMO_FRIENDS.add(userId);
+      if (!DEMO_THREADS.some((t) => t.id === userId)) {
+        DEMO_THREADS.push({
+          id: userId,
+          title: incoming?.display_name ?? `Người dùng ${userId}`,
+          avatar: incoming?.avatar ?? "",
+          kind: "direct",
+          last_preview: "Hai bạn đã trở thành bạn bè",
+          last_ts: Date.now(),
+          unread_count: 0,
+          is_pinned: false,
+          is_muted: false,
+          last_read_in_ts: 0,
+          peer_read_ts: 0,
+          muted_until_ts: 0,
+          is_archived: false,
+        });
+      }
+      emitDemoSocialEvent({
+        kind: "friend_added",
+        thread_id: userId,
+        user_id: userId,
+        self_removed: false,
+      });
+      return {
+        ok: true,
+        user_id: userId,
+        action: "accept",
+        already_friends: false,
+        auto_accepted: false,
+        message: "",
+      };
+    }
+    return invoke<FriendActionResultDto>("friend_accept_request", { userId });
+  },
+  async friendRejectRequest(userId: string): Promise<FriendActionResultDto> {
+    if (!isTauri()) {
+      DEMO_FRIEND_REQUESTS_RECEIVED = DEMO_FRIEND_REQUESTS_RECEIVED.filter(
+        (r) => r.user_id !== userId,
+      );
+      emitDemoSocialEvent({
+        kind: "friend_request_rejected",
+        thread_id: userId,
+        user_id: userId,
+        self_removed: false,
+      });
+      return {
+        ok: true,
+        user_id: userId,
+        action: "reject",
+        already_friends: false,
+        auto_accepted: false,
+        message: "",
+      };
+    }
+    return invoke<FriendActionResultDto>("friend_reject_request", { userId });
+  },
+  async friendUndoRequest(userId: string): Promise<FriendActionResultDto> {
+    if (!isTauri()) {
+      DEMO_FRIEND_REQUESTS_SENT = DEMO_FRIEND_REQUESTS_SENT.filter((r) => r.user_id !== userId);
+      emitDemoSocialEvent({
+        kind: "friend_request_undone",
+        thread_id: userId,
+        user_id: userId,
+        self_removed: false,
+      });
+      return {
+        ok: true,
+        user_id: userId,
+        action: "undo",
+        already_friends: false,
+        auto_accepted: false,
+        message: "",
+      };
+    }
+    return invoke<FriendActionResultDto>("friend_undo_request", { userId });
+  },
+  async friendListRequests(): Promise<FriendRequestsListDto> {
+    if (!isTauri()) {
+      return {
+        received: DEMO_FRIEND_REQUESTS_RECEIVED.map((item) => ({ ...item })),
+        sent: DEMO_FRIEND_REQUESTS_SENT.map((item) => ({ ...item })),
+      };
+    }
+    return invoke<FriendRequestsListDto>("friend_list_requests");
+  },
+  async friendBlockUser(userId: string): Promise<FriendActionResultDto> {
+    if (!isTauri()) {
+      DEMO_BLOCKED.add(userId);
+      emitDemoSocialEvent({
+        kind: "user_blocked",
+        thread_id: userId,
+        user_id: userId,
+        self_removed: false,
+      });
+      return {
+        ok: true,
+        user_id: userId,
+        action: "block",
+        already_friends: false,
+        auto_accepted: false,
+        message: "",
+      };
+    }
+    return invoke<FriendActionResultDto>("friend_block_user", { userId });
+  },
+  async friendUnblockUser(userId: string): Promise<FriendActionResultDto> {
+    if (!isTauri()) {
+      DEMO_BLOCKED.delete(userId);
+      emitDemoSocialEvent({
+        kind: "user_unblocked",
+        thread_id: userId,
+        user_id: userId,
+        self_removed: false,
+      });
+      return {
+        ok: true,
+        user_id: userId,
+        action: "unblock",
+        already_friends: false,
+        auto_accepted: false,
+        message: "",
+      };
+    }
+    return invoke<FriendActionResultDto>("friend_unblock_user", { userId });
+  },
+  async groupLeave(groupId: string, silent?: boolean): Promise<LeaveGroupResultDto> {
+    if (!isTauri()) {
+      const idx = DEMO_THREADS.findIndex((t) => t.id === groupId);
+      if (idx >= 0) DEMO_THREADS.splice(idx, 1);
+      delete DEMO_GROUP_MEMBERS[groupId];
+      emitDemoSocialEvent({
+        kind: "group_left",
+        thread_id: groupId,
+        user_id: null,
+        self_removed: true,
+      });
+      return {
+        group_id: groupId,
+        left: true,
+        member_error: [],
+        message: "",
+      };
+    }
+    return invoke<LeaveGroupResultDto>("group_leave", {
+      groupId,
+      silent: Boolean(silent),
+    });
+  },
+  async groupKickMembers(
+    groupId: string,
+    memberIds: string[],
+  ): Promise<KickGroupMembersResultDto> {
+    if (!isTauri()) {
+      const group = DEMO_GROUP_MEMBERS[groupId];
+      const removed: string[] = [];
+      const failed: string[] = [];
+      if (group) {
+        for (const uid of new Set(memberIds)) {
+          if (uid === "me" || !group.members.some((m) => m.id === uid)) {
+            failed.push(uid);
+          } else {
+            removed.push(uid);
+          }
+        }
+        const removedSet = new Set(removed);
+        group.members = group.members.filter((m) => !removedSet.has(m.id));
+        group.admin_ids = group.admin_ids.filter((id) => !removedSet.has(id));
+      } else {
+        removed.push(...new Set(memberIds));
+      }
+      if (removed.length > 0) {
+        emitDemoSocialEvent({
+          kind: "group_member_removed",
+          thread_id: groupId,
+          user_id: removed[0],
+          self_removed: false,
+        });
+      }
+      return {
+        group_id: groupId,
+        removed,
+        failed,
+        message: "",
+      };
+    }
+    return invoke<KickGroupMembersResultDto>("group_kick_members", {
+      groupId,
+      memberIds,
+    });
+  },
+  async onSocialEvent(handler: (ev: SocialWsEventDto) => void): Promise<() => void> {
+    if (!isTauri()) {
+      DEMO_SOCIAL_LISTENERS.add(handler);
+      return () => {
+        DEMO_SOCIAL_LISTENERS.delete(handler);
+      };
+    }
+    return listen<SocialWsEventDto>("core://social-event", (event) => {
+      handler(event.payload);
+    });
   },
 };

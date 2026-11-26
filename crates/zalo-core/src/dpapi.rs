@@ -8,6 +8,17 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 /// Prefix marking DPAPI-sealed payloads on Windows so we never confuse plaintext with sealed blobs.
 const DPAPI_PREFIX: &str = "dpapi:v1:";
 
+/// Volatile-zeroize a byte slice so the compiler cannot optimize away clearing sensitive memory.
+fn zeroize_bytes(bytes: &mut [u8]) {
+    for b in bytes.iter_mut() {
+        // SAFETY: `b` is a valid, aligned, mutable reference to a single byte inside `bytes`.
+        unsafe {
+            std::ptr::write_volatile(b, 0);
+        }
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Protect sensitive UTF-8 secret material for the current Windows user.
 pub fn protect_secret(plain: &str) -> Result<String> {
     if plain.is_empty() {
@@ -25,7 +36,7 @@ pub fn protect_secret(plain: &str) -> Result<String> {
 }
 
 /// Unprotect secret material previously sealed by [`protect_secret`].
-/// Supports migrating legacy unprefixed plaintext values cleanly when explicitly needed.
+/// On Windows, only DPAPI-sealed (`dpapi:v1:`) envelopes are accepted.
 pub fn unprotect_secret(stored: &str) -> Result<String> {
     if stored.is_empty() {
         return Ok(String::new());
@@ -35,7 +46,15 @@ pub fn unprotect_secret(stored: &str) -> Result<String> {
         {
             let raw = B64.decode(rest.trim())?;
             let plain = win_dpapi_unprotect(&raw)?;
-            return Ok(String::from_utf8(plain)?);
+            return match String::from_utf8(plain) {
+                Ok(s) => Ok(s),
+                Err(err) => {
+                    let utf8_err = err.utf8_error();
+                    let mut bytes = err.into_bytes();
+                    zeroize_bytes(&mut bytes);
+                    Err(utf8_err.into())
+                }
+            };
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -44,8 +63,16 @@ pub fn unprotect_secret(stored: &str) -> Result<String> {
         }
     }
     if let Some(rest) = stored.strip_prefix("plain:v1:") {
-        let raw = B64.decode(rest.trim())?;
-        return Ok(String::from_utf8(raw)?);
+        #[cfg(target_os = "windows")]
+        {
+            let _ = rest;
+            bail!("Plaintext secret envelope (plain:v1:) is not allowed on Windows");
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let raw = B64.decode(rest.trim())?;
+            return Ok(String::from_utf8(raw)?);
+        }
     }
     bail!("Unsupported secret envelope format")
 }
@@ -107,8 +134,9 @@ fn win_dpapi_protect(data: &[u8]) -> Result<Vec<u8>> {
         bail!("CryptProtectData failed");
     }
     let out = unsafe {
-        let slice = std::slice::from_raw_parts(out_blob.pb_data, out_blob.cb_data as usize);
+        let slice = std::slice::from_raw_parts_mut(out_blob.pb_data, out_blob.cb_data as usize);
         let copied = slice.to_vec();
+        zeroize_bytes(slice);
         LocalFree(out_blob.pb_data as *mut c_void);
         copied
     };
@@ -171,8 +199,9 @@ fn win_dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>> {
         bail!("CryptUnprotectData failed");
     }
     let out = unsafe {
-        let slice = std::slice::from_raw_parts(out_blob.pb_data, out_blob.cb_data as usize);
+        let slice = std::slice::from_raw_parts_mut(out_blob.pb_data, out_blob.cb_data as usize);
         let copied = slice.to_vec();
+        zeroize_bytes(slice);
         LocalFree(out_blob.pb_data as *mut c_void);
         copied
     };
@@ -189,7 +218,28 @@ mod tests {
         let sealed = protect_secret(secret).unwrap();
         assert_ne!(sealed, secret);
         assert!(!sealed.contains(secret));
+        #[cfg(target_os = "windows")]
+        assert!(sealed.starts_with(DPAPI_PREFIX));
         let restored = unprotect_secret(&sealed).unwrap();
         assert_eq!(restored, secret);
+    }
+
+    #[test]
+    fn zeroize_bytes_clears_entire_buffer() {
+        let mut buf = b"top_secret_dpapi_plaintext".to_vec();
+        zeroize_bytes(&mut buf);
+        assert!(buf.iter().all(|&b| b == 0));
+
+        let mut empty: [u8; 0] = [];
+        zeroize_bytes(&mut empty);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_rejects_plain_v1_envelope() {
+        let forged = format!("plain:v1:{}", B64.encode(b"forged_plaintext_secret"));
+        let err = unprotect_secret(&forged).unwrap_err().to_string();
+        assert!(err.contains("plain:v1:"));
+        assert!(unprotect_secret("raw_unprefixed_secret").is_err());
     }
 }

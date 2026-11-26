@@ -19,6 +19,8 @@ apps/desktop/.vite/
 session.json
 session*.json
 translate.json
+webapp_accounts.json
+call_audio.json
 *.key
 *.db
 *.db-wal

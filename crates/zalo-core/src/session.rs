@@ -13,7 +13,9 @@ use reqwest::multipart::{Form, Part};
 use reqwest::{redirect, Client, Method};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 
 use crate::crypto;
 use crate::data_dir;
@@ -209,8 +211,13 @@ pub fn decode_data_url_bytes(raw: &str, max_bytes: usize) -> Result<(Vec<u8>, St
         .filter(|s| !s.is_empty())
         .unwrap_or("application/octet-stream")
         .to_string();
+    let b64_payload = payload.trim();
+    let max_b64_len = max_bytes.div_ceil(3).saturating_mul(4);
+    if b64_payload.len() > max_b64_len {
+        anyhow::bail!("Dữ liệu vượt quá giới hạn cho phép");
+    }
     let bytes = B64
-        .decode(payload.trim())
+        .decode(b64_payload)
         .context("Không giải mã được dữ liệu base64")?;
     if bytes.len() > max_bytes {
         anyhow::bail!("Dữ liệu vượt quá giới hạn cho phép");
@@ -228,6 +235,24 @@ pub enum SessionError {
     Http { status: u16, body: String },
     #[error("Lỗi giao thức ({code}): {message}")]
     Protocol { code: i64, message: String },
+}
+
+#[derive(Debug, Error)]
+pub enum MediaDownloadError {
+    #[error("Liên kết media đã hết hạn hoặc không còn tồn tại trên CDN (HTTP {status})")]
+    CdnExpired { status: u16 },
+    #[error("Tải tệp thất bại (HTTP {status})")]
+    HttpStatus { status: u16 },
+    #[error("Không hỗ trợ tải tệp SVG vì lý do bảo mật")]
+    ForbiddenSvg,
+    #[error("Từ chối tải tệp từ URL không nằm trong danh sách CDN tin cậy ({origin})")]
+    UntrustedUrl { origin: String },
+}
+
+impl MediaDownloadError {
+    pub fn is_cdn_expired(&self) -> bool {
+        matches!(self, Self::CdnExpired { .. })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1193,6 +1218,65 @@ impl Session {
             .await
     }
 
+    async fn send_media_get(&self, url: &str) -> Result<reqwest::Response> {
+        let mut current_url = match normalize_allowed_media_url(url) {
+            Ok(u) => u,
+            Err(origin) => {
+                eprintln!("[litechat][media] blocked untrusted media URL: {origin}");
+                return Err(MediaDownloadError::UntrustedUrl { origin }.into());
+            }
+        };
+
+        const MAX_MANUAL_REDIRECT_HOPS: usize = 3;
+        let mut hops = 0usize;
+        loop {
+            let r = self
+                .media_http
+                .get(current_url.clone())
+                .header(REFERER, "https://chat.zalo.me/")
+                .send()
+                .await
+                .map_err(|e| SessionError::Network(e.to_string()))?;
+
+            if r.status().is_redirection() {
+                let Some(loc) = r
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                else {
+                    return Ok(r);
+                };
+                let resolved_raw = match r.url().join(loc.trim()) {
+                    Ok(u) => u.to_string(),
+                    Err(_) => loc.to_string(),
+                };
+                if hops >= MAX_MANUAL_REDIRECT_HOPS {
+                    let target_origin = reqwest::Url::parse(&resolved_raw)
+                        .map(|u| sanitize_url_origin_for_log(&u))
+                        .unwrap_or_else(|_| "URL chuyển hướng không hợp lệ".to_string());
+                    eprintln!("[litechat][media] too many redirects -> {target_origin}");
+                    anyhow::bail!("Tải tệp thất bại: quá nhiều chuyển hướng ({target_origin})");
+                }
+                match normalize_allowed_media_url(&resolved_raw) {
+                    Ok(next_url) => {
+                        current_url = next_url;
+                        hops += 1;
+                        continue;
+                    }
+                    Err(origin) => {
+                        eprintln!(
+                            "[litechat][media] blocked redirect to untrusted URL: {origin}"
+                        );
+                        anyhow::bail!(
+                            "Từ chối tải tệp từ URL chuyển hướng không nằm trong danh sách CDN tin cậy ({origin})"
+                        );
+                    }
+                }
+            }
+            return Ok(r);
+        }
+    }
+
     pub async fn download_media_with_meta_progress<F>(
         &self,
         url: &str,
@@ -1202,66 +1286,7 @@ impl Session {
     where
         F: FnMut(u64, Option<u64>),
     {
-        let mut current_url = match normalize_allowed_media_url(url) {
-            Ok(u) => u,
-            Err(origin) => {
-                eprintln!("[litechat][media] blocked untrusted media URL: {origin}");
-                anyhow::bail!(
-                    "Từ chối tải tệp từ URL không nằm trong danh sách CDN tin cậy ({origin})"
-                );
-            }
-        };
-
-        const MAX_MANUAL_REDIRECT_HOPS: usize = 3;
-        let mut resp = {
-            let mut hops = 0usize;
-            loop {
-                let r = self
-                    .media_http
-                    .get(current_url.clone())
-                    .header(REFERER, "https://chat.zalo.me/")
-                    .send()
-                    .await
-                    .map_err(|e| SessionError::Network(e.to_string()))?;
-
-                if r.status().is_redirection() {
-                    let Some(loc) = r
-                        .headers()
-                        .get(reqwest::header::LOCATION)
-                        .and_then(|v| v.to_str().ok())
-                    else {
-                        break r;
-                    };
-                    let resolved_raw = match r.url().join(loc.trim()) {
-                        Ok(u) => u.to_string(),
-                        Err(_) => loc.to_string(),
-                    };
-                    if hops >= MAX_MANUAL_REDIRECT_HOPS {
-                        let target_origin = reqwest::Url::parse(&resolved_raw)
-                            .map(|u| sanitize_url_origin_for_log(&u))
-                            .unwrap_or_else(|_| "URL chuyển hướng không hợp lệ".to_string());
-                        eprintln!("[litechat][media] too many redirects -> {target_origin}");
-                        anyhow::bail!("Tải tệp thất bại: quá nhiều chuyển hướng ({target_origin})");
-                    }
-                    match normalize_allowed_media_url(&resolved_raw) {
-                        Ok(next_url) => {
-                            current_url = next_url;
-                            hops += 1;
-                            continue;
-                        }
-                        Err(origin) => {
-                            eprintln!(
-                                "[litechat][media] blocked redirect to untrusted URL: {origin}"
-                            );
-                            anyhow::bail!(
-                                "Từ chối tải tệp từ URL chuyển hướng không nằm trong danh sách CDN tin cậy ({origin})"
-                            );
-                        }
-                    }
-                }
-                break r;
-            }
-        };
+        let mut resp = self.send_media_get(url).await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -1317,8 +1342,33 @@ impl Session {
         })
     }
 
+    /// Streams a remote media URL directly into `tmp_path` in O(1) RAM with NO per-file size cap,
+    /// computing SHA-256 incrementally, rejecting SVG MIME types, and classifying HTTP 403/404/410
+    /// as [`MediaDownloadError::CdnExpired`].
+    pub async fn download_media_to_temp_file<F>(
+        &self,
+        url: &str,
+        tmp_path: &Path,
+        on_progress: F,
+    ) -> Result<StreamedMediaMeta>
+    where
+        F: FnMut(u64, Option<u64>),
+    {
+        let resp = self.send_media_get(url).await?;
+        stream_response_to_temp_file(resp, tmp_path, on_progress).await
+    }
+
     pub async fn download_media_data_url(&self, url: &str, max_bytes: usize) -> Result<String> {
         let (bytes, mime) = self.download_media_bytes(url, max_bytes).await?;
+        let ct = mime
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if ct.contains("svg") {
+            anyhow::bail!("Không hỗ trợ hiển thị tệp SVG qua data URL");
+        }
         let final_mime = infer_media_data_url_mime(url, &mime);
         Ok(format!("data:{final_mime};base64,{}", B64.encode(&bytes)))
     }
@@ -1330,6 +1380,239 @@ pub struct DownloadedMedia {
     pub mime: String,
     pub final_url: String,
     pub content_disposition_filename: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamedMediaMeta {
+    pub mime: String,
+    pub file_name: Option<String>,
+    pub size_bytes: u64,
+    pub sha256_hex: String,
+    pub status_code: u16,
+}
+
+pub fn is_forbidden_svg_mime(mime: &str) -> bool {
+    mime.split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .contains("svg")
+}
+
+fn is_valid_safe_mime(ct: &str) -> bool {
+    let Some((kind, subtype)) = ct.split_once('/') else {
+        return false;
+    };
+    if kind.is_empty() || subtype.is_empty() {
+        return false;
+    }
+    let valid_part = |p: &str| {
+        p.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'+' | b'_'))
+    };
+    if !valid_part(kind) || !valid_part(subtype) {
+        return false;
+    }
+    if subtype.contains("svg") {
+        return false;
+    }
+    true
+}
+
+pub fn infer_streamed_media_mime(
+    url: &str,
+    file_name: Option<&str>,
+    content_type: &str,
+) -> String {
+    let ct = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if is_valid_safe_mime(&ct)
+        && ct != "application/octet-stream"
+        && ct != "binary/octet-stream"
+    {
+        return ct;
+    }
+    let hint = file_name
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| {
+            url.split(['?', '#'])
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase()
+        });
+    let from_ext = |s: &str| -> Option<&'static str> {
+        if s.ends_with(".png") {
+            Some("image/png")
+        } else if s.ends_with(".jpg") || s.ends_with(".jpeg") {
+            Some("image/jpeg")
+        } else if s.ends_with(".webp") {
+            Some("image/webp")
+        } else if s.ends_with(".gif") {
+            Some("image/gif")
+        } else if s.ends_with(".bmp") {
+            Some("image/bmp")
+        } else if s.ends_with(".avif") {
+            Some("image/avif")
+        } else if s.ends_with(".mp4") || s.ends_with(".m4v") {
+            Some("video/mp4")
+        } else if s.ends_with(".webm") {
+            Some("video/webm")
+        } else if s.ends_with(".mov") {
+            Some("video/quicktime")
+        } else if s.ends_with(".mkv") {
+            Some("video/x-matroska")
+        } else if s.ends_with(".mp3") {
+            Some("audio/mpeg")
+        } else if s.ends_with(".aac") {
+            Some("audio/aac")
+        } else if s.ends_with(".m4a") {
+            Some("audio/mp4")
+        } else if s.ends_with(".ogg") || s.ends_with(".opus") {
+            Some("audio/ogg")
+        } else if s.ends_with(".wav") {
+            Some("audio/wav")
+        } else if s.ends_with(".pdf") {
+            Some("application/pdf")
+        } else if s.ends_with(".zip") {
+            Some("application/zip")
+        } else if s.ends_with(".txt") {
+            Some("text/plain")
+        } else {
+            None
+        }
+    };
+    if let Some(m) = from_ext(&hint) {
+        return m.to_string();
+    }
+    if file_name.is_some() {
+        let url_path = url
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if let Some(m) = from_ext(&url_path) {
+            return m.to_string();
+        }
+    }
+    "application/octet-stream".to_string()
+}
+
+pub(crate) async fn stream_response_to_temp_file<F>(
+    mut resp: reqwest::Response,
+    tmp_path: &Path,
+    mut on_progress: F,
+) -> Result<StreamedMediaMeta>
+where
+    F: FnMut(u64, Option<u64>),
+{
+    let status_code = resp.status().as_u16();
+    if matches!(status_code, 403 | 404 | 410) {
+        return Err(MediaDownloadError::CdnExpired {
+            status: status_code,
+        }
+        .into());
+    }
+    if !resp.status().is_success() {
+        return Err(MediaDownloadError::HttpStatus {
+            status: status_code,
+        }
+        .into());
+    }
+
+    let raw_ct = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if is_forbidden_svg_mime(&raw_ct) {
+        return Err(MediaDownloadError::ForbiddenSvg.into());
+    }
+
+    let file_name = resp
+        .headers()
+        .get(reqwest::header::CONTENT_DISPOSITION)
+        .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
+        .and_then(parse_content_disposition_filename);
+
+    let mime = infer_streamed_media_mime(resp.url().as_str(), file_name.as_deref(), &raw_ct);
+    if is_forbidden_svg_mime(&mime) {
+        return Err(MediaDownloadError::ForbiddenSvg.into());
+    }
+
+    let total_bytes = resp.content_length();
+    if let Some(parent) = tmp_path.parent() {
+        data_dir::ensure_private_dir(parent)?;
+    }
+
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+    }
+    let file = opts
+        .open(tmp_path)
+        .await
+        .with_context(|| format!("Không tạo được tệp tạm {}", tmp_path.display()))?;
+    let mut writer = tokio::io::BufWriter::with_capacity(64 * 1024, file);
+    let mut hasher = Sha256::new();
+    let mut written: u64 = 0;
+
+    on_progress(0, total_bytes);
+    let mut last_emit = std::time::Instant::now();
+
+    let stream_res: Result<()> = async {
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| SessionError::Network(e.to_string()))?
+        {
+            hasher.update(&chunk);
+            writer
+                .write_all(&chunk)
+                .await
+                .with_context(|| format!("Không ghi được tệp tạm {}", tmp_path.display()))?;
+            written = written.saturating_add(chunk.len() as u64);
+            if last_emit.elapsed() >= std::time::Duration::from_millis(80) {
+                on_progress(written, total_bytes);
+                last_emit = std::time::Instant::now();
+            }
+        }
+        writer
+            .flush()
+            .await
+            .with_context(|| format!("Không đồng bộ được tệp tạm {}", tmp_path.display()))?;
+        Ok(())
+    }
+    .await;
+
+    drop(writer);
+    if let Err(err) = stream_res {
+        let _ = tokio::fs::remove_file(tmp_path).await;
+        return Err(err);
+    }
+
+    on_progress(written, total_bytes.or(Some(written)));
+    let digest = hasher.finalize();
+    let sha256_hex = digest.iter().fold(String::with_capacity(64), |mut acc, b| {
+        use std::fmt::Write;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    });
+
+    Ok(StreamedMediaMeta {
+        mime,
+        file_name,
+        size_bytes: written,
+        sha256_hex,
+        status_code,
+    })
 }
 
 fn percent_decode_utf8(input: &str) -> String {
@@ -1437,6 +1720,25 @@ pub fn parse_content_disposition_filename(header_val: &str) -> Option<String> {
     ext_star.or(plain)
 }
 
+fn is_safe_media_data_url_mime(ct: &str) -> bool {
+    let Some((kind, subtype)) = ct.split_once('/') else {
+        return false;
+    };
+    if !matches!(kind, "image" | "audio" | "video") || subtype.is_empty() {
+        return false;
+    }
+    if !subtype
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'+' | b'_'))
+    {
+        return false;
+    }
+    if subtype.contains("svg") || subtype.contains("xml") || subtype.contains("html") {
+        return false;
+    }
+    true
+}
+
 pub fn infer_media_data_url_mime(url: &str, content_type: &str) -> String {
     let ct = content_type
         .split(';')
@@ -1444,7 +1746,7 @@ pub fn infer_media_data_url_mime(url: &str, content_type: &str) -> String {
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
-    if ct.starts_with("image/") || ct.starts_with("audio/") || ct.starts_with("video/") {
+    if is_safe_media_data_url_mime(&ct) {
         return ct;
     }
     let path = url
@@ -1538,7 +1840,8 @@ fn build_media_http_client(relay: &RelayConfig) -> Result<Client> {
             env!("CARGO_PKG_VERSION"),
             " Safari/537.36"
         ))
-        .timeout(std::time::Duration::from_secs(60));
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(60));
     relay
         .apply_to_client_builder(builder)?
         .build()
@@ -1806,6 +2109,29 @@ mod tests {
     }
 
     #[test]
+    fn infer_media_data_url_mime_never_returns_svg_or_malformed_mime() {
+        for (url, ct, expected) in [
+            ("https://f.zdn.vn/icon.svg", "image/svg+xml", "image/png"),
+            (
+                "https://f.zdn.vn/icon.svg?v=1",
+                "IMAGE/SVG+XML; charset=utf-8",
+                "image/png",
+            ),
+            ("https://f.zdn.vn/blob", "image/svg", "image/png"),
+            ("https://f.zdn.vn/blob", "image/svg+xml", "image/png"),
+            ("https://f.zdn.vn/clip.mp4", "image/svg+xml", "video/mp4"),
+            ("https://f.zdn.vn/blob", "image/png,text/html", "image/png"),
+            ("https://f.zdn.vn/blob", "image/x-bad\r\nX-Injected: 1", "image/png"),
+            ("https://f.zdn.vn/blob", "image/webp", "image/webp"),
+        ] {
+            let got = infer_media_data_url_mime(url, ct);
+            assert_ne!(got, "image/svg+xml");
+            assert!(!got.contains("svg"));
+            assert_eq!(got, expected, "url={url}, ct={ct}");
+        }
+    }
+
+    #[test]
     fn media_host_allowlist_covers_verified_official_domains_and_blocks_unsafe() {
         for host in [
             "f10-zpc.zdn.vn",
@@ -1975,6 +2301,40 @@ mod tests {
     }
 
     #[test]
+    fn decode_data_url_rejects_oversized_base64_before_decoding() {
+        // Exact boundary succeeds (5 bytes -> 8 base64 chars; 5.div_ceil(3)*4 = 8).
+        let (bytes, mime) = decode_data_url_bytes("data:image/png;base64,aGVsbG8=", 5).unwrap();
+        assert_eq!(bytes, b"hello");
+        assert_eq!(mime, "image/png");
+
+        // Invalid base64 characters exceeding max_bytes.div_ceil(3)*4 must fail with size error
+        // BEFORE B64.decode runs (not a base64 syntax error).
+        let oversized_invalid = format!("data:image/png;base64,{}", "!".repeat(13));
+        let err = decode_data_url_bytes(&oversized_invalid, 9)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("vượt quá giới hạn"),
+            "expected early size rejection before base64 decode, got: {err}"
+        );
+
+        // Valid oversized base64 payload is also rejected early.
+        let oversized_valid = format!("data:application/octet-stream;base64,{}", B64.encode([0x41u8; 64]));
+        let err2 = decode_data_url_bytes(&oversized_valid, 16)
+            .unwrap_err()
+            .to_string();
+        assert!(err2.contains("vượt quá giới hạn"));
+
+        // Zero max_bytes accepts empty payload and rejects non-empty payload early.
+        let (empty_bytes, _) = decode_data_url_bytes("data:text/plain;base64,", 0).unwrap();
+        assert!(empty_bytes.is_empty());
+        let err_zero = decode_data_url_bytes("data:text/plain;base64,!!!!", 0)
+            .unwrap_err()
+            .to_string();
+        assert!(err_zero.contains("vượt quá giới hạn"));
+    }
+
+    #[test]
     fn parse_content_disposition_filename_handles_plain_rfc5987_and_traversal() {
         assert_eq!(
             parse_content_disposition_filename(
@@ -2113,5 +2473,141 @@ mod tests {
                 Some("test_sek_token_123")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn download_media_to_temp_file_blocks_untrusted_url() {
+        let s = Session::new().unwrap();
+        let dir = std::env::temp_dir().join(format!("teza-dl-untrusted-{}", std::process::id()));
+        let tmp = dir.join("out.part");
+        let err = s
+            .download_media_to_temp_file(
+                "https://untrusted.example/big.mp4?token=secret",
+                &tmp,
+                |_, _| {},
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<MediaDownloadError>(),
+            Some(MediaDownloadError::UntrustedUrl { .. })
+        ));
+        assert!(!err.to_string().contains("secret"));
+        assert!(!tmp.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn stream_response_to_temp_file_streams_hashes_rejects_svg_and_flags_cdn_expiry() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let payload: Vec<u8> = (0..(150 * 1024 + 19)).map(|i| (i % 239) as u8).collect();
+        let expected_sha = {
+            let d = Sha256::digest(&payload);
+            d.iter().fold(String::with_capacity(64), |mut acc, b| {
+                use std::fmt::Write;
+                let _ = write!(acc, "{b:02x}");
+                acc
+            })
+        };
+        let payload_srv = payload.clone();
+
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut req_buf = [0u8; 1024];
+                let n = sock.read(&mut req_buf).await.unwrap();
+                let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                let path = req_str
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                match path {
+                    "/ok" => {
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Disposition: attachment; filename=\"clip.mp4\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            payload_srv.len()
+                        );
+                        sock.write_all(hdr.as_bytes()).await.unwrap();
+                        sock.write_all(&payload_srv).await.unwrap();
+                    }
+                    "/svg" => {
+                        let body = b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>";
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: image/svg+xml; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        sock.write_all(hdr.as_bytes()).await.unwrap();
+                        sock.write_all(body).await.unwrap();
+                    }
+                    "/gone" => {
+                        let hdr = "HTTP/1.1 410 Gone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        sock.write_all(hdr.as_bytes()).await.unwrap();
+                    }
+                    _ => {
+                        let hdr = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        sock.write_all(hdr.as_bytes()).await.unwrap();
+                    }
+                }
+            }
+        });
+
+        let client = Client::new();
+        let dir = std::env::temp_dir().join(format!("teza-dl-stream-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 1. Streaming 200 OK with SHA-256 + progress + Content-Disposition filename
+        let ok_path = dir.join("ok.part");
+        let resp_ok = client.get(format!("http://{addr}/ok")).send().await.unwrap();
+        let mut progress_calls = Vec::new();
+        let meta = stream_response_to_temp_file(resp_ok, &ok_path, |got, total| {
+            progress_calls.push((got, total));
+        })
+        .await
+        .unwrap();
+        assert_eq!(meta.status_code, 200);
+        assert_eq!(meta.mime, "video/mp4");
+        assert_eq!(meta.file_name.as_deref(), Some("clip.mp4"));
+        assert_eq!(meta.size_bytes, payload.len() as u64);
+        assert_eq!(meta.sha256_hex, expected_sha);
+        assert_eq!(std::fs::read(&ok_path).unwrap(), payload);
+        assert!(progress_calls.first().unwrap().0 == 0);
+        assert_eq!(progress_calls.last().unwrap().0, payload.len() as u64);
+
+        // 2. Rejects image/svg+xml without creating temp file
+        let svg_path = dir.join("svg.part");
+        let resp_svg = client.get(format!("http://{addr}/svg")).send().await.unwrap();
+        let svg_err = stream_response_to_temp_file(resp_svg, &svg_path, |_, _| {})
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            svg_err.downcast_ref::<MediaDownloadError>(),
+            Some(MediaDownloadError::ForbiddenSvg)
+        ));
+        assert!(!svg_path.exists());
+
+        // 3. Classifies 410 and 403 as MediaDownloadError::CdnExpired
+        for (route, expected_code) in [("/gone", 410u16), ("/forbidden", 403u16)] {
+            let p = dir.join(format!("exp_{expected_code}.part"));
+            let r = client.get(format!("http://{addr}{route}")).send().await.unwrap();
+            let err = stream_response_to_temp_file(r, &p, |_, _| {})
+                .await
+                .unwrap_err();
+            let dl_err = err.downcast_ref::<MediaDownloadError>().unwrap();
+            assert!(dl_err.is_cdn_expired());
+            assert!(matches!(
+                dl_err,
+                MediaDownloadError::CdnExpired { status } if *status == expected_code
+            ));
+            assert!(!p.exists());
+        }
+
+        server.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

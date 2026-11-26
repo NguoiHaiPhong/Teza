@@ -61,23 +61,68 @@ impl StoragePaths {
         self.root.join("call_audio.json")
     }
 
+    pub fn media_config_file(&self) -> PathBuf {
+        self.root.join("media_config.json")
+    }
+
+    pub fn avatars_cache_dir(&self) -> PathBuf {
+        self.root.join("avatars_cache")
+    }
+
     pub fn history_db(&self, uin: Option<&str>) -> PathBuf {
-        match uin.filter(|u| !u.trim().is_empty()) {
-            Some(id) => {
-                let clean: String = id.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-                if clean.is_empty() {
-                    self.root.join("history.db")
-                } else {
-                    self.root.join("accounts").join(format!("{clean}_history.db"))
-                }
-            }
+        match clean_uid_segment(uin) {
+            Some(clean) => self.root.join("accounts").join(format!("{clean}_history.db")),
             None => self.root.join("history.db"),
+        }
+    }
+
+    pub fn media_vault_dir(&self, uid: Option<&str>, custom_root: Option<&Path>) -> PathBuf {
+        let uid_seg = clean_uid_segment(uid).unwrap_or_else(|| "default".to_string());
+        match custom_root.filter(|p| !p.as_os_str().is_empty()) {
+            Some(custom) => custom.join(uid_seg),
+            None => self.root.join("media").join(uid_seg),
+        }
+    }
+
+    pub fn media_vault_key_file(&self, uid: Option<&str>) -> PathBuf {
+        match clean_uid_segment(uid) {
+            Some(clean) => self.root.join("accounts").join(format!("{clean}_media.key")),
+            None => self.root.join("media.key"),
         }
     }
 
     pub fn sticker_cache_dir(&self) -> PathBuf {
         self.root.join("stickers_cache")
     }
+
+    pub fn gdrive_config_file(&self) -> PathBuf {
+        self.root.join("gdrive_config.json")
+    }
+
+    pub fn gdrive_tokens_file(&self, uid: Option<&str>) -> PathBuf {
+        let safe_uid = clean_uid_segment(uid).unwrap_or_else(|| "default".to_string());
+        self.root.join(format!("gdrive_tokens_{safe_uid}.dpapi"))
+    }
+
+    pub fn gdrive_master_key_file(&self, uid: Option<&str>) -> PathBuf {
+        let safe_uid = clean_uid_segment(uid).unwrap_or_else(|| "default".to_string());
+        self.root.join(format!("gdrive_master_key_{safe_uid}.dpapi"))
+    }
+
+    pub fn gdrive_device_id_file(&self) -> PathBuf {
+        self.root.join("gdrive_device_id.txt")
+    }
+}
+
+fn clean_uid_segment(uid: Option<&str>) -> Option<String> {
+    uid.filter(|u| !u.trim().is_empty()).and_then(|id| {
+        let clean: String = id.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        if clean.is_empty() {
+            None
+        } else {
+            Some(clean)
+        }
+    })
 }
 
 pub fn sanitize_profile_name(raw: &str) -> Result<String> {
@@ -270,6 +315,69 @@ mod tests {
         write_private_atomic(&f, b"first").unwrap();
         write_private_atomic(&f, b"second").unwrap();
         assert_eq!(std::fs::read(&f).unwrap(), b"second");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn media_vault_paths_support_default_custom_and_sanitized_uid() {
+        let dir = std::env::temp_dir().join(format!("teza-media-paths-{}", std::process::id()));
+        let paths = StoragePaths::from_dir(&dir).unwrap();
+
+        assert_eq!(paths.media_config_file(), dir.join("media_config.json"));
+        assert_eq!(paths.avatars_cache_dir(), dir.join("avatars_cache"));
+        assert_eq!(
+            paths.media_vault_dir(Some("123456"), None),
+            dir.join("media").join("123456")
+        );
+        assert_eq!(
+            paths.media_vault_dir(None, None),
+            dir.join("media").join("default")
+        );
+        assert_eq!(
+            paths.media_vault_dir(Some("../uid_99!"), None),
+            dir.join("media").join("uid99")
+        );
+        let custom = PathBuf::from("E:/TezaVault");
+        assert_eq!(
+            paths.media_vault_dir(Some("123456"), Some(&custom)),
+            custom.join("123456")
+        );
+        assert_eq!(
+            paths.media_vault_dir(None, Some(&custom)),
+            custom.join("default")
+        );
+        assert_eq!(
+            paths.media_vault_key_file(Some("123456")),
+            dir.join("accounts").join("123456_media.key")
+        );
+        assert_eq!(paths.media_vault_key_file(None), dir.join("media.key"));
+
+        assert_eq!(paths.gdrive_config_file(), dir.join("gdrive_config.json"));
+        assert_eq!(
+            paths.gdrive_tokens_file(Some("123456")),
+            dir.join("gdrive_tokens_123456.dpapi")
+        );
+        assert_eq!(
+            paths.gdrive_tokens_file(None),
+            dir.join("gdrive_tokens_default.dpapi")
+        );
+        assert_eq!(
+            paths.gdrive_tokens_file(Some("../uid_99!")),
+            dir.join("gdrive_tokens_uid99.dpapi")
+        );
+        assert_eq!(
+            paths.gdrive_master_key_file(Some("123456")),
+            dir.join("gdrive_master_key_123456.dpapi")
+        );
+        assert_eq!(
+            paths.gdrive_master_key_file(None),
+            dir.join("gdrive_master_key_default.dpapi")
+        );
+        assert_eq!(
+            paths.gdrive_device_id_file(),
+            dir.join("gdrive_device_id.txt")
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

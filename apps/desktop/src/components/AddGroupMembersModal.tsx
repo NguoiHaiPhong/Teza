@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, Loader2, Search, UserPlus, X } from "lucide-react";
 import { bridge } from "../bridge";
 import { useI18n } from "../i18n";
@@ -35,8 +35,22 @@ export function AddGroupMembersModal({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<AddGroupMembersResultDto | null>(null);
+  const closeTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
+    return () => {
+      if (closeTimerRef.current !== null) {
+        window.clearTimeout(closeTimerRef.current);
+        closeTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (closeTimerRef.current !== null) {
+      window.clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = null;
+    }
     if (!open) return;
     setQuery("");
     setPhoneQuery("");
@@ -105,7 +119,7 @@ export function AddGroupMembersModal({
           return [
             {
               id: profile.uid,
-              title: profile.display_name || profile.zalo_name || profile.uid,
+              title: profile.display_name || profile.account_name || profile.uid,
               avatar: profile.avatar,
             },
             ...prev,
@@ -132,7 +146,13 @@ export function AddGroupMembersModal({
       setResult(res);
       onAdded(res);
       if (res.failed.length === 0) {
-        setTimeout(() => onClose(), 900);
+        if (closeTimerRef.current !== null) {
+          window.clearTimeout(closeTimerRef.current);
+        }
+        closeTimerRef.current = window.setTimeout(() => {
+          closeTimerRef.current = null;
+          onClose();
+        }, 900);
       }
     } catch (err) {
       setError(String(err));

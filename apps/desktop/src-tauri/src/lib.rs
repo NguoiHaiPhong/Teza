@@ -5,8 +5,9 @@ mod clipboard;
 mod file_dialog;
 mod screen_shake;
 mod screenshot;
+mod webapp_accounts;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -20,25 +21,42 @@ use tauri::{
     State, WebviewBuilder, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_updater::UpdaterExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 
 use zalo_core::chat::messaging;
 use zalo_core::chat::parser::{
-    format_thread_preview, is_raw_numeric_id, parse_ws_event, pick_str, sticker_image_url,
-    WsParsedAction,
+    clean_group_id, format_thread_preview, is_raw_numeric_id, parse_ws_event, pick_str,
+    sticker_image_url, WsParsedAction,
 };
 use zalo_core::chat::threads;
 use zalo_core::chat::{
-    AddGroupMembersResultDto, ChatFolderDto, FolderFilter, MessageDto, PollDto, ThreadDetailsDto,
-    ThreadDto, ThreadKind, UserProfileDto,
+    AddGroupMembersResultDto, ChatFolderDto, FolderFilter, FriendActionResultDto,
+    FriendRequestsListDto, KickGroupMembersResultDto, LeaveGroupResultDto, MessageDto, PollDto,
+    ThreadDetailsDto, ThreadDto, ThreadKind, UserProfileDto,
 };
 use zalo_core::data_dir::StoragePaths;
+use zalo_core::gdrive::{
+    ensure_relay_disabled, load_or_create_device_id, CloudMasterKey, GDriveClient, GDriveConfigDto,
+    GDriveError, GDrivePruneResultDto, GDriveStatusDto, GDriveStorageOverviewDto,
+    GDriveStoredConfig, GDriveTokens, OAuthLoopbackFlow, VaultFolderIds, GDRIVE_PHASE_CONNECTING,
+    GDRIVE_PHASE_ERROR, GDRIVE_PHASE_IDLE, GDRIVE_PHASE_PAUSED_RELAY, GDRIVE_PHASE_PRUNING,
+    GDRIVE_PHASE_REHYDRATING, GDRIVE_PHASE_SYNCING_HISTORY, GDRIVE_PHASE_UPLOADING_MEDIA,
+    GDRIVE_PROVIDER_NAME, MIN_VAULT_PASSPHRASE_LEN,
+};
+use zalo_core::media_vault::{
+    constant_time_eq, generate_protocol_token, MediaVault, MediaVaultConfig,
+};
 use zalo_core::qr::{self, QrTicket};
 use zalo_core::relay::{RelayConfig, RelayConfigSummary, RelayConfigUpdate, RelayMode};
-use zalo_core::session::{AccountProfile, Session, SessionError, SessionStatus};
+use zalo_core::session::{
+    is_forbidden_svg_mime, AccountProfile, MediaDownloadError, Session, SessionError, SessionStatus,
+};
 use zalo_core::socket::{self, WsSignal};
-use zalo_core::store::MessageStore;
+use zalo_core::store::{
+    CloudMediaBreakdown, MediaObjectRecord, MediaVaultStatsDto, MessageStore,
+    MEDIA_CDN_STATUS_EXPIRED, MEDIA_LOCAL_STATE_LOCAL, MEDIA_LOCAL_STATE_MISSING,
+};
 use zalo_core::translate::{
     classify_skip_reason, classify_skip_reason_for_mode, is_static_non_translatable,
     normalize_lang_base_code, provider_name, translate_api_only_with_relay, TranslateConfig,
@@ -50,6 +68,9 @@ pub struct AppState {
     pub paths: StoragePaths,
     pub session: Arc<Mutex<Session>>,
     pub store: Arc<Mutex<MessageStore>>,
+    pub media_vault: Arc<RwLock<Arc<MediaVault>>>,
+    pub media_protocol_token: String,
+    pub gdrive: Arc<GDriveRuntime>,
     pub ws_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     pub qr_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     pub active_thread_id: Arc<Mutex<Option<String>>>,
@@ -60,8 +81,13 @@ pub struct AppState {
     pub allow_exit: Arc<AtomicBool>,
     pub pending_notify: Arc<Mutex<Option<NotifyToastPayload>>>,
     pub notify_hide_gen: Arc<AtomicU64>,
-    pub active_webapp_label: Arc<Mutex<Option<String>>>,
+    pub webapp_op_lock: Arc<Mutex<()>>,
+    pub webapp_epoch: Arc<AtomicU64>,
+    pub webapp_base_urls: Arc<Mutex<HashMap<String, String>>>,
+    pub webapp_last_popup_ms: Arc<AtomicU64>,
+    pub webapp_accounts: Arc<Mutex<webapp_accounts::WebAppAccountStore>>,
     pub recent_saved_files: Arc<Mutex<VecDeque<PathBuf>>>,
+    pub approved_attachment_paths: Arc<std::sync::Mutex<VecDeque<PathBuf>>>,
     pub call_mgr: Arc<call::CallManager>,
 }
 
@@ -183,6 +209,14 @@ pub struct ThreadMessagesSyncedPayload {
     pub has_more: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SocialWsEventDto {
+    pub kind: String,
+    pub thread_id: Option<String>,
+    pub user_id: Option<String>,
+    pub self_removed: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AttachmentMetaDto {
     pub path: String,
@@ -211,19 +245,20 @@ async fn clear_expired_session(
             handle.abort();
         }
     }
-    let relay_on = {
+    {
         let mut sess = sess_arc.lock().await;
-        let was_relay = sess.relay.enabled;
         if let Ok(fresh) = Session::new_with_relay(sess.relay.clone()) {
             *sess = fresh;
         } else {
             sess.zpw_sek = None;
             sess.secret_key = None;
         }
-        was_relay
-    };
+    }
     if let Some(st) = app.try_state::<AppState>() {
-        st.call_mgr.teardown(Some(app), false, relay_on).await;
+        st.call_mgr.teardown_for_session(Some(app), sess_arc).await;
+        st.gdrive
+            .clear_for_logout_and_emit(app, &st.relay_cfg, &st.store)
+            .await;
     }
     let session_path = paths.session_file();
     if session_path.exists() {
@@ -234,10 +269,54 @@ async fn clear_expired_session(
     }
 }
 
+fn classify_ws_message_unread(
+    is_outgoing: bool,
+    active_thread_id: Option<&str>,
+    msg_thread_id: &str,
+    main_focused: bool,
+) -> (bool, bool) {
+    if is_outgoing {
+        return (false, true);
+    }
+    let is_active_and_focused = main_focused && active_thread_id == Some(msg_thread_id);
+    if is_active_and_focused {
+        (false, true)
+    } else {
+        (true, false)
+    }
+}
+
+fn build_thread_read_synced_payload(thread_id: &str, is_unread: bool) -> serde_json::Value {
+    serde_json::json!({
+        "thread_id": thread_id,
+        "is_unread": is_unread,
+    })
+}
+
+fn pick_latest_incoming_for_seen(messages: &[MessageDto]) -> Option<(String, String, String)> {
+    messages
+        .iter()
+        .filter(|m| !m.is_outgoing && is_server_msg_id(&m.msg_id))
+        .max_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.msg_id.cmp(&b.msg_id)))
+        .map(|m| (m.msg_id.clone(), m.sender_id.clone(), m.msg_type.clone()))
+}
+
+fn is_main_window_focused(app: &AppHandle) -> bool {
+    app.get_window("main")
+        .map(|w| {
+            w.is_visible().unwrap_or(false)
+                && !w.is_minimized().unwrap_or(false)
+                && w.is_focused().unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn ensure_ws_worker(
     app: AppHandle,
     sess_arc: Arc<Mutex<Session>>,
     store_arc: Arc<Mutex<MessageStore>>,
+    media_vault_arc: Arc<RwLock<Arc<MediaVault>>>,
     ws_task_arc: Arc<Mutex<Option<JoinHandle<()>>>>,
     active_thread_arc: Arc<Mutex<Option<String>>>,
     call_mgr: Arc<call::CallManager>,
@@ -252,6 +331,7 @@ async fn ensure_ws_worker(
             app,
             sess_arc,
             store_arc,
+            media_vault_arc,
             ws_task_arc,
             active_thread_arc,
             call_mgr,
@@ -261,10 +341,12 @@ async fn ensure_ws_worker(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn restart_ws_worker(
     app: AppHandle,
     sess_arc: Arc<Mutex<Session>>,
     store_arc: Arc<Mutex<MessageStore>>,
+    media_vault_arc: Arc<RwLock<Arc<MediaVault>>>,
     ws_task_arc: Arc<Mutex<Option<JoinHandle<()>>>>,
     active_thread_arc: Arc<Mutex<Option<String>>>,
     call_mgr: Arc<call::CallManager>,
@@ -353,8 +435,15 @@ async fn restart_ws_worker(
                     }
 
                     let active_id = active_thread_arc.lock().await.clone();
+                    let main_focused = is_main_window_focused(&app);
                     let mut pending_resolve_msgs: Vec<MessageDto> = Vec::new();
+                    let mut auto_cache_jobs: Vec<(String, &'static str, String, String)> =
+                        Vec::new();
+                    let mut orphaned_media_paths: Vec<String> = Vec::new();
                     let mut voip_events = Vec::new();
+                    let mut read_synced_events: Vec<(String, bool)> = Vec::new();
+                    let mut social_events: Vec<SocialWsEventDto> = Vec::new();
+                    let mut self_removed_thread_ids: Vec<String> = Vec::new();
                     let mut threads_touched = false;
                     {
                         let mut store = store_arc.lock().await;
@@ -373,10 +462,12 @@ async fn restart_ws_worker(
                                         &msg.sender_name,
                                         is_group,
                                     );
-                                    let inc_unread = !msg.is_outgoing
-                                        && active_id.as_deref() != Some(msg.thread_id.as_str());
-                                    let clear_unread = msg.is_outgoing
-                                        || active_id.as_deref() == Some(msg.thread_id.as_str());
+                                    let (inc_unread, clear_unread) = classify_ws_message_unread(
+                                        msg.is_outgoing,
+                                        active_id.as_deref(),
+                                        &msg.thread_id,
+                                        main_focused,
+                                    );
                                     let created = store
                                         .update_thread_preview_returning_created(
                                             &msg.thread_id,
@@ -389,6 +480,20 @@ async fn restart_ws_worker(
                                     if created {
                                         threads_touched = true;
                                     }
+                                    if let Some(ref att_url) = msg.attachment_url {
+                                        if let Some(kind) =
+                                            classify_ws_auto_cache_kind(&msg.msg_type)
+                                        {
+                                            if validate_teza_media_remote_url(att_url).is_ok() {
+                                                auto_cache_jobs.push((
+                                                    att_url.clone(),
+                                                    kind,
+                                                    msg.thread_id.clone(),
+                                                    msg.msg_id.clone(),
+                                                ));
+                                            }
+                                        }
+                                    }
                                     let _ = app.emit("core://message-new", &*msg);
                                     if !missing_uids.is_empty()
                                         && missing_uids.iter().any(|u| u == &msg.sender_id)
@@ -396,58 +501,151 @@ async fn restart_ws_worker(
                                         pending_resolve_msgs.push(*msg);
                                     }
                                 }
-                            WsParsedAction::Read {
-                                thread_id,
-                                is_unread,
-                            } => {
-                                let _ = store.set_thread_unread(&thread_id, if is_unread { 1 } else { 0 });
-                                threads_touched = true;
-                            }
-                            WsParsedAction::PeerSeen {
-                                thread_id,
-                                seen_ts,
-                                is_delivered_only,
-                            } => {
-                                if !is_delivered_only {
-                                    if let Ok(peer_ts) = store.update_peer_read_ts(&thread_id, seen_ts) {
-                                        let _ = app.emit(
-                                            "core://thread-receipt",
-                                            serde_json::json!({
-                                                "thread_id": thread_id,
-                                                "peer_read_ts": peer_ts,
-                                            }),
-                                        );
+                                WsParsedAction::Read {
+                                    thread_id,
+                                    is_unread,
+                                } => {
+                                    let _ = store.set_thread_unread(
+                                        &thread_id,
+                                        if is_unread { 1 } else { 0 },
+                                    );
+                                    read_synced_events.push((thread_id, is_unread));
+                                    threads_touched = true;
+                                }
+                                WsParsedAction::PeerSeen {
+                                    thread_id,
+                                    seen_ts,
+                                    is_delivered_only,
+                                } => {
+                                    if !is_delivered_only {
+                                        if let Ok(peer_ts) =
+                                            store.update_peer_read_ts(&thread_id, seen_ts)
+                                        {
+                                            let _ = app.emit(
+                                                "core://thread-receipt",
+                                                serde_json::json!({
+                                                    "thread_id": thread_id,
+                                                    "peer_read_ts": peer_ts,
+                                                }),
+                                            );
+                                        }
                                     }
                                 }
-                            }
-                            WsParsedAction::Recalled { thread_id, msg_id } => {
-                                if let Ok(Some(updated)) = store.mark_recalled(&thread_id, &msg_id) {
-                                    let _ = app.emit("core://message-updated", &updated);
+                                WsParsedAction::Recalled { thread_id, msg_id } => {
+                                    if let Ok(orphans) =
+                                        store.cleanup_orphaned_media_for_msg(&thread_id, &msg_id)
+                                    {
+                                        orphaned_media_paths.extend(orphans);
+                                    }
+                                    if let Ok(Some(updated)) =
+                                        store.mark_recalled(&thread_id, &msg_id)
+                                    {
+                                        let _ = app.emit("core://message-updated", &updated);
+                                    }
                                 }
-                            }
-                            WsParsedAction::Reaction {
-                                thread_id,
-                                msg_id,
-                                emoji,
-                                me,
-                                removed,
-                            } => {
-                                if let Ok(Some(updated)) = store.apply_reaction(
-                                    &thread_id,
-                                    &msg_id,
-                                    emoji.as_deref(),
+                                WsParsedAction::Reaction {
+                                    thread_id,
+                                    msg_id,
+                                    emoji,
                                     me,
                                     removed,
-                                ) {
-                                    let _ = app.emit("core://message-updated", &updated);
+                                } => {
+                                    if let Ok(Some(updated)) = store.apply_reaction(
+                                        &thread_id,
+                                        &msg_id,
+                                        emoji.as_deref(),
+                                        me,
+                                        removed,
+                                    ) {
+                                        let _ = app.emit("core://message-updated", &updated);
+                                    }
+                                }
+                                WsParsedAction::Voip(v) => voip_events.push(v),
+                                WsParsedAction::SocialEvent {
+                                    kind,
+                                    thread_id,
+                                    user_id,
+                                    self_removed,
+                                } => {
+                                    if self_removed {
+                                        if let Some(ref tid) = thread_id {
+                                            let trimmed = tid.trim();
+                                            if !trimmed.is_empty() {
+                                                if let Ok(orphans) = store.delete_thread(trimmed) {
+                                                    orphaned_media_paths.extend(orphans);
+                                                }
+                                                self_removed_thread_ids.push(trimmed.to_string());
+                                                threads_touched = true;
+                                            }
+                                        }
+                                    }
+                                    social_events.push(SocialWsEventDto {
+                                        kind,
+                                        thread_id,
+                                        user_id,
+                                        self_removed,
+                                    });
                                 }
                             }
-                            WsParsedAction::Voip(v) => voip_events.push(v),
                         }
+                    }
+                    if !self_removed_thread_ids.is_empty() {
+                        let mut active = active_thread_arc.lock().await;
+                        if active.as_deref().is_some_and(|cur| {
+                            self_removed_thread_ids.iter().any(|tid| tid == cur)
+                        }) {
+                            *active = None;
+                        }
+                    }
+                    if !orphaned_media_paths.is_empty() {
+                        orphaned_media_paths.sort();
+                        orphaned_media_paths.dedup();
+                        let vault = media_vault_arc.read().await.clone();
+                        vault.unlink_rel_paths(&orphaned_media_paths).await;
+                    }
+                    if !auto_cache_jobs.is_empty() {
+                        let vault = media_vault_arc.read().await.clone();
+                        let cfg = vault.config();
+                        for (url, kind, tid, mid) in auto_cache_jobs {
+                            if !should_auto_cache_kind(&cfg, kind) {
+                                continue;
+                            }
+                            let vault_bg = vault.clone();
+                            let sess_bg = sess_clone.clone_shallow();
+                            let store_bg = store_arc.clone();
+                            let app_bg = app.clone();
+                            tokio::spawn(async move {
+                                if let Ok(obj) = vault_bg
+                                    .ensure_cached_url(
+                                        &sess_bg,
+                                        &store_bg,
+                                        &url,
+                                        kind,
+                                        Some((tid.as_str(), mid.as_str())),
+                                        |_, _| {},
+                                    )
+                                    .await
+                                {
+                                    if obj.cloud_file_id.is_none() {
+                                        if let Some(st) = app_bg.try_state::<AppState>() {
+                                            st.gdrive.notify_sync();
+                                        }
+                                    }
+                                }
+                            });
                         }
                     }
                     for v in voip_events {
                         call_mgr.feed_ws_voip(&v).await;
+                    }
+                    for (thread_id, is_unread) in read_synced_events {
+                        let _ = app.emit(
+                            "core://thread-read-synced",
+                            build_thread_read_synced_payload(&thread_id, is_unread),
+                        );
+                    }
+                    for social_ev in social_events {
+                        let _ = app.emit("core://social-event", &social_ev);
                     }
                     if threads_touched {
                         let _ = app.emit("core://threads-updated", ());
@@ -518,25 +716,38 @@ async fn auth_get_status(app: AppHandle, state: State<'_, AppState>) -> Result<A
                 || sess_snapshot.profile.display_name != profile.display_name
                 || sess_snapshot.profile.avatar != profile.avatar
             {
+                let uid_changed = sess_snapshot.profile.uid != profile.uid;
                 profile = sess_snapshot.profile.clone();
                 let mut sess = state.session.lock().await;
                 sess.profile = profile.clone();
                 let _ = sess.save_to_file(&state.paths.session_file());
+                drop(sess);
+                if uid_changed && !profile.uid.is_empty() {
+                    state
+                        .gdrive
+                        .rebind_for_uid_and_emit(
+                            &app,
+                            Some(&profile.uid),
+                            &state.relay_cfg,
+                            &state.store,
+                        )
+                        .await;
+                }
             }
             ensure_ws_worker(
                 app.clone(),
                 state.session.clone(),
                 state.store.clone(),
+                state.media_vault.clone(),
                 state.ws_task.clone(),
                 state.active_thread_id.clone(),
                 state.call_mgr.clone(),
                 state.paths.clone(),
             )
             .await;
-            let call_sess = state.session.lock().await.clone_shallow();
             let _ = state
                 .call_mgr
-                .ensure_started(app, &call_sess, state.store.clone())
+                .ensure_started_from_session(&app, &state.session, &state.store)
                 .await;
             Ok(AuthStatusDto::Authenticated { profile })
         }
@@ -545,16 +756,16 @@ async fn auth_get_status(app: AppHandle, state: State<'_, AppState>) -> Result<A
                 app.clone(),
                 state.session.clone(),
                 state.store.clone(),
+                state.media_vault.clone(),
                 state.ws_task.clone(),
                 state.active_thread_id.clone(),
                 state.call_mgr.clone(),
                 state.paths.clone(),
             )
             .await;
-            let call_sess = state.session.lock().await.clone_shallow();
             let _ = state
                 .call_mgr
-                .ensure_started(app, &call_sess, state.store.clone())
+                .ensure_started_from_session(&app, &state.session, &state.store)
                 .await;
             Ok(AuthStatusDto::Authenticated { profile })
         }
@@ -602,6 +813,9 @@ async fn auth_start_qr(
 
     let sess_arc = state.session.clone();
     let store_arc = state.store.clone();
+    let media_vault_arc = state.media_vault.clone();
+    let gdrive_arc = state.gdrive.clone();
+    let relay_cfg_arc = state.relay_cfg.clone();
     let ws_task_arc = state.ws_task.clone();
     let active_thread_arc = state.active_thread_id.clone();
     let call_mgr_arc = state.call_mgr.clone();
@@ -638,11 +852,22 @@ async fn auth_start_qr(
                 }
 
                 if !profile.uid.is_empty() {
+                    let prev_vault = media_vault_arc.read().await.clone();
+                    prev_vault.flush_access_touches(&store_arc).await;
                     let db_path = paths.history_db(Some(&profile.uid));
                     if let Ok(new_store) = MessageStore::open(&db_path) {
                         let mut guard = store_arc.lock().await;
                         *guard = new_store;
                     }
+                    rebind_media_vault_unlocked(&media_vault_arc, &paths, Some(&profile.uid)).await;
+                    gdrive_arc
+                        .rebind_for_uid_and_emit(
+                            &app,
+                            Some(&profile.uid),
+                            &relay_cfg_arc,
+                            &store_arc,
+                        )
+                        .await;
                 }
 
                 let _ = app.emit("core://auth-authenticated", &profile);
@@ -650,14 +875,16 @@ async fn auth_start_qr(
                     app.clone(),
                     sess_arc.clone(),
                     store_arc.clone(),
+                    media_vault_arc,
                     ws_task_arc,
                     active_thread_arc,
                     call_mgr_arc.clone(),
                     paths,
                 )
                 .await;
-                let call_sess = sess_arc.lock().await.clone_shallow();
-                let _ = call_mgr_arc.restart(app, &call_sess, store_arc).await;
+                let _ = call_mgr_arc
+                    .restart_from_session(&app, &sess_arc, &store_arc)
+                    .await;
             }
             Err(e) => {
                 let _ = app.emit("core://auth-error", e.to_string());
@@ -678,22 +905,32 @@ async fn auth_logout(app: AppHandle, state: State<'_, AppState>) -> Result<(), S
         handle.abort();
     }
     *state.active_thread_id.lock().await = None;
-    let relay_on = {
+    {
         let mut sess = state.session.lock().await;
-        let was_relay = sess.relay.enabled;
         *sess = Session::new_with_relay(sess.relay.clone()).map_err(|e| e.to_string())?;
-        was_relay
-    };
-    state.call_mgr.teardown(Some(&app), false, relay_on).await;
+    }
+    state
+        .call_mgr
+        .teardown_for_session(Some(&app), &state.session)
+        .await;
     let path = state.paths.session_file();
     if path.exists() {
         std::fs::remove_file(&path).map_err(|e| format!("Không xóa được session.json: {e}"))?;
+    }
+    {
+        let prev_vault = state.media_vault.read().await.clone();
+        prev_vault.flush_access_touches(&state.store).await;
     }
     let fallback_db = state.paths.history_db(None);
     if let Ok(anon_store) = MessageStore::open(&fallback_db) {
         let mut store = state.store.lock().await;
         *store = anon_store;
     }
+    rebind_media_vault_unlocked(&state.media_vault, &state.paths, None).await;
+    state
+        .gdrive
+        .clear_for_logout_and_emit(&app, &state.relay_cfg, &state.store)
+        .await;
     Ok(())
 }
 
@@ -723,11 +960,12 @@ async fn threads_sync(
     };
     let store = state.store.lock().await;
     for t in &remote.threads {
-        if remote.pinned_synced {
-            let _ = store.upsert_thread_synced(t);
-        } else {
-            let _ = store.upsert_thread(t);
-        }
+        let remote_read_authoritative = remote.is_remote_read_authoritative(&t.id);
+        let _ = store.upsert_thread_synced_with_read_state(
+            t,
+            remote.pinned_synced,
+            remote_read_authoritative,
+        );
     }
     store.list_threads(folder).map_err(|e| e.to_string())
 }
@@ -785,7 +1023,6 @@ async fn thread_mark_read(
     state: State<'_, AppState>,
     thread_id: String,
 ) -> Result<(), String> {
-    *state.active_thread_id.lock().await = Some(thread_id.clone());
     let (kind, latest_incoming) = {
         let store = state.store.lock().await;
         store.mark_thread_read(&thread_id).map_err(|e| e.to_string())?;
@@ -794,15 +1031,45 @@ async fn thread_mark_read(
             .ok()
             .flatten()
             .unwrap_or(ThreadKind::Direct);
-        let latest = store.get_latest_incoming_message(&thread_id).ok().flatten();
+        let latest = store
+            .get_latest_incoming_message_with_type(&thread_id)
+            .ok()
+            .flatten()
+            .filter(|(mid, _, _)| is_server_msg_id(mid));
         (kind, latest)
     };
     if thread_id != "cloud-me" {
         let tid = thread_id.clone();
         spawn_best_effort_thread_sync(app, &state, move |sess| async move {
             let res = threads::sync_unread_mark(&sess, &tid, kind, false).await;
-            if let Some((mid, sender_id, _)) = latest_incoming {
-                let _ = threads::send_seen_event(&sess, &tid, kind, &mid, &sender_id).await;
+            if res.as_ref().is_err_and(|e| expired_code(e).is_some()) {
+                return res;
+            }
+            let is_cloud = kind == ThreadKind::Cloud
+                || (!sess.profile.send2me_id.is_empty() && tid == sess.profile.send2me_id);
+            if !is_cloud {
+                let target = match latest_incoming {
+                    Some(item) => Some(item),
+                    None => match threads::fetch_thread_history(&sess, &tid, kind, 10).await {
+                        Ok(msgs) => pick_latest_incoming_for_seen(&msgs),
+                        Err(e) if expired_code(&e).is_some() => return Err(e),
+                        Err(_) => None,
+                    },
+                };
+                if let Some((mid, sender_id, msg_type)) = target {
+                    let seen_res = threads::send_seen_event_with_type(
+                        &sess,
+                        &tid,
+                        kind,
+                        &mid,
+                        &sender_id,
+                        &msg_type,
+                    )
+                    .await;
+                    if seen_res.as_ref().is_err_and(|e| expired_code(e).is_some()) {
+                        return seen_res;
+                    }
+                }
             }
             res
         });
@@ -926,7 +1193,7 @@ async fn notify_show_popup(
     *state.pending_notify.lock().await = Some(payload.clone());
 
     let target_mon = app
-        .get_webview_window("main")
+        .get_window("main")
         .filter(|m| m.is_visible().unwrap_or(false) && !m.is_minimized().unwrap_or(false))
         .and_then(|m| m.current_monitor().ok().flatten())
         .or_else(|| app.primary_monitor().ok().flatten());
@@ -1075,7 +1342,7 @@ async fn notify_click(
     if let Some(w) = app.get_webview_window("teza-notify") {
         let _ = w.hide();
     }
-    if let Some(main_win) = app.get_webview_window("main") {
+    if let Some(main_win) = app.get_window("main") {
         let _ = main_win.show();
         let _ = main_win.unminimize();
         let _ = main_win.set_focus();
@@ -1112,17 +1379,21 @@ async fn thread_get_details(
 
     let mut total_members = None;
     let mut members = Vec::new();
+    let mut creator_id = String::new();
+    let mut admin_ids = Vec::new();
     if kind == ThreadKind::Group {
         let sess_snapshot = {
             let sess = state.session.lock().await;
             sess.clone_shallow()
         };
         if sess_snapshot.is_authenticated() {
-            if let Ok((tot, list)) =
+            if let Ok(details) =
                 threads::fetch_group_details(&sess_snapshot, &thread_id, &known_profiles).await
             {
-                total_members = tot;
-                members = list;
+                total_members = details.total_members;
+                members = details.members;
+                creator_id = details.creator_id;
+                admin_ids = details.admin_ids;
             }
         }
     }
@@ -1131,6 +1402,8 @@ async fn thread_get_details(
         thread_id,
         total_members,
         members,
+        creator_id,
+        admin_ids,
         media_items,
         file_items,
         link_items,
@@ -1331,6 +1604,415 @@ async fn group_add_members(
             Err(format!("Không thêm được thành viên vào nhóm: {e}"))
         }
     }
+}
+
+fn validate_social_user_id(raw: &str) -> Result<String, String> {
+    let cleaned = raw.trim().split('_').next().unwrap_or("").trim();
+    if cleaned.is_empty() {
+        return Err("Mã người dùng không hợp lệ".into());
+    }
+    Ok(cleaned.to_string())
+}
+
+fn validate_social_group_id(raw: &str) -> Result<String, String> {
+    let cleaned = clean_group_id(raw).trim();
+    if cleaned.is_empty() {
+        return Err("Mã nhóm không hợp lệ".into());
+    }
+    Ok(cleaned.to_string())
+}
+
+fn normalize_social_member_ids(
+    member_ids: &[String],
+    self_uid: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let clean_self = self_uid
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.split('_').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let mut out = Vec::new();
+    for raw in member_ids {
+        let uid = raw.trim().split('_').next().unwrap_or("").trim();
+        if uid.is_empty() {
+            continue;
+        }
+        if clean_self == Some(uid) {
+            return Err(
+                "Không thể tự xóa chính mình khỏi nhóm — hãy dùng chức năng Rời nhóm.".into(),
+            );
+        }
+        if !out.iter().any(|existing| existing == uid) {
+            out.push(uid.to_string());
+        }
+    }
+    if out.is_empty() {
+        return Err("Vui lòng chọn ít nhất 1 thành viên".into());
+    }
+    Ok(out)
+}
+
+fn normalize_friend_request_message(message: Option<&str>) -> Option<String> {
+    message
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(150).collect())
+}
+
+async fn require_authenticated_session(state: &State<'_, AppState>) -> Result<Session, String> {
+    let sess = state.session.lock().await;
+    if !sess.is_authenticated() {
+        return Err("Chưa đăng nhập".into());
+    }
+    Ok(sess.clone_shallow())
+}
+
+async fn map_social_call_error(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    err: anyhow::Error,
+) -> String {
+    if let Some(code) = expired_code(&err) {
+        let reason =
+            format!("Phiên đăng nhập đã hết hạn (mã {code}). Vui lòng quét lại mã QR.");
+        clear_expired_session(
+            app,
+            &state.session,
+            Some(&state.ws_task),
+            &state.paths,
+            reason.clone(),
+            true,
+        )
+        .await;
+        return reason;
+    }
+    err.to_string()
+}
+
+fn spawn_best_effort_threads_refresh(
+    app: AppHandle,
+    sess_arc: Arc<Mutex<Session>>,
+    store_arc: Arc<Mutex<MessageStore>>,
+) {
+    tauri::async_runtime::spawn(async move {
+        let sess_snapshot = {
+            let sess = sess_arc.lock().await;
+            if !sess.is_authenticated() {
+                return;
+            }
+            sess.clone_shallow()
+        };
+        if let Ok(remote) = threads::sync_threads_full(&sess_snapshot).await {
+            {
+                let store = store_arc.lock().await;
+                for t in &remote.threads {
+                    let remote_read_authoritative = remote.is_remote_read_authoritative(&t.id);
+                    let _ = store.upsert_thread_synced_with_read_state(
+                        t,
+                        remote.pinned_synced,
+                        remote_read_authoritative,
+                    );
+                }
+            }
+            let _ = app.emit("core://threads-updated", ());
+        }
+    });
+}
+
+#[tauri::command]
+async fn friend_remove(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    user_id: String,
+) -> Result<FriendActionResultDto, String> {
+    let clean_uid = validate_social_user_id(&user_id)?;
+    let sess_snapshot = require_authenticated_session(&state).await?;
+    // Intentionally keep local DM message history intact after unfriending.
+    let res = match threads::remove_friend(&sess_snapshot, &clean_uid).await {
+        Ok(r) => r,
+        Err(e) => return Err(map_social_call_error(&app, &state, e).await),
+    };
+    if res.ok {
+        let _ = app.emit(
+            "core://social-event",
+            &SocialWsEventDto {
+                kind: "friend_removed".to_string(),
+                thread_id: None,
+                user_id: Some(res.user_id.clone()),
+                self_removed: false,
+            },
+        );
+    }
+    Ok(res)
+}
+
+#[tauri::command]
+async fn friend_send_request(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    user_id: String,
+    message: Option<String>,
+) -> Result<FriendActionResultDto, String> {
+    let clean_uid = validate_social_user_id(&user_id)?;
+    let clean_msg = normalize_friend_request_message(message.as_deref());
+    let sess_snapshot = require_authenticated_session(&state).await?;
+    let res =
+        match threads::send_friend_request(&sess_snapshot, &clean_uid, clean_msg.as_deref()).await {
+            Ok(r) => r,
+            Err(e) => return Err(map_social_call_error(&app, &state, e).await),
+        };
+    if res.auto_accepted {
+        let _ = app.emit(
+            "core://social-event",
+            &SocialWsEventDto {
+                kind: "friend_added".to_string(),
+                thread_id: None,
+                user_id: Some(res.user_id.clone()),
+                self_removed: false,
+            },
+        );
+        spawn_best_effort_threads_refresh(app, state.session.clone(), state.store.clone());
+    } else if res.ok && !res.already_friends {
+        let _ = app.emit(
+            "core://social-event",
+            &SocialWsEventDto {
+                kind: "friend_request_sent".to_string(),
+                thread_id: None,
+                user_id: Some(res.user_id.clone()),
+                self_removed: false,
+            },
+        );
+    }
+    Ok(res)
+}
+
+#[tauri::command]
+async fn friend_accept_request(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    user_id: String,
+) -> Result<FriendActionResultDto, String> {
+    let clean_uid = validate_social_user_id(&user_id)?;
+    let sess_snapshot = require_authenticated_session(&state).await?;
+    let res = match threads::accept_friend_request(&sess_snapshot, &clean_uid).await {
+        Ok(r) => r,
+        Err(e) => return Err(map_social_call_error(&app, &state, e).await),
+    };
+    if res.ok {
+        let _ = app.emit(
+            "core://social-event",
+            &SocialWsEventDto {
+                kind: "friend_added".to_string(),
+                thread_id: None,
+                user_id: Some(res.user_id.clone()),
+                self_removed: false,
+            },
+        );
+        spawn_best_effort_threads_refresh(app, state.session.clone(), state.store.clone());
+    }
+    Ok(res)
+}
+
+#[tauri::command]
+async fn friend_reject_request(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    user_id: String,
+) -> Result<FriendActionResultDto, String> {
+    let clean_uid = validate_social_user_id(&user_id)?;
+    let sess_snapshot = require_authenticated_session(&state).await?;
+    let res = match threads::reject_friend_request(&sess_snapshot, &clean_uid).await {
+        Ok(r) => r,
+        Err(e) => return Err(map_social_call_error(&app, &state, e).await),
+    };
+    if res.ok {
+        let _ = app.emit(
+            "core://social-event",
+            &SocialWsEventDto {
+                kind: "friend_request_rejected".to_string(),
+                thread_id: None,
+                user_id: Some(res.user_id.clone()),
+                self_removed: false,
+            },
+        );
+    }
+    Ok(res)
+}
+
+#[tauri::command]
+async fn friend_undo_request(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    user_id: String,
+) -> Result<FriendActionResultDto, String> {
+    let clean_uid = validate_social_user_id(&user_id)?;
+    let sess_snapshot = require_authenticated_session(&state).await?;
+    let res = match threads::undo_friend_request(&sess_snapshot, &clean_uid).await {
+        Ok(r) => r,
+        Err(e) => return Err(map_social_call_error(&app, &state, e).await),
+    };
+    if res.ok {
+        let _ = app.emit(
+            "core://social-event",
+            &SocialWsEventDto {
+                kind: "friend_request_undone".to_string(),
+                thread_id: None,
+                user_id: Some(res.user_id.clone()),
+                self_removed: false,
+            },
+        );
+    }
+    Ok(res)
+}
+
+#[tauri::command]
+async fn friend_list_requests(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<FriendRequestsListDto, String> {
+    let sess_snapshot = require_authenticated_session(&state).await?;
+    match threads::list_friend_requests(&sess_snapshot).await {
+        Ok(list) => Ok(list),
+        Err(e) => Err(map_social_call_error(&app, &state, e).await),
+    }
+}
+
+#[tauri::command]
+async fn friend_block_user(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    user_id: String,
+) -> Result<FriendActionResultDto, String> {
+    let clean_uid = validate_social_user_id(&user_id)?;
+    let sess_snapshot = require_authenticated_session(&state).await?;
+    let res = match threads::block_user(&sess_snapshot, &clean_uid).await {
+        Ok(r) => r,
+        Err(e) => return Err(map_social_call_error(&app, &state, e).await),
+    };
+    if res.ok {
+        let _ = app.emit(
+            "core://social-event",
+            &SocialWsEventDto {
+                kind: "user_blocked".to_string(),
+                thread_id: None,
+                user_id: Some(res.user_id.clone()),
+                self_removed: false,
+            },
+        );
+    }
+    Ok(res)
+}
+
+#[tauri::command]
+async fn friend_unblock_user(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    user_id: String,
+) -> Result<FriendActionResultDto, String> {
+    let clean_uid = validate_social_user_id(&user_id)?;
+    let sess_snapshot = require_authenticated_session(&state).await?;
+    let res = match threads::unblock_user(&sess_snapshot, &clean_uid).await {
+        Ok(r) => r,
+        Err(e) => return Err(map_social_call_error(&app, &state, e).await),
+    };
+    if res.ok {
+        let _ = app.emit(
+            "core://social-event",
+            &SocialWsEventDto {
+                kind: "user_unblocked".to_string(),
+                thread_id: None,
+                user_id: Some(res.user_id.clone()),
+                self_removed: false,
+            },
+        );
+    }
+    Ok(res)
+}
+
+#[tauri::command]
+async fn group_leave(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    group_id: String,
+    silent: Option<bool>,
+) -> Result<LeaveGroupResultDto, String> {
+    let clean_gid = validate_social_group_id(&group_id)?;
+    let sess_snapshot = require_authenticated_session(&state).await?;
+    let res =
+        match threads::leave_group(&sess_snapshot, &clean_gid, silent.unwrap_or(false)).await {
+            Ok(r) => r,
+            Err(e) => return Err(map_social_call_error(&app, &state, e).await),
+        };
+    if res.left {
+        let mut orphans = {
+            let mut store = state.store.lock().await;
+            let mut list = store.delete_thread(&res.group_id).unwrap_or_default();
+            let raw_trimmed = group_id.trim();
+            if !raw_trimmed.is_empty() && raw_trimmed != res.group_id {
+                if let Ok(extra) = store.delete_thread(raw_trimmed) {
+                    list.extend(extra);
+                }
+            }
+            list
+        };
+        orphans.sort();
+        orphans.dedup();
+        {
+            let mut active = state.active_thread_id.lock().await;
+            if active
+                .as_deref()
+                .is_some_and(|cur| cur == res.group_id || cur == group_id.trim())
+            {
+                *active = None;
+            }
+        }
+        if !orphans.is_empty() {
+            let vault = state.media_vault.read().await.clone();
+            vault.unlink_rel_paths(&orphans).await;
+        }
+        let _ = app.emit(
+            "core://social-event",
+            &SocialWsEventDto {
+                kind: "group_left".to_string(),
+                thread_id: Some(res.group_id.clone()),
+                user_id: None,
+                self_removed: true,
+            },
+        );
+        let _ = app.emit("core://threads-updated", ());
+    }
+    Ok(res)
+}
+
+#[tauri::command]
+async fn group_kick_members(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    group_id: String,
+    member_ids: Vec<String>,
+) -> Result<KickGroupMembersResultDto, String> {
+    let clean_gid = validate_social_group_id(&group_id)?;
+    let sess_snapshot = require_authenticated_session(&state).await?;
+    let my_uid = (!sess_snapshot.profile.uid.trim().is_empty())
+        .then_some(sess_snapshot.profile.uid.as_str());
+    let clean_members = normalize_social_member_ids(&member_ids, my_uid)?;
+    let res = match threads::kick_group_members(&sess_snapshot, &clean_gid, &clean_members).await {
+        Ok(r) => r,
+        Err(e) => return Err(map_social_call_error(&app, &state, e).await),
+    };
+    if !res.removed.is_empty() {
+        let _ = app.emit(
+            "core://social-event",
+            &SocialWsEventDto {
+                kind: "group_member_removed".to_string(),
+                thread_id: Some(res.group_id.clone()),
+                user_id: res.removed.first().cloned(),
+                self_removed: false,
+            },
+        );
+    }
+    Ok(res)
 }
 
 #[tauri::command]
@@ -2277,11 +2959,21 @@ async fn message_recall(
             return Err(format!("Thu hồi tin nhắn thất bại: {e}"));
         }
     }
-    let mut store = state.store.lock().await;
-    let updated = store
-        .mark_recalled(&thread_id, &msg_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Không cập nhật được trạng thái thu hồi".to_string())?;
+    let (updated, orphaned_paths) = {
+        let mut store = state.store.lock().await;
+        let orphans = store
+            .cleanup_orphaned_media_for_msg(&thread_id, &msg_id)
+            .unwrap_or_default();
+        let updated = store
+            .mark_recalled(&thread_id, &msg_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Không cập nhật được trạng thái thu hồi".to_string())?;
+        (updated, orphans)
+    };
+    if !orphaned_paths.is_empty() {
+        let vault = state.media_vault.read().await.clone();
+        vault.unlink_rel_paths(&orphaned_paths).await;
+    }
     let _ = app.emit("core://message-updated", &updated);
     Ok(updated)
 }
@@ -2293,10 +2985,20 @@ async fn message_delete_local(
     thread_id: String,
     msg_id: String,
 ) -> Result<(), String> {
-    let mut store = state.store.lock().await;
-    store
-        .delete_message(&thread_id, &msg_id)
-        .map_err(|e| e.to_string())?;
+    let orphaned_paths = {
+        let mut store = state.store.lock().await;
+        let orphans = store
+            .cleanup_orphaned_media_for_msg(&thread_id, &msg_id)
+            .unwrap_or_default();
+        store
+            .delete_message(&thread_id, &msg_id)
+            .map_err(|e| e.to_string())?;
+        orphans
+    };
+    if !orphaned_paths.is_empty() {
+        let vault = state.media_vault.read().await.clone();
+        vault.unlink_rel_paths(&orphaned_paths).await;
+    }
     let _ = app.emit(
         "core://message-deleted",
         serde_json::json!({ "thread_id": thread_id, "msg_id": msg_id }),
@@ -2543,19 +3245,33 @@ async fn persist_and_emit_sent_message(
 }
 
 #[tauri::command]
-async fn pick_attachment_file(app: AppHandle) -> Result<Option<AttachmentMetaDto>, String> {
+async fn pick_attachment_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<AttachmentMetaDto>, String> {
     let owner_hwnd = main_window_hwnd(&app);
 
     let selected = tokio::task::spawn_blocking(move || file_dialog::pick_single_file(owner_hwnd))
         .await
         .map_err(|e| format!("Lỗi tác vụ chọn tệp: {e}"))??;
-    selected.map(|p| attachment_meta_from_path(&p)).transpose()
+    let Some(path) = selected else {
+        return Ok(None);
+    };
+    let meta = attachment_meta_from_path(&path)?;
+    {
+        let mut approved = state
+            .approved_attachment_paths
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        record_approved_attachment_path(&mut approved, &path);
+    }
+    Ok(Some(meta))
 }
 
 fn main_window_hwnd(app: &AppHandle) -> Option<usize> {
     #[cfg(target_os = "windows")]
     {
-        app.get_webview_window("main")
+        app.get_window("main")
             .and_then(|w| w.hwnd().ok())
             .map(|h| h.0 as usize)
     }
@@ -2567,6 +3283,7 @@ fn main_window_hwnd(app: &AppHandle) -> Option<usize> {
 }
 
 const MAX_RECENT_SAVED_FILES: usize = 200;
+const MAX_APPROVED_ATTACHMENT_PATHS: usize = 200;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DownloadProgressPayload {
@@ -2629,6 +3346,40 @@ fn validate_reveal_saved_file(list: &VecDeque<PathBuf>, candidate: &Path) -> Res
         .ok_or_else(|| "Tệp không nằm trong danh sách tệp vừa tải trong phiên này".to_string())
 }
 
+fn record_approved_attachment_path(list: &mut VecDeque<PathBuf>, path: &Path) -> PathBuf {
+    let canonical = normalize_saved_lookup_path(path);
+    if let Some(pos) = list.iter().position(|p| p == &canonical) {
+        list.remove(pos);
+    }
+    list.push_back(canonical.clone());
+    while list.len() > MAX_APPROVED_ATTACHMENT_PATHS {
+        list.pop_front();
+    }
+    canonical
+}
+
+fn validate_approved_attachment_path(
+    list: &VecDeque<PathBuf>,
+    candidate: &Path,
+) -> Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(candidate).map_err(|_| {
+        "Tệp không nằm trong danh sách tệp đã chọn hoặc kéo thả trong phiên này".to_string()
+    })?;
+    list.iter()
+        .find(|p| *p == &canonical)
+        .cloned()
+        .ok_or_else(|| {
+            "Tệp không nằm trong danh sách tệp đã chọn hoặc kéo thả trong phiên này".to_string()
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn mark_of_the_web_ads_path(path: &Path) -> PathBuf {
+    let mut ads = path.as_os_str().to_os_string();
+    ads.push(":Zone.Identifier");
+    PathBuf::from(ads)
+}
+
 #[tauri::command]
 async fn save_remote_file(
     app: AppHandle,
@@ -2636,6 +3387,8 @@ async fn save_remote_file(
     url: String,
     suggested_name: String,
     download_id: Option<String>,
+    thread_id: Option<String>,
+    msg_id: Option<String>,
 ) -> Result<Option<SavedFileResult>, String> {
     let dl_id = download_id
         .map(|s| s.trim().to_string())
@@ -2648,6 +3401,16 @@ async fn save_remote_file(
         } else {
             s.to_string()
         }
+    };
+    let msg_ref_owned = match (
+        thread_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+        msg_id.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+    ) {
+        (Some(tid), Some(mid)) => Some((tid.to_string(), mid.to_string())),
+        _ => None,
     };
 
     emit_download_progress(
@@ -2664,9 +3427,20 @@ async fn save_remote_file(
         },
     );
 
+    enum SaveSource {
+        InlineData(Vec<u8>),
+        VaultObject {
+            vault: Arc<MediaVault>,
+            obj: Box<MediaObjectRecord>,
+        },
+    }
+
     let trimmed = url.trim_start();
-    let is_data_url = trimmed.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("data:"));
-    let (bytes, mime, final_url, cd_name) = if is_data_url {
+    let is_data_url = trimmed
+        .get(..5)
+        .is_some_and(|p| p.eq_ignore_ascii_case("data:"));
+
+    let (source, bytes_len, resolved_name, resolved_ext) = if is_data_url {
         let (data, mime) = match zalo_core::session::decode_data_url_bytes(trimmed, 25 * 1024 * 1024)
         {
             Ok(v) => v,
@@ -2702,17 +3476,45 @@ async fn save_remote_file(
                 error: None,
             },
         );
-        (data, mime, String::new(), None)
+        let (resolved_name, resolved_ext) = file_dialog::resolve_download_filename_and_ext(
+            &suggested_name,
+            None,
+            "",
+            "",
+            &mime,
+            &data,
+        );
+        (
+            SaveSource::InlineData(data),
+            total,
+            resolved_name,
+            resolved_ext,
+        )
     } else {
+        let vault = state.media_vault.read().await.clone();
         let sess_snapshot = {
             let sess = state.session.lock().await;
             sess.clone_shallow()
         };
+        let kind_hint = infer_media_kind_for_download(&suggested_name, &url);
         let app_prog = app.clone();
         let dl_id_prog = dl_id.clone();
         let initial_name_prog = initial_name.clone();
-        let downloaded = match sess_snapshot
-            .download_media_with_meta_progress(&url, 100 * 1024 * 1024, move |bytes, total| {
+        let msg_ref_borrowed = msg_ref_owned
+            .as_ref()
+            .map(|(tid, mid)| (tid.as_str(), mid.as_str()));
+
+        let obj = match resolve_media_with_tier2_gdrive(
+            Some(&app),
+            &vault,
+            &sess_snapshot,
+            &state.store,
+            &state.gdrive,
+            &state.relay_cfg,
+            &url,
+            kind_hint,
+            msg_ref_borrowed,
+            move |bytes, total| {
                 emit_download_progress(
                     &app_prog,
                     DownloadProgressPayload {
@@ -2726,10 +3528,11 @@ async fn save_remote_file(
                         error: None,
                     },
                 );
-            })
-            .await
+            },
+        )
+        .await
         {
-            Ok(d) => d,
+            Ok(obj) => obj,
             Err(e) => {
                 let msg = e.to_string();
                 emit_download_progress(
@@ -2748,24 +3551,60 @@ async fn save_remote_file(
                 return Err(msg);
             }
         };
+
+        let total = obj.size_bytes;
+        emit_download_progress(
+            &app,
+            DownloadProgressPayload {
+                id: dl_id.clone(),
+                file_name: initial_name.clone(),
+                stage: "downloading".to_string(),
+                downloaded_bytes: total,
+                total_bytes: Some(total),
+                saved_path: None,
+                can_open_directly: false,
+                error: None,
+            },
+        );
+
+        let cd_name = {
+            let store = state.store.lock().await;
+            let from_msg = msg_ref_owned.as_ref().and_then(|(tid, mid)| {
+                store
+                    .get_message_media_record(tid, mid, "primary")
+                    .ok()
+                    .flatten()
+                    .and_then(|rec| rec.original_name)
+            });
+            from_msg.or_else(|| {
+                let url_hash = MediaVault::sha256_url(&url);
+                store
+                    .get_message_media_record("__url__", &url_hash, "primary")
+                    .ok()
+                    .flatten()
+                    .and_then(|rec| rec.original_name)
+            })
+        };
+
+        let probe_bytes = read_vault_probe_bytes(&vault, &obj).await;
+        let (resolved_name, resolved_ext) = file_dialog::resolve_download_filename_and_ext(
+            &suggested_name,
+            cd_name.as_deref(),
+            &url,
+            &url,
+            &obj.mime,
+            &probe_bytes,
+        );
         (
-            downloaded.bytes,
-            downloaded.mime,
-            downloaded.final_url,
-            downloaded.content_disposition_filename,
+            SaveSource::VaultObject {
+                vault,
+                obj: Box::new(obj),
+            },
+            total,
+            resolved_name,
+            resolved_ext,
         )
     };
-
-    let bytes_len = bytes.len() as u64;
-    let source_url = if is_data_url { "" } else { url.as_str() };
-    let (resolved_name, resolved_ext) = file_dialog::resolve_download_filename_and_ext(
-        &suggested_name,
-        cd_name.as_deref(),
-        source_url,
-        &final_url,
-        &mime,
-        &bytes,
-    );
 
     emit_download_progress(
         &app,
@@ -2839,8 +3678,18 @@ async fn save_remote_file(
         );
         return Ok(None);
     };
-    if let Err(e) = tokio::fs::write(&path, &bytes).await {
-        let msg = format!("Không ghi được tệp: {e}");
+
+    let write_res: Result<(), String> = match source {
+        SaveSource::InlineData(bytes) => tokio::fs::write(&path, &bytes)
+            .await
+            .map_err(|e| format!("Không ghi được tệp: {e}")),
+        SaveSource::VaultObject { vault, obj } => vault
+            .export_to_path(&obj, &path)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("Không xuất được tệp từ kho cục bộ: {e}")),
+    };
+    if let Err(msg) = write_res {
         emit_download_progress(
             &app,
             DownloadProgressPayload {
@@ -2857,6 +3706,12 @@ async fn save_remote_file(
         return Err(msg);
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        let ads_path = mark_of_the_web_ads_path(&path);
+        let _ = tokio::fs::write(&ads_path, b"[ZoneTransfer]\r\nZoneId=3\r\n").await;
+    }
+
     {
         let mut recent = state.recent_saved_files.lock().await;
         record_recent_saved_file(&mut recent, &path);
@@ -2870,6 +3725,11 @@ async fn save_remote_file(
         .unwrap_or(&resolved_name)
         .to_string();
     let can_open_directly = !file_dialog::is_dangerous_executable_ext(&display_path);
+
+    if let Some((tid, mid)) = msg_ref_owned {
+        let store = state.store.lock().await;
+        let _ = store.set_message_saved_path(&tid, &mid, &path_str);
+    }
 
     emit_download_progress(
         &app,
@@ -2922,32 +3782,105 @@ async fn reveal_saved_file(state: State<'_, AppState>, path: String) -> Result<(
         .map_err(|e| format!("Không thể mở thư mục chứa tệp: {e}"))?
 }
 
+const MAX_PASSTHROUGH_DATA_URL_BYTES: usize = 15 * 1024 * 1024;
+const MAX_SEARCH_GLOBAL_LIMIT: usize = 200;
+const MAX_TRANSLATE_BATCH_ITEMS: usize = 100;
+
+fn validate_media_data_url_passthrough(raw: &str) -> Result<Option<String>, String> {
+    let trimmed = raw.trim();
+    if !trimmed
+        .get(..5)
+        .is_some_and(|p| p.eq_ignore_ascii_case("data:"))
+    {
+        return Ok(None);
+    }
+    if trimmed.len() > MAX_PASSTHROUGH_DATA_URL_BYTES {
+        return Err("Dữ liệu media quá lớn (tối đa 15 MB)".into());
+    }
+    let Some((meta, _payload)) = trimmed[5..].split_once(',') else {
+        return Err("Data URL không hợp lệ".into());
+    };
+    if meta.chars().any(char::is_control) {
+        return Err("Data URL không hợp lệ".into());
+    }
+    let mime = meta
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if mime == "image/svg+xml" || mime.contains("svg") {
+        return Err("Không hỗ trợ định dạng SVG trong data URL".into());
+    }
+    let allowed = (mime.starts_with("image/")
+        || mime.starts_with("audio/")
+        || mime.starts_with("video/"))
+        && mime.split_once('/').is_some_and(|(_, sub)| !sub.is_empty());
+    if !allowed {
+        return Err("Chỉ hỗ trợ data URL hình ảnh, âm thanh hoặc video".into());
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn clamp_search_global_limit(limit: Option<usize>) -> usize {
+    limit.unwrap_or(30).clamp(1, MAX_SEARCH_GLOBAL_LIMIT)
+}
+
+fn validate_translate_batch_len(len: usize) -> Result<(), String> {
+    if len > MAX_TRANSLATE_BATCH_ITEMS {
+        return Err(format!(
+            "Số lượng tin nhắn cần dịch vượt quá giới hạn tối đa ({MAX_TRANSLATE_BATCH_ITEMS} tin nhắn mỗi lượt)"
+        ));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn fetch_image_data_url(
     state: State<'_, AppState>,
     url: String,
 ) -> Result<String, String> {
-    let trimmed = url.trim_start();
-    if trimmed.get(..11).is_some_and(|p| {
-        p.eq_ignore_ascii_case("data:image/")
-            || p.eq_ignore_ascii_case("data:audio/")
-            || p.eq_ignore_ascii_case("data:video/")
-    }) {
-        return Ok(trimmed.to_string());
+    if let Some(passthrough) = validate_media_data_url_passthrough(&url)? {
+        return Ok(passthrough);
     }
     let sess_snapshot = {
         let sess = state.session.lock().await;
         sess.clone_shallow()
     };
-    sess_snapshot
+    let data_url = sess_snapshot
         .download_media_data_url(&url, 25 * 1024 * 1024)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if data_url
+        .get(..19)
+        .is_some_and(|p| p.eq_ignore_ascii_case("data:image/svg+xml"))
+    {
+        return Err("Không hỗ trợ định dạng SVG".into());
+    }
+    Ok(data_url)
 }
 
 #[tauri::command]
-async fn inspect_attachment_path(file_path: String) -> Result<AttachmentMetaDto, String> {
-    attachment_meta_from_path(std::path::Path::new(&file_path))
+async fn inspect_attachment_path(
+    state: State<'_, AppState>,
+    file_path: String,
+) -> Result<AttachmentMetaDto, String> {
+    if file_path.trim().is_empty() {
+        return Err("Đường dẫn tệp trống".into());
+    }
+    let canonical = {
+        let approved = state
+            .approved_attachment_paths
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        validate_approved_attachment_path(&approved, Path::new(&file_path))?
+    };
+    let mut meta = attachment_meta_from_path(&canonical)?;
+    let display = file_dialog::normalize_os_display_path(&canonical);
+    if display.to_string_lossy().len() < 240 {
+        meta.path = display.to_string_lossy().into_owned();
+    }
+    Ok(meta)
 }
 
 #[tauri::command]
@@ -2958,7 +3891,16 @@ async fn message_send_attachment_path(
     file_path: String,
     caption: String,
 ) -> Result<MessageDto, String> {
-    let path = PathBuf::from(&file_path);
+    if file_path.trim().is_empty() {
+        return Err("Đường dẫn tệp trống".into());
+    }
+    let path = {
+        let approved = state
+            .approved_attachment_paths
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        validate_approved_attachment_path(&approved, Path::new(&file_path))?
+    };
     let meta = attachment_meta_from_path(&path)?;
 
     let kind = {
@@ -3002,7 +3944,41 @@ async fn message_send_attachment_path(
         local_demo_attachment_message(&thread_id, &meta.file_name, &caption)
     };
 
-    persist_and_emit_sent_message(&app, &state, msg).await
+    let saved = persist_and_emit_sent_message(&app, &state, msg).await?;
+
+    let vault = state.media_vault.read().await.clone();
+    let store_arc = state.store.clone();
+    let gdrive_arc = state.gdrive.clone();
+    let src_path = path;
+    let kind = infer_media_kind_for_attachment(&meta.file_name, &saved.msg_type);
+    let mime = infer_mime_from_filename_and_bytes(&meta.file_name, None);
+    let url_opt = saved.attachment_url.clone();
+    let tid = saved.thread_id.clone();
+    let mid = saved.msg_id.clone();
+    let orig_name = saved
+        .attachment_name
+        .clone()
+        .or_else(|| Some(meta.file_name.clone()));
+    tauri::async_runtime::spawn(async move {
+        if let Ok(obj) = vault
+            .ingest_local_file(
+                &store_arc,
+                &src_path,
+                kind,
+                mime,
+                url_opt.as_deref(),
+                Some((tid.as_str(), mid.as_str())),
+                orig_name.as_deref(),
+            )
+            .await
+        {
+            if obj.cloud_file_id.is_none() {
+                gdrive_arc.notify_sync();
+            }
+        }
+    });
+
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -3070,7 +4046,41 @@ async fn message_send_raw_attachment(
         local_demo_attachment_message(&thread_id, &file_name, &caption)
     };
 
-    persist_and_emit_sent_message(&app, &state, msg).await
+    let saved = persist_and_emit_sent_message(&app, &state, msg).await?;
+
+    let vault = state.media_vault.read().await.clone();
+    let store_arc = state.store.clone();
+    let gdrive_arc = state.gdrive.clone();
+    let owned_bytes = bytes.into_owned();
+    let media_kind = infer_media_kind_for_attachment(&file_name, &saved.msg_type);
+    let mime = infer_mime_from_filename_and_bytes(&file_name, Some(&owned_bytes));
+    let url_opt = saved.attachment_url.clone();
+    let tid = saved.thread_id.clone();
+    let mid = saved.msg_id.clone();
+    let orig_name = saved
+        .attachment_name
+        .clone()
+        .or_else(|| Some(file_name.clone()));
+    tauri::async_runtime::spawn(async move {
+        if let Ok(obj) = vault
+            .ingest_bytes(
+                &store_arc,
+                &owned_bytes,
+                media_kind,
+                mime,
+                url_opt.as_deref(),
+                Some((tid.as_str(), mid.as_str())),
+                orig_name.as_deref(),
+            )
+            .await
+        {
+            if obj.cloud_file_id.is_none() {
+                gdrive_arc.notify_sync();
+            }
+        }
+    });
+
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -3079,9 +4089,10 @@ async fn search_global(
     query: String,
     limit: Option<usize>,
 ) -> Result<Vec<MessageDto>, String> {
+    let capped_limit = clamp_search_global_limit(limit);
     let store = state.store.lock().await;
     store
-        .search_messages(&query, limit.unwrap_or(30))
+        .search_messages(&query, capped_limit)
         .map_err(|e| e.to_string())
 }
 
@@ -3097,9 +4108,12 @@ async fn translate_save_config(
     update: TranslateConfigUpdate,
 ) -> Result<TranslateConfigSummary, String> {
     let mut cfg = state.translate_cfg.lock().await;
-    cfg.apply_update(update);
-    cfg.save_to_file(&state.paths.translate_file())
+    let mut staged = cfg.clone();
+    staged.apply_update(update);
+    staged
+        .save_to_file(&state.paths.translate_file())
         .map_err(|e| format!("Không lưu được cấu hình dịch: {e}"))?;
+    *cfg = staged;
     Ok(cfg.summary())
 }
 
@@ -3111,6 +4125,7 @@ async fn translate_messages(
     provider: Option<TranslateProvider>,
     force_refresh: Option<bool>,
 ) -> Result<Vec<TranslationResult>, String> {
+    validate_translate_batch_len(items.len())?;
     let cfg = state.translate_cfg.lock().await.clone();
     let relay = state.relay_cfg.lock().await.clone();
     let eff_provider = provider.unwrap_or(cfg.provider);
@@ -3301,6 +4316,7 @@ async fn relay_save_config(
             app.clone(),
             state.session.clone(),
             state.store.clone(),
+            state.media_vault.clone(),
             state.ws_task.clone(),
             state.active_thread_id.clone(),
             state.call_mgr.clone(),
@@ -3308,16 +4324,27 @@ async fn relay_save_config(
         )
         .await;
     }
-    if summary.enabled {
-        state.call_mgr.teardown(Some(&app), is_authed, true).await;
-    } else if is_authed {
-        let call_sess = state.session.lock().await.clone_shallow();
-        let _ = state
+    if summary.enabled || !is_authed {
+        state
             .call_mgr
-            .restart(app.clone(), &call_sess, state.store.clone())
+            .teardown_for_session(Some(&app), &state.session)
             .await;
     } else {
-        state.call_mgr.teardown(Some(&app), false, false).await;
+        let _ = state
+            .call_mgr
+            .restart_from_session(&app, &state.session, &state.store)
+            .await;
+    }
+    if summary.enabled {
+        state
+            .gdrive
+            .pause_for_relay_and_emit(&app, &state.store)
+            .await;
+    } else {
+        state
+            .gdrive
+            .resume_after_relay_and_emit(&app, &state.store)
+            .await;
     }
     let _ = app.emit("core://relay-updated", &summary);
     Ok(summary)
@@ -3380,36 +4407,37 @@ async fn call_start_voice(
     partner_id: String,
     partner_name: Option<String>,
 ) -> Result<call::CallStateDto, String> {
-    let sess_snap = {
-        let sess = state.session.lock().await;
-        if !sess.is_authenticated() {
-            return Err("Chưa đăng nhập".into());
-        }
-        if sess.relay.enabled {
-            return Err(teza_call::CallError::RelayUnsupported.to_string());
-        }
-        sess.clone_shallow()
-    };
     state
         .call_mgr
-        .ensure_started(app, &sess_snap, state.store.clone())
-        .await?;
-    let eng = state
-        .call_mgr
-        .active_engine()
+        .start_outgoing_call_for_session(
+            &app,
+            &state.session,
+            &state.store,
+            partner_id,
+            partner_name,
+            false,
+        )
         .await
-        .ok_or_else(|| "Engine gọi thoại chưa sẵn sàng".to_string())?;
-    let display_name = partner_name
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| partner_id.clone());
-    eng.make_call(partner_id, display_name, teza_call::CallType::DirectVoice)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(state
+}
+
+#[tauri::command]
+async fn call_start_video(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    partner_id: String,
+    partner_name: Option<String>,
+) -> Result<call::CallStateDto, String> {
+    state
         .call_mgr
-        .get_state(true, false, &state.store)
-        .await)
+        .start_outgoing_call_for_session(
+            &app,
+            &state.session,
+            &state.store,
+            partner_id,
+            partner_name,
+            true,
+        )
+        .await
 }
 
 #[tauri::command]
@@ -3474,11 +4502,15 @@ async fn call_hangup(app: AppHandle, state: State<'_, AppState>) -> Result<call:
     if relay_enabled || !authed {
         state
             .call_mgr
-            .teardown(Some(&app), authed, relay_enabled)
+            .teardown_for_session(Some(&app), &state.session)
             .await;
+        let (now_authed, now_relay) = {
+            let sess = state.session.lock().await;
+            (sess.is_authenticated(), sess.relay.enabled)
+        };
         return Ok(state
             .call_mgr
-            .get_state(authed, relay_enabled, &state.store)
+            .get_state(now_authed, now_relay, &state.store)
             .await);
     }
     if let Some(eng) = state.call_mgr.active_engine().await {
@@ -3513,6 +4545,63 @@ async fn call_set_mute(
     Ok(state
         .call_mgr
         .get_state(true, false, &state.store)
+        .await)
+}
+
+#[tauri::command]
+async fn call_set_camera(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<call::CallStateDto, String> {
+    {
+        let sess = state.session.lock().await;
+        if !sess.is_authenticated() {
+            return Err("Chưa đăng nhập".into());
+        }
+        if sess.relay.enabled {
+            return Err(teza_call::CallError::RelayUnsupported.to_string());
+        }
+    }
+    let eng = state
+        .call_mgr
+        .active_engine()
+        .await
+        .ok_or_else(|| "Không có cuộc gọi nào đang hoạt động".to_string())?;
+    eng.set_cam_enabled(enabled)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(state
+        .call_mgr
+        .get_state(true, false, &state.store)
+        .await)
+}
+
+#[tauri::command]
+async fn call_push_video_frame(
+    state: State<'_, AppState>,
+    call_id: i64,
+    data_b64: String,
+) -> Result<bool, String> {
+    state
+        .call_mgr
+        .push_outbound_video_frame_for_session(&state.session, call_id, &data_b64)
+        .await
+}
+
+#[tauri::command]
+async fn call_request_video_keyframe(
+    state: State<'_, AppState>,
+    call_id: Option<i64>,
+) -> Result<bool, String> {
+    {
+        let sess = state.session.lock().await;
+        if !sess.is_authenticated() || sess.relay.enabled {
+            return Ok(false);
+        }
+    }
+    Ok(state
+        .call_mgr
+        .request_remote_video_keyframe(call_id)
         .await)
 }
 
@@ -3665,7 +4754,7 @@ async fn capture_screen(
     capture_all: Option<bool>,
 ) -> Result<screenshot::ScreenCaptureDto, String> {
     let owner_hwnd = main_window_hwnd(&app);
-    let main_win = app.get_webview_window("main");
+    let main_win = app.get_window("main");
     let mut hid_window = false;
 
     if hide_window.unwrap_or(true) {
@@ -3699,10 +4788,21 @@ async fn capture_screen(
 }
 
 const WEBAPP_LABEL_PREFIX: &str = "teza-webapp-";
+const WEBAPP_POPUP_COOLDOWN_MS: u64 = 1500;
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
 
 fn webapp_label(id: &str) -> String {
-    let clean: String = id
-        .trim()
+    let raw = id.trim();
+    let hash = fnv1a_64(raw.as_bytes());
+    let clean: String = raw
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -3711,40 +4811,55 @@ fn webapp_label(id: &str) -> String {
                 '-'
             }
         })
+        .take(40)
         .collect();
     let trimmed = clean.trim_matches('-');
     if trimmed.is_empty() {
-        format!("{WEBAPP_LABEL_PREFIX}default")
+        format!("{WEBAPP_LABEL_PREFIX}app-{hash:016x}")
     } else {
-        format!("{WEBAPP_LABEL_PREFIX}{trimmed}")
+        format!("{WEBAPP_LABEL_PREFIX}{trimmed}-{hash:016x}")
+    }
+}
+
+fn try_acquire_popup_slot(last_popup_ms: &AtomicU64, now_ms: u64, cooldown_ms: u64) -> bool {
+    let clamped_now = now_ms.max(1);
+    let mut prev = last_popup_ms.load(Ordering::Acquire);
+    loop {
+        if prev != 0 && clamped_now.saturating_sub(prev) < cooldown_ms {
+            return false;
+        }
+        match last_popup_ms.compare_exchange_weak(
+            prev,
+            clamped_now,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => prev = actual,
+        }
     }
 }
 
 fn validate_web_url(raw: &str) -> Result<tauri::Url, String> {
-    let trimmed = raw.trim();
-    let with_scheme = if trimmed.contains("://") {
-        trimmed.to_string()
-    } else {
-        format!("https://{trimmed}")
-    };
-    let parsed =
-        tauri::Url::parse(&with_scheme).map_err(|e| format!("URL không hợp lệ: {e}"))?;
-    match parsed.scheme() {
-        "http" | "https" => {}
-        other => return Err(format!("Chỉ hỗ trợ giao thức http/https (nhận: {other})")),
-    }
-    if parsed.host_str().map(str::is_empty).unwrap_or(true) {
-        return Err("URL phải có tên miền hợp lệ".into());
-    }
-    Ok(parsed)
+    webapp_accounts::validate_web_url(raw)
 }
 
 fn hide_all_webapp_children(app: &AppHandle) {
+    if let Some(st) = app.try_state::<AppState>() {
+        st.webapp_epoch.fetch_add(1, Ordering::SeqCst);
+    }
     for (label, wv) in app.webviews() {
         if label.starts_with(WEBAPP_LABEL_PREFIX) {
             let _ = wv.hide();
         }
     }
+}
+
+fn validate_webapp_bounds(x: f64, y: f64, width: f64, height: f64) -> Result<(f64, f64), String> {
+    if !x.is_finite() || !y.is_finite() || !width.is_finite() || !height.is_finite() {
+        return Err("Tọa độ hoặc kích thước khung Web App không hợp lệ".into());
+    }
+    Ok((width.max(120.0), height.max(120.0)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3760,9 +4875,16 @@ async fn webapp_open(
     height: f64,
 ) -> Result<(), String> {
     let parsed = validate_web_url(&url)?;
+    let (safe_w, safe_h) = validate_webapp_bounds(x, y, width, height)?;
     let label = webapp_label(&id);
-    let safe_w = width.max(120.0);
-    let safe_h = height.max(120.0);
+    let parsed_url_str = parsed.as_str().to_string();
+
+    let my_epoch = state.webapp_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+    let _op = state.webapp_op_lock.lock().await;
+
+    if state.webapp_epoch.load(Ordering::SeqCst) != my_epoch {
+        return Ok(());
+    }
 
     for (existing_label, wv) in app.webviews() {
         if existing_label.starts_with(WEBAPP_LABEL_PREFIX) && existing_label != label {
@@ -3771,21 +4893,115 @@ async fn webapp_open(
     }
 
     if let Some(wv) = app.get_webview(&label) {
+        let url_changed = {
+            let mut urls = state.webapp_base_urls.lock().await;
+            let changed = urls.get(&label).map(String::as_str) != Some(parsed_url_str.as_str());
+            if changed {
+                urls.insert(label.clone(), parsed_url_str);
+            }
+            changed
+        };
+        if url_changed {
+            wv.navigate(parsed).map_err(|e| e.to_string())?;
+        }
         wv.set_position(LogicalPosition::new(x, y))
             .map_err(|e| e.to_string())?;
         wv.set_size(LogicalSize::new(safe_w, safe_h))
             .map_err(|e| e.to_string())?;
+        if state.webapp_epoch.load(Ordering::SeqCst) != my_epoch {
+            let _ = wv.hide();
+            return Ok(());
+        }
         wv.show().map_err(|e| e.to_string())?;
-        *state.active_webapp_label.lock().await = Some(label);
         return Ok(());
     }
 
-    let main_win = app
-        .get_webview_window("main")
+    // Use `get_window("main")` instead of `get_webview_window("main")`:
+    // in Tauri v2, `get_webview_window` returns `None` as soon as a window owns
+    // any child webview (`is_webview_window()` requires all webviews to share the window label).
+    let parent_window = app
+        .get_window("main")
         .ok_or_else(|| "Không tìm thấy cửa sổ chính".to_string())?;
-    let parent_window = main_win.as_ref().window();
-    let builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed));
-    parent_window
+    let app_for_new_win = app.clone();
+    let label_for_new_win = label.clone();
+    let popup_ts_for_new_win = state.webapp_last_popup_ms.clone();
+    let app_for_load = app.clone();
+    let label_for_load = label.clone();
+    let app_id_for_load = id.trim().to_string();
+    let accounts_for_load = state.webapp_accounts.clone();
+    let builder = WebviewBuilder::new(&label, WebviewUrl::External(parsed))
+        .on_navigation(|target_url| {
+            matches!(target_url.scheme(), "http" | "https")
+                && !webapp_accounts::is_forbidden_internal_webview_url(target_url)
+        })
+        .on_new_window(move |target_url, features| {
+            if !matches!(target_url.scheme(), "http" | "https")
+                || webapp_accounts::is_forbidden_internal_webview_url(&target_url)
+            {
+                return tauri::webview::NewWindowResponse::Deny;
+            }
+            // Keep sized popups (e.g., OAuth dialogs that rely on window.opener) working normally,
+            // while rate-limiting native popups so malicious pages cannot popup-bomb.
+            if features.size().is_some() {
+                let now = chrono_now_ms().max(1) as u64;
+                if try_acquire_popup_slot(&popup_ts_for_new_win, now, WEBAPP_POPUP_COOLDOWN_MS) {
+                    return tauri::webview::NewWindowResponse::Allow;
+                }
+                return tauri::webview::NewWindowResponse::Deny;
+            }
+            // Navigate standard `target="_blank"` / unsized `window.open` links inside this Web App.
+            let nav_app = app_for_new_win.clone();
+            let nav_label = label_for_new_win.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Some(wv) = nav_app.get_webview(&nav_label) {
+                    let _ = wv.navigate(target_url);
+                }
+            });
+            tauri::webview::NewWindowResponse::Deny
+        })
+        .on_page_load(move |_wv, payload| {
+            if payload.event() != tauri::webview::PageLoadEvent::Finished {
+                return;
+            }
+            if webapp_accounts::is_forbidden_internal_webview_url(payload.url()) {
+                return;
+            }
+            let Ok(loaded_origin) = webapp_accounts::canonical_origin_from_url(payload.url())
+            else {
+                return;
+            };
+            let nav_app = app_for_load.clone();
+            let nav_label = label_for_load.clone();
+            let nav_app_id = app_id_for_load.clone();
+            let accounts = accounts_for_load.clone();
+            tauri::async_runtime::spawn(async move {
+                let creds = {
+                    let store = accounts.lock().await;
+                    match store.resolve_autofill_for_page(&nav_app_id, &loaded_origin) {
+                        Ok(Some(c)) => c,
+                        _ => return,
+                    }
+                };
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let Some(wv) = nav_app.get_webview(&nav_label) else {
+                    return;
+                };
+                let Ok(current_url) = wv.url() else {
+                    return;
+                };
+                if webapp_accounts::verify_origin_matches(&creds.origin, &current_url).is_err() {
+                    return;
+                }
+                if let Ok(script) = webapp_accounts::build_page_load_autofill_script(
+                    &creds.username,
+                    &creds.password,
+                    &creds.origin,
+                ) {
+                    let _ = wv.eval(&script);
+                }
+            });
+        });
+    let child_wv = parent_window
         .add_child(
             builder,
             LogicalPosition::new(x, y),
@@ -3793,7 +5009,77 @@ async fn webapp_open(
         )
         .map_err(|e| format!("Không thể nhúng Web App: {e}"))?;
 
-    *state.active_webapp_label.lock().await = Some(label);
+    state
+        .webapp_base_urls
+        .lock()
+        .await
+        .insert(label, parsed_url_str);
+
+    #[cfg(windows)]
+    webapp_accounts::enable_webview2_password_autosave(&child_wv);
+
+    if state.webapp_epoch.load(Ordering::SeqCst) != my_epoch {
+        let _ = child_wv.hide();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn webapp_accounts_list(
+    state: State<'_, AppState>,
+    app_id: Option<String>,
+    origin: Option<String>,
+) -> Result<Vec<webapp_accounts::WebAppAccountDto>, String> {
+    let store = state.webapp_accounts.lock().await;
+    Ok(store.list(app_id.as_deref(), origin.as_deref()))
+}
+
+#[tauri::command]
+async fn webapp_accounts_save(
+    state: State<'_, AppState>,
+    input: webapp_accounts::WebAppAccountInput,
+) -> Result<webapp_accounts::WebAppAccountDto, String> {
+    let mut store = state.webapp_accounts.lock().await;
+    store.save(input)
+}
+
+#[tauri::command]
+async fn webapp_accounts_delete(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let mut store = state.webapp_accounts.lock().await;
+    store.delete(&id)
+}
+
+#[tauri::command]
+async fn webapp_account_fill(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    app_id: String,
+    account_id: String,
+    submit: Option<bool>,
+) -> Result<(), String> {
+    let creds = {
+        let store = state.webapp_accounts.lock().await;
+        store.resolve_credentials(&account_id)?
+    };
+    if creds.app_id != app_id.trim() {
+        return Err("Tài khoản đã lưu không thuộc Web App hiện tại".into());
+    }
+    let label = webapp_label(&app_id);
+    let wv = app
+        .get_webview(&label)
+        .ok_or_else(|| "Web App chưa được mở để điền tài khoản".to_string())?;
+    let current_url = wv
+        .url()
+        .map_err(|e| format!("Không đọc được URL hiện tại của Web App: {e}"))?;
+    webapp_accounts::verify_origin_matches(&creds.origin, &current_url)?;
+    let script = webapp_accounts::build_autofill_script(
+        &creds.username,
+        &creds.password,
+        &creds.origin,
+        submit.unwrap_or(false),
+    )?;
+    wv.eval(&script)
+        .map_err(|e| format!("Không thể điền thông tin đăng nhập: {e}"))?;
     Ok(())
 }
 
@@ -3806,10 +5092,9 @@ async fn webapp_set_bounds(
     width: f64,
     height: f64,
 ) -> Result<(), String> {
+    let (safe_w, safe_h) = validate_webapp_bounds(x, y, width, height)?;
     let label = webapp_label(&id);
     if let Some(wv) = app.get_webview(&label) {
-        let safe_w = width.max(120.0);
-        let safe_h = height.max(120.0);
         wv.set_position(LogicalPosition::new(x, y))
             .map_err(|e| e.to_string())?;
         wv.set_size(LogicalSize::new(safe_w, safe_h))
@@ -3820,8 +5105,13 @@ async fn webapp_set_bounds(
 
 #[tauri::command]
 async fn webapp_hide_all(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    hide_all_webapp_children(&app);
-    *state.active_webapp_label.lock().await = None;
+    state.webapp_epoch.fetch_add(1, Ordering::SeqCst);
+    let _op = state.webapp_op_lock.lock().await;
+    for (label, wv) in app.webviews() {
+        if label.starts_with(WEBAPP_LABEL_PREFIX) {
+            let _ = wv.hide();
+        }
+    }
     Ok(())
 }
 
@@ -3831,13 +5121,12 @@ async fn webapp_close(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<(), String> {
+    let _op = state.webapp_op_lock.lock().await;
     let label = webapp_label(&id);
+    state.webapp_base_urls.lock().await.remove(&label);
     if let Some(wv) = app.get_webview(&label) {
+        state.webapp_epoch.fetch_add(1, Ordering::SeqCst);
         wv.close().map_err(|e| e.to_string())?;
-    }
-    let mut active = state.active_webapp_label.lock().await;
-    if active.as_deref() == Some(label.as_str()) {
-        *active = None;
     }
     Ok(())
 }
@@ -3845,10 +5134,12 @@ async fn webapp_close(
 #[tauri::command]
 async fn webapp_navigate(
     app: AppHandle,
+    state: State<'_, AppState>,
     id: String,
     action: String,
     url: Option<String>,
 ) -> Result<(), String> {
+    let _op = state.webapp_op_lock.lock().await;
     let label = webapp_label(&id);
     let Some(wv) = app.get_webview(&label) else {
         return Ok(());
@@ -3878,28 +5169,2963 @@ async fn webapp_navigate(
 async fn open_external_url(url: String) -> Result<(), String> {
     let parsed = validate_web_url(&url)?;
     let target = parsed.as_str().to_string();
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("rundll32")
-            .args(["url.dll,FileProtocolHandler", &target])
-            .spawn()
-            .map_err(|e| format!("Không mở được trình duyệt: {e}"))?;
+    tokio::task::spawn_blocking(move || file_dialog::open_url_with_shell(&target))
+        .await
+        .map_err(|e| format!("Không mở được trình duyệt: {e}"))?
+}
+
+const MEDIA_PROTOCOL_RANGE_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
+const MEDIA_PROTOCOL_MAX_EXPLICIT_RANGE_BYTES: u64 = 8 * 1024 * 1024;
+const MEDIA_PROTOCOL_DIRECT_FULL_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const MEDIA_PROTOCOL_IMAGE_FULL_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const VAULT_PROBE_WINDOW_BYTES: u64 = 65_536;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MediaVaultConfigDto {
+    pub custom_vault_dir: Option<String>,
+    pub active_vault_dir: String,
+    pub quota_mb: u64,
+    pub encrypt_at_rest: bool,
+    pub auto_cache_images: bool,
+    pub auto_cache_voice: bool,
+    pub auto_cache_video_files: bool,
+}
+
+fn media_vault_config_to_dto(cfg: &MediaVaultConfig, active_dir: &Path) -> MediaVaultConfigDto {
+    let display = file_dialog::normalize_os_display_path(active_dir);
+    MediaVaultConfigDto {
+        custom_vault_dir: cfg.custom_vault_dir.clone(),
+        active_vault_dir: display.to_string_lossy().into_owned(),
+        quota_mb: cfg.quota_mb,
+        encrypt_at_rest: cfg.encrypt_at_rest,
+        auto_cache_images: cfg.auto_cache_images,
+        auto_cache_voice: cfg.auto_cache_voice,
+        auto_cache_video_files: cfg.auto_cache_video_files,
     }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(&target)
-            .spawn()
-            .map_err(|e| format!("Không mở được trình duyệt: {e}"))?;
+}
+
+fn validate_custom_vault_dir(raw: Option<String>) -> Result<Option<String>, String> {
+    let Some(trimmed) = raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if trimmed.contains('\0') || trimmed.chars().any(char::is_control) {
+        return Err("Đường dẫn thư mục lưu trữ chứa ký tự không hợp lệ".into());
     }
-    #[cfg(all(unix, not(target_os = "macos")))]
+    let path = PathBuf::from(&trimmed);
+    if !path.is_absolute() {
+        return Err(
+            "Đường dẫn thư mục lưu trữ phải là đường dẫn tuyệt đối (ví dụ: E:\\TezaMedia)".into(),
+        );
+    }
+    if path.exists() {
+        if !path.is_dir() {
+            return Err("Đường dẫn đã chọn là tệp tin, không phải thư mục".into());
+        }
+    } else {
+        std::fs::create_dir_all(&path)
+            .map_err(|e| format!("Không tạo được thư mục lưu trữ: {e}"))?;
+    }
+    let display = file_dialog::normalize_os_display_path(&path);
+    Ok(Some(display.to_string_lossy().into_owned()))
+}
+
+fn open_media_vault_with_fallback(
+    paths: &StoragePaths,
+    uid: Option<&str>,
+    cfg: MediaVaultConfig,
+) -> MediaVault {
+    match MediaVault::open(paths, uid, cfg.clone()) {
+        Ok(vault) => vault,
+        Err(first_err) => {
+            if cfg.custom_vault_dir.is_some() {
+                eprintln!(
+                    "[teza][media_vault] Failed to open custom vault dir {:?} ({first_err}); falling back to default media directory",
+                    cfg.custom_vault_dir
+                );
+                let mut fallback_cfg = cfg.clone();
+                fallback_cfg.custom_vault_dir = None;
+                if let Ok(vault) = MediaVault::open(paths, uid, fallback_cfg) {
+                    return vault;
+                }
+            }
+            let ts = chrono_now_ms().max(1);
+            eprintln!(
+                "[teza][media_vault] Default media vault open failed ({first_err}); falling back to temporary media directory"
+            );
+            let tmp_root = std::env::temp_dir().join(format!("teza_recovery_media_{ts}"));
+            let fallback_paths =
+                StoragePaths::from_dir(&tmp_root).unwrap_or_else(|_| paths.clone());
+            let mut safe_cfg = cfg;
+            safe_cfg.custom_vault_dir = None;
+            MediaVault::open(&fallback_paths, uid, safe_cfg)
+                .expect("Failed to open fallback media vault")
+        }
+    }
+}
+
+async fn rebind_media_vault_unlocked(
+    media_vault_lock: &Arc<RwLock<Arc<MediaVault>>>,
+    paths: &StoragePaths,
+    uid: Option<&str>,
+) {
+    let cfg = MediaVaultConfig::load_from_file(&paths.media_config_file());
+    let next = Arc::new(open_media_vault_with_fallback(paths, uid, cfg));
+    let mut guard = media_vault_lock.write().await;
+    *guard = next;
+}
+
+fn classify_ws_auto_cache_kind(msg_type: &str) -> Option<&'static str> {
+    let lower = msg_type.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "chat.photo" | "photo" | "2" | "chat.gif" | "gif" | "chat.sticker" | "sticker" | "5" => {
+            Some("image")
+        }
+        "chat.voice" | "voice" | "3" => Some("audio"),
+        "chat.video" | "video" | "chat.video.msg" | "4" => Some("video"),
+        "chat.file" | "file" | "19" | "share.file" => Some("file"),
+        _ => None,
+    }
+}
+
+fn should_auto_cache_kind(cfg: &MediaVaultConfig, kind: &str) -> bool {
+    match kind {
+        "image" => cfg.auto_cache_images,
+        "audio" => cfg.auto_cache_voice,
+        "video" | "file" => cfg.auto_cache_video_files,
+        _ => false,
+    }
+}
+
+fn infer_media_kind_from_ext(ext: &str) -> &'static str {
+    match ext.trim().trim_start_matches('.').to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "ico" | "heic"
+        | "heif" | "avif" => "image",
+        "mp4" | "m4v" | "mov" | "webm" | "mkv" | "avi" | "wmv" | "flv" | "3gp" => "video",
+        "mp3" | "wav" | "aac" | "m4a" | "ogg" | "opus" | "flac" | "wma" | "amr" => "audio",
+        _ => "file",
+    }
+}
+
+fn infer_media_kind_for_download(suggested_name: &str, url: &str) -> &'static str {
+    if let Some(ext) = file_dialog::extract_extension_from_name(suggested_name)
+        .or_else(|| file_dialog::extract_extension_from_url(url))
     {
-        std::process::Command::new("xdg-open")
-            .arg(&target)
-            .spawn()
-            .map_err(|e| format!("Không mở được trình duyệt: {e}"))?;
+        return infer_media_kind_from_ext(&ext);
+    }
+    "file"
+}
+
+fn infer_media_kind_for_attachment(file_name: &str, msg_type: &str) -> &'static str {
+    if let Some(kind) = classify_ws_auto_cache_kind(msg_type) {
+        if kind != "file" {
+            return kind;
+        }
+    }
+    if let Some(ext) = file_dialog::extract_extension_from_name(file_name) {
+        return infer_media_kind_from_ext(&ext);
+    }
+    "file"
+}
+
+fn infer_mime_from_filename_and_bytes(file_name: &str, bytes_opt: Option<&[u8]>) -> &'static str {
+    let ext = bytes_opt
+        .and_then(file_dialog::sniff_extension_from_bytes)
+        .map(str::to_string)
+        .or_else(|| file_dialog::extract_extension_from_name(file_name));
+    match ext.as_deref().unwrap_or("") {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        "ico" => "image/x-icon",
+        "heic" => "image/heic",
+        "heif" => "image/heif",
+        "avif" => "image/avif",
+        "mp4" => "video/mp4",
+        "m4v" => "video/x-m4v",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "avi" => "video/x-msvideo",
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "ogg" => "audio/ogg",
+        "opus" => "audio/opus",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "amr" => "audio/amr",
+        "pdf" => "application/pdf",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "zip" => "application/zip",
+        "txt" => "text/plain",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn read_vault_probe_bytes(vault: &MediaVault, obj: &MediaObjectRecord) -> Vec<u8> {
+    let total = obj.size_bytes;
+    if total == 0 {
+        return Vec::new();
+    }
+    if total <= VAULT_PROBE_WINDOW_BYTES * 2 {
+        return vault.read_range(obj, 0, total - 1).await.unwrap_or_default();
+    }
+    let mut probe = vault
+        .read_range(obj, 0, VAULT_PROBE_WINDOW_BYTES - 1)
+        .await
+        .unwrap_or_default();
+    if let Ok(tail) = vault
+        .read_range(obj, total - VAULT_PROBE_WINDOW_BYTES, total - 1)
+        .await
+    {
+        probe.extend_from_slice(&tail);
+    }
+    probe
+}
+
+fn decode_query_component(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                out.push(((hi << 4) | lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn validate_teza_media_remote_url(raw: &str) -> Result<String, String> {
+    if raw.chars().any(char::is_control) {
+        return Err("URL media chứa ký tự điều khiển".into());
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 8192 {
+        return Err("URL media không hợp lệ".into());
+    }
+    let parsed = tauri::Url::parse(trimmed).map_err(|_| "URL media không hợp lệ".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("Chỉ cho phép URL http/https cho teza-media".into());
+    }
+    let Some(host) = parsed.host_str().filter(|h| !h.is_empty()) else {
+        return Err("URL media thiếu tên miền".into());
+    };
+    let lower_host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if lower_host == "teza-media.localhost"
+        || lower_host.ends_with(".teza-media.localhost")
+        || webapp_accounts::is_forbidden_internal_webview_url(&parsed)
+    {
+        return Err("Không cho phép địa chỉ nội bộ trong teza-media".into());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("URL media không được chứa thông tin đăng nhập".into());
+    }
+    Ok(parsed.to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TezaMediaQueryParams {
+    url: String,
+    kind: String,
+    token: String,
+    tid: Option<String>,
+    mid: Option<String>,
+}
+
+fn parse_teza_media_query(
+    uri: &tauri::http::Uri,
+) -> Result<TezaMediaQueryParams, (u16, &'static str)> {
+    if uri.path() != "/resolve" {
+        return Err((404, "Not Found"));
+    }
+    let mut raw_url: Option<String> = None;
+    let mut raw_kind: Option<String> = None;
+    let mut raw_token: Option<String> = None;
+    let mut raw_tid: Option<String> = None;
+    let mut raw_mid: Option<String> = None;
+
+    if let Some(query) = uri.query() {
+        for pair in query.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let (k_raw, v_raw) = pair.split_once('=').unwrap_or((pair, ""));
+            let key = decode_query_component(k_raw);
+            let val = decode_query_component(v_raw);
+            match key.as_str() {
+                "url" => raw_url = Some(val),
+                "kind" => raw_kind = Some(val),
+                "t" => raw_token = Some(val),
+                "tid" => raw_tid = Some(val),
+                "mid" => raw_mid = Some(val),
+                _ => {}
+            }
+        }
+    }
+
+    let token = raw_token.unwrap_or_default();
+    let kind = match raw_kind
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("image")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image" => "image",
+        "video" => "video",
+        "audio" => "audio",
+        "file" => "file",
+        "thumb" => "thumb",
+        _ => "image",
+    }
+    .to_string();
+
+    let tid = raw_tid.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let mid = raw_mid.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+
+    Ok(TezaMediaQueryParams {
+        url: raw_url.unwrap_or_default(),
+        kind,
+        token,
+        tid,
+        mid,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParsedByteRange {
+    Valid { start: u64, end_inclusive: u64 },
+    Unsatisfiable,
+    Ignore,
+}
+
+fn parse_http_byte_range(header: &str, total: u64) -> ParsedByteRange {
+    let trimmed = header.trim();
+    let Some(spec) = trimmed
+        .get(..6)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("bytes="))
+        .map(|_| trimmed[6..].trim())
+    else {
+        return ParsedByteRange::Ignore;
+    };
+    if spec.is_empty() || spec.contains(',') {
+        return ParsedByteRange::Ignore;
+    }
+    let Some((start_raw, end_raw)) = spec.split_once('-') else {
+        return ParsedByteRange::Ignore;
+    };
+    let start_str = start_raw.trim();
+    let end_str = end_raw.trim();
+
+    if total == 0 {
+        if start_str.is_empty() && end_str.is_empty() {
+            return ParsedByteRange::Ignore;
+        }
+        return ParsedByteRange::Unsatisfiable;
+    }
+
+    if start_str.is_empty() {
+        let Ok(suffix_len) = end_str.parse::<u64>() else {
+            return ParsedByteRange::Ignore;
+        };
+        if suffix_len == 0 {
+            return ParsedByteRange::Unsatisfiable;
+        }
+        let len = suffix_len
+            .min(total)
+            .min(MEDIA_PROTOCOL_MAX_EXPLICIT_RANGE_BYTES);
+        let start = total - len;
+        return ParsedByteRange::Valid {
+            start,
+            end_inclusive: total - 1,
+        };
+    }
+
+    let Ok(start) = start_str.parse::<u64>() else {
+        return ParsedByteRange::Ignore;
+    };
+    if end_str.is_empty() {
+        if start >= total {
+            return ParsedByteRange::Unsatisfiable;
+        }
+        let end_inclusive = start
+            .saturating_add(MEDIA_PROTOCOL_RANGE_WINDOW_BYTES - 1)
+            .min(total - 1);
+        return ParsedByteRange::Valid {
+            start,
+            end_inclusive,
+        };
+    }
+
+    let Ok(end) = end_str.parse::<u64>() else {
+        return ParsedByteRange::Ignore;
+    };
+    if start > end {
+        return ParsedByteRange::Ignore;
+    }
+    if start >= total {
+        return ParsedByteRange::Unsatisfiable;
+    }
+    let end_inclusive = end
+        .min(total - 1)
+        .min(start.saturating_add(MEDIA_PROTOCOL_MAX_EXPLICIT_RANGE_BYTES - 1));
+    ParsedByteRange::Valid {
+        start,
+        end_inclusive,
+    }
+}
+
+fn allowed_media_cors_origin(headers: &tauri::http::HeaderMap) -> Option<String> {
+    let raw = headers.get("origin")?.to_str().ok()?.trim();
+    match raw {
+        "http://tauri.localhost"
+        | "https://tauri.localhost"
+        | "tauri://localhost"
+        | "http://localhost:1420"
+        | "http://127.0.0.1:1420" => Some(raw.to_string()),
+        _ => None,
+    }
+}
+
+fn sanitize_media_content_type(mime: &str) -> String {
+    let trimmed = mime.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 200
+        || trimmed.chars().any(char::is_control)
+        || tauri::http::HeaderValue::from_str(trimmed).is_err()
+    {
+        return "application/octet-stream".to_string();
+    }
+    trimmed.to_string()
+}
+
+fn map_media_protocol_error(err: &anyhow::Error) -> u16 {
+    if let Some(dl_err) = err.downcast_ref::<MediaDownloadError>() {
+        return match dl_err {
+            MediaDownloadError::ForbiddenSvg => 415,
+            MediaDownloadError::UntrustedUrl { .. } => 403,
+            MediaDownloadError::CdnExpired { .. } => 404,
+            MediaDownloadError::HttpStatus { status } if *status == 404 || *status == 410 => 404,
+            MediaDownloadError::HttpStatus { .. } => 502,
+        };
+    }
+    502
+}
+
+fn build_media_error_response(
+    status: u16,
+    message: &str,
+    cors_origin: Option<&str>,
+    content_range: Option<&str>,
+) -> tauri::http::Response<Vec<u8>> {
+    let mut builder = tauri::http::Response::builder()
+        .status(status)
+        .header("content-type", "text/plain; charset=utf-8")
+        .header("x-content-type-options", "nosniff")
+        .header("cache-control", "no-store");
+    if let Some(cr) = content_range {
+        builder = builder.header("content-range", cr);
+    }
+    if let Some(origin) = cors_origin {
+        builder = builder
+            .header("access-control-allow-origin", origin)
+            .header("vary", "Origin");
+    }
+    builder.body(message.as_bytes().to_vec()).unwrap_or_else(|_| {
+        tauri::http::Response::builder()
+            .status(500)
+            .body(Vec::new())
+            .expect("static fallback HTTP response")
+    })
+}
+
+fn should_serve_full_without_range(is_head: bool, kind: &str, total: u64) -> bool {
+    is_head
+        || total <= MEDIA_PROTOCOL_DIRECT_FULL_MAX_BYTES
+        || (kind == "image" && total <= MEDIA_PROTOCOL_IMAGE_FULL_MAX_BYTES)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_media_success_response(
+    status: u16,
+    content_type: &str,
+    content_length: u64,
+    content_range: Option<String>,
+    cors_origin: Option<&str>,
+    body: Vec<u8>,
+) -> tauri::http::Response<Vec<u8>> {
+    let safe_ct = sanitize_media_content_type(content_type);
+    let mut builder = tauri::http::Response::builder()
+        .status(status)
+        .header("content-type", safe_ct)
+        .header("accept-ranges", "bytes")
+        .header("content-length", content_length.to_string())
+        .header("x-content-type-options", "nosniff")
+        .header("cache-control", "private, max-age=86400");
+    if let Some(cr) = content_range {
+        builder = builder.header("content-range", cr);
+    }
+    if let Some(origin) = cors_origin {
+        builder = builder
+            .header("access-control-allow-origin", origin)
+            .header("vary", "Origin");
+    }
+    builder.body(body).unwrap_or_else(|_| {
+        tauri::http::Response::builder()
+            .status(500)
+            .body(Vec::new())
+            .expect("static fallback HTTP response")
+    })
+}
+
+fn handle_teza_media_protocol<R: tauri::Runtime>(
+    ctx: tauri::UriSchemeContext<'_, R>,
+    request: tauri::http::Request<Vec<u8>>,
+    responder: tauri::UriSchemeResponder,
+) {
+    let cors_origin = allowed_media_cors_origin(request.headers());
+
+    if request.method() == tauri::http::Method::OPTIONS {
+        if let Some(ref origin) = cors_origin {
+            let resp = tauri::http::Response::builder()
+                .status(204)
+                .header("access-control-allow-origin", origin.as_str())
+                .header("access-control-allow-methods", "GET, HEAD")
+                .header("access-control-allow-headers", "Range")
+                .header("vary", "Origin")
+                .header("x-content-type-options", "nosniff")
+                .body(Vec::new())
+                .unwrap_or_else(|_| {
+                    tauri::http::Response::builder()
+                        .status(204)
+                        .body(Vec::new())
+                        .expect("static 204 response")
+                });
+            responder.respond(resp);
+        } else {
+            responder.respond(build_media_error_response(403, "Forbidden", None, None));
+        }
+        return;
+    }
+
+    let is_head = request.method() == tauri::http::Method::HEAD;
+    if request.method() != tauri::http::Method::GET && !is_head {
+        responder.respond(build_media_error_response(
+            405,
+            "Method Not Allowed",
+            cors_origin.as_deref(),
+            None,
+        ));
+        return;
+    }
+
+    let params = match parse_teza_media_query(request.uri()) {
+        Ok(p) => p,
+        Err((status, msg)) => {
+            responder.respond(build_media_error_response(
+                status,
+                msg,
+                cors_origin.as_deref(),
+                None,
+            ));
+            return;
+        }
+    };
+
+    let state = ctx.app_handle().state::<AppState>();
+    if params.token.is_empty()
+        || !constant_time_eq(
+            params.token.as_bytes(),
+            state.media_protocol_token.as_bytes(),
+        )
+    {
+        responder.respond(build_media_error_response(
+            403,
+            "Forbidden",
+            cors_origin.as_deref(),
+            None,
+        ));
+        return;
+    }
+
+    let remote_url = match validate_teza_media_remote_url(&params.url) {
+        Ok(u) => u,
+        Err(_) => {
+            responder.respond(build_media_error_response(
+                400,
+                "Invalid media URL",
+                cors_origin.as_deref(),
+                None,
+            ));
+            return;
+        }
+    };
+
+    let range_hdr = request
+        .headers()
+        .get("range")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    let sess_arc = state.session.clone();
+    let store_arc = state.store.clone();
+    let media_vault_arc = state.media_vault.clone();
+    let gdrive_arc = state.gdrive.clone();
+    let relay_cfg_arc = state.relay_cfg.clone();
+    let app_handle = ctx.app_handle().clone();
+    let kind = params.kind;
+    let tid = params.tid;
+    let mid = params.mid;
+
+    tauri::async_runtime::spawn(async move {
+        let vault = media_vault_arc.read().await.clone();
+        let sess_snap = {
+            let sess = sess_arc.lock().await;
+            sess.clone_shallow()
+        };
+        let msg_ref = match (tid.as_deref(), mid.as_deref()) {
+            (Some(t), Some(m)) => Some((t, m)),
+            _ => None,
+        };
+
+        let obj = match resolve_media_with_tier2_gdrive(
+            Some(&app_handle),
+            &vault,
+            &sess_snap,
+            &store_arc,
+            &gdrive_arc,
+            &relay_cfg_arc,
+            &remote_url,
+            &kind,
+            msg_ref,
+            |_, _| {},
+        )
+        .await
+        {
+            Ok(obj) => obj,
+            Err(err) => {
+                let status = map_media_protocol_error(&err);
+                let label = match status {
+                    415 => "Unsupported Media Type",
+                    403 => "Forbidden",
+                    404 => "Media Not Found",
+                    _ => "Upstream Media Error",
+                };
+                responder.respond(build_media_error_response(
+                    status,
+                    label,
+                    cors_origin.as_deref(),
+                    None,
+                ));
+                return;
+            }
+        };
+
+        if is_forbidden_svg_mime(&obj.mime) {
+            responder.respond(build_media_error_response(
+                415,
+                "SVG media is not supported",
+                cors_origin.as_deref(),
+                None,
+            ));
+            return;
+        }
+
+        let total = obj.size_bytes;
+        if total == 0 {
+            if let Some(ref rh) = range_hdr {
+                if matches!(
+                    parse_http_byte_range(rh, 0),
+                    ParsedByteRange::Unsatisfiable
+                ) {
+                    responder.respond(build_media_error_response(
+                        416,
+                        "Range Not Satisfiable",
+                        cors_origin.as_deref(),
+                        Some("bytes */0"),
+                    ));
+                    return;
+                }
+            }
+            responder.respond(build_media_success_response(
+                200,
+                &obj.mime,
+                0,
+                None,
+                cors_origin.as_deref(),
+                Vec::new(),
+            ));
+            return;
+        }
+
+        if let Some(ref rh) = range_hdr {
+            match parse_http_byte_range(rh, total) {
+                ParsedByteRange::Valid {
+                    start,
+                    end_inclusive,
+                } => {
+                    let body = if is_head {
+                        Vec::new()
+                    } else {
+                        match vault.read_range(&obj, start, end_inclusive).await {
+                            Ok(bytes) => bytes,
+                            Err(_) => {
+                                responder.respond(build_media_error_response(
+                                    502,
+                                    "Failed to read cached media range",
+                                    cors_origin.as_deref(),
+                                    None,
+                                ));
+                                return;
+                            }
+                        }
+                    };
+                    let slice_len = if is_head {
+                        end_inclusive - start + 1
+                    } else {
+                        body.len() as u64
+                    };
+                    let actual_end = if is_head || slice_len == 0 {
+                        end_inclusive
+                    } else {
+                        start + slice_len - 1
+                    };
+                    responder.respond(build_media_success_response(
+                        206,
+                        &obj.mime,
+                        slice_len,
+                        Some(format!("bytes {start}-{actual_end}/{total}")),
+                        cors_origin.as_deref(),
+                        body,
+                    ));
+                    return;
+                }
+                ParsedByteRange::Unsatisfiable => {
+                    let cr = format!("bytes */{total}");
+                    responder.respond(build_media_error_response(
+                        416,
+                        "Range Not Satisfiable",
+                        cors_origin.as_deref(),
+                        Some(&cr),
+                    ));
+                    return;
+                }
+                ParsedByteRange::Ignore => {}
+            }
+        }
+
+        if should_serve_full_without_range(is_head, &kind, total) {
+            let body = if is_head {
+                Vec::new()
+            } else {
+                match vault.read_range(&obj, 0, total - 1).await {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        responder.respond(build_media_error_response(
+                            502,
+                            "Failed to read cached media",
+                            cors_origin.as_deref(),
+                            None,
+                        ));
+                        return;
+                    }
+                }
+            };
+            let len = if is_head { total } else { body.len() as u64 };
+            responder.respond(build_media_success_response(
+                200,
+                &obj.mime,
+                len,
+                None,
+                cors_origin.as_deref(),
+                body,
+            ));
+        } else {
+            let end_inclusive = (MEDIA_PROTOCOL_RANGE_WINDOW_BYTES - 1).min(total - 1);
+            let body = match vault.read_range(&obj, 0, end_inclusive).await {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    responder.respond(build_media_error_response(
+                        502,
+                        "Failed to read cached media window",
+                        cors_origin.as_deref(),
+                        None,
+                    ));
+                    return;
+                }
+            };
+            let slice_len = body.len() as u64;
+            let actual_end = if slice_len == 0 {
+                end_inclusive
+            } else {
+                slice_len - 1
+            };
+            responder.respond(build_media_success_response(
+                206,
+                &obj.mime,
+                slice_len,
+                Some(format!("bytes 0-{actual_end}/{total}")),
+                cors_origin.as_deref(),
+                body,
+            ));
+        }
+    });
+}
+
+#[tauri::command]
+async fn media_get_protocol_token(state: State<'_, AppState>) -> Result<String, String> {
+    Ok(state.media_protocol_token.clone())
+}
+
+#[tauri::command]
+async fn media_get_config(state: State<'_, AppState>) -> Result<MediaVaultConfigDto, String> {
+    let vault = state.media_vault.read().await.clone();
+    let cfg = vault.config();
+    Ok(media_vault_config_to_dto(&cfg, vault.vault_dir()))
+}
+
+#[tauri::command]
+async fn media_save_config(
+    state: State<'_, AppState>,
+    config: MediaVaultConfigDto,
+) -> Result<MediaVaultConfigDto, String> {
+    let custom_dir = validate_custom_vault_dir(config.custom_vault_dir)?;
+    let next_cfg = MediaVaultConfig {
+        custom_vault_dir: custom_dir,
+        quota_mb: config.quota_mb,
+        encrypt_at_rest: config.encrypt_at_rest,
+        auto_cache_images: config.auto_cache_images,
+        auto_cache_voice: config.auto_cache_voice,
+        auto_cache_video_files: config.auto_cache_video_files,
+    };
+
+    let uid_opt = {
+        let sess = state.session.lock().await;
+        let trimmed = sess.profile.uid.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    };
+
+    let old_vault = state.media_vault.read().await.clone();
+    let old_cfg = old_vault.config();
+    let dir_changed = old_cfg.custom_vault_dir != next_cfg.custom_vault_dir;
+    old_vault.flush_access_touches(&state.store).await;
+
+    let active_vault = if dir_changed {
+        let rebound = MediaVault::open(&state.paths, uid_opt.as_deref(), next_cfg.clone())
+            .map_err(|e| format!("Không khởi tạo được thư mục kho media: {e}"))?;
+        next_cfg
+            .save_to_file(&state.paths.media_config_file())
+            .map_err(|e| format!("Không lưu được cấu hình kho media: {e}"))?;
+        let arc = Arc::new(rebound);
+        let mut guard = state.media_vault.write().await;
+        *guard = arc.clone();
+        arc
+    } else {
+        next_cfg
+            .save_to_file(&state.paths.media_config_file())
+            .map_err(|e| format!("Không lưu được cấu hình kho media: {e}"))?;
+        old_vault.update_config(next_cfg.clone());
+        old_vault
+    };
+
+    let quota_lowered =
+        next_cfg.quota_mb > 0 && (old_cfg.quota_mb == 0 || next_cfg.quota_mb < old_cfg.quota_mb);
+    if quota_lowered {
+        let _ = active_vault.run_lru_eviction(&state.store).await;
+    }
+
+    Ok(media_vault_config_to_dto(
+        &next_cfg,
+        active_vault.vault_dir(),
+    ))
+}
+
+#[tauri::command]
+async fn media_get_stats(state: State<'_, AppState>) -> Result<MediaVaultStatsDto, String> {
+    let vault = state.media_vault.read().await.clone();
+    vault.flush_access_touches(&state.store).await;
+    let store = state.store.lock().await;
+    store.compute_media_stats().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn media_clear_cache(
+    state: State<'_, AppState>,
+    include_pinned: Option<bool>,
+) -> Result<MediaVaultStatsDto, String> {
+    let vault = state.media_vault.read().await.clone();
+    vault
+        .clear_cache(&state.store, include_pinned.unwrap_or(false))
+        .await
+        .map_err(|e| format!("Không thể dọn bộ nhớ đệm media: {e}"))
+}
+
+#[tauri::command]
+async fn media_pick_vault_dir(app: AppHandle) -> Result<Option<String>, String> {
+    let owner_hwnd = main_window_hwnd(&app);
+    let picked = tokio::task::spawn_blocking(move || file_dialog::pick_directory(owner_hwnd))
+        .await
+        .map_err(|e| format!("Lỗi tác vụ chọn thư mục: {e}"))??;
+    Ok(picked.map(|p| {
+        file_dialog::normalize_os_display_path(&p)
+            .to_string_lossy()
+            .into_owned()
+    }))
+}
+
+#[tauri::command]
+async fn media_set_pin(
+    state: State<'_, AppState>,
+    sha256: String,
+    pinned: bool,
+) -> Result<(), String> {
+    let clean = sha256.trim();
+    if clean.is_empty() {
+        return Err("Mã SHA-256 media không hợp lệ".into());
+    }
+    let store = state.store.lock().await;
+    store
+        .set_media_pin(clean, pinned)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn media_open_vault_dir(state: State<'_, AppState>) -> Result<(), String> {
+    let dir = state.media_vault.read().await.vault_dir().to_path_buf();
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("Không tạo được thư mục kho media: {e}"))?;
+    }
+    tokio::task::spawn_blocking(move || file_dialog::open_directory(&dir))
+        .await
+        .map_err(|e| format!("Không thể mở thư mục kho media: {e}"))?
+}
+
+const GDRIVE_MEDIA_SYNC_BATCH_LIMIT: usize = 50;
+const GDRIVE_SYNC_WAKE_COALESCE_SECS: u64 = 2;
+
+struct TempFileGuard(PathBuf);
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn effective_gdrive_uid(uid: Option<&str>) -> &str {
+    uid.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default")
+}
+
+fn check_gdrive_relay_gate(relay_enabled: bool) -> Result<(), String> {
+    ensure_relay_disabled(relay_enabled).map_err(|e| e.to_string())
+}
+
+fn validate_gdrive_passphrase(passphrase: &str) -> Result<(), String> {
+    if passphrase.trim().chars().count() < MIN_VAULT_PASSPHRASE_LEN {
+        return Err(format!(
+            "Mật khẩu đồng bộ E2EE phải có ít nhất {MIN_VAULT_PASSPHRASE_LEN} ký tự"
+        ));
     }
     Ok(())
+}
+
+fn compute_prune_cutoff_ts_ms(now_ms: i64, older_than_days: u32) -> i64 {
+    let delta_ms = i64::from(older_than_days).saturating_mul(86_400_000);
+    now_ms.saturating_sub(delta_ms)
+}
+
+fn should_trigger_gdrive_rehydration(
+    relay_enabled: bool,
+    gdrive_ready: bool,
+    primary_err: &anyhow::Error,
+    cloud_candidate: Option<&MediaObjectRecord>,
+) -> bool {
+    if relay_enabled || !gdrive_ready {
+        return false;
+    }
+    let Some(obj) = cloud_candidate else {
+        return false;
+    };
+    if !obj
+        .cloud_file_id
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        return false;
+    }
+    let is_cdn_expired_or_gone = primary_err
+        .downcast_ref::<MediaDownloadError>()
+        .is_some_and(|dl| {
+            dl.is_cdn_expired()
+                || matches!(dl, MediaDownloadError::HttpStatus { status } if *status == 403 || *status == 404 || *status == 410)
+        });
+    is_cdn_expired_or_gone || obj.local_state == MEDIA_LOCAL_STATE_MISSING
+}
+
+struct GDriveInner {
+    uid: Option<String>,
+    config: GDriveStoredConfig,
+    tokens: Option<GDriveTokens>,
+    master_key: Option<CloudMasterKey>,
+    has_remote_manifest: bool,
+    syncing: bool,
+    phase: String,
+    progress_done: u64,
+    progress_total: u64,
+    last_sync_ts: Option<i64>,
+    last_history_sync_ts: Option<i64>,
+    last_error: Option<String>,
+}
+
+fn build_gdrive_status_snapshot(
+    relay_blocked: bool,
+    inner: &GDriveInner,
+    breakdown: &CloudMediaBreakdown,
+) -> GDriveStatusDto {
+    let connected = inner.tokens.is_some();
+    let vault_unlocked = connected && inner.master_key.is_some();
+    let has_remote_manifest = inner.has_remote_manifest
+        || inner
+            .tokens
+            .as_ref()
+            .is_some_and(|t| t.manifest_file_id.is_some());
+    let (syncing, phase, progress_done, progress_total) = if relay_blocked {
+        (false, GDRIVE_PHASE_PAUSED_RELAY.to_string(), 0, 0)
+    } else {
+        let p = if inner.phase == GDRIVE_PHASE_PAUSED_RELAY || inner.phase.is_empty() {
+            GDRIVE_PHASE_IDLE.to_string()
+        } else {
+            inner.phase.clone()
+        };
+        (inner.syncing, p, inner.progress_done, inner.progress_total)
+    };
+    GDriveStatusDto {
+        relay_blocked,
+        oauth_configured: inner.config.is_oauth_configured(),
+        connected,
+        account_email: inner.tokens.as_ref().and_then(|t| t.account_email.clone()),
+        account_name: inner.tokens.as_ref().and_then(|t| t.account_name.clone()),
+        vault_unlocked,
+        has_remote_manifest,
+        sync_enabled: inner.config.sync_enabled,
+        sync_media: inner.config.sync_media,
+        sync_history: inner.config.sync_history,
+        syncing,
+        phase,
+        progress_done,
+        progress_total,
+        pending_media_count: breakdown.pending_count,
+        pending_media_bytes: breakdown.pending_bytes,
+        last_sync_ts: inner.last_sync_ts,
+        last_history_sync_ts: inner.last_history_sync_ts,
+        last_error: inner.last_error.clone(),
+    }
+}
+
+pub struct GDriveRuntime {
+    paths: StoragePaths,
+    client: GDriveClient,
+    device_id: String,
+    inner: Mutex<GDriveInner>,
+    sync_lock: Mutex<()>,
+    connect_lock: Mutex<()>,
+    sync_notify: Arc<tokio::sync::Notify>,
+    cancel_tx: tokio::sync::watch::Sender<u64>,
+    oauth_cancel: Arc<tokio::sync::Notify>,
+    bg_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    rehydrating: std::sync::Mutex<HashMap<String, tokio::sync::watch::Receiver<bool>>>,
+}
+
+impl GDriveRuntime {
+    fn new(
+        paths: StoragePaths,
+        uid: Option<&str>,
+        last_sync_ts: Option<i64>,
+        last_history_sync_ts: Option<i64>,
+    ) -> Self {
+        let config = GDriveStoredConfig::load_from_file(&paths.gdrive_config_file());
+        let device_id = load_or_create_device_id(&paths.gdrive_device_id_file())
+            .unwrap_or_else(|_| format!("dev-fallback-{}", std::process::id()));
+        let client = GDriveClient::new().expect("Failed to initialize direct Google Drive client");
+        let clean_uid = uid
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let (tokens, master_key) = if let Some(ref u) = clean_uid {
+            let t = GDriveTokens::load_from_file(&paths.gdrive_tokens_file(Some(u)))
+                .ok()
+                .flatten();
+            let k = if t.is_some() {
+                CloudMasterKey::load_from_file(&paths.gdrive_master_key_file(Some(u)))
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            (t, k)
+        } else {
+            (None, None)
+        };
+        let has_remote_manifest = tokens
+            .as_ref()
+            .is_some_and(|t| t.manifest_file_id.is_some())
+            || master_key.is_some();
+        let (cancel_tx, _) = tokio::sync::watch::channel(0u64);
+        Self {
+            paths,
+            client,
+            device_id,
+            inner: Mutex::new(GDriveInner {
+                uid: clean_uid,
+                config,
+                tokens,
+                master_key,
+                has_remote_manifest,
+                syncing: false,
+                phase: GDRIVE_PHASE_IDLE.to_string(),
+                progress_done: 0,
+                progress_total: 0,
+                last_sync_ts,
+                last_history_sync_ts,
+                last_error: None,
+            }),
+            sync_lock: Mutex::new(()),
+            connect_lock: Mutex::new(()),
+            sync_notify: Arc::new(tokio::sync::Notify::new()),
+            cancel_tx,
+            oauth_cancel: Arc::new(tokio::sync::Notify::new()),
+            bg_task: Mutex::new(None),
+            rehydrating: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn notify_sync(&self) {
+        self.sync_notify.notify_one();
+    }
+
+    fn cancel_active_operations(&self) {
+        self.cancel_tx.send_modify(|v| *v = v.wrapping_add(1));
+        self.oauth_cancel.notify_waiters();
+    }
+
+    fn cancel_oauth_flow(&self) {
+        self.cancel_tx.send_modify(|v| *v = v.wrapping_add(1));
+        self.oauth_cancel.notify_waiters();
+    }
+
+    async fn shutdown(&self) {
+        self.cancel_active_operations();
+        if let Some(handle) = self.bg_task.lock().await.take() {
+            handle.abort();
+        }
+    }
+
+    async fn auto_sync_interval_secs(&self) -> u64 {
+        self.inner
+            .lock()
+            .await
+            .config
+            .auto_sync_interval_secs
+            .clamp(30, 86_400)
+    }
+
+    async fn is_connected_and_unlocked(&self) -> bool {
+        let guard = self.inner.lock().await;
+        guard.tokens.is_some() && guard.master_key.is_some()
+    }
+
+    async fn can_background_sync(&self) -> bool {
+        let guard = self.inner.lock().await;
+        guard.tokens.is_some()
+            && guard.master_key.is_some()
+            && guard.config.sync_enabled
+            && (guard.config.sync_media || guard.config.sync_history)
+    }
+
+    async fn snapshot_status(
+        &self,
+        relay_blocked: bool,
+        store: &Arc<Mutex<MessageStore>>,
+    ) -> GDriveStatusDto {
+        let breakdown = {
+            let guard = store.lock().await;
+            guard.compute_cloud_media_breakdown().unwrap_or_default()
+        };
+        let inner = self.inner.lock().await;
+        build_gdrive_status_snapshot(relay_blocked, &inner, &breakdown)
+    }
+
+    async fn emit_status<R: tauri::Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        relay_blocked: bool,
+        store: &Arc<Mutex<MessageStore>>,
+    ) -> GDriveStatusDto {
+        let status = self.snapshot_status(relay_blocked, store).await;
+        let _ = app.emit("core://gdrive-sync-status", &status);
+        status
+    }
+
+    async fn clear_for_logout_and_emit(
+        &self,
+        app: &AppHandle,
+        relay_cfg: &Arc<Mutex<RelayConfig>>,
+        store: &Arc<Mutex<MessageStore>>,
+    ) {
+        self.cancel_active_operations();
+        let relay_enabled = relay_cfg.lock().await.enabled;
+        {
+            let mut inner = self.inner.lock().await;
+            inner.uid = None;
+            inner.tokens = None;
+            inner.master_key = None;
+            inner.has_remote_manifest = false;
+            inner.syncing = false;
+            inner.phase = if relay_enabled {
+                GDRIVE_PHASE_PAUSED_RELAY.to_string()
+            } else {
+                GDRIVE_PHASE_IDLE.to_string()
+            };
+            inner.progress_done = 0;
+            inner.progress_total = 0;
+            inner.last_sync_ts = None;
+            inner.last_history_sync_ts = None;
+            inner.last_error = None;
+        }
+        let _ = self.emit_status(app, relay_enabled, store).await;
+    }
+
+    async fn rebind_for_uid_and_emit(
+        &self,
+        app: &AppHandle,
+        uid: Option<&str>,
+        relay_cfg: &Arc<Mutex<RelayConfig>>,
+        store: &Arc<Mutex<MessageStore>>,
+    ) {
+        self.cancel_active_operations();
+        let clean_uid = uid
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let (last_sync_ts, last_history_sync_ts) = {
+            let guard = store.lock().await;
+            (
+                guard.get_gdrive_last_sync_ts().ok().flatten(),
+                guard.get_gdrive_last_history_sync_ts().ok().flatten(),
+            )
+        };
+        let (tokens, master_key) = if let Some(ref u) = clean_uid {
+            let t = GDriveTokens::load_from_file(&self.paths.gdrive_tokens_file(Some(u)))
+                .ok()
+                .flatten();
+            let k = if t.is_some() {
+                CloudMasterKey::load_from_file(&self.paths.gdrive_master_key_file(Some(u)))
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            (t, k)
+        } else {
+            (None, None)
+        };
+        let relay_enabled = relay_cfg.lock().await.enabled;
+        let should_wake = {
+            let mut inner = self.inner.lock().await;
+            inner.uid = clean_uid;
+            inner.has_remote_manifest = tokens
+                .as_ref()
+                .is_some_and(|t| t.manifest_file_id.is_some())
+                || master_key.is_some();
+            inner.tokens = tokens;
+            inner.master_key = master_key;
+            inner.syncing = false;
+            inner.phase = if relay_enabled {
+                GDRIVE_PHASE_PAUSED_RELAY.to_string()
+            } else {
+                GDRIVE_PHASE_IDLE.to_string()
+            };
+            inner.progress_done = 0;
+            inner.progress_total = 0;
+            inner.last_sync_ts = last_sync_ts;
+            inner.last_history_sync_ts = last_history_sync_ts;
+            inner.last_error = None;
+            !relay_enabled
+                && inner.config.sync_enabled
+                && inner.tokens.is_some()
+                && inner.master_key.is_some()
+        };
+        let _ = self.emit_status(app, relay_enabled, store).await;
+        if should_wake {
+            self.notify_sync();
+        }
+    }
+
+    async fn pause_for_relay_and_emit(
+        &self,
+        app: &AppHandle,
+        store: &Arc<Mutex<MessageStore>>,
+    ) -> GDriveStatusDto {
+        self.cancel_active_operations();
+        {
+            let mut inner = self.inner.lock().await;
+            inner.syncing = false;
+            inner.phase = GDRIVE_PHASE_PAUSED_RELAY.to_string();
+            inner.progress_done = 0;
+            inner.progress_total = 0;
+        }
+        self.emit_status(app, true, store).await
+    }
+
+    async fn resume_after_relay_and_emit(
+        &self,
+        app: &AppHandle,
+        store: &Arc<Mutex<MessageStore>>,
+    ) -> GDriveStatusDto {
+        let should_wake = {
+            let mut inner = self.inner.lock().await;
+            if inner.phase == GDRIVE_PHASE_PAUSED_RELAY {
+                inner.phase = GDRIVE_PHASE_IDLE.to_string();
+            }
+            inner.config.sync_enabled && inner.tokens.is_some() && inner.master_key.is_some()
+        };
+        let status = self.emit_status(app, false, store).await;
+        if should_wake {
+            self.notify_sync();
+        }
+        status
+    }
+
+    async fn ensure_fresh_tokens(
+        &self,
+        relay_enabled: bool,
+    ) -> Result<(GDriveTokens, Option<String>), GDriveError> {
+        ensure_relay_disabled(relay_enabled)?;
+        let (mut tokens, oauth_cfg, uid_opt) = {
+            let inner = self.inner.lock().await;
+            let tokens = inner.tokens.clone().ok_or(GDriveError::NotConnected)?;
+            let oauth_cfg = inner.config.resolve_oauth_config()?;
+            (tokens, oauth_cfg, inner.uid.clone())
+        };
+        let refreshed = self
+            .client
+            .refresh_access_token_with_broker(
+                relay_enabled,
+                &oauth_cfg.client_id,
+                oauth_cfg.client_secret.as_deref(),
+                oauth_cfg.token_broker_url.as_deref(),
+                &mut tokens,
+            )
+            .await?;
+        if refreshed {
+            let mut inner = self.inner.lock().await;
+            if inner.uid == uid_opt && inner.tokens.is_some() {
+                tokens.save_to_file(&self.paths.gdrive_tokens_file(uid_opt.as_deref()))?;
+                inner.tokens = Some(tokens.clone());
+            }
+        }
+        Ok((tokens, uid_opt))
+    }
+
+    async fn ensure_folders_cached(
+        &self,
+        relay_enabled: bool,
+        tokens: &mut GDriveTokens,
+        uid_opt: Option<&str>,
+    ) -> Result<VaultFolderIds, GDriveError> {
+        ensure_relay_disabled(relay_enabled)?;
+        if let (Some(root), Some(uid_dir), Some(blobs), Some(history)) = (
+            tokens.root_folder_id.clone(),
+            tokens.uid_folder_id.clone(),
+            tokens.blobs_folder_id.clone(),
+            tokens.history_folder_id.clone(),
+        ) {
+            return Ok(VaultFolderIds {
+                root_folder_id: root,
+                uid_folder_id: uid_dir,
+                blobs_folder_id: blobs,
+                history_folder_id: history,
+                manifest_file_id: tokens.manifest_file_id.clone(),
+            });
+        }
+        let access_token = tokens.access_token.clone();
+        let folders = self
+            .client
+            .ensure_vault_folders(
+                relay_enabled,
+                &access_token,
+                effective_gdrive_uid(uid_opt),
+                tokens,
+            )
+            .await?;
+        {
+            let mut inner = self.inner.lock().await;
+            if inner.uid.as_deref() == uid_opt && inner.tokens.is_some() {
+                let _ = tokens.save_to_file(&self.paths.gdrive_tokens_file(uid_opt));
+                inner.tokens = Some(tokens.clone());
+                inner.has_remote_manifest =
+                    inner.has_remote_manifest || folders.manifest_file_id.is_some();
+            }
+        }
+        Ok(folders)
+    }
+}
+
+fn spawn_gdrive_background_sync_loop(
+    app: AppHandle,
+    gdrive: Arc<GDriveRuntime>,
+    relay_cfg: Arc<Mutex<RelayConfig>>,
+    store: Arc<Mutex<MessageStore>>,
+    media_vault: Arc<RwLock<Arc<MediaVault>>>,
+) {
+    let gdrive_bg = gdrive.clone();
+    let handle = tauri::async_runtime::spawn(async move {
+        loop {
+            let interval_secs = gdrive_bg.auto_sync_interval_secs().await;
+            let woke_by_notify = tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(interval_secs)) => false,
+                _ = gdrive_bg.sync_notify.notified() => true,
+            };
+            if woke_by_notify {
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    GDRIVE_SYNC_WAKE_COALESCE_SECS,
+                ))
+                .await;
+            }
+            let relay_enabled = relay_cfg.lock().await.enabled;
+            if relay_enabled || !gdrive_bg.can_background_sync().await {
+                continue;
+            }
+            let _ =
+                run_gdrive_sync_cycle(&app, &gdrive_bg, &relay_cfg, &store, &media_vault, false)
+                    .await;
+        }
+    });
+    tauri::async_runtime::spawn(async move {
+        let mut guard = gdrive.bg_task.lock().await;
+        if let Some(prev) = guard.replace(handle) {
+            prev.abort();
+        }
+    });
+}
+
+enum SyncCycleOutcome {
+    Finished,
+    Cancelled,
+}
+
+async fn run_gdrive_sync_cycle(
+    app: &AppHandle,
+    gdrive: &Arc<GDriveRuntime>,
+    relay_cfg: &Arc<Mutex<RelayConfig>>,
+    store: &Arc<Mutex<MessageStore>>,
+    media_vault: &Arc<RwLock<Arc<MediaVault>>>,
+    force: bool,
+) -> Result<GDriveStatusDto, String> {
+    let initial_relay = relay_cfg.lock().await.enabled;
+    if initial_relay {
+        let status = gdrive.snapshot_status(true, store).await;
+        return if force {
+            Err(GDriveError::RelayBlocked.to_string())
+        } else {
+            Ok(status)
+        };
+    }
+
+    let _sync_guard = if force {
+        gdrive.sync_lock.lock().await
+    } else {
+        match gdrive.sync_lock.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                let relay_now = relay_cfg.lock().await.enabled;
+                return Ok(gdrive.snapshot_status(relay_now, store).await);
+            }
+        }
+    };
+
+    let relay_now = relay_cfg.lock().await.enabled;
+    if relay_now {
+        let status = gdrive.snapshot_status(true, store).await;
+        return if force {
+            Err(GDriveError::RelayBlocked.to_string())
+        } else {
+            Ok(status)
+        };
+    }
+
+    enum SyncPrep {
+        Ready {
+            master_key: CloudMasterKey,
+            uid_opt: Option<String>,
+            sync_media: bool,
+            sync_history: bool,
+        },
+        NotConnected,
+        VaultLocked,
+        Skip,
+    }
+    let prep = {
+        let mut inner = gdrive.inner.lock().await;
+        if inner.tokens.is_none() {
+            SyncPrep::NotConnected
+        } else if let Some(mk) = inner.master_key.clone() {
+            if (!force && !inner.config.sync_enabled)
+                || (!inner.config.sync_media && !inner.config.sync_history)
+            {
+                SyncPrep::Skip
+            } else {
+                inner.syncing = true;
+                inner.last_error = None;
+                inner.progress_done = 0;
+                inner.progress_total = 0;
+                inner.phase = if inner.config.sync_media {
+                    GDRIVE_PHASE_UPLOADING_MEDIA.to_string()
+                } else {
+                    GDRIVE_PHASE_SYNCING_HISTORY.to_string()
+                };
+                SyncPrep::Ready {
+                    master_key: mk,
+                    uid_opt: inner.uid.clone(),
+                    sync_media: inner.config.sync_media,
+                    sync_history: inner.config.sync_history,
+                }
+            }
+        } else {
+            SyncPrep::VaultLocked
+        }
+    };
+    let (master_key, uid_opt, sync_media, sync_history) = match prep {
+        SyncPrep::Ready {
+            master_key,
+            uid_opt,
+            sync_media,
+            sync_history,
+        } => (master_key, uid_opt, sync_media, sync_history),
+        SyncPrep::NotConnected => {
+            return if force {
+                Err(GDriveError::NotConnected.to_string())
+            } else {
+                Ok(gdrive.snapshot_status(false, store).await)
+            };
+        }
+        SyncPrep::VaultLocked => {
+            return if force {
+                Err(GDriveError::VaultLocked.to_string())
+            } else {
+                Ok(gdrive.snapshot_status(false, store).await)
+            };
+        }
+        SyncPrep::Skip => {
+            return Ok(gdrive.snapshot_status(false, store).await);
+        }
+    };
+
+    let mut cancel_rx = gdrive.cancel_tx.subscribe();
+    let _ = cancel_rx.borrow_and_update();
+    let _ = gdrive.emit_status(app, false, store).await;
+
+    let sync_body = async {
+        let (mut tokens, _) = gdrive
+            .ensure_fresh_tokens(relay_cfg.lock().await.enabled)
+            .await
+            .map_err(|e| e.to_string())?;
+        let folders = gdrive
+            .ensure_folders_cached(relay_cfg.lock().await.enabled, &mut tokens, uid_opt.as_deref())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // 1. Upload pending local media blobs first so history delta immediately carries new cloud_file_ids
+        if sync_media {
+            let vault = media_vault.read().await.clone();
+            let initial_pending = {
+                let guard = store.lock().await;
+                guard
+                    .compute_cloud_media_breakdown()
+                    .map(|b| b.pending_count)
+                    .unwrap_or(0)
+            };
+            if initial_pending > 0 {
+                {
+                    let mut inner = gdrive.inner.lock().await;
+                    inner.phase = GDRIVE_PHASE_UPLOADING_MEDIA.to_string();
+                    inner.progress_done = 0;
+                    inner.progress_total = initial_pending;
+                }
+                let _ = gdrive.emit_status(app, false, store).await;
+
+                let mut attempted = std::collections::HashSet::<String>::new();
+                let mut uploaded_count: u64 = 0;
+                loop {
+                    let batch = {
+                        let guard = store.lock().await;
+                        guard
+                            .list_pending_cloud_uploads(GDRIVE_MEDIA_SYNC_BATCH_LIMIT)
+                            .map_err(|e| format!("SQLite pending cloud uploads failed: {e}"))?
+                    };
+                    let next_items: Vec<MediaObjectRecord> = batch
+                        .into_iter()
+                        .filter(|obj| attempted.insert(obj.sha256.clone()))
+                        .collect();
+                    if next_items.is_empty() {
+                        break;
+                    }
+
+                    for obj in next_items {
+                        let relay_step = relay_cfg.lock().await.enabled;
+                        check_gdrive_relay_gate(relay_step)?;
+
+                        let (fresh_tokens, _) = gdrive
+                            .ensure_fresh_tokens(relay_step)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        tokens = fresh_tokens;
+
+                        let blob_name = format!("{}.tzmb", obj.sha256);
+                        let existing_id = gdrive
+                            .client
+                            .find_file_in_folder(
+                                relay_step,
+                                &tokens.access_token,
+                                &folders.blobs_folder_id,
+                                &blob_name,
+                                None,
+                            )
+                            .await
+                            .map_err(|e| e.to_string())?
+                            .map(|f| f.id);
+
+                        let cloud_file_id = if let Some(fid) = existing_id {
+                            fid
+                        } else {
+                            let tmp_guard =
+                                TempFileGuard::new(vault.next_cloud_tmp_path("gdrive-up", "tzmb"));
+                            if let Err(prep_err) = vault
+                                .prepare_cloud_encrypted_temp(
+                                    &obj,
+                                    master_key.as_bytes(),
+                                    tmp_guard.path(),
+                                )
+                                .await
+                            {
+                                let missing_on_disk = obj
+                                    .local_rel_path
+                                    .as_deref()
+                                    .and_then(|rel| vault.resolve_blob_path(rel).ok())
+                                    .is_some_and(|p| !p.exists());
+                                if missing_on_disk {
+                                    let guard = store.lock().await;
+                                    let _ = guard.mark_media_evicted(&obj.sha256);
+                                    continue;
+                                }
+                                return Err(format!(
+                                    "Không chuẩn bị được tệp mã hóa đám mây: {prep_err}"
+                                ));
+                            }
+
+                            let relay_upload = relay_cfg.lock().await.enabled;
+                            check_gdrive_relay_gate(relay_upload)?;
+
+                            let fid = gdrive
+                                .client
+                                .upload_file_resumable(
+                                    relay_upload,
+                                    &tokens.access_token,
+                                    &folders.blobs_folder_id,
+                                    &blob_name,
+                                    "application/octet-stream",
+                                    tmp_guard.path(),
+                                )
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            drop(tmp_guard);
+                            fid
+                        };
+
+                        let synced_ts = chrono_now_ms();
+                        {
+                            let guard = store.lock().await;
+                            guard
+                                .mark_media_cloud_synced(
+                                    &obj.sha256,
+                                    GDRIVE_PROVIDER_NAME,
+                                    &cloud_file_id,
+                                    1,
+                                    synced_ts,
+                                )
+                                .map_err(|e| format!("SQLite mark_media_cloud_synced: {e}"))?;
+                        }
+                        uploaded_count = uploaded_count.saturating_add(1);
+                        {
+                            let mut inner = gdrive.inner.lock().await;
+                            inner.progress_done = uploaded_count;
+                            if inner.progress_total < uploaded_count {
+                                inner.progress_total = uploaded_count;
+                            }
+                        }
+                        let _ = gdrive.emit_status(app, false, store).await;
+                    }
+                }
+            }
+        }
+
+        // 2. Sync encrypted delta message history (pull unseen remote deltas + push local changes)
+        if sync_history {
+            let relay_hist = relay_cfg.lock().await.enabled;
+            check_gdrive_relay_gate(relay_hist)?;
+
+            {
+                let mut inner = gdrive.inner.lock().await;
+                inner.phase = GDRIVE_PHASE_SYNCING_HISTORY.to_string();
+                inner.progress_done = 0;
+                inner.progress_total = 0;
+            }
+            let _ = gdrive.emit_status(app, false, store).await;
+
+            let (fresh_tokens, _) = gdrive
+                .ensure_fresh_tokens(relay_hist)
+                .await
+                .map_err(|e| e.to_string())?;
+            tokens = fresh_tokens;
+
+            let last_hist_ts = {
+                let guard = store.lock().await;
+                guard
+                    .get_gdrive_last_history_sync_ts()
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0)
+            };
+
+            let report = gdrive
+                .client
+                .sync_history_deltas(
+                    relay_hist,
+                    &tokens.access_token,
+                    &folders.history_folder_id,
+                    store,
+                    &master_key,
+                    effective_gdrive_uid(uid_opt.as_deref()),
+                    &gdrive.device_id,
+                    last_hist_ts,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+
+            let persisted_hist_ts = {
+                let guard = store.lock().await;
+                guard.get_gdrive_last_history_sync_ts().ok().flatten()
+            };
+            {
+                let mut inner = gdrive.inner.lock().await;
+                if let Some(ts) = persisted_hist_ts {
+                    inner.last_history_sync_ts = Some(ts);
+                } else if report.new_last_history_sync_ts > 0 {
+                    inner.last_history_sync_ts = Some(report.new_last_history_sync_ts);
+                }
+            }
+            if report.downloaded_deltas > 0 || report.applied_messages > 0 {
+                let _ = app.emit("core://threads-updated", ());
+            }
+        }
+
+        let now_ms = chrono_now_ms();
+        {
+            let guard = store.lock().await;
+            let _ = guard.set_gdrive_last_sync_ts(now_ms);
+        }
+        {
+            let mut inner = gdrive.inner.lock().await;
+            inner.last_sync_ts = Some(now_ms);
+        }
+        Ok::<SyncCycleOutcome, String>(SyncCycleOutcome::Finished)
+    };
+
+    let outcome = tokio::select! {
+        biased;
+        _ = cancel_rx.changed() => Ok(SyncCycleOutcome::Cancelled),
+        res = sync_body => res,
+    };
+
+    let relay_after = relay_cfg.lock().await.enabled;
+    match outcome {
+        Ok(SyncCycleOutcome::Finished) => {
+            {
+                let mut inner = gdrive.inner.lock().await;
+                inner.syncing = false;
+                inner.phase = if relay_after {
+                    GDRIVE_PHASE_PAUSED_RELAY.to_string()
+                } else {
+                    GDRIVE_PHASE_IDLE.to_string()
+                };
+                inner.progress_done = 0;
+                inner.progress_total = 0;
+                inner.last_error = None;
+            }
+            Ok(gdrive.emit_status(app, relay_after, store).await)
+        }
+        Ok(SyncCycleOutcome::Cancelled) => {
+            {
+                let mut inner = gdrive.inner.lock().await;
+                inner.syncing = false;
+                inner.phase = if relay_after {
+                    GDRIVE_PHASE_PAUSED_RELAY.to_string()
+                } else {
+                    GDRIVE_PHASE_IDLE.to_string()
+                };
+                inner.progress_done = 0;
+                inner.progress_total = 0;
+            }
+            let status = gdrive.emit_status(app, relay_after, store).await;
+            if force && relay_after {
+                Err(GDriveError::RelayBlocked.to_string())
+            } else {
+                Ok(status)
+            }
+        }
+        Err(err_msg) => {
+            {
+                let mut inner = gdrive.inner.lock().await;
+                inner.syncing = false;
+                if relay_after {
+                    inner.phase = GDRIVE_PHASE_PAUSED_RELAY.to_string();
+                    inner.last_error = None;
+                } else {
+                    inner.phase = GDRIVE_PHASE_ERROR.to_string();
+                    inner.last_error = Some(err_msg.clone());
+                }
+                inner.progress_done = 0;
+                inner.progress_total = 0;
+            }
+            let _ = gdrive.emit_status(app, relay_after, store).await;
+            Err(if relay_after {
+                GDriveError::RelayBlocked.to_string()
+            } else {
+                err_msg
+            })
+        }
+    }
+}
+
+struct CloudLookupResult {
+    obj: MediaObjectRecord,
+    original_name: Option<String>,
+    cdn_expired: bool,
+}
+
+async fn lookup_cloud_candidate(
+    store: &Arc<Mutex<MessageStore>>,
+    url: &str,
+    kind: &str,
+    msg_ref: Option<(&str, &str)>,
+) -> Option<CloudLookupResult> {
+    let variant = if kind.eq_ignore_ascii_case("thumb") {
+        "thumb"
+    } else {
+        "primary"
+    };
+    let url_hash = MediaVault::sha256_url(url);
+    let guard = store.lock().await;
+    if let Some((tid, mid)) = msg_ref {
+        if let Ok(Some(obj)) = guard.lookup_media_by_msg(tid, mid, variant) {
+            if obj
+                .cloud_file_id
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            {
+                let mm = guard
+                    .get_message_media_record(tid, mid, variant)
+                    .ok()
+                    .flatten();
+                let original_name = mm.as_ref().and_then(|r| r.original_name.clone());
+                let cdn_expired = mm
+                    .as_ref()
+                    .is_some_and(|r| r.cdn_status == MEDIA_CDN_STATUS_EXPIRED);
+                return Some(CloudLookupResult {
+                    obj,
+                    original_name,
+                    cdn_expired,
+                });
+            }
+        }
+    }
+    if let Ok(Some(obj)) = guard.lookup_media_by_url_hash(&url_hash) {
+        if obj
+            .cloud_file_id
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            let mm = guard
+                .get_message_media_record("__url__", &url_hash, variant)
+                .ok()
+                .flatten();
+            let original_name = mm.as_ref().and_then(|r| r.original_name.clone());
+            let cdn_expired = mm
+                .as_ref()
+                .is_some_and(|r| r.cdn_status == MEDIA_CDN_STATUS_EXPIRED);
+            return Some(CloudLookupResult {
+                obj,
+                original_name,
+                cdn_expired,
+            });
+        }
+    }
+    None
+}
+
+async fn try_rehydrate_local_hit(
+    vault: &Arc<MediaVault>,
+    store: &Arc<Mutex<MessageStore>>,
+    sha256: &str,
+) -> Option<MediaObjectRecord> {
+    let obj = {
+        let guard = store.lock().await;
+        guard.get_media_object(sha256).ok().flatten()?
+    };
+    if obj.local_state != MEDIA_LOCAL_STATE_LOCAL {
+        return None;
+    }
+    let rel = obj.local_rel_path.as_deref()?;
+    let path = vault.resolve_blob_path(rel).ok()?;
+    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        Some(obj)
+    } else {
+        None
+    }
+}
+
+struct RehydrateLeaderGuard<'a> {
+    map: &'a std::sync::Mutex<HashMap<String, tokio::sync::watch::Receiver<bool>>>,
+    sha: String,
+    tx: Option<tokio::sync::watch::Sender<bool>>,
+}
+
+impl Drop for RehydrateLeaderGuard<'_> {
+    fn drop(&mut self) {
+        {
+            let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+            map.remove(&self.sha);
+        }
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(true);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn rehydrate_cloud_object<R: tauri::Runtime>(
+    app: Option<&AppHandle<R>>,
+    vault: &Arc<MediaVault>,
+    store: &Arc<Mutex<MessageStore>>,
+    gdrive: &Arc<GDriveRuntime>,
+    relay_cfg: &Arc<Mutex<RelayConfig>>,
+    candidate: &CloudLookupResult,
+    url: &str,
+    kind: &str,
+    msg_ref: Option<(&str, &str)>,
+) -> Result<MediaObjectRecord, GDriveError> {
+    let sha = candidate.obj.sha256.clone();
+    let cloud_file_id = candidate
+        .obj
+        .cloud_file_id
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or(GDriveError::NotFound)?;
+
+    // Singleflight coordination per SHA-256 using watch::Receiver<bool> so Followers never miss Leader completion
+    loop {
+        enum RehydrateSlot<'a> {
+            Leader(RehydrateLeaderGuard<'a>),
+            Follower(tokio::sync::watch::Receiver<bool>),
+        }
+        let slot = {
+            let mut map = gdrive
+                .rehydrating
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = map.get(&sha) {
+                RehydrateSlot::Follower(existing.clone())
+            } else {
+                let (tx, rx) = tokio::sync::watch::channel(false);
+                map.insert(sha.clone(), rx);
+                RehydrateSlot::Leader(RehydrateLeaderGuard {
+                    map: &gdrive.rehydrating,
+                    sha: sha.clone(),
+                    tx: Some(tx),
+                })
+            }
+        };
+        match slot {
+            RehydrateSlot::Follower(mut rx) => {
+                let _ = rx.wait_for(|&done| done).await;
+                if let Some(hit) = try_rehydrate_local_hit(vault, store, &sha).await {
+                    return Ok(hit);
+                }
+                if relay_cfg.lock().await.enabled {
+                    return Err(GDriveError::RelayBlocked);
+                }
+                let still_has_cloud = {
+                    let guard = store.lock().await;
+                    guard
+                        .get_media_object(&sha)
+                        .ok()
+                        .flatten()
+                        .and_then(|o| o.cloud_file_id)
+                        .is_some_and(|s| !s.trim().is_empty())
+                };
+                if !still_has_cloud {
+                    return Err(GDriveError::NotFound);
+                }
+                continue;
+            }
+            RehydrateSlot::Leader(_leader_guard) => {
+                let result: Result<MediaObjectRecord, GDriveError> = async {
+                    if let Some(hit) = try_rehydrate_local_hit(vault, store, &sha).await {
+                        return Ok(hit);
+                    }
+                    let relay_now = relay_cfg.lock().await.enabled;
+                    ensure_relay_disabled(relay_now)?;
+                    let master_key = {
+                        let inner = gdrive.inner.lock().await;
+                        if inner.tokens.is_none() {
+                            return Err(GDriveError::NotConnected);
+                        }
+                        inner.master_key.clone().ok_or(GDriveError::VaultLocked)?
+                    };
+                    let (tokens, _) = gdrive.ensure_fresh_tokens(relay_now).await?;
+
+                    let set_rehydrating_phase = {
+                        let mut inner = gdrive.inner.lock().await;
+                        if !inner.syncing {
+                            inner.phase = GDRIVE_PHASE_REHYDRATING.to_string();
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if set_rehydrating_phase {
+                        if let Some(app_h) = app {
+                            let _ = gdrive.emit_status(app_h, false, store).await;
+                        }
+                    }
+
+                    let mut cancel_rx = gdrive.cancel_tx.subscribe();
+                    let _ = cancel_rx.borrow_and_update();
+
+                    let tmp_guard =
+                        TempFileGuard::new(vault.next_cloud_tmp_path("gdrive-dl", "tzmb"));
+                    let dl_res = tokio::select! {
+                        biased;
+                        _ = cancel_rx.changed() => Err(GDriveError::RelayBlocked),
+                        res = gdrive.client.download_file_to_path(
+                            relay_cfg.lock().await.enabled,
+                            &tokens.access_token,
+                            &cloud_file_id,
+                            tmp_guard.path(),
+                        ) => res,
+                    };
+
+                    if set_rehydrating_phase {
+                        let relay_after = relay_cfg.lock().await.enabled;
+                        {
+                            let mut inner = gdrive.inner.lock().await;
+                            if inner.phase == GDRIVE_PHASE_REHYDRATING {
+                                inner.phase = if relay_after {
+                                    GDRIVE_PHASE_PAUSED_RELAY.to_string()
+                                } else {
+                                    GDRIVE_PHASE_IDLE.to_string()
+                                };
+                            }
+                        }
+                        if let Some(app_h) = app {
+                            let _ = gdrive.emit_status(app_h, relay_after, store).await;
+                        }
+                    }
+
+                    match dl_res {
+                        Ok(_) => {}
+                        Err(GDriveError::NotFound) => {
+                            let guard = store.lock().await;
+                            let _ = guard.clear_media_cloud_links(std::slice::from_ref(&sha));
+                            return Err(GDriveError::NotFound);
+                        }
+                        Err(e) => return Err(e),
+                    }
+
+                    let eff_kind = if candidate.obj.kind.trim().is_empty() {
+                        kind
+                    } else {
+                        candidate.obj.kind.as_str()
+                    };
+                    let eff_mime = if candidate.obj.mime.trim().is_empty() {
+                        "application/octet-stream"
+                    } else {
+                        candidate.obj.mime.as_str()
+                    };
+                    let variant = if eff_kind.eq_ignore_ascii_case("thumb") {
+                        "thumb"
+                    } else {
+                        "primary"
+                    };
+                    let msg_ref_variant = msg_ref.map(|(t, m)| (t, m, variant));
+
+                    let obj = vault
+                        .ingest_from_cloud_encrypted_temp(
+                            store,
+                            tmp_guard.path(),
+                            master_key.as_bytes(),
+                            &sha,
+                            eff_kind,
+                            eff_mime,
+                            Some(url),
+                            msg_ref_variant,
+                            candidate.original_name.as_deref(),
+                        )
+                        .await
+                        .map_err(|e| GDriveError::Other(e.to_string()))?;
+                    drop(tmp_guard);
+
+                    if vault.config().quota_mb > 0 {
+                        let _ = vault
+                            .run_lru_eviction_excluding(store, Some(&obj.sha256))
+                            .await;
+                    }
+                    Ok(obj)
+                }
+                .await;
+
+                return result;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_media_with_tier2_gdrive<R: tauri::Runtime, F>(
+    app: Option<&AppHandle<R>>,
+    vault: &Arc<MediaVault>,
+    session: &Session,
+    store: &Arc<Mutex<MessageStore>>,
+    gdrive: &Arc<GDriveRuntime>,
+    relay_cfg: &Arc<Mutex<RelayConfig>>,
+    url: &str,
+    kind: &str,
+    msg_ref: Option<(&str, &str)>,
+    on_progress: F,
+) -> Result<MediaObjectRecord, anyhow::Error>
+where
+    F: FnMut(u64, Option<u64>),
+{
+    // Fast Tier 1 local hit check when a cloud record already knows CDN is expired
+    if let Some(candidate) = lookup_cloud_candidate(store, url, kind, msg_ref).await {
+        if candidate.obj.local_state == MEDIA_LOCAL_STATE_MISSING && candidate.cdn_expired {
+            let relay_enabled = relay_cfg.lock().await.enabled;
+            if !relay_enabled && gdrive.is_connected_and_unlocked().await {
+                match rehydrate_cloud_object(
+                    app, vault, store, gdrive, relay_cfg, &candidate, url, kind, msg_ref,
+                )
+                .await
+                {
+                    Ok(obj) => return Ok(obj),
+                    Err(GDriveError::NotFound) => {
+                        return Err(anyhow::Error::new(MediaDownloadError::HttpStatus {
+                            status: 404,
+                        }));
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+
+    match vault
+        .ensure_cached_url(session, store, url, kind, msg_ref, on_progress)
+        .await
+    {
+        Ok(obj) => {
+            if obj.cloud_file_id.is_none() {
+                gdrive.notify_sync();
+            }
+            Ok(obj)
+        }
+        Err(primary_err) => {
+            let candidate = lookup_cloud_candidate(store, url, kind, msg_ref).await;
+            let relay_enabled = relay_cfg.lock().await.enabled;
+            let gdrive_ready = if relay_enabled {
+                false
+            } else {
+                gdrive.is_connected_and_unlocked().await
+            };
+            if should_trigger_gdrive_rehydration(
+                relay_enabled,
+                gdrive_ready,
+                &primary_err,
+                candidate.as_ref().map(|c| &c.obj),
+            ) {
+                if let Some(cand) = candidate {
+                    return match rehydrate_cloud_object(
+                        app, vault, store, gdrive, relay_cfg, &cand, url, kind, msg_ref,
+                    )
+                    .await
+                    {
+                        Ok(obj) => Ok(obj),
+                        Err(GDriveError::NotFound) => {
+                            Err(anyhow::Error::new(MediaDownloadError::HttpStatus {
+                                status: 404,
+                            }))
+                        }
+                        Err(_) => Err(primary_err),
+                    };
+                }
+            }
+            Err(primary_err)
+        }
+    }
+}
+
+#[tauri::command]
+async fn gdrive_get_config(state: State<'_, AppState>) -> Result<GDriveConfigDto, String> {
+    let inner = state.gdrive.inner.lock().await;
+    Ok(inner.config.to_dto())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn gdrive_save_config(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    token_broker_url: Option<String>,
+    reset_custom_oauth: Option<bool>,
+    sync_enabled: Option<bool>,
+    sync_media: Option<bool>,
+    sync_history: Option<bool>,
+) -> Result<GDriveConfigDto, String> {
+    let relay_enabled = state.relay_cfg.lock().await.enabled;
+    let (dto, should_wake) = {
+        let mut inner = state.gdrive.inner.lock().await;
+        let mut staged = inner.config.clone();
+        if reset_custom_oauth.unwrap_or(false) {
+            staged.reset_custom_oauth();
+        } else {
+            if let Some(cid) = client_id {
+                staged.client_id = cid.trim().to_string();
+            }
+            if let Some(secret) = client_secret {
+                staged
+                    .set_client_secret(Some(&secret))
+                    .map_err(|e| e.to_string())?;
+            }
+            if let Some(broker) = token_broker_url {
+                staged
+                    .set_token_broker_url(Some(&broker))
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        if let Some(v) = sync_enabled {
+            staged.sync_enabled = v;
+        }
+        if let Some(v) = sync_media {
+            staged.sync_media = v;
+        }
+        if let Some(v) = sync_history {
+            staged.sync_history = v;
+        }
+        staged
+            .save_to_file(&state.paths.gdrive_config_file())
+            .map_err(|e| e.to_string())?;
+        inner.config = staged;
+        let dto = inner.config.to_dto();
+        let wake = !relay_enabled
+            && inner.config.sync_enabled
+            && inner.tokens.is_some()
+            && inner.master_key.is_some();
+        (dto, wake)
+    };
+    let _ = state
+        .gdrive
+        .emit_status(&app, relay_enabled, &state.store)
+        .await;
+    if should_wake {
+        state.gdrive.notify_sync();
+    }
+    Ok(dto)
+}
+
+#[tauri::command]
+async fn gdrive_get_status(state: State<'_, AppState>) -> Result<GDriveStatusDto, String> {
+    let relay_enabled = state.relay_cfg.lock().await.enabled;
+    Ok(state
+        .gdrive
+        .snapshot_status(relay_enabled, &state.store)
+        .await)
+}
+
+#[tauri::command]
+async fn gdrive_connect_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<GDriveStatusDto, String> {
+    let relay_enabled = state.relay_cfg.lock().await.enabled;
+    check_gdrive_relay_gate(relay_enabled)?;
+
+    let _connect_guard = state.gdrive.connect_lock.lock().await;
+    let relay_check = state.relay_cfg.lock().await.enabled;
+    check_gdrive_relay_gate(relay_check)?;
+
+    let current_uid = {
+        let sess = state.session.lock().await;
+        let u = sess.profile.uid.trim();
+        (!u.is_empty()).then(|| u.to_string())
+    };
+    let (oauth_cfg, uid_opt) = {
+        let mut inner = state.gdrive.inner.lock().await;
+        if current_uid.is_some() {
+            inner.uid = current_uid;
+        }
+        let oauth_cfg = inner
+            .config
+            .resolve_oauth_config()
+            .map_err(|e| e.to_string())?;
+        (oauth_cfg, inner.uid.clone())
+    };
+
+    let flow = OAuthLoopbackFlow::bind(relay_check, &oauth_cfg.client_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let auth_url = flow.auth_url.clone();
+
+    // Subscribe to cancellation watch BEFORE launching the browser so Relay-ON or disconnect
+    // during `open_url_with_shell` can never miss cancellation and leave the listener blocked.
+    let mut cancel_rx = state.gdrive.cancel_tx.subscribe();
+    let _ = cancel_rx.borrow_and_update();
+
+    {
+        let mut inner = state.gdrive.inner.lock().await;
+        inner.phase = GDRIVE_PHASE_CONNECTING.to_string();
+        inner.last_error = None;
+    }
+    let _ = state.gdrive.emit_status(&app, false, &state.store).await;
+
+    let open_res = tokio::task::spawn_blocking(move || file_dialog::open_url_with_shell(&auth_url))
+        .await
+        .map_err(|e| format!("Không mở được trình duyệt hệ thống: {e}"))
+        .and_then(|r| r);
+    if let Err(err_msg) = open_res {
+        let relay_now = state.relay_cfg.lock().await.enabled;
+        {
+            let mut inner = state.gdrive.inner.lock().await;
+            inner.phase = if relay_now {
+                GDRIVE_PHASE_PAUSED_RELAY.to_string()
+            } else {
+                GDRIVE_PHASE_ERROR.to_string()
+            };
+            inner.last_error = if relay_now { None } else { Some(err_msg.clone()) };
+        }
+        let _ = state.gdrive.emit_status(&app, relay_now, &state.store).await;
+        return Err(err_msg);
+    }
+
+    let relay_before_wait = state.relay_cfg.lock().await.enabled;
+    let wait_res = if relay_before_wait {
+        Err(GDriveError::RelayBlocked)
+    } else if cancel_rx.has_changed().unwrap_or(false) {
+        Err(GDriveError::AuthCancelled)
+    } else {
+        tokio::select! {
+            biased;
+            _ = cancel_rx.changed() => {
+                if state.relay_cfg.lock().await.enabled {
+                    Err(GDriveError::RelayBlocked)
+                } else {
+                    Err(GDriveError::AuthCancelled)
+                }
+            }
+            res = flow.wait_for_code(Some(state.gdrive.oauth_cancel.clone())) => res,
+        }
+    };
+
+    let (code, code_verifier, redirect_uri) = match wait_res {
+        Ok(tuple) => tuple,
+        Err(e) => {
+            let relay_now = state.relay_cfg.lock().await.enabled;
+            let err_msg = if relay_now {
+                GDriveError::RelayBlocked.to_string()
+            } else {
+                e.to_string()
+            };
+            {
+                let mut inner = state.gdrive.inner.lock().await;
+                inner.phase = if relay_now {
+                    GDRIVE_PHASE_PAUSED_RELAY.to_string()
+                } else {
+                    GDRIVE_PHASE_IDLE.to_string()
+                };
+                inner.last_error = if relay_now
+                    || matches!(e, GDriveError::AuthCancelled | GDriveError::RelayBlocked)
+                {
+                    None
+                } else {
+                    Some(err_msg.clone())
+                };
+            }
+            let _ = state.gdrive.emit_status(&app, relay_now, &state.store).await;
+            return Err(err_msg);
+        }
+    };
+
+    let relay_after_cb = state.relay_cfg.lock().await.enabled;
+    if let Err(err_msg) = check_gdrive_relay_gate(relay_after_cb) {
+        let _ = state.gdrive.emit_status(&app, true, &state.store).await;
+        return Err(err_msg);
+    }
+
+    // Bring Teza back to the foreground right after the browser OAuth callback completes.
+    if let Some(main_win) = app.get_window("main") {
+        let _ = main_win.unminimize();
+        let _ = main_win.set_focus();
+    }
+
+    let setup_res: Result<(GDriveTokens, bool, Option<String>), GDriveError> = async {
+        let mut tokens = state
+            .gdrive
+            .client
+            .exchange_oauth_code_with_broker(
+                relay_after_cb,
+                &oauth_cfg.client_id,
+                oauth_cfg.client_secret.as_deref(),
+                oauth_cfg.token_broker_url.as_deref(),
+                &code,
+                &code_verifier,
+                &redirect_uri,
+            )
+            .await?;
+
+        let (quota, email, name) = state
+            .gdrive
+            .client
+            .fetch_drive_quota(state.relay_cfg.lock().await.enabled, &tokens.access_token)
+            .await?;
+        tokens.account_email = email;
+        tokens.account_name = name;
+
+        let access_token = tokens.access_token.clone();
+        let (has_manifest, mut connect_warning) = match state
+            .gdrive
+            .client
+            .ensure_vault_folders(
+                state.relay_cfg.lock().await.enabled,
+                &access_token,
+                effective_gdrive_uid(uid_opt.as_deref()),
+                &mut tokens,
+            )
+            .await
+        {
+            Ok(folders) => (folders.manifest_file_id.is_some(), None),
+            Err(GDriveError::StorageQuotaExceeded) => (
+                false,
+                Some(GDriveError::StorageQuotaExceeded.to_string()),
+            ),
+            Err(e) => return Err(e),
+        };
+        if connect_warning.is_none()
+            && quota
+                .drive_limit_bytes
+                .is_some_and(|lim| lim > 0 && quota.drive_usage_bytes >= lim)
+        {
+            connect_warning = Some(GDriveError::StorageQuotaExceeded.to_string());
+        }
+        Ok((tokens, has_manifest, connect_warning))
+    }
+    .await;
+
+    let (tokens, has_manifest, connect_warning) = match setup_res {
+        Ok(triple) => triple,
+        Err(e) => {
+            let relay_now = state.relay_cfg.lock().await.enabled;
+            let err_msg = if relay_now {
+                GDriveError::RelayBlocked.to_string()
+            } else {
+                e.to_string()
+            };
+            {
+                let mut inner = state.gdrive.inner.lock().await;
+                inner.phase = if relay_now {
+                    GDRIVE_PHASE_PAUSED_RELAY.to_string()
+                } else {
+                    GDRIVE_PHASE_ERROR.to_string()
+                };
+                inner.last_error = if relay_now { None } else { Some(err_msg.clone()) };
+            }
+            let _ = state.gdrive.emit_status(&app, relay_now, &state.store).await;
+            return Err(err_msg);
+        }
+    };
+
+    let relay_final = state.relay_cfg.lock().await.enabled;
+    check_gdrive_relay_gate(relay_final)?;
+
+    // Save DPAPI-sealed tokens and clear any previous cached master key so passphrase unlock matches the newly connected Drive
+    tokens
+        .save_to_file(&state.paths.gdrive_tokens_file(uid_opt.as_deref()))
+        .map_err(|e| e.to_string())?;
+    CloudMasterKey::delete_file(&state.paths.gdrive_master_key_file(uid_opt.as_deref()));
+
+    {
+        let mut inner = state.gdrive.inner.lock().await;
+        inner.tokens = Some(tokens);
+        inner.master_key = None;
+        inner.has_remote_manifest = has_manifest;
+        inner.syncing = false;
+        inner.phase = GDRIVE_PHASE_IDLE.to_string();
+        inner.progress_done = 0;
+        inner.progress_total = 0;
+        inner.last_error = connect_warning;
+    }
+
+    Ok(state.gdrive.emit_status(&app, false, &state.store).await)
+}
+
+#[tauri::command]
+async fn gdrive_connect_cancel(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<GDriveStatusDto, String> {
+    state.gdrive.cancel_oauth_flow();
+    let relay_enabled = state.relay_cfg.lock().await.enabled;
+    {
+        let mut inner = state.gdrive.inner.lock().await;
+        if inner.phase == GDRIVE_PHASE_CONNECTING {
+            inner.phase = if relay_enabled {
+                GDRIVE_PHASE_PAUSED_RELAY.to_string()
+            } else {
+                GDRIVE_PHASE_IDLE.to_string()
+            };
+            inner.last_error = None;
+        }
+    }
+    Ok(state
+        .gdrive
+        .emit_status(&app, relay_enabled, &state.store)
+        .await)
+}
+
+#[tauri::command]
+async fn gdrive_disconnect(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<GDriveStatusDto, String> {
+    state.gdrive.cancel_active_operations();
+    let session_uid = {
+        let sess = state.session.lock().await;
+        let u = sess.profile.uid.trim();
+        (!u.is_empty()).then(|| u.to_string())
+    };
+    let stored_uid = {
+        let mut inner = state.gdrive.inner.lock().await;
+        let prev_uid = inner.uid.clone();
+        inner.tokens = None;
+        inner.master_key = None;
+        inner.has_remote_manifest = false;
+        inner.syncing = false;
+        inner.phase = GDRIVE_PHASE_IDLE.to_string();
+        inner.progress_done = 0;
+        inner.progress_total = 0;
+        inner.last_error = None;
+        prev_uid
+    };
+    // Remove local DPAPI tokens & cached master key for active UID while leaving remote Drive backup intact
+    GDriveTokens::delete_file(&state.paths.gdrive_tokens_file(stored_uid.as_deref()));
+    CloudMasterKey::delete_file(&state.paths.gdrive_master_key_file(stored_uid.as_deref()));
+    if session_uid != stored_uid {
+        GDriveTokens::delete_file(&state.paths.gdrive_tokens_file(session_uid.as_deref()));
+        CloudMasterKey::delete_file(&state.paths.gdrive_master_key_file(session_uid.as_deref()));
+    }
+    let relay_enabled = state.relay_cfg.lock().await.enabled;
+    Ok(state
+        .gdrive
+        .emit_status(&app, relay_enabled, &state.store)
+        .await)
+}
+
+#[tauri::command]
+async fn gdrive_unlock_vault(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    passphrase: String,
+) -> Result<GDriveStatusDto, String> {
+    let relay_enabled = state.relay_cfg.lock().await.enabled;
+    check_gdrive_relay_gate(relay_enabled)?;
+    validate_gdrive_passphrase(&passphrase)?;
+
+    let (mut tokens, uid_opt) = state
+        .gdrive
+        .ensure_fresh_tokens(relay_enabled)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let access_token = tokens.access_token.clone();
+    let (master_key, _created_new) = state
+        .gdrive
+        .client
+        .unlock_or_init_vault(
+            state.relay_cfg.lock().await.enabled,
+            &access_token,
+            effective_gdrive_uid(uid_opt.as_deref()),
+            &passphrase,
+            &mut tokens,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let relay_after = state.relay_cfg.lock().await.enabled;
+    check_gdrive_relay_gate(relay_after)?;
+
+    master_key
+        .save_to_file(&state.paths.gdrive_master_key_file(uid_opt.as_deref()))
+        .map_err(|e| e.to_string())?;
+    tokens
+        .save_to_file(&state.paths.gdrive_tokens_file(uid_opt.as_deref()))
+        .map_err(|e| e.to_string())?;
+
+    let should_wake = {
+        let mut inner = state.gdrive.inner.lock().await;
+        if inner.uid != uid_opt {
+            return Err("Tài khoản đã thay đổi trong lúc mở khóa kho đám mây".into());
+        }
+        inner.tokens = Some(tokens);
+        inner.master_key = Some(master_key);
+        inner.has_remote_manifest = true;
+        inner.phase = GDRIVE_PHASE_IDLE.to_string();
+        inner.last_error = None;
+        inner.config.sync_enabled
+    };
+
+    let status = state.gdrive.emit_status(&app, false, &state.store).await;
+    if should_wake {
+        state.gdrive.notify_sync();
+    }
+    Ok(status)
+}
+
+#[tauri::command]
+async fn gdrive_sync_now(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<GDriveStatusDto, String> {
+    let relay_enabled = state.relay_cfg.lock().await.enabled;
+    check_gdrive_relay_gate(relay_enabled)?;
+    run_gdrive_sync_cycle(
+        &app,
+        &state.gdrive,
+        &state.relay_cfg,
+        &state.store,
+        &state.media_vault,
+        true,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn gdrive_get_storage_overview(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<GDriveStorageOverviewDto, String> {
+    let relay_enabled = state.relay_cfg.lock().await.enabled;
+    check_gdrive_relay_gate(relay_enabled)?;
+
+    let (mut tokens, uid_opt) = state
+        .gdrive
+        .ensure_fresh_tokens(relay_enabled)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let (quota, email, name) = state
+        .gdrive
+        .client
+        .fetch_drive_quota(state.relay_cfg.lock().await.enabled, &tokens.access_token)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if email.is_some() || name.is_some() {
+        let mut changed = false;
+        if email.is_some() && tokens.account_email != email {
+            tokens.account_email = email;
+            changed = true;
+        }
+        if name.is_some() && tokens.account_name != name {
+            tokens.account_name = name;
+            changed = true;
+        }
+        if changed {
+            let mut inner = state.gdrive.inner.lock().await;
+            if inner.uid == uid_opt && inner.tokens.is_some() {
+                let _ = tokens.save_to_file(&state.paths.gdrive_tokens_file(uid_opt.as_deref()));
+                inner.tokens = Some(tokens.clone());
+            }
+        }
+    }
+
+    let folders = state
+        .gdrive
+        .ensure_folders_cached(
+            state.relay_cfg.lock().await.enabled,
+            &mut tokens,
+            uid_opt.as_deref(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let history_files = state
+        .gdrive
+        .client
+        .list_folder_files(
+            state.relay_cfg.lock().await.enabled,
+            &tokens.access_token,
+            &folders.history_folder_id,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut history_bytes: u64 = 0;
+    let mut history_file_count: u64 = 0;
+    for f in history_files {
+        if f.name.ends_with(".delta.enc") {
+            history_bytes = history_bytes.saturating_add(f.size);
+            history_file_count = history_file_count.saturating_add(1);
+        }
+    }
+
+    check_gdrive_relay_gate(state.relay_cfg.lock().await.enabled)?;
+
+    let clamped_limit = limit.unwrap_or(50).clamp(1, 500);
+    let (breakdown, by_thread, largest_items) = {
+        let guard = state.store.lock().await;
+        let breakdown = guard
+            .compute_cloud_media_breakdown()
+            .map_err(|e| e.to_string())?;
+        let by_thread = guard
+            .list_cloud_usage_by_thread()
+            .map_err(|e| e.to_string())?;
+        let largest_items = guard
+            .list_largest_cloud_items(clamped_limit)
+            .map_err(|e| e.to_string())?;
+        (breakdown, by_thread, largest_items)
+    };
+
+    Ok(GDriveStorageOverviewDto {
+        quota: Some(quota),
+        teza_cloud_total_bytes: breakdown.total_bytes.saturating_add(history_bytes),
+        teza_cloud_object_count: breakdown.total_count,
+        images_bytes: breakdown.images_bytes,
+        videos_bytes: breakdown.videos_bytes,
+        voice_bytes: breakdown.voice_bytes,
+        files_bytes: breakdown.files_bytes,
+        history_bytes,
+        history_file_count,
+        by_thread,
+        largest_items,
+    })
+}
+
+async fn execute_gdrive_prune_targets(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    targets: Vec<(String, String, u64)>,
+) -> Result<GDrivePruneResultDto, String> {
+    let relay_enabled = state.relay_cfg.lock().await.enabled;
+    check_gdrive_relay_gate(relay_enabled)?;
+
+    let _sync_guard = state.gdrive.sync_lock.lock().await;
+    check_gdrive_relay_gate(state.relay_cfg.lock().await.enabled)?;
+
+    let (mut tokens, _) = state
+        .gdrive
+        .ensure_fresh_tokens(state.relay_cfg.lock().await.enabled)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if targets.is_empty() {
+        let _ = state.gdrive.emit_status(app, false, &state.store).await;
+        return Ok(GDrivePruneResultDto::default());
+    }
+
+    let total = targets.len() as u64;
+    {
+        let mut inner = state.gdrive.inner.lock().await;
+        inner.syncing = true;
+        inner.phase = GDRIVE_PHASE_PRUNING.to_string();
+        inner.progress_done = 0;
+        inner.progress_total = total;
+        inner.last_error = None;
+    }
+    let _ = state.gdrive.emit_status(app, false, &state.store).await;
+
+    let mut deleted_shas: Vec<String> = Vec::with_capacity(targets.len());
+    let mut deleted_count: u64 = 0;
+    let mut freed_bytes: u64 = 0;
+    let mut failed_count: u64 = 0;
+    let mut relay_interrupted = false;
+
+    for (idx, (sha, cloud_file_id, size_bytes)) in targets.into_iter().enumerate() {
+        let relay_step = state.relay_cfg.lock().await.enabled;
+        if relay_step {
+            relay_interrupted = true;
+            break;
+        }
+        if let Ok((fresh_tokens, _)) = state.gdrive.ensure_fresh_tokens(relay_step).await {
+            tokens = fresh_tokens;
+        }
+        match state
+            .gdrive
+            .client
+            .delete_drive_file(relay_step, &tokens.access_token, &cloud_file_id)
+            .await
+        {
+            Ok(()) => {
+                deleted_shas.push(sha);
+                deleted_count = deleted_count.saturating_add(1);
+                freed_bytes = freed_bytes.saturating_add(size_bytes);
+            }
+            Err(GDriveError::RelayBlocked) => {
+                relay_interrupted = true;
+                break;
+            }
+            Err(_) => {
+                failed_count = failed_count.saturating_add(1);
+            }
+        }
+        {
+            let mut inner = state.gdrive.inner.lock().await;
+            inner.progress_done = (idx as u64).saturating_add(1);
+        }
+        let _ = state.gdrive.emit_status(app, false, &state.store).await;
+    }
+
+    if !deleted_shas.is_empty() {
+        let guard = state.store.lock().await;
+        let _ = guard.mark_media_cloud_pruned(&deleted_shas);
+    }
+
+    let relay_after = relay_interrupted || state.relay_cfg.lock().await.enabled;
+    {
+        let mut inner = state.gdrive.inner.lock().await;
+        inner.syncing = false;
+        inner.phase = if relay_after {
+            GDRIVE_PHASE_PAUSED_RELAY.to_string()
+        } else {
+            GDRIVE_PHASE_IDLE.to_string()
+        };
+        inner.progress_done = 0;
+        inner.progress_total = 0;
+    }
+    let _ = state
+        .gdrive
+        .emit_status(app, relay_after, &state.store)
+        .await;
+
+    if relay_interrupted {
+        return Err(GDriveError::RelayBlocked.to_string());
+    }
+    Ok(GDrivePruneResultDto {
+        deleted_count,
+        freed_bytes,
+        failed_count,
+    })
+}
+
+#[tauri::command]
+async fn gdrive_delete_cloud_items(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    sha256s: Vec<String>,
+) -> Result<GDrivePruneResultDto, String> {
+    let relay_enabled = state.relay_cfg.lock().await.enabled;
+    check_gdrive_relay_gate(relay_enabled)?;
+    let targets = {
+        let guard = state.store.lock().await;
+        guard
+            .list_cloud_items_by_sha256s(&sha256s)
+            .map_err(|e| e.to_string())?
+    };
+    execute_gdrive_prune_targets(&app, &state, targets).await
+}
+
+#[tauri::command]
+async fn gdrive_delete_cloud_by_thread(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> Result<GDrivePruneResultDto, String> {
+    let relay_enabled = state.relay_cfg.lock().await.enabled;
+    check_gdrive_relay_gate(relay_enabled)?;
+    let trimmed = thread_id.trim();
+    if trimmed.is_empty() {
+        return Err("Mã cuộc trò chuyện không hợp lệ".into());
+    }
+    let targets = {
+        let guard = state.store.lock().await;
+        guard
+            .list_cloud_items_exclusive_to_thread(trimmed)
+            .map_err(|e| e.to_string())?
+    };
+    execute_gdrive_prune_targets(&app, &state, targets).await
+}
+
+#[tauri::command]
+async fn gdrive_prune_cloud_older_than(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    older_than_days: u32,
+) -> Result<GDrivePruneResultDto, String> {
+    let relay_enabled = state.relay_cfg.lock().await.enabled;
+    check_gdrive_relay_gate(relay_enabled)?;
+    let cutoff_ms = compute_prune_cutoff_ts_ms(chrono_now_ms(), older_than_days);
+    let targets = {
+        let guard = state.store.lock().await;
+        guard
+            .list_cloud_items_older_than(cutoff_ms)
+            .map_err(|e| e.to_string())?
+    };
+    execute_gdrive_prune_targets(&app, &state, targets).await
 }
 
 fn chrono_now_ms() -> i64 {
@@ -3909,54 +8135,161 @@ fn chrono_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn init_session_with_relay_fallback(
+    session_path: &Path,
+    relay_cfg: RelayConfig,
+) -> (Session, RelayConfig) {
+    match Session::load_from_file_with_relay(session_path, relay_cfg.clone()) {
+        Ok(sess) => (sess, relay_cfg),
+        Err(load_err) => match Session::new_with_relay(relay_cfg.clone()) {
+            Ok(sess) => (sess, relay_cfg),
+            Err(init_err) => {
+                eprintln!(
+                    "[teza][startup] Failed to initialize session with saved relay config (load={load_err}; init={init_err}); falling back to default direct relay config"
+                );
+                let default_relay = RelayConfig::default();
+                let sess = Session::load_from_file_with_relay(session_path, default_relay.clone())
+                    .or_else(|_| Session::new_with_relay(default_relay.clone()))
+                    .expect("Failed to initialize session with default relay config");
+                (sess, default_relay)
+            }
+        },
+    }
+}
+
+fn append_os_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+fn quarantine_corrupt_store_files(db_path: &Path, ts: i64) {
+    let candidates = [
+        db_path.to_path_buf(),
+        append_os_suffix(db_path, ".key"),
+        append_os_suffix(db_path, "-wal"),
+        append_os_suffix(db_path, "-shm"),
+        append_os_suffix(db_path, "-journal"),
+    ];
+    let suffix = format!(".corrupt.{ts}");
+    for src in candidates {
+        if src.exists() {
+            let dst = append_os_suffix(&src, &suffix);
+            if let Err(rename_err) = std::fs::rename(&src, &dst) {
+                eprintln!(
+                    "[teza][startup] Failed to quarantine {} -> {}: {rename_err}; removing broken file",
+                    src.display(),
+                    dst.display()
+                );
+                let _ = std::fs::remove_file(&src);
+            } else {
+                eprintln!(
+                    "[teza][startup] Quarantined corrupt history file {} -> {}",
+                    src.display(),
+                    dst.display()
+                );
+            }
+        }
+    }
+}
+
+fn open_message_store_with_recovery(db_path: &Path) -> MessageStore {
+    match MessageStore::open(db_path) {
+        Ok(store) => store,
+        Err(first_err) => {
+            eprintln!(
+                "[teza][startup] Failed to open history database {} ({first_err}); quarantining broken DB/key files and opening a fresh store",
+                db_path.display()
+            );
+            let ts = chrono_now_ms().max(1);
+            quarantine_corrupt_store_files(db_path, ts);
+            MessageStore::open(db_path).unwrap_or_else(|second_err| {
+                eprintln!(
+                    "[teza][startup] Fresh history database {} also failed ({second_err}); falling back to temporary store",
+                    db_path.display()
+                );
+                let fallback_path =
+                    std::env::temp_dir().join(format!("teza_recovery_history_{ts}.db"));
+                MessageStore::open(&fallback_path)
+                    .expect("Failed to open fallback SQLite history database")
+            })
+        }
+    }
+}
+
 pub fn run() {
     let paths = StoragePaths::resolve_default(None).expect("Failed to resolve storage directory");
-    let relay_cfg = RelayConfig::load_from_file(&paths.relay_file());
+    let loaded_relay_cfg = RelayConfig::load_from_file(&paths.relay_file());
     let session_path = paths.session_file();
-    let session = Session::load_from_file_with_relay(&session_path, relay_cfg.clone())
-        .unwrap_or_else(|_| {
-            Session::new_with_relay(relay_cfg.clone()).expect("Failed to initialize session")
-        });
+    let (session, relay_cfg) = init_session_with_relay_fallback(&session_path, loaded_relay_cfg);
     let uid = if session.profile.uid.is_empty() {
         None
     } else {
         Some(session.profile.uid.as_str())
     };
     let db_path = paths.history_db(uid);
-    let store = MessageStore::open(&db_path).expect("Failed to open SQLite history database");
+    let store = open_message_store_with_recovery(&db_path);
+    let gdrive_last_sync_ts = store.get_gdrive_last_sync_ts().ok().flatten();
+    let gdrive_last_history_sync_ts = store.get_gdrive_last_history_sync_ts().ok().flatten();
+    let media_cfg = MediaVaultConfig::load_from_file(&paths.media_config_file());
+    let media_vault = open_media_vault_with_fallback(&paths, uid, media_cfg);
+    let media_protocol_token =
+        generate_protocol_token().expect("Failed to generate CSPRNG media protocol token");
+    let gdrive = Arc::new(GDriveRuntime::new(
+        paths.clone(),
+        uid,
+        gdrive_last_sync_ts,
+        gdrive_last_history_sync_ts,
+    ));
 
     let translate_cfg = TranslateConfig::load_from_file(&paths.translate_file());
     let sess_arc = Arc::new(Mutex::new(session));
     let store_arc = Arc::new(Mutex::new(store));
+    let media_vault_arc = Arc::new(RwLock::new(Arc::new(media_vault)));
+    let relay_cfg_arc = Arc::new(Mutex::new(relay_cfg));
     let ws_task_arc = Arc::new(Mutex::new(None));
     let qr_task_arc = Arc::new(Mutex::new(None));
 
     let close_to_tray = Arc::new(AtomicBool::new(true));
     let allow_exit = Arc::new(AtomicBool::new(false));
     let call_mgr = Arc::new(call::CallManager::new(paths.clone()));
+    let webapp_accounts =
+        webapp_accounts::WebAppAccountStore::load(paths.root.join("webapp_accounts.json"));
+    let gdrive_for_setup = gdrive.clone();
+    let relay_for_setup = relay_cfg_arc.clone();
+    let store_for_setup = store_arc.clone();
+    let media_vault_for_setup = media_vault_arc.clone();
     let state = AppState {
         paths,
         session: sess_arc,
         store: store_arc,
+        media_vault: media_vault_arc,
+        media_protocol_token,
+        gdrive,
         ws_task: ws_task_arc,
         qr_task: qr_task_arc,
         active_thread_id: Arc::new(Mutex::new(None)),
         translate_cfg: Arc::new(Mutex::new(translate_cfg)),
-        relay_cfg: Arc::new(Mutex::new(relay_cfg)),
+        relay_cfg: relay_cfg_arc,
         pending_update: Arc::new(Mutex::new(None)),
         close_to_tray: close_to_tray.clone(),
         allow_exit: allow_exit.clone(),
         pending_notify: Arc::new(Mutex::new(None)),
         notify_hide_gen: Arc::new(AtomicU64::new(0)),
-        active_webapp_label: Arc::new(Mutex::new(None)),
+        webapp_op_lock: Arc::new(Mutex::new(())),
+        webapp_epoch: Arc::new(AtomicU64::new(0)),
+        webapp_base_urls: Arc::new(Mutex::new(HashMap::new())),
+        webapp_last_popup_ms: Arc::new(AtomicU64::new(0)),
+        webapp_accounts: Arc::new(Mutex::new(webapp_accounts)),
         recent_saved_files: Arc::new(Mutex::new(VecDeque::new())),
+        approved_attachment_paths: Arc::new(std::sync::Mutex::new(VecDeque::new())),
         call_mgr,
     };
 
     let builder = tauri::Builder::default();
     #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-        if let Some(w) = app.get_webview_window("main") {
+        if let Some(w) = app.get_window("main") {
             let _ = w.show();
             let _ = w.unminimize();
             let _ = w.set_focus();
@@ -3967,6 +8300,7 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .register_asynchronous_uri_scheme_protocol("teza-media", handle_teza_media_protocol)
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             auth_get_status,
@@ -3988,7 +8322,17 @@ pub fn run() {
             folders_sync_remote_labels,
             user_get_profile,
             user_find_by_phone,
+            friend_remove,
+            friend_send_request,
+            friend_accept_request,
+            friend_reject_request,
+            friend_undo_request,
+            friend_list_requests,
+            friend_block_user,
+            friend_unblock_user,
             group_add_members,
+            group_leave,
+            group_kick_members,
             reminder_create,
             poll_create,
             poll_get_detail,
@@ -4027,10 +8371,14 @@ pub fn run() {
             call_set_devices,
             call_test_audio,
             call_start_voice,
+            call_start_video,
             call_answer,
             call_decline,
             call_hangup,
             call_set_mute,
+            call_set_camera,
+            call_push_video_frame,
+            call_request_video_keyframe,
             notify_show_popup,
             notify_get_current,
             notify_dismiss,
@@ -4047,10 +8395,41 @@ pub fn run() {
             webapp_hide_all,
             webapp_close,
             webapp_navigate,
+            webapp_accounts_list,
+            webapp_accounts_save,
+            webapp_accounts_delete,
+            webapp_account_fill,
             open_external_url,
+            media_get_protocol_token,
+            media_get_config,
+            media_save_config,
+            media_get_stats,
+            media_clear_cache,
+            media_pick_vault_dir,
+            media_set_pin,
+            media_open_vault_dir,
+            gdrive_get_config,
+            gdrive_save_config,
+            gdrive_get_status,
+            gdrive_connect_start,
+            gdrive_connect_cancel,
+            gdrive_disconnect,
+            gdrive_unlock_vault,
+            gdrive_sync_now,
+            gdrive_get_storage_overview,
+            gdrive_delete_cloud_items,
+            gdrive_delete_cloud_by_thread,
+            gdrive_prune_cloud_older_than,
         ])
         .setup(move |app| {
-            let _ = app.get_webview_window("main");
+            let _ = app.get_window("main");
+            spawn_gdrive_background_sync_loop(
+                app.handle().clone(),
+                gdrive_for_setup,
+                relay_for_setup,
+                store_for_setup,
+                media_vault_for_setup,
+            );
             let open_item = MenuItem::with_id(app, "open", "Mở Teza", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Thoát Teza", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open_item, &quit_item])?;
@@ -4061,7 +8440,7 @@ pub fn run() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(move |app_handle, event| {
                     if event.id() == "open" {
-                        if let Some(w) = app_handle.get_webview_window("main") {
+                        if let Some(w) = app_handle.get_window("main") {
                             let _ = w.show();
                             let _ = w.unminimize();
                             let _ = w.set_focus();
@@ -4071,7 +8450,10 @@ pub fn run() {
                         let quit_app = app_handle.clone();
                         tauri::async_runtime::spawn(async move {
                             if let Some(st) = quit_app.try_state::<AppState>() {
-                                st.call_mgr.teardown(None, false, false).await;
+                                st.gdrive.shutdown().await;
+                                let vault = st.media_vault.read().await.clone();
+                                vault.flush_access_touches(&st.store).await;
+                                st.call_mgr.teardown_for_session(None, &st.session).await;
                             }
                             quit_app.exit(0);
                         });
@@ -4084,7 +8466,7 @@ pub fn run() {
                         ..
                     } = event
                     {
-                        if let Some(w) = tray_icon.app_handle().get_webview_window("main") {
+                        if let Some(w) = tray_icon.app_handle().get_window("main") {
                             let _ = w.show();
                             let _ = w.unminimize();
                             let _ = w.set_focus();
@@ -4099,14 +8481,43 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if window.label() == "main" {
-                if let WindowEvent::CloseRequested { api, .. } = event {
-                    let st = window.state::<AppState>();
-                    if st.close_to_tray.load(Ordering::SeqCst)
-                        && !st.allow_exit.load(Ordering::SeqCst)
-                    {
-                        api.prevent_close();
-                        hide_all_webapp_children(window.app_handle());
-                        let _ = window.hide();
+                match event {
+                    WindowEvent::CloseRequested { api, .. } => {
+                        let st = window.state::<AppState>();
+                        if st.close_to_tray.load(Ordering::SeqCst)
+                            && !st.allow_exit.load(Ordering::SeqCst)
+                        {
+                            api.prevent_close();
+                            hide_all_webapp_children(window.app_handle());
+                            let _ = window.hide();
+                        }
+                    }
+                    WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => {
+                        let st = window.state::<AppState>();
+                        let mut approved = st
+                            .approved_attachment_paths
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        for p in paths {
+                            record_approved_attachment_path(&mut approved, p);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .on_webview_event(|webview, event| {
+            if webview.label() == "main" {
+                if let tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) =
+                    event
+                {
+                    let st = webview.state::<AppState>();
+                    let mut approved = st
+                        .approved_attachment_paths
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    for p in paths {
+                        record_approved_attachment_path(&mut approved, p);
                     }
                 }
             }
@@ -4203,12 +8614,73 @@ mod tests {
     }
 
     #[test]
-    fn validate_web_url_rejects_non_http_schemes() {
+    fn validate_web_url_rejects_non_http_schemes_and_defaults_lan_to_http() {
         assert!(super::validate_web_url("https://calendar.google.com").is_ok());
-        assert!(super::validate_web_url("notion.so").is_ok());
         assert_eq!(
             super::validate_web_url("notion.so").unwrap().as_str(),
             "https://notion.so/"
+        );
+        assert_eq!(
+            super::validate_web_url("http://10.7.12.233/index.html")
+                .unwrap()
+                .as_str(),
+            "http://10.7.12.233/index.html"
+        );
+        assert_eq!(
+            super::validate_web_url("http://10.7.12.233:5093/summary_error.html")
+                .unwrap()
+                .as_str(),
+            "http://10.7.12.233:5093/summary_error.html"
+        );
+        assert_eq!(
+            super::validate_web_url("10.7.12.233/index.html")
+                .unwrap()
+                .as_str(),
+            "http://10.7.12.233/index.html"
+        );
+        assert_eq!(
+            super::validate_web_url("10.7.12.233:5093/summary_error.html")
+                .unwrap()
+                .as_str(),
+            "http://10.7.12.233:5093/summary_error.html"
+        );
+        assert_eq!(
+            super::validate_web_url("https://10.7.12.233/secure")
+                .unwrap()
+                .as_str(),
+            "https://10.7.12.233/secure"
+        );
+        assert_eq!(
+            super::validate_web_url("localhost:3000/dashboard")
+                .unwrap()
+                .as_str(),
+            "http://localhost:3000/dashboard"
+        );
+        assert_eq!(
+            super::validate_web_url("192.168.1.20:8080")
+                .unwrap()
+                .as_str(),
+            "http://192.168.1.20:8080/"
+        );
+        assert_eq!(
+            super::validate_web_url("172.16.5.10/status")
+                .unwrap()
+                .as_str(),
+            "http://172.16.5.10/status"
+        );
+        assert_eq!(
+            super::validate_web_url("100.95.41.126:9000")
+                .unwrap()
+                .as_str(),
+            "http://100.95.41.126:9000/"
+        );
+        assert_eq!(
+            super::validate_web_url("nas.local/files").unwrap().as_str(),
+            "http://nas.local/files"
+        );
+        assert_eq!(
+            super::validate_web_url("[::1]:8080/api").unwrap().as_str(),
+            "http://[::1]:8080/api"
         );
         assert!(super::validate_web_url("javascript:alert(1)").is_err());
         assert!(super::validate_web_url("file:///C:/Windows/win.ini").is_err());
@@ -4283,5 +8755,975 @@ mod tests {
         assert!(super::is_recent_saved_file(&list, &safe_file).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn webapp_label_is_collision_free_and_deterministic() {
+        let a = super::webapp_label("erp/1");
+        let b = super::webapp_label("erp.1");
+        let c = super::webapp_label("erp-1");
+        let d = super::webapp_label("erp/1");
+        assert_eq!(a, d);
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(b, c);
+        assert!(a.starts_with(super::WEBAPP_LABEL_PREFIX));
+        assert!(b.starts_with(super::WEBAPP_LABEL_PREFIX));
+        assert!(a
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'));
+
+        let empty = super::webapp_label("   ");
+        let dashes = super::webapp_label("---");
+        assert_ne!(empty, dashes);
+        assert!(empty.starts_with(super::WEBAPP_LABEL_PREFIX));
+    }
+
+    #[test]
+    fn popup_rate_limiter_enforces_cooldown() {
+        use std::sync::atomic::AtomicU64;
+
+        let last = AtomicU64::new(0);
+        assert!(super::try_acquire_popup_slot(&last, 10_000, 1500));
+        assert!(!super::try_acquire_popup_slot(&last, 10_500, 1500));
+        assert!(!super::try_acquire_popup_slot(&last, 11_499, 1500));
+        assert!(super::try_acquire_popup_slot(&last, 11_500, 1500));
+        assert!(!super::try_acquire_popup_slot(&last, 12_000, 1500));
+    }
+
+    #[test]
+    fn startup_recovery_handles_invalid_relay_and_corrupt_history_db() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use zalo_core::relay::RelayConfig;
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("teza_startup_recovery_{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. Invalid saved relay config must not panic and must fall back to default relay
+        let broken_relay = RelayConfig {
+            enabled: true,
+            host: "invalid host with spaces".into(),
+            port: 0,
+            ..RelayConfig::default()
+        };
+        let session_path = dir.join("session.json");
+        let (sess, effective_relay) =
+            super::init_session_with_relay_fallback(&session_path, broken_relay);
+        assert!(!effective_relay.enabled);
+        assert!(!sess.relay.enabled);
+
+        // 2. Corrupt SQLite DB + corrupt .key must be quarantined and reopened cleanly
+        let db_path = dir.join("history.db");
+        let key_path = super::append_os_suffix(&db_path, ".key");
+        std::fs::write(&db_path, b"not-a-sqlite-database").unwrap();
+        std::fs::write(&key_path, b"dpapi:v1:corrupted-base64!!!").unwrap();
+
+        let store = super::open_message_store_with_recovery(&db_path);
+        assert!(store
+            .list_threads(zalo_core::chat::FolderFilter::All)
+            .unwrap()
+            .is_empty());
+
+        let entries: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            entries.iter().any(|n| n.starts_with("history.db.corrupt.")),
+            "expected quarantined db file in {entries:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|n| n.starts_with("history.db.key.corrupt.")),
+            "expected quarantined key file in {entries:?}"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn mark_of_the_web_ads_path_appends_zone_identifier() {
+        use std::path::Path;
+
+        let p = Path::new(r"C:\Users\Demo\Downloads\report.pdf");
+        let ads = super::mark_of_the_web_ads_path(p);
+        assert_eq!(
+            ads.to_string_lossy(),
+            r"C:\Users\Demo\Downloads\report.pdf:Zone.Identifier"
+        );
+    }
+
+    #[test]
+    fn fetch_image_data_url_passthrough_rejects_svg_non_media_and_oversized_payloads() {
+        // Non-data URLs return Ok(None) so caller proceeds to remote HTTP fetch
+        assert_eq!(
+            super::validate_media_data_url_passthrough("https://photo.zdn.vn/a.jpg").unwrap(),
+            None
+        );
+
+        // Valid raster image, audio, and video data URLs pass through
+        for ok in [
+            "data:image/png;base64,iVBORw0KGgo=",
+            "  DATA:IMAGE/JPEG;base64,/9j/4AAQ  ",
+            "data:audio/mpeg;base64,SUQz",
+            "data:video/mp4;base64,AAAA",
+        ] {
+            let out = super::validate_media_data_url_passthrough(ok).unwrap();
+            assert_eq!(out.as_deref(), Some(ok.trim()));
+        }
+
+        // SVG (case-insensitive) and non-media data URLs must be rejected
+        for blocked in [
+            "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=",
+            "DATA:IMAGE/SVG+XML,<svg onload=alert(1)>",
+            "data:image/svg+xml;charset=utf-8,%3Csvg%3E",
+            "data:image/svg ,foo",
+            "data:text/html,<script>alert(1)</script>",
+            "data:application/javascript,alert(1)",
+            "data:image/,empty-subtype",
+            "data:image/png;base64",
+            "data:image/png\n;base64,AAAA",
+        ] {
+            assert!(
+                super::validate_media_data_url_passthrough(blocked).is_err(),
+                "expected blocked data URL: {blocked}"
+            );
+        }
+
+        // Oversized data URL (> 15 MiB) must be rejected
+        let oversized = format!(
+            "data:image/png;base64,{}",
+            "A".repeat(super::MAX_PASSTHROUGH_DATA_URL_BYTES)
+        );
+        assert!(super::validate_media_data_url_passthrough(&oversized).is_err());
+    }
+
+    #[test]
+    fn search_global_limit_translate_batch_and_webapp_bounds_are_enforced() {
+        assert_eq!(super::clamp_search_global_limit(None), 30);
+        assert_eq!(super::clamp_search_global_limit(Some(0)), 1);
+        assert_eq!(super::clamp_search_global_limit(Some(1)), 1);
+        assert_eq!(super::clamp_search_global_limit(Some(45)), 45);
+        assert_eq!(super::clamp_search_global_limit(Some(200)), 200);
+        assert_eq!(super::clamp_search_global_limit(Some(99_999)), 200);
+
+        assert!(super::validate_translate_batch_len(0).is_ok());
+        assert!(super::validate_translate_batch_len(100).is_ok());
+        assert!(super::validate_translate_batch_len(101).is_err());
+
+        assert_eq!(
+            super::validate_webapp_bounds(10.0, 20.0, 800.0, 600.0).unwrap(),
+            (800.0, 600.0)
+        );
+        assert_eq!(
+            super::validate_webapp_bounds(0.0, 0.0, 10.0, -5.0).unwrap(),
+            (120.0, 120.0)
+        );
+        assert!(super::validate_webapp_bounds(f64::NAN, 0.0, 400.0, 300.0).is_err());
+        assert!(super::validate_webapp_bounds(0.0, f64::INFINITY, 400.0, 300.0).is_err());
+        assert!(super::validate_webapp_bounds(0.0, 0.0, f64::NEG_INFINITY, 300.0).is_err());
+        assert!(super::validate_webapp_bounds(0.0, 0.0, 400.0, f64::NAN).is_err());
+    }
+
+    #[test]
+    fn approved_attachment_paths_allowlist_validates_dedups_and_enforces_cap() {
+        use std::collections::VecDeque;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("teza_approved_attach_{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let approved_file = dir.join("picked.png");
+        std::fs::write(&approved_file, b"png").unwrap();
+        let unapproved_file = dir.join("secret.txt");
+        std::fs::write(&unapproved_file, b"secret").unwrap();
+
+        let mut list = VecDeque::new();
+        assert!(super::validate_approved_attachment_path(&list, &approved_file).is_err());
+        assert!(super::validate_approved_attachment_path(&list, &unapproved_file).is_err());
+
+        super::record_approved_attachment_path(&mut list, &approved_file);
+        super::record_approved_attachment_path(&mut list, &approved_file);
+        assert_eq!(list.len(), 1);
+        assert!(super::validate_approved_attachment_path(&list, &approved_file).is_ok());
+        assert!(super::validate_approved_attachment_path(&list, &unapproved_file).is_err());
+
+        for idx in 0..(super::MAX_APPROVED_ATTACHMENT_PATHS + 5) {
+            super::record_approved_attachment_path(&mut list, &dir.join(format!("f_{idx}.bin")));
+        }
+        assert_eq!(list.len(), super::MAX_APPROVED_ATTACHMENT_PATHS);
+        assert!(super::validate_approved_attachment_path(&list, &approved_file).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classify_ws_message_unread_respects_window_focus_and_direction() {
+        // Outgoing messages (including self-echo from phone) always clear unread regardless of focus.
+        assert_eq!(
+            super::classify_ws_message_unread(true, None, "peer-1", false),
+            (false, true)
+        );
+        assert_eq!(
+            super::classify_ws_message_unread(true, Some("peer-1"), "peer-1", false),
+            (false, true)
+        );
+        assert_eq!(
+            super::classify_ws_message_unread(true, Some("peer-1"), "peer-1", true),
+            (false, true)
+        );
+
+        // Incoming message on active thread is only marked read when main window is visible & focused.
+        assert_eq!(
+            super::classify_ws_message_unread(false, Some("peer-1"), "peer-1", true),
+            (false, true)
+        );
+        // Unfocused / minimized / hidden active thread must honestly increment SQLite unread.
+        assert_eq!(
+            super::classify_ws_message_unread(false, Some("peer-1"), "peer-1", false),
+            (true, false)
+        );
+        // Incoming message on another thread or when no thread is active increments unread.
+        assert_eq!(
+            super::classify_ws_message_unread(false, Some("peer-2"), "peer-1", true),
+            (true, false)
+        );
+        assert_eq!(
+            super::classify_ws_message_unread(false, None, "peer-1", true),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn thread_read_synced_payload_matches_frontend_contract() {
+        assert_eq!(
+            super::build_thread_read_synced_payload("12345", false),
+            serde_json::json!({ "thread_id": "12345", "is_unread": false })
+        );
+        assert_eq!(
+            super::build_thread_read_synced_payload("grp-9", true),
+            serde_json::json!({ "thread_id": "grp-9", "is_unread": true })
+        );
+    }
+
+    #[test]
+    fn pick_latest_incoming_for_seen_selects_newest_server_incoming_with_msg_type() {
+        let mk = |msg_id: &str, sender_id: &str, msg_type: &str, ts: i64, is_outgoing: bool| {
+            zalo_core::chat::MessageDto {
+                msg_id: msg_id.into(),
+                thread_id: "peer-1".into(),
+                sender_id: sender_id.into(),
+                sender_name: sender_id.into(),
+                text: String::new(),
+                msg_type: msg_type.into(),
+                ts,
+                is_outgoing,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            }
+        };
+
+        assert_eq!(super::pick_latest_incoming_for_seen(&[]), None);
+        assert_eq!(
+            super::pick_latest_incoming_for_seen(&[mk("100", "me", "chat.text", 1_000, true)]),
+            None
+        );
+
+        let msgs = vec![
+            mk("101", "u1", "chat.text", 1_000, false),
+            mk("local-999", "u1", "chat.text", 9_000, false),
+            mk("202", "u2", "chat.photo", 3_000, false),
+            mk("203", "u3", "share.file", 3_000, false),
+            mk("300", "me", "chat.text", 5_000, true),
+        ];
+        assert_eq!(
+            super::pick_latest_incoming_for_seen(&msgs),
+            Some(("203".into(), "u3".into(), "share.file".into()))
+        );
+    }
+
+    #[test]
+    fn teza_media_query_and_remote_url_validation_enforce_security_boundaries() {
+        let uri: tauri::http::Uri =
+            "http://teza-media.localhost/resolve?url=https%3A%2F%2Fphoto.zdn.vn%2Fa%2Bb%20c.jpg&kind=video&t=deadbeef&tid=t1&mid=m2"
+                .parse()
+                .unwrap();
+        let parsed = super::parse_teza_media_query(&uri).unwrap();
+        assert_eq!(parsed.url, "https://photo.zdn.vn/a+b c.jpg");
+        assert_eq!(parsed.kind, "video");
+        assert_eq!(parsed.token, "deadbeef");
+        assert_eq!(parsed.tid.as_deref(), Some("t1"));
+        assert_eq!(parsed.mid.as_deref(), Some("m2"));
+
+        // Default kind is "image" when omitted or unknown
+        let uri_default: tauri::http::Uri =
+            "teza-media://localhost/resolve?url=https%3A%2F%2Fphoto.zdn.vn%2Fx.png&kind=weird&t=tok"
+                .parse()
+                .unwrap();
+        let parsed_def = super::parse_teza_media_query(&uri_default).unwrap();
+        assert_eq!(parsed_def.kind, "image");
+        assert_eq!(parsed_def.tid, None);
+        assert_eq!(parsed_def.mid, None);
+
+        // Wrong path must return 404
+        let bad_path: tauri::http::Uri =
+            "http://teza-media.localhost/etc/passwd?t=tok".parse().unwrap();
+        assert_eq!(super::parse_teza_media_query(&bad_path).unwrap_err().0, 404);
+
+        // Valid remote URLs pass
+        assert!(super::validate_teza_media_remote_url("https://photo.zdn.vn/pic.jpg").is_ok());
+        assert!(super::validate_teza_media_remote_url("http://cdn.zdn.vn/v.mp4").is_ok());
+
+        // Local filesystem paths, non-http schemes, internal hosts, and credentials must fail
+        for bad in [
+            "",
+            "   ",
+            r"C:\Windows\win.ini",
+            r"\\server\share\secret.txt",
+            "/etc/passwd",
+            "file:///C:/Windows/win.ini",
+            "data:image/png;base64,AAAA",
+            "javascript:alert(1)",
+            "teza-media://localhost/resolve?url=https://a.b",
+            "http://teza-media.localhost/resolve?url=https://a.b",
+            "http://tauri.localhost/index.html",
+            "http://ipc.localhost/cmd",
+            "https://user:pass@photo.zdn.vn/a.jpg",
+            "https://photo.zdn.vn/a.jpg\r\nX-Inject: 1",
+        ] {
+            assert!(
+                super::validate_teza_media_remote_url(bad).is_err(),
+                "expected validate_teza_media_remote_url to reject: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_byte_range_parser_handles_video_streaming_windows_and_edge_cases() {
+        use super::{
+            parse_http_byte_range, ParsedByteRange, MEDIA_PROTOCOL_MAX_EXPLICIT_RANGE_BYTES,
+            MEDIA_PROTOCOL_RANGE_WINDOW_BYTES,
+        };
+
+        // Open-ended range on a 50 MiB video caps to 2 MiB slice for O(1) RAM streaming
+        let total = 50 * 1024 * 1024;
+        assert_eq!(
+            parse_http_byte_range("bytes=0-", total),
+            ParsedByteRange::Valid {
+                start: 0,
+                end_inclusive: MEDIA_PROTOCOL_RANGE_WINDOW_BYTES - 1,
+            }
+        );
+        // Second window near EOF clamps to total - 1
+        assert_eq!(
+            parse_http_byte_range(&format!("bytes={}-", total - 100), total),
+            ParsedByteRange::Valid {
+                start: total - 100,
+                end_inclusive: total - 1,
+            }
+        );
+        // Closed range within limit
+        assert_eq!(
+            parse_http_byte_range("bytes=1024-4095", total),
+            ParsedByteRange::Valid {
+                start: 1024,
+                end_inclusive: 4095,
+            }
+        );
+        // Oversized explicit closed range is capped to max window
+        assert_eq!(
+            parse_http_byte_range("bytes=0-40000000", total),
+            ParsedByteRange::Valid {
+                start: 0,
+                end_inclusive: MEDIA_PROTOCOL_MAX_EXPLICIT_RANGE_BYTES - 1,
+            }
+        );
+        // Suffix range (e.g. MP4 moov atom at tail)
+        assert_eq!(
+            parse_http_byte_range("bytes=-4096", total),
+            ParsedByteRange::Valid {
+                start: total - 4096,
+                end_inclusive: total - 1,
+            }
+        );
+        // Unsatisfiable ranges
+        assert_eq!(
+            parse_http_byte_range(&format!("bytes={total}-"), total),
+            ParsedByteRange::Unsatisfiable
+        );
+        assert_eq!(
+            parse_http_byte_range("bytes=-0", total),
+            ParsedByteRange::Unsatisfiable
+        );
+        assert_eq!(
+            parse_http_byte_range("bytes=0-0", 0),
+            ParsedByteRange::Unsatisfiable
+        );
+        // Ignored / malformed / multi-range
+        assert_eq!(
+            parse_http_byte_range("items=0-5", total),
+            ParsedByteRange::Ignore
+        );
+        assert_eq!(
+            parse_http_byte_range("bytes=0-10, 20-30", total),
+            ParsedByteRange::Ignore
+        );
+        assert_eq!(
+            parse_http_byte_range("bytes=200-100", total),
+            ParsedByteRange::Ignore
+        );
+    }
+
+    #[test]
+    fn media_protocol_responses_set_security_and_range_headers() {
+        let mut hdrs = tauri::http::HeaderMap::new();
+        hdrs.insert(
+            "origin",
+            tauri::http::HeaderValue::from_static("http://tauri.localhost"),
+        );
+        assert_eq!(
+            super::allowed_media_cors_origin(&hdrs).as_deref(),
+            Some("http://tauri.localhost")
+        );
+        hdrs.insert(
+            "origin",
+            tauri::http::HeaderValue::from_static("https://evil.example"),
+        );
+        assert_eq!(super::allowed_media_cors_origin(&hdrs), None);
+
+        let resp = super::build_media_success_response(
+            206,
+            "video/mp4",
+            1024,
+            Some("bytes 0-1023/4096".into()),
+            Some("http://tauri.localhost"),
+            vec![0u8; 1024],
+        );
+        assert_eq!(resp.status().as_u16(), 206);
+        assert_eq!(resp.headers().get("accept-ranges").unwrap(), "bytes");
+        assert_eq!(
+            resp.headers().get("content-range").unwrap(),
+            "bytes 0-1023/4096"
+        );
+        assert_eq!(resp.headers().get("content-length").unwrap(), "1024");
+        assert_eq!(resp.headers().get("content-type").unwrap(), "video/mp4");
+        assert_eq!(
+            resp.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            resp.headers().get("cache-control").unwrap(),
+            "private, max-age=86400"
+        );
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").unwrap(),
+            "http://tauri.localhost"
+        );
+
+        let err_resp = super::build_media_error_response(415, "SVG blocked", None, None);
+        assert_eq!(err_resp.status().as_u16(), 415);
+        assert_eq!(
+            err_resp.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert!(err_resp
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none());
+
+        // Non-Range HEAD always returns 200 OK with full Content-Length (0 RAM body),
+        // even for >8 MiB videos/files; non-Range GET still caps large non-image payloads.
+        let half_gib = 512 * 1024 * 1024;
+        assert!(super::should_serve_full_without_range(
+            true, "video", half_gib
+        ));
+        assert!(super::should_serve_full_without_range(
+            true, "file", half_gib
+        ));
+        assert!(!super::should_serve_full_without_range(
+            false, "video", half_gib
+        ));
+        assert!(super::should_serve_full_without_range(
+            false,
+            "video",
+            super::MEDIA_PROTOCOL_DIRECT_FULL_MAX_BYTES
+        ));
+        assert!(super::should_serve_full_without_range(
+            false,
+            "image",
+            32 * 1024 * 1024
+        ));
+    }
+
+    #[test]
+    fn custom_vault_dir_and_ws_auto_cache_classification_are_strict() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use zalo_core::media_vault::MediaVaultConfig;
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("teza_vault_dir_val_{stamp}"));
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("not_a_dir.txt");
+        std::fs::write(&file, b"hi").unwrap();
+        let new_sub = base.join("custom_media_vault");
+
+        assert_eq!(super::validate_custom_vault_dir(None).unwrap(), None);
+        assert_eq!(
+            super::validate_custom_vault_dir(Some("   ".into())).unwrap(),
+            None
+        );
+        assert!(super::validate_custom_vault_dir(Some("relative/path".into())).is_err());
+        assert!(super::validate_custom_vault_dir(Some("C:\\bad\0dir".into())).is_err());
+        assert!(super::validate_custom_vault_dir(Some(
+            file.to_string_lossy().into_owned()
+        ))
+        .is_err());
+        let created = super::validate_custom_vault_dir(Some(
+            new_sub.to_string_lossy().into_owned(),
+        ))
+        .unwrap();
+        assert!(created.is_some());
+        assert!(new_sub.is_dir());
+
+        // WS auto-cache classification & config gating
+        let cfg = MediaVaultConfig::default();
+        assert_eq!(super::classify_ws_auto_cache_kind("chat.photo"), Some("image"));
+        assert_eq!(super::classify_ws_auto_cache_kind("chat.sticker"), Some("image"));
+        assert_eq!(super::classify_ws_auto_cache_kind("chat.voice"), Some("audio"));
+        assert_eq!(super::classify_ws_auto_cache_kind("chat.video"), Some("video"));
+        assert_eq!(super::classify_ws_auto_cache_kind("share.file"), Some("file"));
+        assert_eq!(super::classify_ws_auto_cache_kind("chat.link"), None);
+        assert_eq!(super::classify_ws_auto_cache_kind("chat.text"), None);
+
+        assert!(super::should_auto_cache_kind(&cfg, "image"));
+        assert!(super::should_auto_cache_kind(&cfg, "audio"));
+        assert!(!super::should_auto_cache_kind(&cfg, "video"));
+        assert!(!super::should_auto_cache_kind(&cfg, "file"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn media_vault_probe_and_streaming_export_roundtrip_encrypted_large_blob() {
+        use std::sync::Arc;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tokio::sync::Mutex;
+        use zalo_core::data_dir::StoragePaths;
+        use zalo_core::media_vault::{MediaVault, MediaVaultConfig};
+        use zalo_core::store::MessageStore;
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("teza_tauri_vault_rt_{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let paths = StoragePaths::from_dir(&dir).unwrap();
+        let store = Arc::new(Mutex::new(
+            MessageStore::open(&paths.history_db(Some("u1"))).unwrap(),
+        ));
+        let vault = MediaVault::open(&paths, Some("u1"), MediaVaultConfig::default()).unwrap();
+
+        // Build >160 KiB synthetic ZIP/XLSX payload so probe reads head + tail in O(1) RAM
+        let mut payload = b"PK\x03\x04\x14\x00\x00\x00\x00\x00".to_vec();
+        payload.resize(170_000, 0x42);
+        payload.extend_from_slice(b"xl/workbook.xml\x00PK\x05\x06");
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let obj = vault
+                .ingest_bytes(
+                    &store,
+                    &payload,
+                    "file",
+                    "application/octet-stream",
+                    Some("https://file-stal-9.dlfl.vn/gr/abc/blob"),
+                    Some(("t1", "m1")),
+                    Some("report"),
+                )
+                .await
+                .unwrap();
+            assert!(obj.is_encrypted);
+
+            let probe = super::read_vault_probe_bytes(&vault, &obj).await;
+            assert!(probe.len() <= (super::VAULT_PROBE_WINDOW_BYTES * 2) as usize);
+            let (resolved_name, resolved_ext) = super::file_dialog::resolve_download_filename_and_ext(
+                "download",
+                None,
+                "https://file-stal-9.dlfl.vn/gr/abc/blob",
+                "https://file-stal-9.dlfl.vn/gr/abc/blob",
+                &obj.mime,
+                &probe,
+            );
+            assert_eq!(resolved_name, "download.xlsx");
+            assert_eq!(resolved_ext.as_deref(), Some("xlsx"));
+
+            let export_path = dir.join("exported.xlsx");
+            let written = vault.export_to_path(&obj, &export_path).await.unwrap();
+            assert_eq!(written, payload.len() as u64);
+            assert_eq!(std::fs::read(&export_path).unwrap(), payload);
+        });
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gdrive_relay_exclusion_gate_and_status_snapshot_formatting() {
+        use zalo_core::gdrive::{
+            CloudMasterKey, GDriveStoredConfig, GDriveTokens, GDRIVE_PHASE_IDLE,
+            GDRIVE_PHASE_PAUSED_RELAY, GDRIVE_PHASE_UPLOADING_MEDIA,
+        };
+        use zalo_core::store::CloudMediaBreakdown;
+
+        // 1. Strict Relay exclusion helper
+        assert!(super::check_gdrive_relay_gate(false).is_ok());
+        let blocked_err = super::check_gdrive_relay_gate(true).unwrap_err();
+        assert!(
+            blocked_err.to_ascii_lowercase().contains("relay"),
+            "unexpected error message: {blocked_err}"
+        );
+
+        // 2. Status snapshot formatting when Relay is ON vs OFF
+        let inner = super::GDriveInner {
+            uid: Some("u42".into()),
+            config: GDriveStoredConfig {
+                client_id: "test-client-id.apps.googleusercontent.com".into(),
+                client_secret_dpapi_b64: None,
+                token_broker_url: String::new(),
+                sync_enabled: true,
+                sync_media: true,
+                sync_history: true,
+                auto_sync_interval_secs: 300,
+            },
+            tokens: Some(GDriveTokens {
+                access_token: "ya29.secret".into(),
+                refresh_token: "1//refresh".into(),
+                expires_at_epoch_secs: 9_999_999_999,
+                account_email: Some("alice@example.com".into()),
+                account_name: Some("Alice".into()),
+                root_folder_id: Some("r1".into()),
+                uid_folder_id: Some("u1".into()),
+                blobs_folder_id: Some("b1".into()),
+                history_folder_id: Some("h1".into()),
+                manifest_file_id: Some("m1".into()),
+            }),
+            master_key: Some(CloudMasterKey::from_bytes([7u8; 32])),
+            has_remote_manifest: true,
+            syncing: true,
+            phase: GDRIVE_PHASE_UPLOADING_MEDIA.to_string(),
+            progress_done: 3,
+            progress_total: 10,
+            last_sync_ts: Some(1_700_000_000_000),
+            last_history_sync_ts: Some(1_700_000_000_000),
+            last_error: None,
+        };
+        let breakdown = CloudMediaBreakdown {
+            total_bytes: 2048,
+            total_count: 2,
+            images_bytes: 2048,
+            videos_bytes: 0,
+            voice_bytes: 0,
+            files_bytes: 0,
+            pending_count: 4,
+            pending_bytes: 8192,
+        };
+
+        let paused = super::build_gdrive_status_snapshot(true, &inner, &breakdown);
+        assert!(paused.relay_blocked);
+        assert_eq!(paused.phase, GDRIVE_PHASE_PAUSED_RELAY);
+        assert!(!paused.syncing);
+        assert_eq!(paused.progress_done, 0);
+        assert_eq!(paused.progress_total, 0);
+        assert!(paused.connected);
+        assert!(paused.vault_unlocked);
+        assert_eq!(paused.account_email.as_deref(), Some("alice@example.com"));
+
+        let active = super::build_gdrive_status_snapshot(false, &inner, &breakdown);
+        assert!(!active.relay_blocked);
+        assert_eq!(active.phase, GDRIVE_PHASE_UPLOADING_MEDIA);
+        assert!(active.syncing);
+        assert_eq!(active.progress_done, 3);
+        assert_eq!(active.progress_total, 10);
+        assert_eq!(active.pending_media_count, 4);
+        assert_eq!(active.pending_media_bytes, 8192);
+
+        // Stale paused_relay phase normalizes back to idle once Relay is disabled
+        let mut paused_inner = inner;
+        paused_inner.syncing = false;
+        paused_inner.phase = GDRIVE_PHASE_PAUSED_RELAY.to_string();
+        let resumed = super::build_gdrive_status_snapshot(false, &paused_inner, &breakdown);
+        assert!(!resumed.relay_blocked);
+        assert_eq!(resumed.phase, GDRIVE_PHASE_IDLE);
+        assert!(!resumed.syncing);
+    }
+
+    #[test]
+    fn gdrive_passphrase_validation_and_prune_cutoff_calculation() {
+        // Passphrase validation (< 8 chars or whitespace-only rejected; >= 8 accepted)
+        assert!(super::validate_gdrive_passphrase("").is_err());
+        assert!(super::validate_gdrive_passphrase("short77").is_err());
+        assert!(super::validate_gdrive_passphrase("        ").is_err());
+        assert!(super::validate_gdrive_passphrase("   1234567   ").is_err());
+        assert!(super::validate_gdrive_passphrase("12345678").is_ok());
+        assert!(super::validate_gdrive_passphrase("mật khẩu mạnh").is_ok());
+
+        // Prune age cutoff calculation
+        let now_ms: i64 = 1_750_000_000_000;
+        assert_eq!(super::compute_prune_cutoff_ts_ms(now_ms, 0), now_ms);
+        assert_eq!(
+            super::compute_prune_cutoff_ts_ms(now_ms, 30),
+            now_ms - 30 * 86_400_000
+        );
+        assert_eq!(
+            super::compute_prune_cutoff_ts_ms(now_ms, 90),
+            now_ms - 90 * 86_400_000
+        );
+        assert_eq!(
+            super::compute_prune_cutoff_ts_ms(now_ms, 365),
+            now_ms - 365 * 86_400_000
+        );
+        // Must never panic on extreme day counts
+        let _ = super::compute_prune_cutoff_ts_ms(now_ms, u32::MAX);
+    }
+
+    #[test]
+    fn gdrive_tier2_rehydration_gating_respects_relay_lock_and_expiry() {
+        use zalo_core::session::MediaDownloadError;
+        use zalo_core::store::{
+            MediaObjectRecord, MEDIA_LOCAL_STATE_LOCAL, MEDIA_LOCAL_STATE_MISSING,
+        };
+
+        let make_obj = |local_state: i32, cloud_file_id: Option<&str>| MediaObjectRecord {
+            sha256: "a".repeat(64),
+            kind: "video".into(),
+            mime: "video/mp4".into(),
+            size_bytes: 123_456,
+            thumb_sha256: None,
+            width: None,
+            height: None,
+            duration_ms: None,
+            local_state,
+            local_rel_path: None,
+            is_encrypted: true,
+            pin_count: 0,
+            created_ts: 1,
+            last_accessed_ts: 1,
+            cloud_provider: cloud_file_id.map(|_| "gdrive".into()),
+            cloud_file_id: cloud_file_id.map(str::to_string),
+            cloud_encrypted: true,
+            cloud_key_ver: 1,
+            cloud_synced_ts: Some(10),
+        };
+
+        let expired_err = anyhow::Error::new(MediaDownloadError::CdnExpired { status: 403 });
+        let transient_err = anyhow::anyhow!("network timeout");
+        let evicted_cloud = make_obj(MEDIA_LOCAL_STATE_MISSING, Some("gd-file-1"));
+        let local_cloud = make_obj(MEDIA_LOCAL_STATE_LOCAL, Some("gd-file-1"));
+        let no_cloud = make_obj(MEDIA_LOCAL_STATE_MISSING, None);
+
+        // Relay active MUST ALWAYS block Tier 2 rehydration
+        assert!(!super::should_trigger_gdrive_rehydration(
+            true,
+            true,
+            &expired_err,
+            Some(&evicted_cloud)
+        ));
+        // Locked/disconnected Drive MUST block Tier 2 rehydration
+        assert!(!super::should_trigger_gdrive_rehydration(
+            false,
+            false,
+            &expired_err,
+            Some(&evicted_cloud)
+        ));
+        // No cloud_file_id -> cannot rehydrate
+        assert!(!super::should_trigger_gdrive_rehydration(
+            false,
+            true,
+            &expired_err,
+            Some(&no_cloud)
+        ));
+        // CDN expired + cloud_file_id + !relay + unlocked -> triggers rehydration
+        assert!(super::should_trigger_gdrive_rehydration(
+            false,
+            true,
+            &expired_err,
+            Some(&local_cloud)
+        ));
+        // Evicted local blob (local_state == 0) + cloud_file_id + !relay + unlocked -> triggers rehydration
+        assert!(super::should_trigger_gdrive_rehydration(
+            false,
+            true,
+            &transient_err,
+            Some(&evicted_cloud)
+        ));
+        // Present local state + non-expired transient error -> does not trigger Drive rehydration
+        assert!(!super::should_trigger_gdrive_rehydration(
+            false,
+            true,
+            &transient_err,
+            Some(&local_cloud)
+        ));
+    }
+
+    #[test]
+    fn gdrive_rehydrate_singleflight_guard_never_loses_follower_wakeup() {
+        use std::collections::HashMap;
+        use std::sync::Mutex as StdMutex;
+
+        let map: StdMutex<HashMap<String, tokio::sync::watch::Receiver<bool>>> =
+            StdMutex::new(HashMap::new());
+        let sha = "b".repeat(64);
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        map.lock().unwrap().insert(sha.clone(), rx);
+        let leader_guard = super::RehydrateLeaderGuard {
+            map: &map,
+            sha: sha.clone(),
+            tx: Some(tx),
+        };
+        // Follower clones receiver while Leader is active
+        let mut follower_rx = map.lock().unwrap().get(&sha).unwrap().clone();
+        // Leader finishes and drops BEFORE Follower begins awaiting `wait_for`
+        drop(leader_guard);
+        assert!(
+            !map.lock().unwrap().contains_key(&sha),
+            "leader drop must remove singleflight key"
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                follower_rx.wait_for(|&done| done),
+            )
+            .await
+            .expect("follower must wake immediately without lost-wakeup deadlock");
+            assert!(res.is_ok());
+            assert!(*res.unwrap());
+        });
+    }
+
+    #[test]
+    fn social_ws_event_dto_serializes_and_deserializes_exact_contract() {
+        let ev = super::SocialWsEventDto {
+            kind: "group_left".to_string(),
+            thread_id: Some("987654321".to_string()),
+            user_id: None,
+            self_removed: true,
+        };
+        let v = serde_json::to_value(&ev).expect("serialize SocialWsEventDto");
+        assert_eq!(v["kind"], "group_left");
+        assert_eq!(v["thread_id"], "987654321");
+        assert!(v["user_id"].is_null());
+        assert_eq!(v["self_removed"], true);
+        let roundtrip: super::SocialWsEventDto =
+            serde_json::from_value(v).expect("deserialize SocialWsEventDto");
+        assert_eq!(roundtrip, ev);
+
+        let friend_ev = super::SocialWsEventDto {
+            kind: "friend_added".to_string(),
+            thread_id: None,
+            user_id: Some("123456789".to_string()),
+            self_removed: false,
+        };
+        let fv = serde_json::to_value(&friend_ev).expect("serialize friend event");
+        assert_eq!(fv["kind"], "friend_added");
+        assert!(fv["thread_id"].is_null());
+        assert_eq!(fv["user_id"], "123456789");
+        assert_eq!(fv["self_removed"], false);
+        let roundtrip_friend: super::SocialWsEventDto =
+            serde_json::from_value(fv).expect("deserialize friend event");
+        assert_eq!(roundtrip_friend, friend_ev);
+    }
+
+    #[test]
+    fn social_input_validation_helpers_clean_and_reject_invalid_inputs() {
+        // User ID validation
+        assert_eq!(
+            super::validate_social_user_id("  123456_0 ").unwrap(),
+            "123456"
+        );
+        assert_eq!(super::validate_social_user_id("998877").unwrap(), "998877");
+        assert!(super::validate_social_user_id("").is_err());
+        assert!(super::validate_social_user_id("   ").is_err());
+        assert!(super::validate_social_user_id("_0").is_err());
+
+        // Group ID validation
+        assert_eq!(
+            super::validate_social_group_id(" g123456789 ").unwrap(),
+            "123456789"
+        );
+        assert_eq!(
+            super::validate_social_group_id("group_555666").unwrap(),
+            "555666"
+        );
+        assert_eq!(
+            super::validate_social_group_id("G777888").unwrap(),
+            "777888"
+        );
+        assert!(super::validate_social_group_id("").is_err());
+        assert!(super::validate_social_group_id("   ").is_err());
+        assert!(super::validate_social_group_id("group_").is_err());
+        assert!(super::validate_social_group_id("g").is_err());
+
+        // Member IDs normalization, dedup, and self-kick guard
+        let cleaned = super::normalize_social_member_ids(
+            &[
+                " 111_0 ".to_string(),
+                "".to_string(),
+                "222".to_string(),
+                "111".to_string(),
+                "   ".to_string(),
+            ],
+            Some("999_0"),
+        )
+        .unwrap();
+        assert_eq!(cleaned, vec!["111".to_string(), "222".to_string()]);
+        assert!(super::normalize_social_member_ids(&[], Some("999")).is_err());
+        assert!(super::normalize_social_member_ids(&["   ".to_string()], Some("999")).is_err());
+        assert!(
+            super::normalize_social_member_ids(
+                &["111".to_string(), "999_0".to_string()],
+                Some("999")
+            )
+            .is_err()
+        );
+
+        // Friend request message normalization and UTF-8 safe truncation
+        assert_eq!(super::normalize_friend_request_message(None), None);
+        assert_eq!(super::normalize_friend_request_message(Some("   \t\n ")), None);
+        assert_eq!(
+            super::normalize_friend_request_message(Some("  Xin chào bạn!  ")),
+            Some("Xin chào bạn!".to_string())
+        );
+        let long_vi = "Chào ".repeat(50); // 250 Unicode chars with diacritics
+        let truncated = super::normalize_friend_request_message(Some(&long_vi)).unwrap();
+        assert_eq!(truncated.chars().count(), 150);
     }
 }

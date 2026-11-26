@@ -3,6 +3,7 @@ import type {
   CallDevicesDto,
   CallEndReason,
   CallPhase,
+  CallSnapshotDto,
   ThreadKind,
 } from "../types.ts";
 
@@ -181,7 +182,7 @@ function pickEffectiveDevice(
   if (phys) {
     return { def, effective: phys };
   }
-  if (!avoidSpdifOnAuto) {
+  if (avoidSpdifOnAuto) {
     const fallbackPhys = list.find((d) => !isVirtualAudioName(d));
     if (fallbackPhys) {
       return { def, effective: fallbackPhys };
@@ -208,4 +209,34 @@ export function resolveEffectiveCallDevices(
     hasPhysicalInput: inputs.some((d) => !isVirtualAudioName(d)),
     hasPhysicalOutput: outputs.some((d) => !isVirtualAudioName(d)),
   };
+}
+
+export function shouldShowVideoOverlay(
+  active: CallSnapshotDto | null,
+  minimized: boolean,
+): boolean {
+  if (!active || minimized) return false;
+  return (
+    active.call_type === "DirectVideo" &&
+    active.phase !== "idle" &&
+    active.phase !== "incoming_ringing"
+  );
+}
+
+export function shouldCaptureLocalVideo(active: CallSnapshotDto | null): boolean {
+  if (!active) return false;
+  return (
+    active.call_type === "DirectVideo" &&
+    active.phase === "connected" &&
+    active.cam_enabled
+  );
+}
+
+export function isCameraFailureStatus(status: string): boolean {
+  return (
+    status === "unavailable" ||
+    status === "denied" ||
+    status === "unsupported" ||
+    status === "error"
+  );
 }

@@ -2407,7 +2407,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "litechat-desktop"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2421,13 +2421,16 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
  "teza-call",
+ "teza-video",
  "tokio",
+ "webview2-com",
+ "windows-core 0.62.2",
  "zalo-core",
 ]
 
 [[package]]
 name = "litechat-relay"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3666,12 +3669,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams 0.4.2",
  "web-sys",
  "webpki-roots 1.0.12",
 ]
@@ -3711,7 +3716,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams",
+ "wasm-streams 0.5.0",
  "web-sys",
 ]
 
@@ -4905,7 +4910,7 @@ dependencies = [
 
 [[package]]
 name = "teza-call"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4916,6 +4921,18 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
+ "zalo-core",
+]
+
+[[package]]
+name = "teza-video"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "teza-call",
  "tokio",
  "zalo-core",
 ]
@@ -5538,6 +5555,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b1f9c3798725016c6ee5f2f57869ec0831e8bbc0ab0310a86e787e97f41389e"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
@@ -6195,7 +6225,7 @@ dependencies = [
 
 [[package]]
 name = "zalo-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -6211,10 +6241,12 @@ dependencies = [
  "md-5",
  "qrcode",
  "reqwest 0.12.28",
+ "ring",
  "rusqlite",
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",

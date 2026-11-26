@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -10,6 +10,7 @@ import {
   Bell,
   BellOff,
   Bookmark,
+  Briefcase,
   Check,
   CheckCheck,
   ChevronDown,
@@ -17,14 +18,18 @@ import {
   Download,
   ExternalLink,
   FileText,
+  Flame,
+  Folder,
   FolderPlus,
   Forward,
+  Heart,
   Image as ImageIcon,
   Info,
   Languages,
   LayoutGrid,
   Link2,
   Lock,
+  LogOut,
   Menu,
   MessageSquare,
   MessagesSquare,
@@ -37,11 +42,17 @@ import {
   RefreshCw,
   Search,
   Settings,
+  Shield,
+  Star,
+  Tag,
   Trash2,
   UploadCloud,
   User,
+  UserCheck,
+  UserMinus,
   UserPlus,
   Users,
+  Video,
   X,
   Zap,
 } from "lucide-react";
@@ -71,6 +82,7 @@ import {
   shouldNotifyMessage,
 } from "./utils/notifyPrefs";
 import {
+  applyThreadReadSync,
   bumpThreadList,
   compareThreads,
   computeLayoutMode,
@@ -83,6 +95,7 @@ import {
   formatThreadTime,
   getDisplayBodyText,
   looksLikePhoneQuery,
+  shouldAutoMarkReadOnFocus,
   upsertMsg,
 } from "./utils/threadState";
 import {
@@ -93,7 +106,17 @@ import {
   canStartVoiceCall,
   classifyCallEndReason,
   formatCallDuration,
+  isCameraFailureStatus,
+  shouldCaptureLocalVideo,
+  shouldShowVideoOverlay,
 } from "./utils/callState";
+import {
+  LocalCameraEncoder,
+  RemoteH264Renderer,
+  listBrowserCameras,
+  type CameraDeviceInfo,
+  type LocalCameraStatus,
+} from "./utils/videoCallMedia";
 import {
   classifySkipTranslation,
   isEffectivelySameText,
@@ -101,40 +124,19 @@ import {
   normalizeLangBase,
 } from "./utils/translateFilter";
 import { ActiveCallBar } from "./components/ActiveCallBar";
-import { AddGroupMembersModal } from "./components/AddGroupMembersModal";
 import { Composer } from "./components/Composer";
-import { CreatePollModal } from "./components/CreatePollModal";
-import { CreateReminderModal } from "./components/CreateReminderModal";
 import { DownloadOverlay } from "./components/DownloadOverlay";
-import { FindUserModal } from "./components/FindUserModal";
-import { FolderEditorModal, renderFolderIcon } from "./components/FolderEditorModal";
-import { ForwardModal } from "./components/ForwardModal";
 import { IncomingCallModal } from "./components/IncomingCallModal";
-import { MediaLightbox, type LightboxItem } from "./components/MediaLightbox";
+import type { LightboxItem } from "./components/MediaLightbox";
 import { MessageBubble, type MessageTranslationState } from "./components/MessageBubble";
 import { NavDrawer } from "./components/NavDrawer";
 import { PasscodeLockScreen } from "./components/PasscodeLockScreen";
 import { QrLoginModal } from "./components/QrLoginModal";
-import { QuickSearchModal } from "./components/QuickSearchModal";
 import { RelayImage } from "./components/RelayImage";
 import { ReplyThreadPanel } from "./components/ReplyThreadPanel";
-import { ScreenshotEditorModal } from "./components/ScreenshotEditorModal";
-import {
-  SettingsModal,
-  type DensityMode,
-  type FontSizeScale,
-  type SettingsTab,
-} from "./components/SettingsModal";
+import type { DensityMode, FontSizeScale, SettingsTab } from "./components/SettingsModal";
 import { ThreadAvatar } from "./components/ThreadAvatar";
-import {
-  TRANSLATE_LANG_OPTIONS,
-  TranslateSettingsModal,
-} from "./components/TranslateSettingsModal";
 import { TriforceEffects } from "./components/TriforceEffects";
-import { UpdateModal } from "./components/UpdateModal";
-import { UserProfileModal } from "./components/UserProfileModal";
-import { WebAppHub } from "./components/WebAppHub";
-import { WebAppWorkspace } from "./components/WebAppWorkspace";
 import { useI18n, type TranslationKey } from "./i18n";
 import {
   DEFAULT_PASSCODE_CONFIG,
@@ -146,6 +148,7 @@ import {
   applyDownloadProgress,
   type DownloadProgressItem,
 } from "./utils/downloadState";
+import { buildComposerMentionMembers, isPlaceholderMemberName } from "./utils/mentions";
 import { parsePollPayload } from "./utils/richMessage";
 import {
   loadWebAppsConfig,
@@ -159,8 +162,11 @@ import type {
   BuiltInRailFolderId,
   CallDevicesDto,
   CallEventEnvelopeDto,
+  CallSnapshotDto,
   CallStateDto,
   CallTelemetryDto,
+  CallVideoFrameDto,
+  CallVideoKeyframeRequestDto,
   ChatFolderDto,
   ConnectionStatus,
   DownloadProgressDto,
@@ -178,9 +184,93 @@ import type {
   ThemeMode,
   ThreadDetailsDto,
   ThreadDto,
+  ThreadMemberDto,
   TranslateConfigSummary,
   UserProfileDto,
 } from "./types";
+
+const AddGroupMembersModal = lazy(() =>
+  import("./components/AddGroupMembersModal").then((m) => ({ default: m.AddGroupMembersModal })),
+);
+const CreatePollModal = lazy(() =>
+  import("./components/CreatePollModal").then((m) => ({ default: m.CreatePollModal })),
+);
+const CreateReminderModal = lazy(() =>
+  import("./components/CreateReminderModal").then((m) => ({ default: m.CreateReminderModal })),
+);
+const FindUserModal = lazy(() =>
+  import("./components/FindUserModal").then((m) => ({ default: m.FindUserModal })),
+);
+const FolderEditorModal = lazy(() =>
+  import("./components/FolderEditorModal").then((m) => ({ default: m.FolderEditorModal })),
+);
+const ForwardModal = lazy(() =>
+  import("./components/ForwardModal").then((m) => ({ default: m.ForwardModal })),
+);
+const FriendRequestsModal = lazy(() => import("./components/FriendRequestsModal"));
+const MediaLightbox = lazy(() =>
+  import("./components/MediaLightbox").then((m) => ({ default: m.MediaLightbox })),
+);
+const QuickSearchModal = lazy(() =>
+  import("./components/QuickSearchModal").then((m) => ({ default: m.QuickSearchModal })),
+);
+const ScreenshotEditorModal = lazy(() =>
+  import("./components/ScreenshotEditorModal").then((m) => ({ default: m.ScreenshotEditorModal })),
+);
+const SettingsModal = lazy(() =>
+  import("./components/SettingsModal").then((m) => ({ default: m.SettingsModal })),
+);
+const TranslateSettingsModal = lazy(() =>
+  import("./components/TranslateSettingsModal").then((m) => ({
+    default: m.TranslateSettingsModal,
+  })),
+);
+const UpdateModal = lazy(() =>
+  import("./components/UpdateModal").then((m) => ({ default: m.UpdateModal })),
+);
+const UserProfileModal = lazy(() =>
+  import("./components/UserProfileModal").then((m) => ({ default: m.UserProfileModal })),
+);
+const VideoCallOverlay = lazy(() =>
+  import("./components/VideoCallOverlay").then((m) => ({ default: m.VideoCallOverlay })),
+);
+const WebAppHub = lazy(() =>
+  import("./components/WebAppHub").then((m) => ({ default: m.WebAppHub })),
+);
+const WebAppWorkspace = lazy(() =>
+  import("./components/WebAppWorkspace").then((m) => ({ default: m.WebAppWorkspace })),
+);
+
+const FOLDER_ICON_MAP: Record<string, typeof Folder> = {
+  folder: Folder,
+  briefcase: Briefcase,
+  star: Star,
+  heart: Heart,
+  users: Users,
+  user: User,
+  tag: Tag,
+  bookmark: Bookmark,
+  flame: Flame,
+  shield: Shield,
+};
+
+function renderFolderIcon(iconId: string, className = "h-5 w-5") {
+  const Icon = FOLDER_ICON_MAP[iconId] ?? Folder;
+  return <Icon className={className} />;
+}
+
+const TRANSLATE_LANG_OPTIONS = [
+  { code: "VI", label: "Tiếng Việt (VI)" },
+  { code: "EN", label: "English (EN)" },
+  { code: "JA", label: "日本語 (JA)" },
+  { code: "KO", label: "한국어 (KO)" },
+  { code: "ZH", label: "中文 (ZH)" },
+  { code: "FR", label: "Français (FR)" },
+  { code: "DE", label: "Deutsch (DE)" },
+  { code: "RU", label: "Русский (RU)" },
+  { code: "TH", label: "ภาษาไทย (TH)" },
+  { code: "ID", label: "Bahasa Indonesia (ID)" },
+];
 
 const FOLDERS: { id: FolderFilter; labelKey: TranslationKey; icon: typeof MessageSquare }[] = [
   { id: "all", labelKey: "folderAll", icon: MessagesSquare },
@@ -252,6 +342,11 @@ export default function App() {
   const [drawerOpen, setDrawerOpen] = useState(true);
   const [quickSearchOpen, setQuickSearchOpen] = useState(false);
   const [threadDetails, setThreadDetails] = useState<ThreadDetailsDto | null>(null);
+  const [groupMembersCache, setGroupMembersCache] = useState<Record<string, ThreadMemberDto[]>>(
+    {},
+  );
+  const detailsFetchKeyRef = useRef<string | null>(null);
+  const detailsInFlightRef = useRef<string | null>(null);
   const [detailsLoading, setDetailsLoading] = useState(false);
   const [detailsTab, setDetailsTab] = useState<"media" | "files" | "links">("media");
   const [threadMenu, setThreadMenu] = useState<{ thread: ThreadDto; x: number; y: number } | null>(
@@ -262,6 +357,22 @@ export default function App() {
   const [profileInitial, setProfileInitial] = useState<UserProfileDto | null>(null);
   const [findUserOpen, setFindUserOpen] = useState(false);
   const [findUserInitialPhone, setFindUserInitialPhone] = useState("");
+  const [friendRequestsOpen, setFriendRequestsOpen] = useState(false);
+  const [pendingFriendRequestsCount, setPendingFriendRequestsCount] = useState(0);
+  const [socialNotice, setSocialNotice] = useState<{
+    text: string;
+    tone: "info" | "success" | "warn" | "error";
+  } | null>(null);
+  const [leaveGroupTarget, setLeaveGroupTarget] = useState<ThreadDto | null>(null);
+  const [leaveGroupSilent, setLeaveGroupSilent] = useState(false);
+  const [leaveGroupBusy, setLeaveGroupBusy] = useState(false);
+  const [leaveGroupError, setLeaveGroupError] = useState<string | null>(null);
+  const [kickTarget, setKickTarget] = useState<{
+    groupId: string;
+    member: ThreadMemberDto;
+  } | null>(null);
+  const [kickBusy, setKickBusy] = useState(false);
+  const [kickError, setKickError] = useState<string | null>(null);
   const [addMembersOpen, setAddMembersOpen] = useState(false);
   const [createReminderOpen, setCreateReminderOpen] = useState(false);
   const [createPollOpen, setCreatePollOpen] = useState(false);
@@ -342,6 +453,7 @@ export default function App() {
   });
   const [webAppsCfg, setWebAppsCfg] = useState<WebAppsConfig>(() => loadWebAppsConfig());
   const [activeWebAppId, setActiveWebAppId] = useState<string | null>(null);
+  const [lastOpenedWebAppId, setLastOpenedWebAppId] = useState<string | null>(null);
   const [webAppHubOpen, setWebAppHubOpen] = useState<boolean>(false);
   const [closeToTray, setCloseToTray] = useState<boolean>(
     () => localStorage.getItem("litechat.closeToTray") !== "0",
@@ -369,7 +481,7 @@ export default function App() {
   } | null>(null);
   const [buzzCooldownUntil, setBuzzCooldownUntil] = useState<Record<string, number>>({});
   const [buzzNow, setBuzzNow] = useState(() => Date.now());
-  const [appVersion, setAppVersion] = useState("0.5.0");
+  const [appVersion, setAppVersion] = useState("0.6.0");
   const [updateModalOpen, setUpdateModalOpen] = useState(false);
   const [availableUpdate, setAvailableUpdate] = useState<AppUpdateInfo | null>(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
@@ -382,9 +494,24 @@ export default function App() {
   const [callDevices, setCallDevices] = useState<CallDevicesDto | null>(null);
   const [callDevicesLoading, setCallDevicesLoading] = useState(false);
   const [callActionBusy, setCallActionBusy] = useState(false);
+  const [callHangupBusy, setCallHangupBusy] = useState(false);
+  const [activeCallDevicesOpen, setActiveCallDevicesOpen] = useState(false);
   const [callNotice, setCallNotice] = useState<{
     text: string;
     tone: "info" | "warn" | "error";
+  } | null>(null);
+  const [videoOverlayMinimized, setVideoOverlayMinimized] = useState(false);
+  const [localVideoStream, setLocalVideoStream] = useState<MediaStream | null>(null);
+  const [localCameraStatus, setLocalCameraStatus] = useState<LocalCameraStatus>("idle");
+  const [localCameraError, setLocalCameraError] = useState<string | null>(null);
+  const [cameraDevices, setCameraDevices] = useState<CameraDeviceInfo[]>([]);
+  const [selectedCameraId, setSelectedCameraId] = useState<string | null>(
+    () => localStorage.getItem("teza.callCameraId") || null,
+  );
+  const [hasRemoteVideoFrame, setHasRemoteVideoFrame] = useState(false);
+  const [remoteVideoDims, setRemoteVideoDims] = useState<{
+    width: number;
+    height: number;
   } | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState<number>(() => {
     const raw = Number(localStorage.getItem("litechat.sidebarWidth"));
@@ -404,9 +531,34 @@ export default function App() {
   const handledDoneDownloadIdsRef = useRef<Set<string>>(new Set());
   const toastErrorTimerRef = useRef<number | null>(null);
   const callNoticeTimerRef = useRef<number | null>(null);
+  const socialNoticeTimerRef = useRef<number | null>(null);
+  const pendingFriendRequestsCountRef = useRef<number>(pendingFriendRequestsCount);
+  const silentSyncInFlightRef = useRef<boolean>(false);
+  const recentlyLeftGroupIdsRef = useRef<Set<string>>(new Set());
+  const recentlyLeftTimersRef = useRef<Map<string, number>>(new Map());
+  const activeCallRef = useRef<CallSnapshotDto | null>(null);
+  const remoteVideoRendererRef = useRef<RemoteH264Renderer | null>(null);
+  const remoteCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const localCameraEncoderRef = useRef<LocalCameraEncoder | null>(null);
+  const selectedCameraIdRef = useRef<string | null>(selectedCameraId);
+  const cameraStartSeqRef = useRef(0);
+  const encoderRunningCallIdRef = useRef<number | null>(null);
+  const encoderRunningDeviceIdRef = useRef<string | null>(null);
+  const lastVideoCallIdRef = useRef<number | null>(null);
+  const lastPliRequestAtRef = useRef<number>(0);
+  const inFlightVideoPushesRef = useRef(0);
+  const groupMembersCacheRef = useRef<Record<string, ThreadMemberDto[]>>(groupMembersCache);
+  const pendingAttachmentRef = useRef<PendingAttachment | null>(pendingAttachment);
+  const hasActiveWebAppRef = useRef<boolean>(false);
+  const webAppHubOpenRef = useRef<boolean>(false);
+  const chatPaneVisibleRef = useRef<boolean>(true);
+  const hasBlockingOverlayRef = useRef<boolean>(false);
   const buzzStreaksRef = useRef<BuzzStreakMap>(new Map());
   const buzzShakeTimerRef = useRef<number | null>(null);
   const buzzToastTimerRef = useRef<number | null>(null);
+  const jumpHighlightTimerRef = useRef<number | null>(null);
+  const jumpRetryTimerRef = useRef<number | null>(null);
+  const sidebarDragCleanupRef = useRef<(() => void) | null>(null);
   const activeThreadRootIdRef = useRef<string | null>(activeThreadRootId);
   const inChatSearchInputRef = useRef<HTMLInputElement | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
@@ -449,6 +601,7 @@ export default function App() {
   themeRef.current = theme;
   tRef.current = t;
   myProfileRef.current = myProfile;
+  pendingFriendRequestsCountRef.current = pendingFriendRequestsCount;
   activeThreadRootIdRef.current = activeThreadRootId;
   translationsRef.current = translationsByMsg;
   translateCfgRef.current = translateCfg;
@@ -460,34 +613,68 @@ export default function App() {
   authedRef.current = authed;
   capturingScreenRef.current = capturingScreen;
   screenshotEditorRef.current = screenshotEditor;
-  progressiveEscStateRef.current = {
-    hasOverlay: Boolean(
+  activeCallRef.current = callState.active;
+  selectedCameraIdRef.current = selectedCameraId;
+  groupMembersCacheRef.current = groupMembersCache;
+  pendingAttachmentRef.current = pendingAttachment;
+  webAppHubOpenRef.current = Boolean(webAppsCfg.enabled && webAppHubOpen);
+  const showVideoOverlay = Boolean(
+    authed && !isLocked && shouldShowVideoOverlay(callState.active, videoOverlayMinimized),
+  );
+  const hasBlockingOverlay = Boolean(
+    isLocked ||
       settingsOpen ||
-        navDrawerOpen ||
-        folderModalOpen ||
-        quickSearchOpen ||
-        findUserOpen ||
-        addMembersOpen ||
-        createReminderOpen ||
-        createPollOpen ||
-        screenshotEditor ||
-        profileUid ||
-        lightboxState ||
-        forwardMessages.length > 0 ||
-        updateModalOpen ||
-        translateModalOpen ||
-        selectMode,
-    ),
+      navDrawerOpen ||
+      folderModalOpen ||
+      quickSearchOpen ||
+      findUserOpen ||
+      friendRequestsOpen ||
+      Boolean(leaveGroupTarget) ||
+      addMembersOpen ||
+      createReminderOpen ||
+      createPollOpen ||
+      screenshotEditor ||
+      profileUid ||
+      lightboxState ||
+      forwardMessages.length > 0 ||
+      updateModalOpen ||
+      translateModalOpen ||
+      showVideoOverlay ||
+      activeCallDevicesOpen ||
+      callState.phase === "incoming_ringing",
+  );
+  hasBlockingOverlayRef.current = hasBlockingOverlay;
+  progressiveEscStateRef.current = {
+    hasOverlay: Boolean(hasBlockingOverlay || selectMode),
     hasMenu: Boolean(threadMenu || folderMenu || drawerMuteOpen),
     inChatSearch: inChatSearchOpen,
     hasThreadPanel: Boolean(activeThreadRootId),
     hasReply: Boolean(replyTo),
   };
 
+  const updatePendingAttachment = useCallback((next: PendingAttachment | null) => {
+    const prev = pendingAttachmentRef.current;
+    const prevUrl = prev?.kind === "raw" ? prev.previewUrl : null;
+    const nextUrl = next?.kind === "raw" ? next.previewUrl : null;
+    if (prevUrl && prevUrl !== nextUrl) {
+      URL.revokeObjectURL(prevUrl);
+    }
+    pendingAttachmentRef.current = next;
+    setPendingAttachment(next);
+  }, []);
+
+  const leaveWebApps = useCallback(() => {
+    setActiveWebAppId(null);
+    setWebAppHubOpen(false);
+    void bridge.webappHideAll();
+  }, []);
+
   const layout = useMemo(
     () => computeLayoutMode(windowWidth, manualSidebarCompact),
     [windowWidth, manualSidebarCompact],
   );
+  const chatPaneVisible = !(layout.mode === "single" && mobilePane === "list");
+  chatPaneVisibleRef.current = chatPaneVisible;
   const prevAutoCompactDrawerRef = useRef(layout.autoCompactDrawer);
 
   useEffect(() => {
@@ -653,6 +840,8 @@ export default function App() {
         if (
           authedRef.current &&
           selectedIdRef.current &&
+          !hasActiveWebAppRef.current &&
+          !webAppHubOpenRef.current &&
           !capturingScreenRef.current &&
           !screenshotEditorRef.current
         ) {
@@ -665,7 +854,12 @@ export default function App() {
         e.preventDefault();
         setQuickSearchOpen((v) => !v);
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
-        if (selectedIdRef.current && !activeThreadRootIdRef.current) {
+        if (
+          selectedIdRef.current &&
+          !activeThreadRootIdRef.current &&
+          !hasActiveWebAppRef.current &&
+          !webAppHubOpenRef.current
+        ) {
           e.preventDefault();
           setInChatSearchOpen(true);
           setTimeout(() => inChatSearchInputRef.current?.focus(), 20);
@@ -686,8 +880,7 @@ export default function App() {
         const targetFolder = railIds[Number(e.key) - 1];
         if (targetFolder) {
           e.preventDefault();
-          setActiveWebAppId(null);
-          void bridge.webappHideAll();
+          leaveWebApps();
           setFolder(targetFolder);
         }
       } else if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
@@ -700,29 +893,45 @@ export default function App() {
           curIdx < 0 ? 0 : (curIdx + delta + list.length) % list.length;
         setSelectedId(list[nextIdx].id);
       } else if (e.key === "Escape") {
+        if (e.defaultPrevented) return;
         const esc = progressiveEscStateRef.current;
+        if (esc.hasOverlay) {
+          return;
+        }
+        if (document.querySelector("[data-teza-floating-popup]")) {
+          return;
+        }
         if (esc.hasMenu) {
+          e.preventDefault();
           setThreadMenu(null);
           setFolderMenu(null);
           setDrawerMuteOpen(false);
-        } else if (!esc.hasOverlay) {
-          if (esc.inChatSearch) {
-            setInChatSearchOpen(false);
-            setInChatSearchQuery("");
-          } else if (esc.hasThreadPanel) {
-            setActiveThreadRootId(null);
-          } else if (esc.hasReply) {
-            setReplyTo(null);
-          }
+        } else if (esc.inChatSearch) {
+          e.preventDefault();
+          setInChatSearchOpen(false);
+          setInChatSearchQuery("");
+        } else if (esc.hasThreadPanel) {
+          e.preventDefault();
+          setActiveThreadRootId(null);
+        } else if (esc.hasReply) {
+          e.preventDefault();
+          setReplyTo(null);
         }
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
+  }, [leaveWebApps]);
 
+  const isInActiveCall = callState.phase !== "idle";
   useEffect(() => {
-    if (!authed || !passcodeCfg.enabled || passcodeCfg.autoLockMinutes <= 0 || isLocked) {
+    if (
+      !authed ||
+      !passcodeCfg.enabled ||
+      passcodeCfg.autoLockMinutes <= 0 ||
+      isLocked ||
+      isInActiveCall
+    ) {
       return;
     }
     lastActivityAtRef.current = Date.now();
@@ -751,12 +960,13 @@ export default function App() {
       }
       window.clearInterval(timer);
     };
-  }, [authed, passcodeCfg.enabled, passcodeCfg.autoLockMinutes, isLocked]);
+  }, [authed, passcodeCfg.enabled, passcodeCfg.autoLockMinutes, isLocked, isInActiveCall]);
 
   useEffect(() => {
     if (!selectMode || forwardMessages.length > 0) return;
     const onEsc = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
+      if (e.key === "Escape" && !e.defaultPrevented && !hasBlockingOverlayRef.current) {
+        e.preventDefault();
         setSelectMode(false);
         setSelectedMsgIds(new Set());
       }
@@ -791,6 +1001,20 @@ export default function App() {
     }, 4500);
   }, []);
 
+  const showSocialNotice = useCallback(
+    (text: string, tone: "info" | "success" | "warn" | "error" = "info") => {
+      setSocialNotice({ text, tone });
+      if (socialNoticeTimerRef.current !== null) {
+        window.clearTimeout(socialNoticeTimerRef.current);
+      }
+      socialNoticeTimerRef.current = window.setTimeout(() => {
+        socialNoticeTimerRef.current = null;
+        setSocialNotice(null);
+      }, 4500);
+    },
+    [],
+  );
+
   const refreshCallDevices = useCallback(() => {
     setCallDevicesLoading(true);
     void bridge
@@ -800,14 +1024,272 @@ export default function App() {
       .finally(() => setCallDevicesLoading(false));
   }, []);
 
+  const refreshCameraDevices = useCallback(() => {
+    void listBrowserCameras()
+      .then(setCameraDevices)
+      .catch(() => undefined);
+  }, []);
+
+  const handleSelectCameraDevice = useCallback((deviceId: string | null) => {
+    const clean = deviceId?.trim() || null;
+    setSelectedCameraId(clean);
+    if (clean) {
+      localStorage.setItem("teza.callCameraId", clean);
+    } else {
+      localStorage.removeItem("teza.callCameraId");
+    }
+  }, []);
+
+  const ensureRemoteVideoRenderer = useCallback(() => {
+    if (!remoteVideoRendererRef.current) {
+      remoteVideoRendererRef.current = new RemoteH264Renderer({
+        onFirstFrame: () => {
+          setHasRemoteVideoFrame(true);
+        },
+        onDimensions: (width, height) => {
+          setRemoteVideoDims((prev) =>
+            prev && prev.width === width && prev.height === height ? prev : { width, height },
+          );
+        },
+        onKeyframeNeeded: () => {
+          const cur = activeCallRef.current;
+          if (
+            !cur ||
+            cur.call_type !== "DirectVideo" ||
+            cur.phase !== "connected" ||
+            !cur.peer_cam_enabled
+          ) {
+            return;
+          }
+          const now = Date.now();
+          if (now - lastPliRequestAtRef.current < 800) {
+            return;
+          }
+          lastPliRequestAtRef.current = now;
+          void bridge.callRequestVideoKeyframe(cur.call_id).catch(() => undefined);
+        },
+        onError: (err) => {
+          console.debug("[video-ui] remote renderer:", err);
+        },
+      });
+      if (remoteCanvasRef.current) {
+        remoteVideoRendererRef.current.attachCanvas(remoteCanvasRef.current);
+      }
+    }
+    return remoteVideoRendererRef.current;
+  }, []);
+
+  const handleRemoteCanvasChange = useCallback(
+    (canvas: HTMLCanvasElement | null) => {
+      remoteCanvasRef.current = canvas;
+      if (canvas) {
+        ensureRemoteVideoRenderer().attachCanvas(canvas);
+      } else {
+        remoteVideoRendererRef.current?.attachCanvas(null);
+      }
+    },
+    [ensureRemoteVideoRenderer],
+  );
+
+  const stopLocalCameraEncoder = useCallback((destroy = false) => {
+    cameraStartSeqRef.current += 1;
+    encoderRunningCallIdRef.current = null;
+    encoderRunningDeviceIdRef.current = null;
+    const enc = localCameraEncoderRef.current;
+    if (enc) {
+      if (destroy) {
+        enc.destroy();
+        localCameraEncoderRef.current = null;
+      } else {
+        enc.stop();
+      }
+    }
+    setLocalVideoStream(null);
+  }, []);
+
+  const startLocalCameraForCall = useCallback(
+    async (callId: number, deviceId: string | null) => {
+      const seq = ++cameraStartSeqRef.current;
+      if (localCameraEncoderRef.current) {
+        localCameraEncoderRef.current.destroy();
+        localCameraEncoderRef.current = null;
+      }
+      encoderRunningCallIdRef.current = callId;
+      encoderRunningDeviceIdRef.current = deviceId;
+      setLocalCameraError(null);
+      setLocalCameraStatus("starting");
+
+      const encoder = new LocalCameraEncoder({
+        onEncodedAu: (dataB64, isKeyFrame) => {
+          const cur = activeCallRef.current;
+          if (
+            !cur ||
+            cur.call_type !== "DirectVideo" ||
+            cur.phase !== "connected" ||
+            cur.call_id !== callId ||
+            !cur.cam_enabled
+          ) {
+            return;
+          }
+          if (
+            (!isKeyFrame && inFlightVideoPushesRef.current >= 2) ||
+            inFlightVideoPushesRef.current >= 4
+          ) {
+            localCameraEncoderRef.current?.requestKeyframe();
+            return;
+          }
+          inFlightVideoPushesRef.current += 1;
+          void bridge
+            .callPushVideoFrame(callId, dataB64)
+            .catch(() => undefined)
+            .finally(() => {
+              inFlightVideoPushesRef.current = Math.max(0, inFlightVideoPushesRef.current - 1);
+            });
+        },
+        onStatusChange: (status, detail) => {
+          if (cameraStartSeqRef.current !== seq) return;
+          setLocalCameraStatus(status);
+          setLocalCameraError(detail ?? null);
+          if (startResolved && (status === "error" || status === "unavailable")) {
+            encoder.destroy();
+            if (localCameraEncoderRef.current === encoder) {
+              localCameraEncoderRef.current = null;
+            }
+            setLocalVideoStream(null);
+            showCallNotice(
+              tRef.current(
+                status === "error"
+                  ? "callVideoCameraErrorNotice"
+                  : "callVideoCameraUnavailableNotice",
+              ),
+              "warn",
+            );
+            const cur = activeCallRef.current;
+            if (
+              cur &&
+              cur.call_type === "DirectVideo" &&
+              cur.call_id === callId &&
+              cur.cam_enabled
+            ) {
+              void bridge
+                .callSetCamera(false)
+                .then(setCallState)
+                .catch(() => undefined)
+                .finally(() => {
+                  if (
+                    cameraStartSeqRef.current === seq &&
+                    encoderRunningCallIdRef.current === callId
+                  ) {
+                    encoderRunningCallIdRef.current = null;
+                    encoderRunningDeviceIdRef.current = null;
+                  }
+                });
+            } else if (cameraStartSeqRef.current === seq) {
+              encoderRunningCallIdRef.current = null;
+              encoderRunningDeviceIdRef.current = null;
+            }
+          }
+        },
+        onStreamChange: (stream) => {
+          if (cameraStartSeqRef.current !== seq) {
+            if (stream) {
+              stream.getTracks().forEach((tr) => tr.stop());
+            }
+            return;
+          }
+          setLocalVideoStream(stream);
+        },
+      });
+      localCameraEncoderRef.current = encoder;
+
+      let startResolved = false;
+      let status = await encoder.start(deviceId);
+      if (cameraStartSeqRef.current !== seq) {
+        encoder.destroy();
+        if (localCameraEncoderRef.current === encoder) {
+          localCameraEncoderRef.current = null;
+        }
+        return status;
+      }
+
+      if (deviceId && (status === "error" || status === "unavailable")) {
+        // Saved camera device may have been unplugged; fall back to default camera once
+        localStorage.removeItem("teza.callCameraId");
+        setSelectedCameraId(null);
+        encoderRunningDeviceIdRef.current = null;
+        status = await encoder.start(null);
+        if (cameraStartSeqRef.current !== seq) {
+          encoder.destroy();
+          if (localCameraEncoderRef.current === encoder) {
+            localCameraEncoderRef.current = null;
+          }
+          return status;
+        }
+      }
+      startResolved = true;
+
+      void listBrowserCameras()
+        .then(setCameraDevices)
+        .catch(() => undefined);
+
+      if (isCameraFailureStatus(status)) {
+        encoder.destroy();
+        if (localCameraEncoderRef.current === encoder) {
+          localCameraEncoderRef.current = null;
+        }
+        setLocalVideoStream(null);
+        setLocalCameraStatus(status);
+
+        const noticeKey: TranslationKey =
+          status === "denied"
+            ? "callVideoCameraDeniedNotice"
+            : status === "unsupported"
+              ? "callVideoCameraUnsupportedNotice"
+              : status === "error"
+                ? "callVideoCameraErrorNotice"
+                : "callVideoCameraUnavailableNotice";
+        showCallNotice(tRef.current(noticeKey), "warn");
+
+        const cur = activeCallRef.current;
+        if (
+          cur &&
+          cur.call_type === "DirectVideo" &&
+          cur.call_id === callId &&
+          cur.cam_enabled
+        ) {
+          void bridge
+            .callSetCamera(false)
+            .then(setCallState)
+            .catch(() => undefined)
+            .finally(() => {
+              if (
+                cameraStartSeqRef.current === seq &&
+                encoderRunningCallIdRef.current === callId
+              ) {
+                encoderRunningCallIdRef.current = null;
+                encoderRunningDeviceIdRef.current = null;
+              }
+            });
+        } else if (cameraStartSeqRef.current === seq) {
+          encoderRunningCallIdRef.current = null;
+          encoderRunningDeviceIdRef.current = null;
+        }
+      }
+      return status;
+    },
+    [showCallNotice],
+  );
+
   const handleSelectCallDevices = useCallback(
-    async (input: string | null, output: string | null) => {
+    async (input: string | null, output: string | null): Promise<boolean> => {
       setCallDevicesLoading(true);
       try {
         const next = await bridge.callSetDevices(input, output);
         setCallDevices(next);
+        return true;
       } catch (err) {
         showError(err);
+        return false;
       } finally {
         setCallDevicesLoading(false);
       }
@@ -832,10 +1314,29 @@ export default function App() {
     [callActionBusy, showError],
   );
 
+  const handleStartVideoCall = useCallback(
+    async (partnerId: string, partnerName?: string) => {
+      if (callActionBusy) return;
+      setCallActionBusy(true);
+      setCallNotice(null);
+      setVideoOverlayMinimized(false);
+      try {
+        const next = await bridge.callStartVideo(partnerId, partnerName);
+        setCallState(next);
+      } catch (err) {
+        showError(err);
+      } finally {
+        setCallActionBusy(false);
+      }
+    },
+    [callActionBusy, showError],
+  );
+
   const handleAnswerCall = useCallback(
     async (callId: number) => {
       if (callActionBusy) return;
       setCallActionBusy(true);
+      setVideoOverlayMinimized(false);
       try {
         const next = await bridge.callAnswer(callId);
         setCallState(next);
@@ -855,29 +1356,37 @@ export default function App() {
       try {
         const next = await bridge.callDecline(callId);
         setCallState(next);
-        if (next.phase === "idle") setCallTelemetry(null);
+        if (next.phase === "idle") {
+          setCallTelemetry(null);
+          stopLocalCameraEncoder(true);
+          remoteVideoRendererRef.current?.reset();
+        }
       } catch (err) {
         showError(err);
       } finally {
         setCallActionBusy(false);
       }
     },
-    [callActionBusy, showError],
+    [callActionBusy, showError, stopLocalCameraEncoder],
   );
 
   const handleHangupCall = useCallback(async () => {
-    if (callActionBusy) return;
-    setCallActionBusy(true);
+    if (callHangupBusy) return;
+    setCallHangupBusy(true);
+    stopLocalCameraEncoder(true);
     try {
       const next = await bridge.callHangup();
       setCallState(next);
-      if (next.phase === "idle") setCallTelemetry(null);
+      if (next.phase === "idle") {
+        setCallTelemetry(null);
+        remoteVideoRendererRef.current?.reset();
+      }
     } catch (err) {
       showError(err);
     } finally {
-      setCallActionBusy(false);
+      setCallHangupBusy(false);
     }
-  }, [callActionBusy, showError]);
+  }, [callHangupBusy, showError, stopLocalCameraEncoder]);
 
   const handleToggleCallMute = useCallback(
     async (nextMuted: boolean) => {
@@ -893,6 +1402,35 @@ export default function App() {
       }
     },
     [callActionBusy, showError],
+  );
+
+  const handleToggleCallCamera = useCallback(
+    async (nextEnabled: boolean) => {
+      if (callActionBusy) return;
+      setCallActionBusy(true);
+      try {
+        const next = await bridge.callSetCamera(nextEnabled);
+        if (!nextEnabled && (!next.active || !next.active.cam_enabled)) {
+          stopLocalCameraEncoder(true);
+          setLocalCameraStatus("off");
+          setLocalCameraError(null);
+        }
+        setCallState(next);
+        if (
+          nextEnabled &&
+          next.active &&
+          shouldCaptureLocalVideo(next.active) &&
+          encoderRunningCallIdRef.current !== next.active.call_id
+        ) {
+          void startLocalCameraForCall(next.active.call_id, selectedCameraIdRef.current);
+        }
+      } catch (err) {
+        showError(err);
+      } finally {
+        setCallActionBusy(false);
+      }
+    },
+    [callActionBusy, showError, startLocalCameraForCall, stopLocalCameraEncoder],
   );
 
   const snapScrollToBottom = useCallback(() => {
@@ -912,6 +1450,41 @@ export default function App() {
         window.clearTimeout(callNoticeTimerRef.current);
         callNoticeTimerRef.current = null;
       }
+      if (socialNoticeTimerRef.current !== null) {
+        window.clearTimeout(socialNoticeTimerRef.current);
+        socialNoticeTimerRef.current = null;
+      }
+      for (const timerId of recentlyLeftTimersRef.current.values()) {
+        window.clearTimeout(timerId);
+      }
+      recentlyLeftTimersRef.current.clear();
+      recentlyLeftGroupIdsRef.current.clear();
+      if (webToastTimerRef.current !== null) {
+        window.clearTimeout(webToastTimerRef.current);
+        webToastTimerRef.current = null;
+      }
+      if (buzzToastTimerRef.current !== null) {
+        window.clearTimeout(buzzToastTimerRef.current);
+        buzzToastTimerRef.current = null;
+      }
+      if (buzzShakeTimerRef.current !== null) {
+        window.clearTimeout(buzzShakeTimerRef.current);
+        buzzShakeTimerRef.current = null;
+      }
+      if (jumpHighlightTimerRef.current !== null) {
+        window.clearTimeout(jumpHighlightTimerRef.current);
+        jumpHighlightTimerRef.current = null;
+      }
+      if (jumpRetryTimerRef.current !== null) {
+        window.clearTimeout(jumpRetryTimerRef.current);
+        jumpRetryTimerRef.current = null;
+      }
+      sidebarDragCleanupRef.current?.();
+      sidebarDragCleanupRef.current = null;
+      localCameraEncoderRef.current?.destroy();
+      localCameraEncoderRef.current = null;
+      remoteVideoRendererRef.current?.destroy();
+      remoteVideoRendererRef.current = null;
     };
   }, []);
 
@@ -931,6 +1504,21 @@ export default function App() {
   const resetSessionUi = useCallback(() => {
     setMyProfile(null);
     setProfileUid(null);
+    setFriendRequestsOpen(false);
+    setPendingFriendRequestsCount(0);
+    setSocialNotice(null);
+    setLeaveGroupTarget(null);
+    setLeaveGroupSilent(false);
+    setLeaveGroupBusy(false);
+    setLeaveGroupError(null);
+    setKickTarget(null);
+    setKickBusy(false);
+    setKickError(null);
+    for (const timerId of recentlyLeftTimersRef.current.values()) {
+      window.clearTimeout(timerId);
+    }
+    recentlyLeftTimersRef.current.clear();
+    recentlyLeftGroupIdsRef.current.clear();
     setForwardMessages([]);
     setSelectMode(false);
     setSelectedMsgIds(new Set());
@@ -947,8 +1535,11 @@ export default function App() {
     setSelectedId(null);
     setReplyTo(null);
     setActiveThreadRootId(null);
-    setPendingAttachment(null);
+    updatePendingAttachment(null);
     setThreadDetails(null);
+    setGroupMembersCache({});
+    detailsFetchKeyRef.current = null;
+    detailsInFlightRef.current = null;
     setThreadMenu(null);
     setThreadMenuFoldersExpanded(false);
     setShowScrollDown(false);
@@ -958,11 +1549,22 @@ export default function App() {
     setCallState(DEFAULT_CALL_STATE);
     setCallTelemetry(null);
     setCallActionBusy(false);
+    setCallHangupBusy(false);
+    setActiveCallDevicesOpen(false);
     setCallNotice(null);
+    stopLocalCameraEncoder(true);
+    remoteVideoRendererRef.current?.reset();
+    lastVideoCallIdRef.current = null;
+    lastPliRequestAtRef.current = 0;
+    setVideoOverlayMinimized(false);
+    setLocalCameraStatus("idle");
+    setLocalCameraError(null);
+    setHasRemoteVideoFrame(false);
+    setRemoteVideoDims(null);
     setIsLocked(false);
-    setActiveWebAppId(null);
-    void bridge.webappHideAll();
-  }, []);
+    setLastOpenedWebAppId(null);
+    leaveWebApps();
+  }, [stopLocalCameraEncoder, updatePendingAttachment, leaveWebApps]);
 
   useEffect(() => {
     if (!authed) return;
@@ -981,6 +1583,64 @@ export default function App() {
     if (!authed || isLocked || callState.phase !== "incoming_ringing") return;
     return startIncomingRingtone(notifyPrefs.sound);
   }, [authed, isLocked, callState.phase, notifyPrefs.sound]);
+
+  const activeVideoCallId =
+    callState.active?.call_type === "DirectVideo" && callState.phase !== "idle"
+      ? callState.active.call_id
+      : null;
+
+  useEffect(() => {
+    if (activeVideoCallId === lastVideoCallIdRef.current) return;
+    lastVideoCallIdRef.current = activeVideoCallId;
+    lastPliRequestAtRef.current = 0;
+    remoteVideoRendererRef.current?.reset();
+    setHasRemoteVideoFrame(false);
+    setRemoteVideoDims(null);
+    setVideoOverlayMinimized(false);
+    if (activeVideoCallId === null) {
+      stopLocalCameraEncoder(true);
+      setLocalCameraStatus("idle");
+      setLocalCameraError(null);
+    } else {
+      refreshCameraDevices();
+    }
+  }, [activeVideoCallId, refreshCameraDevices, stopLocalCameraEncoder]);
+
+  useEffect(() => {
+    const active = callState.active;
+    if (active?.call_type === "DirectVideo" && !active.peer_cam_enabled) {
+      setHasRemoteVideoFrame(false);
+      remoteVideoRendererRef.current?.reset();
+    }
+  }, [callState.active?.call_id, callState.active?.call_type, callState.active?.peer_cam_enabled]);
+
+  useEffect(() => {
+    const active = callState.active;
+    if (shouldCaptureLocalVideo(active) && active) {
+      if (
+        encoderRunningCallIdRef.current !== active.call_id ||
+        encoderRunningDeviceIdRef.current !== selectedCameraId
+      ) {
+        void startLocalCameraForCall(active.call_id, selectedCameraId);
+      }
+      return;
+    }
+
+    if (localCameraEncoderRef.current || encoderRunningCallIdRef.current !== null) {
+      stopLocalCameraEncoder(true);
+      if (active?.call_type === "DirectVideo" && !active.cam_enabled) {
+        setLocalCameraStatus((prev) => (isCameraFailureStatus(prev) ? prev : "off"));
+      }
+    }
+  }, [
+    callState.active?.call_id,
+    callState.active?.call_type,
+    callState.active?.phase,
+    callState.active?.cam_enabled,
+    selectedCameraId,
+    startLocalCameraForCall,
+    stopLocalCameraEncoder,
+  ]);
 
   const isTranslatableText = useCallback((m: MessageDto) => {
     if (m.is_recalled) return false;
@@ -1188,6 +1848,15 @@ export default function App() {
     try {
       const list = await bridge.syncThreads("all");
       setThreads(list);
+      const curTid = selectedIdRef.current;
+      if (curTid && pendingMarkReadRef.current === curTid) {
+        const synced = list.find((t) => t.id === curTid);
+        if (synced && synced.unread_count === 0) {
+          pendingMarkReadRef.current = null;
+          setUnreadDividerCount(0);
+          setUnreadBelow(0);
+        }
+      }
       if (!selectedIdRef.current && list.length > 0) {
         setSelectedId(list[0].id);
       }
@@ -1197,6 +1866,195 @@ export default function App() {
       setSyncing(false);
     }
   }, [showError]);
+
+  const refreshThreadsSilently = useCallback(async () => {
+    if (silentSyncInFlightRef.current) return;
+    silentSyncInFlightRef.current = true;
+    try {
+      const list = await bridge.syncThreads("all");
+      setThreads(list);
+      const curTid = selectedIdRef.current;
+      if (curTid && pendingMarkReadRef.current === curTid) {
+        const synced = list.find((item) => item.id === curTid);
+        if (synced && synced.unread_count === 0) {
+          pendingMarkReadRef.current = null;
+          setUnreadDividerCount(0);
+          setUnreadBelow(0);
+        }
+      }
+    } catch {
+      // Best-effort silent refresh
+    } finally {
+      silentSyncInFlightRef.current = false;
+    }
+  }, []);
+
+  const refreshFriendRequestsCount = useCallback(async () => {
+    try {
+      const res = await bridge.friendListRequests();
+      setPendingFriendRequestsCount(Array.isArray(res.received) ? res.received.length : 0);
+    } catch {
+      // Best-effort badge refresh
+    }
+  }, []);
+
+  const handleRelationshipChanged = useCallback(() => {
+    void refreshFriendRequestsCount();
+    void refreshThreadsSilently();
+  }, [refreshFriendRequestsCount, refreshThreadsSilently]);
+
+  const removeGroupThreadLocally = useCallback((groupId: string) => {
+    threadsRef.current = threadsRef.current.filter((item) => item.id !== groupId);
+    setThreads((prev) => prev.filter((item) => item.id !== groupId));
+    setGroupMembersCache((prev) => {
+      if (!(groupId in prev)) return prev;
+      const next = { ...prev };
+      delete next[groupId];
+      return next;
+    });
+    setCustomFolders((prev) =>
+      prev.map((cf) =>
+        cf.thread_ids.includes(groupId)
+          ? { ...cf, thread_ids: cf.thread_ids.filter((id) => id !== groupId) }
+          : cf,
+      ),
+    );
+    setKickTarget((prev) => (prev?.groupId === groupId ? null : prev));
+    setLeaveGroupTarget((prev) => (prev?.id === groupId ? null : prev));
+    if (selectedIdRef.current === groupId) {
+      selectedIdRef.current = null;
+      if (pendingMarkReadRef.current === groupId) {
+        pendingMarkReadRef.current = null;
+      }
+      detailsFetchKeyRef.current = null;
+      detailsInFlightRef.current = null;
+      setSelectedId(null);
+      setMessages([]);
+      setThreadDetails(null);
+      setDrawerOpen(false);
+      setAddMembersOpen(false);
+      setCreatePollOpen(false);
+      setCreateReminderOpen(false);
+      setActiveThreadRootId(null);
+      setReplyTo(null);
+      setPinnedMessages([]);
+      setHasMoreHistory(false);
+      void bridge.setActiveThread(null);
+    }
+  }, []);
+
+  const markRecentlyLeftGroup = useCallback((groupId: string) => {
+    recentlyLeftGroupIdsRef.current.add(groupId);
+    const prevTimer = recentlyLeftTimersRef.current.get(groupId);
+    if (prevTimer !== undefined) {
+      window.clearTimeout(prevTimer);
+    }
+    const timerId = window.setTimeout(() => {
+      recentlyLeftTimersRef.current.delete(groupId);
+      recentlyLeftGroupIdsRef.current.delete(groupId);
+    }, 10_000);
+    recentlyLeftTimersRef.current.set(groupId, timerId);
+  }, []);
+
+  const unmarkRecentlyLeftGroup = useCallback((groupId: string) => {
+    recentlyLeftGroupIdsRef.current.delete(groupId);
+    const prevTimer = recentlyLeftTimersRef.current.get(groupId);
+    if (prevTimer !== undefined) {
+      window.clearTimeout(prevTimer);
+      recentlyLeftTimersRef.current.delete(groupId);
+    }
+  }, []);
+
+  const handleOpenLeaveGroupDialog = useCallback((target: ThreadDto) => {
+    setLeaveGroupSilent(false);
+    setLeaveGroupError(null);
+    setLeaveGroupBusy(false);
+    setLeaveGroupTarget(target);
+  }, []);
+
+  const handleConfirmLeaveGroup = useCallback(async () => {
+    if (!leaveGroupTarget || leaveGroupBusy) return;
+    const target = leaveGroupTarget;
+    const silent = leaveGroupSilent;
+    setLeaveGroupBusy(true);
+    setLeaveGroupError(null);
+    markRecentlyLeftGroup(target.id);
+    try {
+      const res = await bridge.groupLeave(target.id, silent);
+      if (res.left) {
+        removeGroupThreadLocally(target.id);
+        setLeaveGroupTarget(null);
+        setLeaveGroupSilent(false);
+        setLeaveGroupError(null);
+        showSocialNotice(tRef.current("groupLeftSuccess", { name: target.title }), "success");
+      } else {
+        unmarkRecentlyLeftGroup(target.id);
+        setLeaveGroupError(res.message?.trim() || tRef.current("groupLeaveBtn"));
+      }
+    } catch (err) {
+      unmarkRecentlyLeftGroup(target.id);
+      const clean = String(err).replace(/^Error:\s*/i, "").trim();
+      setLeaveGroupError(clean || String(err));
+    } finally {
+      setLeaveGroupBusy(false);
+    }
+  }, [
+    leaveGroupTarget,
+    leaveGroupSilent,
+    leaveGroupBusy,
+    markRecentlyLeftGroup,
+    unmarkRecentlyLeftGroup,
+    removeGroupThreadLocally,
+    showSocialNotice,
+  ]);
+
+  const handleConfirmKickMember = useCallback(async () => {
+    if (!kickTarget || kickBusy) return;
+    const { groupId, member } = kickTarget;
+    setKickBusy(true);
+    setKickError(null);
+    try {
+      const res = await bridge.groupKickMembers(groupId, [member.id]);
+      const removedOk =
+        res.removed.includes(member.id) ||
+        (res.removed.length > 0 && !res.failed.includes(member.id));
+      if (removedOk) {
+        setGroupMembersCache((prev) => {
+          if (!(groupId in prev)) return prev;
+          const next = { ...prev };
+          delete next[groupId];
+          return next;
+        });
+        setThreadDetails((prev) => {
+          if (!prev || prev.thread_id !== groupId) return prev;
+          const nextMembers = prev.members.filter((m) => m.id !== member.id);
+          return {
+            ...prev,
+            members: nextMembers,
+            total_members:
+              typeof prev.total_members === "number"
+                ? Math.max(nextMembers.length, prev.total_members - 1)
+                : prev.total_members,
+            admin_ids: (prev.admin_ids ?? []).filter((id) => id !== member.id),
+          };
+        });
+        setDetailsRefreshTick((n) => n + 1);
+        setKickTarget(null);
+        setKickError(null);
+        showSocialNotice(tRef.current("groupKickSuccess", { name: member.name }), "success");
+      } else {
+        const msg = res.message?.trim() || tRef.current("groupKickFailed");
+        setKickError(msg);
+        showSocialNotice(msg, "error");
+      }
+    } catch (err) {
+      const clean = String(err).replace(/^Error:\s*/i, "").trim() || tRef.current("groupKickFailed");
+      setKickError(clean);
+      showSocialNotice(clean, "error");
+    } finally {
+      setKickBusy(false);
+    }
+  }, [kickTarget, kickBusy, showSocialNotice]);
 
   useEffect(() => {
     if (bootedRef.current) return;
@@ -1228,27 +2086,96 @@ export default function App() {
     if (pendingMarkReadRef.current === tid) {
       pendingMarkReadRef.current = null;
     }
+    threadsRef.current = applyThreadReadSync(threadsRef.current, tid, false);
     void bridge.markRead(tid);
-    setThreads((prev) =>
-      prev.map((t) =>
-        t.id === tid
-          ? {
-              ...t,
-              unread_count: 0,
-              last_read_in_ts: Math.max(t.last_read_in_ts ?? 0, t.last_ts),
-            }
-          : t,
-      ),
-    );
+    if (
+      tid === selectedIdRef.current &&
+      authedRef.current &&
+      !isLockedRef.current &&
+      !hasActiveWebAppRef.current &&
+      !webAppHubOpenRef.current &&
+      chatPaneVisibleRef.current
+    ) {
+      void bridge.setActiveThread(tid);
+    }
+    setThreads((prev) => applyThreadReadSync(prev, tid, false));
   }, []);
 
-  const openThreadById = useCallback((tid: string) => {
-    setActiveWebAppId(null);
-    void bridge.webappHideAll();
-    setSelectedId(tid);
-    setActiveThreadRootId(null);
-    setMobilePane("chat");
-  }, []);
+  const tryAutoMarkReadActiveThread = useCallback(() => {
+    const tid = selectedIdRef.current;
+    if (!tid) return;
+    const activeThreadUnread =
+      threadsRef.current.find((t) => t.id === tid)?.unread_count ?? 0;
+    const el = scrollContainerRef.current;
+    const isMountedVisible = Boolean(el && el.clientHeight > 0);
+    const isScrollable = isMountedVisible
+      ? el!.scrollHeight > el!.clientHeight + 1
+      : undefined;
+    const distFromBottom = isMountedVisible
+      ? Math.max(0, el!.scrollHeight - el!.scrollTop - el!.clientHeight)
+      : null;
+    if (
+      shouldAutoMarkReadOnFocus({
+        authed: authedRef.current,
+        isLocked: isLockedRef.current,
+        hasActiveWebApp: hasActiveWebAppRef.current,
+        webAppHubOpen: webAppHubOpenRef.current,
+        windowFocused: document.hasFocus(),
+        visibilityState: document.visibilityState,
+        selectedId: tid,
+        pendingMarkReadId: pendingMarkReadRef.current,
+        activeThreadUnread,
+        distFromBottom,
+        isScrollable,
+        chatPaneVisible: chatPaneVisibleRef.current,
+        initialScrollReady: initialScrollReadyRef.current,
+      })
+    ) {
+      completeMarkReadForThread(tid);
+    }
+  }, [completeMarkReadForThread]);
+
+  useEffect(() => {
+    let rafId = 0;
+    const onFocusOrVisibility = () => {
+      if (rafId) {
+        window.cancelAnimationFrame(rafId);
+        rafId = 0;
+      }
+      const el = scrollContainerRef.current;
+      if (
+        document.visibilityState === "visible" &&
+        document.hasFocus() &&
+        (!el || el.clientHeight === 0)
+      ) {
+        rafId = window.requestAnimationFrame(() => {
+          rafId = 0;
+          tryAutoMarkReadActiveThread();
+        });
+        return;
+      }
+      tryAutoMarkReadActiveThread();
+    };
+    window.addEventListener("focus", onFocusOrVisibility);
+    document.addEventListener("visibilitychange", onFocusOrVisibility);
+    return () => {
+      if (rafId) {
+        window.cancelAnimationFrame(rafId);
+      }
+      window.removeEventListener("focus", onFocusOrVisibility);
+      document.removeEventListener("visibilitychange", onFocusOrVisibility);
+    };
+  }, [tryAutoMarkReadActiveThread]);
+
+  const openThreadById = useCallback(
+    (tid: string) => {
+      leaveWebApps();
+      setSelectedId(tid);
+      setActiveThreadRootId(null);
+      setMobilePane("chat");
+    },
+    [leaveWebApps],
+  );
 
   const triggerNotifyPopup = useCallback((payload: NotifyToastPayload) => {
     if (isTauri()) {
@@ -1307,6 +2234,18 @@ export default function App() {
           const prev = prevConnStatusRef.current;
           prevConnStatusRef.current = ev.payload;
           setConnStatus(ev.payload);
+          if (prev !== "connected" && ev.payload === "connected") {
+            const curTid = selectedIdRef.current;
+            if (curTid) {
+              const curThread = threadsRef.current.find((t) => t.id === curTid);
+              if (
+                curThread?.kind === "group" &&
+                (groupMembersCacheRef.current[curTid]?.length ?? 0) === 0
+              ) {
+                setDetailsRefreshTick((n) => n + 1);
+              }
+            }
+          }
           if (prev === "reconnecting" && ev.payload === "connected") {
             void syncRemoteThreads();
             const curTid = selectedIdRef.current;
@@ -1331,17 +2270,25 @@ export default function App() {
           const msg = ev.payload;
           const hasThread = threadsRef.current.some((t) => t.id === msg.thread_id);
           const isActiveThread = msg.thread_id === selectedIdRef.current;
-          const el = isActiveThread ? scrollContainerRef.current : null;
+          const chatVisible =
+            !isLockedRef.current &&
+            !hasActiveWebAppRef.current &&
+            !webAppHubOpenRef.current &&
+            chatPaneVisibleRef.current;
+          const el = isActiveThread && chatVisible ? scrollContainerRef.current : null;
           const nearBottom =
             isActiveThread &&
+            chatVisible &&
+            Boolean(el) &&
             (stickToBottomRef.current ||
-              !el ||
-              el.scrollHeight - el.scrollTop - el.clientHeight < 140);
+              el!.scrollHeight - el!.scrollTop - el!.clientHeight < 140);
+          const wasPendingMarkRead = pendingMarkReadRef.current === msg.thread_id;
           const readingLive =
             !msg.is_outgoing &&
             nearBottom &&
             document.hasFocus() &&
-            pendingMarkReadRef.current !== msg.thread_id;
+            document.visibilityState === "visible" &&
+            !wasPendingMarkRead;
           const incUnread = !msg.is_outgoing && !readingLive;
           setThreads((prev) => bumpThreadList(prev, msg, incUnread));
           if (!hasThread) {
@@ -1357,12 +2304,27 @@ export default function App() {
             }
             if (!msg.is_outgoing && readingLive) {
               completeMarkReadForThread(msg.thread_id);
+            } else if (!msg.is_outgoing) {
+              pendingMarkReadRef.current = msg.thread_id;
+              void bridge.setActiveThread(null);
+            } else if (wasPendingMarkRead) {
+              pendingMarkReadRef.current = null;
+              if (authedRef.current && chatVisible) {
+                void bridge.setActiveThread(msg.thread_id);
+              }
             }
             if (msg.is_outgoing) {
               stickToBottomRef.current = true;
+              setUnreadDividerCount(0);
+              setUnreadBelow(0);
             }
-            if ((nearBottom && pendingMarkReadRef.current !== msg.thread_id) || msg.is_outgoing) {
-              setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
+            if ((nearBottom && !wasPendingMarkRead) || msg.is_outgoing) {
+              setTimeout(() => {
+                lastProgrammaticScrollAtRef.current = performance.now();
+                bottomRef.current?.scrollIntoView({
+                  behavior: document.visibilityState === "visible" ? "smooth" : "auto",
+                });
+              }, 40);
             } else if (!msg.is_outgoing) {
               setUnreadBelow((n) => n + 1);
               setShowScrollDown(true);
@@ -1429,7 +2391,8 @@ export default function App() {
                 }
                 if (fullScreenBuzz && isTauri()) {
                   setBuzzShaking(false);
-                  window.setTimeout(() => {
+                  buzzShakeTimerRef.current = window.setTimeout(() => {
+                    buzzShakeTimerRef.current = null;
                     void bridge.buzzShakeScreen().catch(() => undefined);
                   }, 60);
                 } else {
@@ -1499,6 +2462,37 @@ export default function App() {
         listen("core://threads-updated", () => {
           void bridge.listThreads("all").then(setThreads);
         }),
+        listen<{ thread_id: string; is_unread: boolean }>("core://thread-read-synced", (ev) => {
+          const { thread_id, is_unread } = ev.payload;
+          threadsRef.current = applyThreadReadSync(threadsRef.current, thread_id, is_unread);
+          setThreads((prev) => applyThreadReadSync(prev, thread_id, is_unread));
+          if (thread_id === selectedIdRef.current) {
+            if (!is_unread) {
+              setUnreadDividerCount(0);
+              setUnreadBelow(0);
+              if (pendingMarkReadRef.current === thread_id) {
+                pendingMarkReadRef.current = null;
+              }
+              const el = scrollContainerRef.current;
+              const nearBottomOrFlat =
+                Boolean(el && el.clientHeight > 0) &&
+                (el!.scrollHeight <= el!.clientHeight + 1 ||
+                  el!.scrollHeight - el!.scrollTop - el!.clientHeight < 90);
+              if (
+                authedRef.current &&
+                !isLockedRef.current &&
+                !hasActiveWebAppRef.current &&
+                !webAppHubOpenRef.current &&
+                chatPaneVisibleRef.current &&
+                nearBottomOrFlat
+              ) {
+                void bridge.setActiveThread(thread_id);
+              }
+            } else {
+              void bridge.setActiveThread(null);
+            }
+          }
+        }),
         listen<{ thread_id: string; peer_read_ts: number }>("core://thread-receipt", (ev) => {
           const { thread_id, peer_read_ts } = ev.payload;
           setThreads((prev) =>
@@ -1544,7 +2538,15 @@ export default function App() {
                   snapScrollToBottom();
                 }
               });
-              if (pendingMarkReadRef.current !== ev.payload.thread_id) {
+              if (
+                pendingMarkReadRef.current !== ev.payload.thread_id &&
+                document.hasFocus() &&
+                document.visibilityState === "visible" &&
+                !isLockedRef.current &&
+                !hasActiveWebAppRef.current &&
+                !webAppHubOpenRef.current &&
+                chatPaneVisibleRef.current
+              ) {
                 completeMarkReadForThread(ev.payload.thread_id);
               }
             }
@@ -1573,6 +2575,8 @@ export default function App() {
             showCallNotice(event.message, "error");
           } else if (event.type === "call_ended") {
             setCallTelemetry(null);
+            stopLocalCameraEncoder(true);
+            remoteVideoRendererRef.current?.reset();
             playCallCueTone("end", notifyPrefsRef.current.sound);
             const classified = classifyCallEndReason(event.reason);
             if (!classified.isSilent) {
@@ -1609,6 +2613,31 @@ export default function App() {
         }),
         listen<CallTelemetryDto>("core://call-telemetry", (ev) => {
           setCallTelemetry(ev.payload);
+        }),
+        listen<CallVideoFrameDto>("core://call-video-frame", (ev) => {
+          const payload = ev.payload;
+          const cur = activeCallRef.current;
+          if (
+            !cur ||
+            cur.call_type !== "DirectVideo" ||
+            cur.call_id !== payload.call_id ||
+            !cur.peer_cam_enabled
+          ) {
+            return;
+          }
+          ensureRemoteVideoRenderer().pushFrame({
+            timestamp: payload.timestamp,
+            is_keyframe: payload.is_keyframe,
+            just_synced: payload.just_synced,
+            data_b64: payload.data_b64,
+          });
+        }),
+        listen<CallVideoKeyframeRequestDto>("core://call-video-keyframe-request", (ev) => {
+          const cur = activeCallRef.current;
+          if (!cur || cur.call_type !== "DirectVideo" || cur.call_id !== ev.payload.call_id) {
+            return;
+          }
+          localCameraEncoderRef.current?.requestKeyframe();
         }),
         listen<string>("core://open-thread", (ev) => {
           if (ev.payload) {
@@ -1654,6 +2683,8 @@ export default function App() {
     triggerNotifyPopup,
     snapScrollToBottom,
     showCallNotice,
+    ensureRemoteVideoRenderer,
+    stopLocalCameraEncoder,
   ]);
 
   useEffect(() => {
@@ -1668,7 +2699,110 @@ export default function App() {
       .listChatFolders()
       .then(setCustomFolders)
       .catch(() => undefined);
-  }, [authed]);
+    void refreshFriendRequestsCount();
+  }, [authed, refreshFriendRequestsCount]);
+
+  useEffect(() => {
+    if (!authed) return;
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+    void bridge
+      .onSocialEvent((ev) => {
+        if (cancelled) return;
+        if (
+          (ev.kind === "group_left" || ev.kind === "group_member_removed") &&
+          ev.self_removed &&
+          ev.thread_id
+        ) {
+          const gid = ev.thread_id;
+          const groupTitle =
+            threadsRef.current.find((item) => item.id === gid)?.title || gid;
+          removeGroupThreadLocally(gid);
+          if (!(ev.kind === "group_left" && recentlyLeftGroupIdsRef.current.has(gid))) {
+            if (ev.kind === "group_left") {
+              showSocialNotice(
+                tRef.current("groupLeftSuccess", { name: groupTitle }),
+                "info",
+              );
+            } else {
+              showSocialNotice(
+                tRef.current("groupRemovedSelfNotice", { name: groupTitle }),
+                "warn",
+              );
+            }
+          }
+          return;
+        }
+
+        if (
+          ev.kind === "group_member_removed" ||
+          ev.kind === "group_member_joined" ||
+          ev.kind === "group_admin_changed"
+        ) {
+          if (ev.thread_id) {
+            const gid = ev.thread_id;
+            setGroupMembersCache((prev) => {
+              if (!(gid in prev)) return prev;
+              const next = { ...prev };
+              delete next[gid];
+              return next;
+            });
+            if (gid === selectedIdRef.current) {
+              setDetailsRefreshTick((n) => n + 1);
+            } else if (
+              ev.kind === "group_member_joined" &&
+              !threadsRef.current.some((item) => item.id === gid)
+            ) {
+              void refreshThreadsSilently();
+            }
+          }
+          return;
+        }
+
+        if (ev.kind.startsWith("friend_") || ev.kind.startsWith("user_")) {
+          void refreshFriendRequestsCount();
+          if (ev.kind === "friend_added") {
+            void refreshThreadsSilently();
+          }
+        }
+      })
+      .then((fn) => {
+        if (cancelled) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [
+    authed,
+    removeGroupThreadLocally,
+    refreshFriendRequestsCount,
+    refreshThreadsSilently,
+    showSocialNotice,
+  ]);
+
+  useEffect(() => {
+    if (!leaveGroupTarget) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !leaveGroupBusy) {
+        e.preventDefault();
+        setLeaveGroupTarget(null);
+        setLeaveGroupError(null);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [leaveGroupTarget, leaveGroupBusy]);
+
+  useEffect(() => {
+    setKickTarget(null);
+    setKickError(null);
+  }, [selectedId, drawerOpen]);
 
   useEffect(() => {
     if (!folderMenu) return;
@@ -1683,24 +2817,61 @@ export default function App() {
   );
 
   useEffect(() => {
-    if (!authed || !selectedId || (!drawerOpen && activeThreadKind !== "group")) {
+    if (
+      !authed ||
+      !selectedId ||
+      activeThreadKind === null ||
+      (!drawerOpen && activeThreadKind !== "group")
+    ) {
+      return;
+    }
+    const fetchKey = `${selectedId}:${detailsRefreshTick}`;
+    if (detailsFetchKeyRef.current === fetchKey || detailsInFlightRef.current === fetchKey) {
       return;
     }
     let cancelled = false;
+    detailsInFlightRef.current = fetchKey;
     setDetailsLoading(true);
     void bridge
       .getThreadDetails(selectedId)
       .then((res) => {
-        if (!cancelled) setThreadDetails(res);
+        if (detailsInFlightRef.current === fetchKey) {
+          detailsInFlightRef.current = null;
+        }
+        if (cancelled) return;
+        if (res.members.length > 0) {
+          setGroupMembersCache((prev) => ({ ...prev, [res.thread_id]: res.members }));
+        }
+        if (activeThreadKind !== null && (activeThreadKind !== "group" || res.members.length > 0)) {
+          detailsFetchKeyRef.current = fetchKey;
+        }
+        setThreadDetails((prev) => {
+          if (
+            res.members.length === 0 &&
+            prev?.thread_id === res.thread_id &&
+            prev.members.length > 0
+          ) {
+            return { ...res, members: prev.members };
+          }
+          return res;
+        });
       })
       .catch(() => {
-        if (!cancelled) setThreadDetails(null);
+        if (detailsInFlightRef.current === fetchKey) {
+          detailsInFlightRef.current = null;
+        }
+        if (!cancelled) {
+          setThreadDetails((prev) => (prev?.thread_id === selectedId ? prev : null));
+        }
       })
       .finally(() => {
         if (!cancelled) setDetailsLoading(false);
       });
     return () => {
       cancelled = true;
+      if (detailsInFlightRef.current === fetchKey) {
+        detailsInFlightRef.current = null;
+      }
     };
   }, [authed, drawerOpen, selectedId, activeThreadKind, detailsRefreshTick]);
 
@@ -1719,7 +2890,13 @@ export default function App() {
         if (el) {
           el.scrollIntoView({ behavior: "smooth", block: "center" });
           setHighlightedId(targetId);
-          setTimeout(() => setHighlightedId(null), 1800);
+          if (jumpHighlightTimerRef.current !== null) {
+            window.clearTimeout(jumpHighlightTimerRef.current);
+          }
+          jumpHighlightTimerRef.current = window.setTimeout(() => {
+            jumpHighlightTimerRef.current = null;
+            setHighlightedId(null);
+          }, 1800);
           return true;
         }
         return false;
@@ -1734,7 +2911,13 @@ export default function App() {
           if (selectedIdRef.current === tid) {
             setMessages(around.messages);
             setHasMoreHistory(around.has_more);
-            setTimeout(() => highlightEl(msgId), 60);
+            if (jumpRetryTimerRef.current !== null) {
+              window.clearTimeout(jumpRetryTimerRef.current);
+            }
+            jumpRetryTimerRef.current = window.setTimeout(() => {
+              jumpRetryTimerRef.current = null;
+              highlightEl(msgId);
+            }, 60);
           }
         } else {
           showError("Không tìm thấy tin nhắn gốc trong lịch sử cục bộ");
@@ -1770,7 +2953,7 @@ export default function App() {
           if (paths.length === 1) {
             const meta = await bridge.inspectAttachmentPath(paths[0]);
             if (!active) return;
-            setPendingAttachment({
+            updatePendingAttachment({
               kind: "path",
               path: meta.path,
               fileName: meta.file_name,
@@ -1795,6 +2978,10 @@ export default function App() {
         }
       })
       .then((fn) => {
+        if (!active) {
+          fn();
+          return;
+        }
         unlisten = fn;
       });
     return () => {
@@ -1802,7 +2989,7 @@ export default function App() {
       setDragHover(false);
       unlisten?.();
     };
-  }, [authed, showError]);
+  }, [authed, showError, updatePendingAttachment]);
 
   useEffect(() => {
     if (!authed || !selectedId) return;
@@ -1819,9 +3006,18 @@ export default function App() {
     const initWatermark = current?.last_read_in_ts ?? 0;
     setUnreadDividerCount(initUnread);
     setUnreadWatermarkTs(initWatermark);
-    if (initUnread === 0) {
+    const chatObscured = Boolean(
+      isLockedRef.current ||
+        hasActiveWebAppRef.current ||
+        webAppHubOpenRef.current ||
+        !chatPaneVisibleRef.current,
+    );
+    if (initUnread === 0 && !chatObscured) {
       pendingMarkReadRef.current = null;
       completeMarkReadForThread(selectedId);
+    } else if (initUnread === 0) {
+      pendingMarkReadRef.current = null;
+      void bridge.setActiveThread(null);
     } else {
       pendingMarkReadRef.current = selectedId;
       void bridge.setActiveThread(null);
@@ -1837,7 +3033,8 @@ export default function App() {
     lastOlderCursorRef.current = null;
     setReplyTo(null);
     setActiveThreadRootId(null);
-    setPendingAttachment(null);
+    updatePendingAttachment(null);
+    setThreadDetails(null);
     setMessages([]);
     setHasMoreHistory(false);
     setLoadingOlder(false);
@@ -1884,14 +3081,14 @@ export default function App() {
                   .getElementById("unread-divider")
                   ?.scrollIntoView({ block: "start" });
                 const el = scrollContainerRef.current;
+                initialScrollReadyRef.current = true;
                 if (!el || el.scrollHeight - el.scrollTop - el.clientHeight < 90) {
-                  completeMarkReadForThread(selectedId);
                   stickToBottomRef.current = true;
+                  tryAutoMarkReadActiveThread();
                 } else {
                   setShowScrollDown(true);
                   setUnreadBelow(initUnread);
                 }
-                initialScrollReadyRef.current = true;
 
                 let userInteracted = false;
                 const markUserInteracted = () => {
@@ -1930,7 +3127,7 @@ export default function App() {
                 }
                 initialScrollReadyRef.current = true;
                 if (pendingMarkReadRef.current === selectedId) {
-                  completeMarkReadForThread(selectedId);
+                  tryAutoMarkReadActiveThread();
                 }
               });
             });
@@ -1957,7 +3154,16 @@ export default function App() {
       detachUserWatch?.();
       detachUserWatch = null;
     };
-  }, [authed, selectedId, jumpToMsg, refreshPinnedMessages, completeMarkReadForThread, snapScrollToBottom]);
+  }, [
+    authed,
+    selectedId,
+    jumpToMsg,
+    refreshPinnedMessages,
+    completeMarkReadForThread,
+    tryAutoMarkReadActiveThread,
+    snapScrollToBottom,
+    updatePendingAttachment,
+  ]);
 
   const activeThreadLang = selectedId ? threadAutoTranslate[selectedId] : undefined;
   const prevTranslateCodeRef = useRef(translateCode);
@@ -2036,6 +3242,7 @@ export default function App() {
 
   const handleSelectSearchResult = useCallback(
     async (hit: MessageDto) => {
+      leaveWebApps();
       setMobilePane("chat");
       if (hit.thread_id === selectedId) {
         if (messages.some((m) => m.msg_id === hit.msg_id)) {
@@ -2055,7 +3262,7 @@ export default function App() {
         setSelectedId(hit.thread_id);
       }
     },
-    [selectedId, messages, jumpToMsg, showError],
+    [selectedId, messages, jumpToMsg, showError, leaveWebApps],
   );
 
   const visibleThreads = useMemo(() => {
@@ -2200,10 +3407,13 @@ export default function App() {
   const activeWebApp = useMemo(
     () =>
       webAppsCfg.enabled && activeWebAppId
-        ? webAppsCfg.items.find((x) => x.id === activeWebAppId) ?? null
+        ? webAppsCfg.items.find(
+            (x) => x.id === activeWebAppId && x.openMode === "embedded",
+          ) ?? null
         : null,
     [webAppsCfg, activeWebAppId],
   );
+  hasActiveWebAppRef.current = Boolean(activeWebApp);
 
   const webappSuspended = Boolean(
     isLocked ||
@@ -2212,6 +3422,8 @@ export default function App() {
       folderModalOpen ||
       quickSearchOpen ||
       findUserOpen ||
+      friendRequestsOpen ||
+      Boolean(leaveGroupTarget) ||
       translateModalOpen ||
       updateModalOpen ||
       profileUid ||
@@ -2221,7 +3433,11 @@ export default function App() {
       forwardMessages.length > 0 ||
       addMembersOpen ||
       createReminderOpen ||
-      createPollOpen,
+      createPollOpen ||
+      screenshotEditor ||
+      showVideoOverlay ||
+      activeCallDevicesOpen ||
+      callState.phase === "incoming_ringing",
   );
 
   useEffect(() => {
@@ -2230,23 +3446,105 @@ export default function App() {
     }
   }, [activeWebApp]);
 
+  const prevChatObscuredRef = useRef<boolean>(
+    Boolean(isLocked || activeWebApp || (webAppsCfg.enabled && webAppHubOpen) || !chatPaneVisible),
+  );
+  useEffect(() => {
+    const obscured = Boolean(
+      isLocked || activeWebApp || (webAppsCfg.enabled && webAppHubOpen) || !chatPaneVisible,
+    );
+    const wasObscured = prevChatObscuredRef.current;
+    prevChatObscuredRef.current = obscured;
+
+    if (!authed || !selectedId || obscured) {
+      void bridge.setActiveThread(null);
+      return;
+    }
+
+    if (!wasObscured) return;
+
+    const activeThreadUnread =
+      threadsRef.current.find((t) => t.id === selectedId)?.unread_count ?? 0;
+    if (pendingMarkReadRef.current !== selectedId && activeThreadUnread === 0) {
+      void bridge.setActiveThread(selectedId);
+      return;
+    }
+
+    let raf1 = 0;
+    let raf2 = 0;
+    raf1 = window.requestAnimationFrame(() => {
+      raf2 = window.requestAnimationFrame(() => {
+        tryAutoMarkReadActiveThread();
+      });
+    });
+    return () => {
+      if (raf1) window.cancelAnimationFrame(raf1);
+      if (raf2) window.cancelAnimationFrame(raf2);
+    };
+  }, [
+    authed,
+    selectedId,
+    isLocked,
+    activeWebApp,
+    webAppsCfg.enabled,
+    webAppHubOpen,
+    chatPaneVisible,
+    tryAutoMarkReadActiveThread,
+  ]);
+
   const handleWebAppsCfgChange = useCallback(
     (next: WebAppsConfig) => {
       const prevMap = new Map(webAppsCfg.items.map((x) => [x.id, x]));
       const nextMap = new Map(next.items.map((x) => [x.id, x]));
+      const removedIds: string[] = [];
       for (const [id, prevItem] of prevMap) {
         const nextItem = nextMap.get(id);
-        if (!nextItem || nextItem.url !== prevItem.url || nextItem.openMode !== prevItem.openMode) {
+        if (!nextItem) {
+          removedIds.push(id);
+          void bridge.webappClose(id);
+        } else if (nextItem.url !== prevItem.url || nextItem.openMode !== prevItem.openMode) {
           void bridge.webappClose(id);
         }
       }
+      if (removedIds.length > 0) {
+        for (const removedId of removedIds) {
+          void bridge
+            .listWebAppAccounts(removedId)
+            .then((accounts) =>
+              Promise.allSettled(
+                accounts.map((acc) => bridge.deleteWebAppAccount(acc.id)),
+              ),
+            )
+            .catch(() => undefined);
+        }
+      }
+      const nextActiveItem = activeWebAppId ? nextMap.get(activeWebAppId) : undefined;
       if (!next.enabled) {
         setActiveWebAppId(null);
+        setLastOpenedWebAppId(null);
         setWebAppHubOpen(false);
         void bridge.webappHideAll();
-      } else if (activeWebAppId && !nextMap.has(activeWebAppId)) {
-        setActiveWebAppId(null);
-        void bridge.webappHideAll();
+      } else {
+        if (
+          activeWebAppId &&
+          (!nextActiveItem || nextActiveItem.openMode !== "embedded")
+        ) {
+          setActiveWebAppId(null);
+          void bridge.webappHideAll();
+        }
+        setLastOpenedWebAppId((prev) => {
+          if (!prev) return null;
+          const nextLastItem = nextMap.get(prev);
+          const prevLastItem = prevMap.get(prev);
+          if (
+            !nextLastItem ||
+            nextLastItem.openMode !== "embedded" ||
+            (prevLastItem && nextLastItem.url !== prevLastItem.url)
+          ) {
+            return null;
+          }
+          return prev;
+        });
       }
       saveWebAppsConfig(next);
       setWebAppsCfg(next);
@@ -2262,6 +3560,7 @@ export default function App() {
       }
       setWebAppHubOpen(false);
       setActiveWebAppId(item.id);
+      setLastOpenedWebAppId(item.id);
       if (layout.mode === "single") setMobilePane("chat");
     },
     [layout.mode, showError],
@@ -2330,17 +3629,21 @@ export default function App() {
         if (pendingMarkReadRef.current === target.id) {
           pendingMarkReadRef.current = null;
         }
-        setThreads((prev) =>
-          prev.map((t) =>
-            t.id === target.id
-              ? {
-                  ...t,
-                  unread_count: 0,
-                  last_read_in_ts: Math.max(t.last_read_in_ts ?? 0, t.last_ts),
-                }
-              : t,
-          ),
-        );
+        if (selectedIdRef.current === target.id) {
+          setUnreadDividerCount(0);
+          setUnreadBelow(0);
+          if (
+            authedRef.current &&
+            !isLockedRef.current &&
+            !hasActiveWebAppRef.current &&
+            !webAppHubOpenRef.current &&
+            chatPaneVisibleRef.current
+          ) {
+            void bridge.setActiveThread(target.id);
+          }
+        }
+        threadsRef.current = applyThreadReadSync(threadsRef.current, target.id, false);
+        setThreads((prev) => applyThreadReadSync(prev, target.id, false));
       } catch (err) {
         showError(err);
       }
@@ -2384,9 +3687,35 @@ export default function App() {
       try {
         await Promise.all(targets.map((t) => bridge.markRead(t.id)));
         const ids = new Set(targets.map((t) => t.id));
-        setThreads((prev) =>
-          prev.map((t) => (ids.has(t.id) ? { ...t, unread_count: 0 } : t)),
-        );
+        const curTid = selectedIdRef.current;
+        if (curTid && ids.has(curTid)) {
+          if (pendingMarkReadRef.current === curTid) {
+            pendingMarkReadRef.current = null;
+          }
+          setUnreadDividerCount(0);
+          setUnreadBelow(0);
+          if (
+            authedRef.current &&
+            !isLockedRef.current &&
+            !hasActiveWebAppRef.current &&
+            !webAppHubOpenRef.current &&
+            chatPaneVisibleRef.current
+          ) {
+            void bridge.setActiveThread(curTid);
+          }
+        }
+        const applyAll = (list: ThreadDto[]) =>
+          list.map((t) =>
+            ids.has(t.id)
+              ? {
+                  ...t,
+                  unread_count: 0,
+                  last_read_in_ts: Math.max(t.last_read_in_ts ?? 0, t.last_ts),
+                }
+              : t,
+          );
+        threadsRef.current = applyAll(threadsRef.current);
+        setThreads(applyAll);
       } catch (err) {
         showError(err);
       }
@@ -2543,7 +3872,15 @@ export default function App() {
         map.set(t.id, t.avatar);
       }
     }
-    if (threadDetails?.members) {
+    const cachedMembers = selectedId ? groupMembersCache[selectedId] : undefined;
+    if (cachedMembers) {
+      for (const mem of cachedMembers) {
+        if (mem.id && mem.avatar) {
+          map.set(mem.id, mem.avatar);
+        }
+      }
+    }
+    if (selectedId && threadDetails?.thread_id === selectedId && threadDetails.members) {
       for (const mem of threadDetails.members) {
         if (mem.id && mem.avatar) {
           map.set(mem.id, mem.avatar);
@@ -2551,10 +3888,10 @@ export default function App() {
       }
     }
     return map;
-  }, [threads, threadDetails]);
+  }, [threads, selectedId, groupMembersCache, threadDetails]);
 
   const handleSaveRemoteFile = useCallback(
-    (url: string, suggestedName: string) => {
+    (url: string, suggestedName: string, opts?: { threadId?: string; msgId?: string }) => {
       const downloadId = `dl-${Date.now()}-${++downloadSeqRef.current}`;
       if (isTauri()) {
         setActiveDownloads((prev) =>
@@ -2571,7 +3908,7 @@ export default function App() {
         );
       }
       void bridge
-        .saveRemoteFile(url, suggestedName, downloadId)
+        .saveRemoteFile(url, suggestedName, downloadId, opts)
         .then((res) => {
           setActiveDownloads((prev) => prev.filter((item) => item.id !== downloadId));
           if (res && !handledDoneDownloadIdsRef.current.has(downloadId)) {
@@ -2621,6 +3958,8 @@ export default function App() {
         .map((m) => ({
           url: normalizeMediaRequestUrl(m.attachment_url),
           title: m.attachment_name || "Hình ảnh",
+          threadId: m.thread_id,
+          msgId: m.msg_id,
         }));
       const foundIdx = gallery.findIndex((item) => item.url === targetUrl);
       if (foundIdx >= 0) {
@@ -2693,25 +4032,54 @@ export default function App() {
     [showError, refreshPinnedMessages],
   );
 
-  const handleStartChatFromProfile = useCallback((profile: UserProfileDto) => {
-    setThreads((prev) => {
-      if (prev.some((t) => t.id === profile.uid)) return prev;
-      const created: ThreadDto = {
-        id: profile.uid,
-        title: profile.display_name || profile.uid,
-        avatar: profile.avatar,
-        kind: "direct",
-        last_preview: "",
-        last_ts: 0,
-        unread_count: 0,
-        is_pinned: false,
-        is_muted: false,
-      };
-      return [created, ...prev].sort(compareThreads);
-    });
-    setSelectedId(profile.uid);
-    setMobilePane("chat");
-  }, []);
+  const handleStartChatFromProfile = useCallback(
+    (profile: UserProfileDto) => {
+      leaveWebApps();
+      setThreads((prev) => {
+        if (prev.some((t) => t.id === profile.uid)) return prev;
+        const created: ThreadDto = {
+          id: profile.uid,
+          title: profile.display_name || profile.uid,
+          avatar: profile.avatar,
+          kind: "direct",
+          last_preview: "",
+          last_ts: 0,
+          unread_count: 0,
+          is_pinned: false,
+          is_muted: false,
+        };
+        return [created, ...prev].sort(compareThreads);
+      });
+      setSelectedId(profile.uid);
+      setMobilePane("chat");
+    },
+    [leaveWebApps],
+  );
+
+  const handleStartChatFromFriendRequest = useCallback(
+    (uid: string, name: string, avatar: string) => {
+      setFriendRequestsOpen(false);
+      leaveWebApps();
+      setThreads((prev) => {
+        if (prev.some((t) => t.id === uid)) return prev;
+        const created: ThreadDto = {
+          id: uid,
+          title: name || uid,
+          avatar: avatar || "",
+          kind: "direct",
+          last_preview: "",
+          last_ts: 0,
+          unread_count: 0,
+          is_pinned: false,
+          is_muted: false,
+        };
+        return [created, ...prev].sort(compareThreads);
+      });
+      setSelectedId(uid);
+      setMobilePane("chat");
+    },
+    [leaveWebApps],
+  );
 
   const handleSendSticker = useCallback(
     async (sticker: StickerItem) => {
@@ -2808,20 +4176,58 @@ export default function App() {
     [showError],
   );
 
-  const activeMentionMembers = useMemo(
+  const directDirectory = useMemo(() => {
+    const map = new Map<string, { name: string; avatar: string }>();
+    for (const th of threads) {
+      if (th.kind === "direct" && th.id) {
+        map.set(th.id, { name: th.title, avatar: th.avatar });
+      }
+    }
+    return map;
+  }, [threads]);
+
+  const activeThreadDetails = useMemo(
     () =>
-      activeThread?.kind === "group" && threadDetails?.thread_id === activeThread.id
-        ? threadDetails.members
-        : [],
+      activeThread && threadDetails?.thread_id === activeThread.id ? threadDetails : null,
     [activeThread, threadDetails],
+  );
+
+  const activeMentionMembers = useMemo<ThreadMemberDto[]>(() => {
+    if (!activeThread || activeThread.kind !== "group") return [];
+    if (activeThreadDetails && activeThreadDetails.members.length > 0) {
+      return activeThreadDetails.members;
+    }
+    return groupMembersCache[activeThread.id] ?? [];
+  }, [activeThread, activeThreadDetails, groupMembersCache]);
+
+  const composerMentionMembers = useMemo<ThreadMemberDto[]>(
+    () =>
+      buildComposerMentionMembers({
+        thread: activeThread,
+        groupMembers: activeMentionMembers,
+        messages,
+        selfUid: myProfile?.uid,
+        directDirectory,
+        mentionAllRole: lang === "vi" ? "Mọi người" : lang === "ko" ? "모두" : "Everyone",
+      }),
+    [activeThread, activeMentionMembers, messages, myProfile?.uid, directDirectory, lang],
   );
 
   const messageMentionCandidates = useMemo(() => {
     const byId = new Map<string, { id: string; name: string }>();
     const add = (id: string | undefined, name: string | undefined) => {
       const uid = (id || "").trim();
-      const nm = (name || "").trim();
-      if (!uid || !nm || nm === "Bạn" || /^\d{6,}$/.test(nm)) return;
+      if (!uid) return;
+      let nm = (name || "").normalize("NFC").trim();
+      const dirEntry = directDirectory.get(uid);
+      if (
+        isPlaceholderMemberName(nm) &&
+        dirEntry?.name &&
+        !isPlaceholderMemberName(dirEntry.name)
+      ) {
+        nm = dirEntry.name.normalize("NFC").trim();
+      }
+      if (!nm || isPlaceholderMemberName(nm)) return;
       const existing = byId.get(uid);
       if (!existing || nm.length > existing.name.length) {
         byId.set(uid, { id: uid, name: nm });
@@ -2840,7 +4246,7 @@ export default function App() {
       add(activeThread.id, activeThread.title);
     }
     return Array.from(byId.values());
-  }, [activeMentionMembers, messages, myProfile, activeThread]);
+  }, [activeMentionMembers, messages, myProfile, activeThread, directDirectory]);
 
   const currentPinned =
     pinnedMessages.length > 0 ? pinnedMessages[pinnedIdx % pinnedMessages.length] : null;
@@ -3017,6 +4423,10 @@ export default function App() {
 
   useEffect(() => {
     return () => {
+      const curAtt = pendingAttachmentRef.current;
+      if (curAtt?.kind === "raw" && curAtt.previewUrl) {
+        URL.revokeObjectURL(curAtt.previewUrl);
+      }
       if (screenshotEditorRef.current?.revokeUrl) {
         URL.revokeObjectURL(screenshotEditorRef.current.revokeUrl);
       }
@@ -3027,9 +4437,9 @@ export default function App() {
     att: PendingAttachment,
     caption: string,
     rootMsgId: string,
-  ) => {
+  ): Promise<boolean> => {
     const sent = await handleSendAttachment(att, caption);
-    if (!sent) return;
+    if (!sent) return false;
     setLocalThreadLinks((prev) => {
       const entries = Object.entries({ ...prev, [sent.msg_id]: rootMsgId }).slice(-500);
       const next = Object.fromEntries(entries);
@@ -3040,6 +4450,7 @@ export default function App() {
       }
       return next;
     });
+    return true;
   };
 
   const handleSendBuzz = async () => {
@@ -3074,209 +4485,260 @@ export default function App() {
     );
   };
 
+  const webAppStageFallback = (
+    <div
+      className="relative z-10 flex min-w-0 flex-1 items-center justify-center"
+      style={{ background: "var(--bg-stage)", color: "var(--text-secondary)" }}
+    >
+      <RefreshCw className="h-5 w-5 animate-spin opacity-60" />
+    </div>
+  );
+
   const utilityModals = (
     <>
-      <FindUserModal
-        open={findUserOpen}
-        initialPhone={findUserInitialPhone}
-        onClose={() => {
-          setFindUserOpen(false);
-          setFindUserInitialPhone("");
-        }}
-        onOpenProfile={(profile) => {
-          setProfileInitial(profile);
-          setProfileUid(profile.uid);
-        }}
-        onStartChat={handleStartChatFromProfile}
-      />
+      {findUserOpen && (
+        <Suspense fallback={null}>
+          <FindUserModal
+            open={findUserOpen}
+            initialPhone={findUserInitialPhone}
+            onClose={() => {
+              setFindUserOpen(false);
+              setFindUserInitialPhone("");
+            }}
+            onOpenProfile={(profile) => {
+              setProfileInitial(profile);
+              setProfileUid(profile.uid);
+            }}
+            onStartChat={handleStartChatFromProfile}
+            onRelationshipChanged={handleRelationshipChanged}
+          />
+        </Suspense>
+      )}
 
-      <FolderEditorModal
-        open={folderModalOpen}
-        folders={customFolders}
-        threads={threads}
-        initialEditingFolder={editingFolder}
-        onClose={() => {
-          setFolderModalOpen(false);
-          setEditingFolder(null);
-        }}
-        onSaveFolder={async (targetFolder) => {
-          const updated = await bridge.saveChatFolder(targetFolder);
-          setCustomFolders(updated);
-        }}
-        onDeleteFolder={async (folderId) => {
-          const updated = await bridge.deleteChatFolder(folderId);
-          setCustomFolders(updated);
-          if (folder === `custom:${folderId}`) {
-            setFolder("all");
-          }
-        }}
-        onReorderFolders={async (orderedIds) => {
-          const updated = await bridge.reorderChatFolders(orderedIds);
-          setCustomFolders(updated);
-        }}
-        onSyncRemoteLabels={async () => {
-          const updated = await bridge.syncRemoteLabelFolders();
-          setCustomFolders(updated);
-          return updated.length;
-        }}
-      />
+      {authed && friendRequestsOpen && (
+        <Suspense fallback={null}>
+          <FriendRequestsModal
+            open={friendRequestsOpen}
+            onClose={() => setFriendRequestsOpen(false)}
+            onOpenProfile={(uid) => {
+              setProfileInitial(null);
+              setProfileUid(uid);
+            }}
+            onStartChat={handleStartChatFromFriendRequest}
+            onChanged={(receivedCount) => {
+              const prevCount = pendingFriendRequestsCountRef.current;
+              setPendingFriendRequestsCount(receivedCount);
+              if (receivedCount < prevCount) {
+                void refreshThreadsSilently();
+              }
+            }}
+          />
+        </Suspense>
+      )}
 
-      <SettingsModal
-        open={settingsOpen}
-        initialTab={settingsInitialTab}
-        myProfile={myProfile}
-        connStatus={connStatus}
-        onOpenMyProfile={() => {
-          if (myProfile?.uid) setProfileUid(myProfile.uid);
-        }}
-        onLogout={() => {
-          void bridge.logout().then(() => {
-            setAuthed(false);
-            resetSessionUi();
-            void refreshQr();
-          });
-        }}
-        theme={theme}
-        onThemeChange={setTheme}
-        fontSize={fontSize}
-        onFontSizeChange={setFontSize}
-        density={density}
-        onDensityChange={setDensity}
-        fxEnabled={fxEnabled}
-        onFxChange={setFxEnabled}
-        sendOnEnter={sendOnEnter}
-        onSendOnEnterChange={setSendOnEnter}
-        notifyPrefs={notifyPrefs}
-        onNotifyPrefsChange={setNotifyPrefs}
-        onTestSound={() => playMessageSound(true)}
-        onTestNotification={() => {
-          const sampleThread =
-            threads.find((t) => t.id === selectedId) ??
-            threads.find((t) => t.kind !== "cloud") ??
-            threads[0];
-          const sampleMsg: MessageDto = {
-            msg_id: `preview-${Date.now()}`,
-            thread_id: sampleThread?.id || "cloud-me",
-            sender_id: sampleThread?.id || "u-demo",
-            sender_name: sampleThread?.title || "Teza",
-            text: "Đây là thông báo thử — bấm vào đây để mở hội thoại này.",
-            msg_type: "chat.text",
-            ts: Date.now(),
-            is_outgoing: false,
-            is_recalled: false,
-            is_pinned: false,
-            quote: null,
-            reactions: [],
-            attachment_url: null,
-            attachment_name: null,
-          };
-          const { title, body } = formatNotificationContent({
-            msg: sampleMsg,
-            thread: sampleThread,
-            previewMode: notifyPrefs.previewMode,
-          });
-          triggerNotifyPopup({
-            thread_id: sampleMsg.thread_id,
-            title,
-            body,
-            avatar: sampleThread?.avatar || "",
-            theme,
-            position: notifyPrefs.position,
-            duration_ms: notifyPrefs.durationSec * 1000,
-          });
-        }}
-        closeToTray={closeToTray}
-        onCloseToTrayChange={setCloseToTray}
-        customFoldersCount={customFolders.length}
-        hiddenBuiltInFolders={hiddenBuiltInFolders}
-        onToggleBuiltInFolder={handleToggleBuiltInFolder}
-        railDisplayMode={railDisplayMode}
-        onRailDisplayModeChange={(mode) => {
-          setRailDisplayMode(mode);
-          localStorage.setItem("teza.railDisplayMode", mode);
-        }}
-        onOpenFoldersModal={() => {
-          setEditingFolder(null);
-          setFolderModalOpen(true);
-        }}
-        webAppsCfg={webAppsCfg}
-        onWebAppsCfgChange={handleWebAppsCfgChange}
-        onOpenWebApp={handleActivateWebApp}
-        passcodeCfg={passcodeCfg}
-        onUpdatePasscode={handleUpdatePasscode}
-        onLockNow={() => {
-          if (passcodeCfg.enabled) setIsLocked(true);
-        }}
-        translateCfg={translateCfg}
-        onOpenTranslateModal={() => setTranslateModalOpen(true)}
-        relayCfg={relayCfg}
-        onRelaySaved={(cfg) => {
-          applyRelaySummary(cfg);
-          if (!authed) {
-            void refreshQr();
-          }
-        }}
-        focusRelay={focusRelaySettings}
-        callDevices={callDevices}
-        callDevicesLoading={callDevicesLoading}
-        onRefreshCallDevices={refreshCallDevices}
-        onSelectCallDevices={handleSelectCallDevices}
-        appVersion={appVersion}
-        availableUpdate={availableUpdate}
-        onOpenUpdateModal={() => setUpdateModalOpen(true)}
-        onClose={() => {
-          setSettingsOpen(false);
-          setFocusRelaySettings(false);
-        }}
-      />
+      {folderModalOpen && (
+        <Suspense fallback={null}>
+          <FolderEditorModal
+            open={folderModalOpen}
+            folders={customFolders}
+            threads={threads}
+            initialEditingFolder={editingFolder}
+            onClose={() => {
+              setFolderModalOpen(false);
+              setEditingFolder(null);
+            }}
+            onSaveFolder={async (targetFolder) => {
+              const updated = await bridge.saveChatFolder(targetFolder);
+              setCustomFolders(updated);
+            }}
+            onDeleteFolder={async (folderId) => {
+              const updated = await bridge.deleteChatFolder(folderId);
+              setCustomFolders(updated);
+              if (folder === `custom:${folderId}`) {
+                setFolder("all");
+              }
+            }}
+            onReorderFolders={async (orderedIds) => {
+              const updated = await bridge.reorderChatFolders(orderedIds);
+              setCustomFolders(updated);
+            }}
+            onSyncRemoteLabels={async () => {
+              const updated = await bridge.syncRemoteLabelFolders();
+              setCustomFolders(updated);
+              return updated.length;
+            }}
+          />
+        </Suspense>
+      )}
 
-      <UpdateModal
-        open={updateModalOpen}
-        currentVersion={appVersion}
-        availableUpdate={availableUpdate}
-        checking={checkingUpdate}
-        errorText={updateError}
-        lastCheckedAt={lastUpdateCheckAt}
-        onCheckNow={() => checkForUpdates(false)}
-        onClose={() => setUpdateModalOpen(false)}
-      />
+      {settingsOpen && (
+        <Suspense fallback={null}>
+          <SettingsModal
+            open={settingsOpen}
+            initialTab={settingsInitialTab}
+            myProfile={myProfile}
+            connStatus={connStatus}
+            onOpenMyProfile={() => {
+              if (myProfile?.uid) setProfileUid(myProfile.uid);
+            }}
+            onLogout={() => {
+              void bridge.logout().then(() => {
+                setAuthed(false);
+                resetSessionUi();
+                void refreshQr();
+              });
+            }}
+            theme={theme}
+            onThemeChange={setTheme}
+            fontSize={fontSize}
+            onFontSizeChange={setFontSize}
+            density={density}
+            onDensityChange={setDensity}
+            fxEnabled={fxEnabled}
+            onFxChange={setFxEnabled}
+            sendOnEnter={sendOnEnter}
+            onSendOnEnterChange={setSendOnEnter}
+            notifyPrefs={notifyPrefs}
+            onNotifyPrefsChange={setNotifyPrefs}
+            onTestSound={() => playMessageSound(true)}
+            onTestNotification={() => {
+              const sampleThread =
+                threads.find((t) => t.id === selectedId) ??
+                threads.find((t) => t.kind !== "cloud") ??
+                threads[0];
+              const sampleMsg: MessageDto = {
+                msg_id: `preview-${Date.now()}`,
+                thread_id: sampleThread?.id || "cloud-me",
+                sender_id: sampleThread?.id || "u-demo",
+                sender_name: sampleThread?.title || "Teza",
+                text: "Đây là thông báo thử — bấm vào đây để mở hội thoại này.",
+                msg_type: "chat.text",
+                ts: Date.now(),
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: null,
+                reactions: [],
+                attachment_url: null,
+                attachment_name: null,
+              };
+              const { title, body } = formatNotificationContent({
+                msg: sampleMsg,
+                thread: sampleThread,
+                previewMode: notifyPrefs.previewMode,
+              });
+              triggerNotifyPopup({
+                thread_id: sampleMsg.thread_id,
+                title,
+                body,
+                avatar: sampleThread?.avatar || "",
+                theme,
+                position: notifyPrefs.position,
+                duration_ms: notifyPrefs.durationSec * 1000,
+              });
+            }}
+            closeToTray={closeToTray}
+            onCloseToTrayChange={setCloseToTray}
+            customFoldersCount={customFolders.length}
+            hiddenBuiltInFolders={hiddenBuiltInFolders}
+            onToggleBuiltInFolder={handleToggleBuiltInFolder}
+            railDisplayMode={railDisplayMode}
+            onRailDisplayModeChange={(mode) => {
+              setRailDisplayMode(mode);
+              localStorage.setItem("teza.railDisplayMode", mode);
+            }}
+            onOpenFoldersModal={() => {
+              setEditingFolder(null);
+              setFolderModalOpen(true);
+            }}
+            webAppsCfg={webAppsCfg}
+            onWebAppsCfgChange={handleWebAppsCfgChange}
+            onOpenWebApp={handleActivateWebApp}
+            passcodeCfg={passcodeCfg}
+            onUpdatePasscode={handleUpdatePasscode}
+            onLockNow={() => {
+              if (passcodeCfg.enabled) setIsLocked(true);
+            }}
+            translateCfg={translateCfg}
+            onOpenTranslateModal={() => setTranslateModalOpen(true)}
+            relayCfg={relayCfg}
+            onRelaySaved={(cfg) => {
+              applyRelaySummary(cfg);
+              if (!authed) {
+                void refreshQr();
+              }
+            }}
+            focusRelay={focusRelaySettings}
+            callDevices={callDevices}
+            callDevicesLoading={callDevicesLoading}
+            onRefreshCallDevices={refreshCallDevices}
+            onSelectCallDevices={handleSelectCallDevices}
+            appVersion={appVersion}
+            availableUpdate={availableUpdate}
+            onOpenUpdateModal={() => setUpdateModalOpen(true)}
+            onClose={() => {
+              setSettingsOpen(false);
+              setFocusRelaySettings(false);
+            }}
+          />
+        </Suspense>
+      )}
 
-      <TranslateSettingsModal
-        open={translateModalOpen}
-        config={translateCfg}
-        onClose={() => setTranslateModalOpen(false)}
-        onSaved={(cfg) => {
-          const prevCfg = translateCfgRef.current;
-          setTranslateCfg(cfg);
-          translateCfgRef.current = cfg;
-          const providerChanged = Boolean(prevCfg && prevCfg.provider !== cfg.provider);
-          const modeChanged = Boolean(prevCfg && prevCfg.detect_mode !== cfg.detect_mode);
-          const langChanged = Boolean(prevCfg && prevCfg.target_lang !== cfg.target_lang);
-          if (providerChanged || modeChanged || langChanged) {
-            translationCacheRef.current.clear();
-            translationsRef.current = {};
-            setTranslationsByMsg({});
-          }
-          if (selectedId && threadAutoTranslate[selectedId]) {
-            const nextLang = cfg.target_lang || translateCode;
-            setThreadAutoTranslate((prev) => ({
-              ...prev,
-              [selectedId]: nextLang,
-            }));
-            if ((providerChanged || modeChanged) && !langChanged) {
-              void translateBatchMessages(messages, nextLang, false, providerChanged);
-            }
-          }
-        }}
-        onCacheCleared={() => {
-          translationCacheRef.current.clear();
-          translationsRef.current = {};
-          setTranslationsByMsg({});
-          if (selectedId && threadAutoTranslate[selectedId]) {
-            void translateBatchMessages(messages, threadAutoTranslate[selectedId], false, false);
-          }
-        }}
-      />
+      {updateModalOpen && (
+        <Suspense fallback={null}>
+          <UpdateModal
+            open={updateModalOpen}
+            currentVersion={appVersion}
+            availableUpdate={availableUpdate}
+            checking={checkingUpdate}
+            errorText={updateError}
+            lastCheckedAt={lastUpdateCheckAt}
+            onCheckNow={() => checkForUpdates(false)}
+            onClose={() => setUpdateModalOpen(false)}
+          />
+        </Suspense>
+      )}
+
+      {translateModalOpen && (
+        <Suspense fallback={null}>
+          <TranslateSettingsModal
+            open={translateModalOpen}
+            config={translateCfg}
+            onClose={() => setTranslateModalOpen(false)}
+            onSaved={(cfg) => {
+              const prevCfg = translateCfgRef.current;
+              setTranslateCfg(cfg);
+              translateCfgRef.current = cfg;
+              const providerChanged = Boolean(prevCfg && prevCfg.provider !== cfg.provider);
+              const modeChanged = Boolean(prevCfg && prevCfg.detect_mode !== cfg.detect_mode);
+              const langChanged = Boolean(prevCfg && prevCfg.target_lang !== cfg.target_lang);
+              if (providerChanged || modeChanged || langChanged) {
+                translationCacheRef.current.clear();
+                translationsRef.current = {};
+                setTranslationsByMsg({});
+              }
+              if (selectedId && threadAutoTranslate[selectedId]) {
+                const nextLang = cfg.target_lang || translateCode;
+                setThreadAutoTranslate((prev) => ({
+                  ...prev,
+                  [selectedId]: nextLang,
+                }));
+                if ((providerChanged || modeChanged) && !langChanged) {
+                  void translateBatchMessages(messages, nextLang, false, providerChanged);
+                }
+              }
+            }}
+            onCacheCleared={() => {
+              translationCacheRef.current.clear();
+              translationsRef.current = {};
+              setTranslationsByMsg({});
+              if (selectedId && threadAutoTranslate[selectedId]) {
+                void translateBatchMessages(messages, threadAutoTranslate[selectedId], false, false);
+              }
+            }}
+          />
+        </Suspense>
+      )}
     </>
   );
 
@@ -3339,14 +4801,15 @@ export default function App() {
           openThreadById(cloudId);
         }}
         onOpenArchived={() => {
-          setActiveWebAppId(null);
-          void bridge.webappHideAll();
+          leaveWebApps();
           setFolder("archived");
         }}
         onOpenFindUser={() => {
           setFindUserInitialPhone("");
           setFindUserOpen(true);
         }}
+        onOpenFriendRequests={() => setFriendRequestsOpen(true)}
+        pendingFriendRequestsCount={pendingFriendRequestsCount}
         onOpenFolders={() => {
           setEditingFolder(null);
           setFolderModalOpen(true);
@@ -3414,8 +4877,7 @@ export default function App() {
               <button
                 key={item.id}
                 onClick={() => {
-                  setActiveWebAppId(null);
-                  setWebAppHubOpen(false);
+                  leaveWebApps();
                   setFolder(item.id);
                 }}
                 title={itemLabel}
@@ -3474,8 +4936,7 @@ export default function App() {
                 type="button"
                 title={`${cf.name} (Chuột phải để tùy chỉnh)`}
                 onClick={() => {
-                  setActiveWebAppId(null);
-                  setWebAppHubOpen(false);
+                  leaveWebApps();
                   setFolder(sel);
                 }}
                 onContextMenu={(e) => {
@@ -3649,32 +5110,33 @@ export default function App() {
       </aside>
 
       {activeWebApp ? (
-        <WebAppWorkspace
-          app={activeWebApp}
-          suspended={webappSuspended}
-          allEmbeddedApps={embeddedWebApps}
-          onSelectApp={handleActivateWebApp}
-          onBackToHub={() => {
-            void bridge.webappHideAll();
-            setActiveWebAppId(null);
-            setWebAppHubOpen(true);
-          }}
-          onCloseToChat={() => {
-            setActiveWebAppId(null);
-            setWebAppHubOpen(false);
-          }}
-          onOpenExternal={(url) => void bridge.openExternalUrl(url).catch(showError)}
-          onError={showError}
-        />
+        <Suspense fallback={webAppStageFallback}>
+          <WebAppWorkspace
+            app={activeWebApp}
+            suspended={webappSuspended}
+            allEmbeddedApps={embeddedWebApps}
+            onSelectApp={handleActivateWebApp}
+            onBackToHub={() => {
+              void bridge.webappHideAll();
+              setActiveWebAppId(null);
+              setWebAppHubOpen(true);
+            }}
+            onCloseToChat={leaveWebApps}
+            onOpenExternal={(url) => void bridge.openExternalUrl(url).catch(showError)}
+            onError={showError}
+          />
+        </Suspense>
       ) : webAppsCfg.enabled && webAppHubOpen ? (
-        <WebAppHub
-          config={webAppsCfg}
-          lastActiveId={activeWebAppId}
-          onChangeConfig={handleWebAppsCfgChange}
-          onLaunch={handleActivateWebApp}
-          onOpenExternal={(url) => void bridge.openExternalUrl(url).catch(showError)}
-          onCloseToChat={() => setWebAppHubOpen(false)}
-        />
+        <Suspense fallback={webAppStageFallback}>
+          <WebAppHub
+            config={webAppsCfg}
+            lastActiveId={lastOpenedWebAppId}
+            onChangeConfig={handleWebAppsCfgChange}
+            onLaunch={handleActivateWebApp}
+            onOpenExternal={(url) => void bridge.openExternalUrl(url).catch(showError)}
+            onCloseToChat={() => setWebAppHubOpen(false)}
+          />
+        </Suspense>
       ) : (
         <>
       {/* Column 2: Resizable / Auto-Collapsing Thread List */}
@@ -3706,7 +5168,7 @@ export default function App() {
                   setManualSidebarCompact(false);
                   localStorage.setItem("litechat.sidebarCompact", "0");
                 }}
-                title="Mở rộng danh sách hội thoại"
+                title={t("expandListTitle")}
                 className="hover-menu flex h-9 w-9 items-center justify-center rounded-xl transition"
                 style={{ background: "var(--bg-surface)", color: "var(--accent)" }}
               >
@@ -3716,7 +5178,7 @@ export default function App() {
             <button
               type="button"
               onClick={() => setQuickSearchOpen(true)}
-              title="Tìm kiếm toàn cục (Ctrl+K)"
+              title={t("globalSearchTitle")}
               className="hover-menu flex h-9 w-9 items-center justify-center rounded-xl transition"
               style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
             >
@@ -3728,11 +5190,31 @@ export default function App() {
                 setFindUserInitialPhone("");
                 setFindUserOpen(true);
               }}
-              title="Tìm bạn theo số điện thoại"
+              title={t("findFriendByPhoneTitle")}
               className="hover-menu flex h-9 w-9 items-center justify-center rounded-xl transition"
               style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
             >
               <UserPlus className="h-4 w-4" />
+            </button>
+            <button
+              type="button"
+              onClick={() => setFriendRequestsOpen(true)}
+              title={t("friendRequestsMenu")}
+              className="hover-menu relative flex h-9 w-9 items-center justify-center rounded-xl transition"
+              style={{
+                background: "var(--bg-surface)",
+                color: pendingFriendRequestsCount > 0 ? "var(--accent)" : "var(--text-secondary)",
+              }}
+            >
+              <UserCheck className="h-4 w-4" />
+              {pendingFriendRequestsCount > 0 && (
+                <span
+                  className="absolute -right-1 -top-1 min-w-[16px] rounded-full px-1 py-0.5 text-center text-[10px] font-bold leading-none"
+                  style={{ background: "var(--accent)", color: "var(--text-on-accent)" }}
+                >
+                  {pendingFriendRequestsCount > 99 ? "99+" : pendingFriendRequestsCount}
+                </span>
+              )}
             </button>
           </div>
         ) : (
@@ -3761,6 +5243,26 @@ export default function App() {
                 style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
               >
                 <UserPlus className="h-4 w-4" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setFriendRequestsOpen(true)}
+                title={t("friendRequestsMenu")}
+                className="hover-menu relative shrink-0 rounded-lg p-2 transition"
+                style={{
+                  background: "var(--bg-surface)",
+                  color: pendingFriendRequestsCount > 0 ? "var(--accent)" : "var(--text-secondary)",
+                }}
+              >
+                <UserCheck className="h-4 w-4" />
+                {pendingFriendRequestsCount > 0 && (
+                  <span
+                    className="absolute -right-1 -top-1 min-w-[16px] rounded-full px-1 py-0.5 text-center text-[10px] font-bold leading-none"
+                    style={{ background: "var(--accent)", color: "var(--text-on-accent)" }}
+                  >
+                    {pendingFriendRequestsCount > 99 ? "99+" : pendingFriendRequestsCount}
+                  </span>
+                )}
               </button>
               <button
                 type="button"
@@ -4042,6 +5544,7 @@ export default function App() {
                         e.stopPropagation();
                         setProfileUid(thread.id);
                       }}
+                      onKeyDown={(e) => e.stopPropagation()}
                       title={t("lookupProfile")}
                       className="shrink-0 rounded-full transition hover:opacity-85"
                     >
@@ -4156,6 +5659,7 @@ export default function App() {
           title={t("resizeThreadsTitle")}
           onPointerDown={(e) => {
             e.preventDefault();
+            sidebarDragCleanupRef.current?.();
             const startX = e.clientX;
             const startW = sidebarWidth;
             const onMove = (ev: PointerEvent) => {
@@ -4163,6 +5667,14 @@ export default function App() {
               if (rawW < 160) return;
               const next = Math.min(440, Math.max(240, rawW));
               setSidebarWidth(next);
+            };
+            const cleanup = () => {
+              window.removeEventListener("pointermove", onMove);
+              window.removeEventListener("pointerup", onUp);
+              window.removeEventListener("pointercancel", onCancel);
+              if (sidebarDragCleanupRef.current === cleanup) {
+                sidebarDragCleanupRef.current = null;
+              }
             };
             const onUp = (ev: PointerEvent) => {
               const rawW = startW + (ev.clientX - startX);
@@ -4175,11 +5687,15 @@ export default function App() {
                 localStorage.setItem("litechat.sidebarCompact", "0");
                 localStorage.setItem("litechat.sidebarWidth", String(finalW));
               }
-              window.removeEventListener("pointermove", onMove);
-              window.removeEventListener("pointerup", onUp);
+              cleanup();
             };
+            const onCancel = () => {
+              cleanup();
+            };
+            sidebarDragCleanupRef.current = cleanup;
             window.addEventListener("pointermove", onMove);
             window.addEventListener("pointerup", onUp);
+            window.addEventListener("pointercancel", onCancel);
           }}
           className="relative z-20 w-1.5 shrink-0 cursor-col-resize transition-colors hover:bg-sky-500/35"
           style={{ background: "var(--bg-sidebar)", borderRight: "1px solid var(--border-subtle)" }}
@@ -4238,7 +5754,7 @@ export default function App() {
               threadKind={activeThread.kind}
               peerReadTs={activeThread.peer_read_ts}
               pendingAttachment={pendingAttachment}
-              onPendingAttachmentChange={setPendingAttachment}
+              onPendingAttachmentChange={updatePendingAttachment}
               translationsByMsg={translationsByMsg}
               replaceWithTranslation={Boolean(activeThreadLang)}
               drawerOpen={drawerOpen}
@@ -4252,6 +5768,8 @@ export default function App() {
               onSendThreadAttachment={handleSendThreadAttachment}
               onBuzz={handleSendBuzz}
               buzzCooldownSec={buzzCooldownSec}
+              sendOnEnter={sendOnEnter}
+              hasBlockingOverlay={hasBlockingOverlay}
               getSenderAvatar={(uid) => avatarByUserId.get(uid)}
               onSaveFile={handleSaveRemoteFile}
               onRetrySend={handleRetryFailedMessage}
@@ -4270,7 +5788,7 @@ export default function App() {
                   return next;
                 })
               }
-              mentionMembers={activeMentionMembers}
+              mentionMembers={composerMentionMembers}
               displayMentionMembers={messageMentionCandidates}
               onSendSticker={handleSendSticker}
               onTogglePin={handleTogglePinMessage}
@@ -4334,29 +5852,55 @@ export default function App() {
                 {activeThread.kind === "direct" &&
                   activeThread.id !== "cloud-me" &&
                   activeThread.id !== myProfile?.uid && (
-                    <button
-                      type="button"
-                      disabled={!activeCallCheck.allowed || callActionBusy}
-                      onClick={() => void handleStartVoiceCall(activeThread.id, activeThread.title)}
-                      title={
-                        activeCallCheck.disabledReason === "relay_enabled"
-                          ? t("callDisabledRelayTooltip")
-                          : activeCallCheck.disabledReason === "busy"
-                            ? t("callAlreadyActiveTooltip")
-                            : t("callVoiceTitle")
-                      }
-                      className="rounded-lg p-2 transition hover:opacity-80 disabled:cursor-not-allowed disabled:opacity-40"
-                      style={{
-                        color: activeCallCheck.allowed
-                          ? "var(--accent)"
-                          : "var(--text-secondary)",
-                        background: activeCallCheck.allowed
-                          ? "var(--accent-soft)"
-                          : "transparent",
-                      }}
-                    >
-                      <Phone className="h-4 w-4" />
-                    </button>
+                    <>
+                      <button
+                        type="button"
+                        disabled={!activeCallCheck.allowed || callActionBusy}
+                        onClick={() => void handleStartVoiceCall(activeThread.id, activeThread.title)}
+                        title={
+                          activeCallCheck.disabledReason === "relay_enabled"
+                            ? t("callDisabledRelayTooltip")
+                            : activeCallCheck.disabledReason === "busy"
+                              ? t("callAlreadyActiveTooltip")
+                              : t("callVoiceTitle")
+                        }
+                        className="rounded-lg p-2 transition hover:opacity-80 disabled:cursor-not-allowed disabled:opacity-40"
+                        style={{
+                          color: activeCallCheck.allowed
+                            ? "var(--accent)"
+                            : "var(--text-secondary)",
+                          background: activeCallCheck.allowed
+                            ? "var(--accent-soft)"
+                            : "transparent",
+                        }}
+                      >
+                        <Phone className="h-4 w-4" />
+                      </button>
+                      <button
+                        type="button"
+                        disabled={!activeCallCheck.allowed || callActionBusy}
+                        onClick={() => void handleStartVideoCall(activeThread.id, activeThread.title)}
+                        title={
+                          activeCallCheck.disabledReason === "relay_enabled"
+                            ? t("callDisabledRelayTooltip")
+                            : activeCallCheck.disabledReason === "busy"
+                              ? t("callAlreadyActiveTooltip")
+                              : t("callVideoTitle")
+                        }
+                        aria-label={t("callVideoTitle")}
+                        className="rounded-lg p-2 transition hover:opacity-80 disabled:cursor-not-allowed disabled:opacity-40"
+                        style={{
+                          color: activeCallCheck.allowed
+                            ? "var(--accent)"
+                            : "var(--text-secondary)",
+                          background: activeCallCheck.allowed
+                            ? "var(--accent-soft)"
+                            : "transparent",
+                        }}
+                      >
+                        <Video className="h-4 w-4" />
+                      </button>
+                    </>
                   )}
                 <button
                   onClick={handleToggleThreadTranslate}
@@ -4559,7 +6103,9 @@ export default function App() {
                   }}
                   onKeyDown={(e) => {
                     if (e.key === "Escape") {
+                      e.preventDefault();
                       setInChatSearchOpen(false);
+                      setInChatSearchQuery("");
                     } else if (e.key === "Enter" && inChatMatches.length > 0) {
                       e.preventDefault();
                       setInChatMatchIdx((i) =>
@@ -4718,12 +6264,7 @@ export default function App() {
                 setShowScrollDown(farUp);
                 if (!farUp) setUnreadBelow(0);
                 if (distFromBottom < 90 && selectedId) {
-                  const activeUnread =
-                    pendingMarkReadRef.current === selectedId ||
-                    (threadsRef.current.find((t) => t.id === selectedId)?.unread_count ?? 0) > 0;
-                  if (activeUnread) {
-                    completeMarkReadForThread(selectedId);
-                  }
+                  tryAutoMarkReadActiveThread();
                 }
               }}
               className="relative flex-1 overflow-y-auto px-5 py-2.5"
@@ -4947,8 +6488,8 @@ export default function App() {
                 draft={draftsByThread[activeThread.id] ?? ""}
                 onDraftChange={(val, tid) => setDraftForThread(tid ?? activeThread.id, val)}
                 pendingAttachment={pendingAttachment}
-                onPendingAttachmentChange={setPendingAttachment}
-                mentionMembers={activeMentionMembers}
+                onPendingAttachmentChange={updatePendingAttachment}
+                mentionMembers={composerMentionMembers}
                 onSendSticker={handleSendSticker}
                 onCancelReply={() => setReplyTo(null)}
                 onSendText={handleSendText}
@@ -5049,8 +6590,8 @@ export default function App() {
             <div className="mt-2 text-[15.5px] font-semibold">{activeThread.title}</div>
             <div className="text-[13px]" style={{ color: "var(--text-secondary)" }}>
               {activeThread.kind === "group"
-                ? threadDetails?.total_members
-                  ? t("groupMembersLine", { count: threadDetails.total_members })
+                ? activeThreadDetails?.total_members
+                  ? t("groupMembersLine", { count: activeThreadDetails.total_members })
                   : t("groupChatLabel")
                 : activeThread.kind === "cloud"
                   ? t("myCloudShort")
@@ -5199,7 +6740,12 @@ export default function App() {
                     className="text-[13px] font-semibold"
                     style={{ color: "var(--text-secondary)" }}
                   >
-                    {t("membersTitle", { count: threadDetails?.total_members ?? threadDetails?.members.length ?? "..." })}
+                    {t("membersTitle", {
+                      count:
+                        activeThreadDetails?.total_members ??
+                        activeThreadDetails?.members.length ??
+                        "...",
+                    })}
                   </div>
                   <button
                     type="button"
@@ -5212,30 +6758,111 @@ export default function App() {
                     <span>{t("add")}</span>
                   </button>
                 </div>
-                {detailsLoading && !threadDetails ? (
-                  <div className="text-[13px] opacity-60">{t("loadingMembers")}</div>
-                ) : threadDetails && threadDetails.members.length > 0 ? (
-                  <div className="max-h-48 space-y-1.5 overflow-y-auto">
-                    {threadDetails.members.map((mem) => (
+                {kickTarget && kickTarget.groupId === activeThread.id && (
+                  <div
+                    className="mb-2 rounded-xl p-2.5 text-xs"
+                    style={{
+                      background: "var(--danger-bg)",
+                      border: "1px solid rgba(244, 63, 94, 0.35)",
+                    }}
+                  >
+                    <div className="font-medium leading-snug" style={{ color: "var(--danger-text)" }}>
+                      {t("groupKickConfirmDesc", { name: kickTarget.member.name })}
+                    </div>
+                    {kickError && (
+                      <div className="mt-1.5 text-[11px] leading-snug text-rose-400">
+                        {kickError}
+                      </div>
+                    )}
+                    <div className="mt-2 flex items-center justify-end gap-1.5">
                       <button
-                        key={mem.id}
                         type="button"
-                        onClick={() => setProfileUid(mem.id)}
-                        title={t("lookupProfile")}
-                        className="hover-menu flex w-full items-center gap-2 rounded-lg px-1.5 py-1 text-left transition"
+                        disabled={kickBusy}
+                        onClick={() => {
+                          setKickTarget(null);
+                          setKickError(null);
+                        }}
+                        className="hover-menu rounded-lg px-2.5 py-1 text-[11.5px] font-medium transition disabled:opacity-50"
+                        style={{ background: "var(--bg-surface)", color: "var(--text-primary)" }}
                       >
-                        <ThreadAvatar avatar={mem.avatar} title={mem.name} kind="direct" size="sm" />
-                        <div className="min-w-0 flex-1">
-                          <div className="truncate text-[13.5px] font-medium">{mem.name}</div>
-                          {mem.role !== "Thành viên" && (
-                            <div className="text-xs" style={{ color: "var(--accent)" }}>
-                              {mem.role}
-                            </div>
-                          )}
-                        </div>
+                        {t("socialCancelBtn")}
                       </button>
-                    ))}
+                      <button
+                        type="button"
+                        disabled={kickBusy}
+                        onClick={() => void handleConfirmKickMember()}
+                        className="rounded-lg bg-rose-600 px-2.5 py-1 text-[11.5px] font-semibold text-white transition hover:bg-rose-500 disabled:opacity-50"
+                      >
+                        {t("socialConfirmActionBtn")}
+                      </button>
+                    </div>
                   </div>
+                )}
+                {detailsLoading && !activeThreadDetails ? (
+                  <div className="text-[13px] opacity-60">{t("loadingMembers")}</div>
+                ) : activeThreadDetails && activeThreadDetails.members.length > 0 ? (
+                  (() => {
+                    const myUid = myProfile?.uid?.trim() || "";
+                    const groupCreatorId = activeThreadDetails.creator_id?.trim() || "";
+                    const groupAdminIds = activeThreadDetails.admin_ids ?? [];
+                    const isSelfCreator = Boolean(myUid && groupCreatorId && myUid === groupCreatorId);
+                    const isSelfAdmin = Boolean(myUid && groupAdminIds.includes(myUid));
+                    return (
+                      <div className="max-h-48 space-y-1.5 overflow-y-auto">
+                        {activeThreadDetails.members.map((mem) => {
+                          const memberIsCreator = Boolean(groupCreatorId && mem.id === groupCreatorId);
+                          const memberIsAdmin = groupAdminIds.includes(mem.id);
+                          const canKick = Boolean(
+                            myUid &&
+                              mem.id !== myUid &&
+                              (isSelfCreator || (isSelfAdmin && !memberIsCreator && !memberIsAdmin)),
+                          );
+                          return (
+                            <div
+                              key={mem.id}
+                              className="hover-menu flex w-full items-center gap-1.5 rounded-lg px-1.5 py-1 transition"
+                            >
+                              <button
+                                type="button"
+                                onClick={() => setProfileUid(mem.id)}
+                                title={t("lookupProfile")}
+                                className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                              >
+                                <ThreadAvatar
+                                  avatar={mem.avatar}
+                                  title={mem.name}
+                                  kind="direct"
+                                  size="sm"
+                                />
+                                <div className="min-w-0 flex-1">
+                                  <div className="truncate text-[13.5px] font-medium">{mem.name}</div>
+                                  {mem.role && mem.role !== "Thành viên" && (
+                                    <div className="text-xs" style={{ color: "var(--accent)" }}>
+                                      {mem.role}
+                                    </div>
+                                  )}
+                                </div>
+                              </button>
+                              {canKick && (
+                                <button
+                                  type="button"
+                                  disabled={kickBusy}
+                                  onClick={() => {
+                                    setKickError(null);
+                                    setKickTarget({ groupId: activeThread.id, member: mem });
+                                  }}
+                                  title={t("groupKickMemberTitle")}
+                                  className="shrink-0 rounded-md p-1.5 text-rose-500 transition hover:bg-rose-500/15 disabled:opacity-50"
+                                >
+                                  <UserMinus className="h-3.5 w-3.5" />
+                                </button>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    );
+                  })()
                 ) : (
                   <div className="text-[13px] opacity-60">{t("noMembersList")}</div>
                 )}
@@ -5254,7 +6881,7 @@ export default function App() {
                   }}
                 >
                   <ImageIcon className="h-3.5 w-3.5" />
-                  {t("tabMedia", { count: threadDetails?.media_items.length ?? 0 })}
+                  {t("tabMedia", { count: activeThreadDetails?.media_items.length ?? 0 })}
                 </button>
                 <button
                   type="button"
@@ -5266,7 +6893,7 @@ export default function App() {
                   }}
                 >
                   <FileText className="h-3.5 w-3.5" />
-                  {t("tabFiles", { count: threadDetails?.file_items.length ?? 0 })}
+                  {t("tabFiles", { count: activeThreadDetails?.file_items.length ?? 0 })}
                 </button>
                 <button
                   type="button"
@@ -5278,14 +6905,14 @@ export default function App() {
                   }}
                 >
                   <Link2 className="h-3.5 w-3.5" />
-                  {t("tabLinks", { count: threadDetails?.link_items?.length ?? 0 })}
+                  {t("tabLinks", { count: activeThreadDetails?.link_items?.length ?? 0 })}
                 </button>
               </div>
 
               {detailsTab === "media" ? (
-                threadDetails && threadDetails.media_items.length > 0 ? (
+                activeThreadDetails && activeThreadDetails.media_items.length > 0 ? (
                   <div className="grid grid-cols-3 gap-1.5">
-                    {threadDetails.media_items.slice(0, 18).map((item) => {
+                    {activeThreadDetails.media_items.slice(0, 18).map((item) => {
                       const tLower = item.msg_type.toLowerCase();
                       const isVid =
                         tLower.includes("video") ||
@@ -5322,6 +6949,8 @@ export default function App() {
                             item.attachment_url && (
                               <RelayImage
                                 src={item.attachment_url}
+                                threadId={item.thread_id}
+                                msgId={item.msg_id}
                                 alt={item.attachment_name || "Media"}
                                 referrerPolicy="no-referrer"
                                 className="h-full w-full object-cover"
@@ -5337,9 +6966,9 @@ export default function App() {
                   <div className="py-4 text-center text-xs opacity-60">{t("noMediaYet")}</div>
                 )
               ) : detailsTab === "files" ? (
-                threadDetails && threadDetails.file_items.length > 0 ? (
+                activeThreadDetails && activeThreadDetails.file_items.length > 0 ? (
                 <div className="space-y-1.5">
-                  {threadDetails.file_items.slice(0, 20).map((item) => {
+                  {activeThreadDetails.file_items.slice(0, 20).map((item) => {
                     const drawerAction = classifyDrawerFileAction(item);
                     const normalizedUrl = normalizeMediaRequestUrl(item.attachment_url);
                     return (
@@ -5353,6 +6982,7 @@ export default function App() {
                             handleSaveRemoteFile(
                               normalizedUrl,
                               item.attachment_name || "attachment",
+                              { threadId: item.thread_id, msgId: item.msg_id },
                             );
                           } else {
                             void jumpToMsg(item.msg_id);
@@ -5386,9 +7016,9 @@ export default function App() {
                 ) : (
                   <div className="py-4 text-center text-xs opacity-60">{t("noFilesYet")}</div>
                 )
-              ) : threadDetails && (threadDetails.link_items?.length ?? 0) > 0 ? (
+              ) : activeThreadDetails && (activeThreadDetails.link_items?.length ?? 0) > 0 ? (
                 <div className="space-y-1.5">
-                  {threadDetails.link_items.slice(0, 25).map((item) => {
+                  {activeThreadDetails.link_items.slice(0, 25).map((item) => {
                     const url = extractFirstUrl(item.text);
                     return (
                       <div
@@ -5430,6 +7060,56 @@ export default function App() {
               )}
             </div>
           </div>
+
+          {activeThread.kind === "direct" && (
+            <div
+              className="mt-3 shrink-0 pt-3"
+              style={{ borderTop: "1px solid var(--border-subtle)" }}
+            >
+              <button
+                type="button"
+                onClick={() => {
+                  setProfileInitial(null);
+                  setProfileUid(activeThread.id);
+                }}
+                className="hover-menu flex w-full items-center justify-center gap-2 rounded-xl px-3 py-2 text-xs font-semibold transition"
+                style={{
+                  background: "var(--bg-surface)",
+                  color: "var(--text-primary)",
+                  border: "1px solid var(--border-subtle)",
+                }}
+              >
+                <Shield className="h-3.5 w-3.5 shrink-0" style={{ color: "var(--accent)" }} />
+                <span className="truncate">{t("dmManageRelationshipBtn")}</span>
+              </button>
+            </div>
+          )}
+
+          {activeThread.kind === "group" && (
+            <div
+              className="mt-3 shrink-0 pt-3"
+              style={{ borderTop: "1px solid var(--border-subtle)" }}
+            >
+              <div
+                className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider"
+                style={{ color: "var(--text-secondary)" }}
+              >
+                {t("groupDangerZoneTitle")}
+              </div>
+              <button
+                type="button"
+                onClick={() => handleOpenLeaveGroupDialog(activeThread)}
+                className="flex w-full items-center justify-center gap-2 rounded-xl px-3 py-2 text-xs font-semibold text-rose-500 transition hover:bg-rose-500/15"
+                style={{
+                  background: "var(--danger-bg)",
+                  border: "1px solid rgba(244, 63, 94, 0.3)",
+                }}
+              >
+                <LogOut className="h-3.5 w-3.5 shrink-0" />
+                <span>{t("groupLeaveBtn")}</span>
+              </button>
+            </div>
+          )}
         </aside>
         </>
       )}
@@ -5440,8 +7120,8 @@ export default function App() {
         <div
           className="fixed z-50 max-h-[75vh] w-56 overflow-y-auto rounded-xl py-1 shadow-2xl"
           style={{
-            left: Math.min(threadMenu.x, window.innerWidth - 232),
-            top: Math.min(threadMenu.y, window.innerHeight - 330),
+            left: Math.max(8, Math.min(threadMenu.x, window.innerWidth - 232)),
+            top: Math.max(8, Math.min(threadMenu.y, window.innerHeight - 330)),
             background: "var(--bg-sidebar)",
             border: "1px solid var(--border-subtle)",
           }}
@@ -5608,6 +7288,22 @@ export default function App() {
           >
             <FolderPlus className="h-3.5 w-3.5" /> {t("manageFoldersEllipsis")}
           </button>
+          {threadMenu.thread.kind === "group" && (
+            <>
+              <div className="my-1 h-px" style={{ background: "var(--border-subtle)" }} />
+              <button
+                type="button"
+                onClick={() => {
+                  const target = threadMenu.thread;
+                  setThreadMenu(null);
+                  handleOpenLeaveGroupDialog(target);
+                }}
+                className="hover-menu flex w-full items-center gap-2 px-3 py-2 text-left text-[13.5px] text-rose-500"
+              >
+                <LogOut className="h-3.5 w-3.5" /> {t("groupLeaveBtn")}
+              </button>
+            </>
+          )}
         </div>
       )}
 
@@ -5615,8 +7311,8 @@ export default function App() {
         <div
           className="fixed z-50 w-52 rounded-xl py-1 shadow-2xl"
           style={{
-            left: Math.min(folderMenu.x, window.innerWidth - 220),
-            top: Math.min(folderMenu.y, window.innerHeight - 150),
+            left: Math.max(8, Math.min(folderMenu.x, window.innerWidth - 220)),
+            top: Math.max(8, Math.min(folderMenu.y, window.innerHeight - 150)),
             background: "var(--bg-sidebar)",
             border: "1px solid var(--border-subtle)",
           }}
@@ -5662,167 +7358,307 @@ export default function App() {
 
       {utilityModals}
 
-      <QuickSearchModal
-        open={quickSearchOpen}
-        threads={threads}
-        onClose={() => setQuickSearchOpen(false)}
-        onSelectMessage={(hit) => void handleSelectSearchResult(hit)}
-        onFindPhone={(phone) => {
-          setFindUserInitialPhone(phone);
-          setFindUserOpen(true);
-        }}
-      />
-
-      {activeThread && activeThread.kind === "group" && (
-        <AddGroupMembersModal
-          open={addMembersOpen}
-          threadId={activeThread.id}
-          groupTitle={activeThread.title}
-          threads={threads}
-          existingMemberIds={(threadDetails?.members ?? []).map((m) => m.id)}
-          onClose={() => setAddMembersOpen(false)}
-          onAdded={(res) => {
-            if (res.added.length > 0) {
-              setDetailsRefreshTick((n) => n + 1);
-            }
-          }}
-        />
+      {quickSearchOpen && (
+        <Suspense fallback={null}>
+          <QuickSearchModal
+            open={quickSearchOpen}
+            threads={threads}
+            onClose={() => setQuickSearchOpen(false)}
+            onSelectMessage={(hit) => void handleSelectSearchResult(hit)}
+            onFindPhone={(phone) => {
+              setFindUserInitialPhone(phone);
+              setFindUserOpen(true);
+            }}
+          />
+        </Suspense>
       )}
 
-      {activeThread && (
-        <CreateReminderModal
-          open={createReminderOpen}
-          threadTitle={activeThread.title}
-          onClose={() => setCreateReminderOpen(false)}
-          onSubmit={async (title, startTimeMs, repeat) => {
-            const msg = await bridge.createReminder(
-              activeThread.id,
-              title,
-              startTimeMs,
-              repeat,
-            );
-            setMessages((prev) => upsertMsg(prev, msg));
-            setThreads((prev) => bumpThreadList(prev, msg, false));
-            setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
-          }}
-        />
-      )}
-
-      {activeThread && activeThread.kind === "group" && (
-        <CreatePollModal
-          open={createPollOpen}
-          groupTitle={activeThread.title}
-          onClose={() => setCreatePollOpen(false)}
-          onSubmit={async (payload) => {
-            const msg = await bridge.createPoll(
-              activeThread.id,
-              payload.question,
-              payload.options,
-              payload.expiredTimeMs,
-              payload.allowMulti,
-              payload.allowAddOption,
-              payload.isAnonymous,
-            );
-            setMessages((prev) => upsertMsg(prev, msg));
-            setThreads((prev) => bumpThreadList(prev, msg, false));
-            setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
-          }}
-        />
-      )}
-
-      <ForwardModal
-        messages={forwardMessages}
-        threads={threads}
-        onClose={() => setForwardMessages([])}
-        onForwardTo={async (targetThreadId, msgs) => {
-          try {
-            for (const msg of msgs) {
-              const content =
-                msg.attachment_url && /^https:\/\//i.test(msg.attachment_url)
-                  ? `${msg.text ? `${msg.text}\n` : ""}${msg.attachment_url}`
-                  : msg.text;
-              if (!content.trim()) continue;
-              const sent = await bridge.sendText(targetThreadId, content);
-              setThreads((prev) => bumpThreadList(prev, sent, false));
-              if (targetThreadId === selectedIdRef.current) {
-                setMessages((prev) => upsertMsg(prev, sent));
+      {activeThread && activeThread.kind === "group" && addMembersOpen && (
+        <Suspense fallback={null}>
+          <AddGroupMembersModal
+            open={addMembersOpen}
+            threadId={activeThread.id}
+            groupTitle={activeThread.title}
+            threads={threads}
+            existingMemberIds={(activeThreadDetails?.members ?? activeMentionMembers).map((m) => m.id)}
+            onClose={() => setAddMembersOpen(false)}
+            onAdded={(res) => {
+              if (res.added.length > 0) {
+                setDetailsRefreshTick((n) => n + 1);
               }
-            }
-            if (targetThreadId === selectedIdRef.current) {
+            }}
+          />
+        </Suspense>
+      )}
+
+      {activeThread && createReminderOpen && (
+        <Suspense fallback={null}>
+          <CreateReminderModal
+            open={createReminderOpen}
+            threadTitle={activeThread.title}
+            onClose={() => setCreateReminderOpen(false)}
+            onSubmit={async (title, startTimeMs, repeat) => {
+              const msg = await bridge.createReminder(
+                activeThread.id,
+                title,
+                startTimeMs,
+                repeat,
+              );
+              setMessages((prev) => upsertMsg(prev, msg));
+              setThreads((prev) => bumpThreadList(prev, msg, false));
               setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
+            }}
+          />
+        </Suspense>
+      )}
+
+      {activeThread && activeThread.kind === "group" && createPollOpen && (
+        <Suspense fallback={null}>
+          <CreatePollModal
+            open={createPollOpen}
+            groupTitle={activeThread.title}
+            onClose={() => setCreatePollOpen(false)}
+            onSubmit={async (payload) => {
+              const msg = await bridge.createPoll(
+                activeThread.id,
+                payload.question,
+                payload.options,
+                payload.expiredTimeMs,
+                payload.allowMulti,
+                payload.allowAddOption,
+                payload.isAnonymous,
+              );
+              setMessages((prev) => upsertMsg(prev, msg));
+              setThreads((prev) => bumpThreadList(prev, msg, false));
+              setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
+            }}
+          />
+        </Suspense>
+      )}
+
+      {forwardMessages.length > 0 && (
+        <Suspense fallback={null}>
+          <ForwardModal
+            messages={forwardMessages}
+            threads={threads}
+            onClose={() => setForwardMessages([])}
+            onForwardTo={async (targetThreadId, msgs) => {
+              try {
+                for (const msg of msgs) {
+                  const content =
+                    msg.attachment_url && /^https:\/\//i.test(msg.attachment_url)
+                      ? `${msg.text ? `${msg.text}\n` : ""}${msg.attachment_url}`
+                      : msg.text;
+                  if (!content.trim()) continue;
+                  const sent = await bridge.sendText(targetThreadId, content);
+                  setThreads((prev) => bumpThreadList(prev, sent, false));
+                  if (targetThreadId === selectedIdRef.current) {
+                    setMessages((prev) => upsertMsg(prev, sent));
+                  }
+                }
+                if (targetThreadId === selectedIdRef.current) {
+                  setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
+                }
+                setSelectMode(false);
+                setSelectedMsgIds(new Set());
+              } catch (err) {
+                showError(err);
+              }
+            }}
+          />
+        </Suspense>
+      )}
+
+      {lightboxState && (
+        <Suspense fallback={null}>
+          <MediaLightbox
+            items={lightboxState.items}
+            activeIndex={lightboxState.index}
+            onIndexChange={(idx) =>
+              setLightboxState((prev) => (prev ? { ...prev, index: idx } : null))
             }
-            setSelectMode(false);
-            setSelectedMsgIds(new Set());
-          } catch (err) {
-            showError(err);
-          }
-        }}
-      />
+            onClose={() => setLightboxState(null)}
+            onNotify={showError}
+          />
+        </Suspense>
+      )}
 
-      <MediaLightbox
-        items={lightboxState?.items ?? []}
-        activeIndex={lightboxState?.index ?? null}
-        onIndexChange={(idx) =>
-          setLightboxState((prev) => (prev ? { ...prev, index: idx } : null))
-        }
-        onClose={() => setLightboxState(null)}
-        onNotify={showError}
-      />
+      {profileUid && (
+        <Suspense fallback={null}>
+          <UserProfileModal
+            userId={profileUid}
+            initialProfile={profileInitial}
+            onClose={() => {
+              setProfileUid(null);
+              setProfileInitial(null);
+            }}
+            onOpenImage={openLightboxForUrl}
+            onOpenGroup={(gid) => {
+              leaveWebApps();
+              setSelectedId(gid);
+              setMobilePane("chat");
+            }}
+            onStartChat={handleStartChatFromProfile}
+            onRelationshipChanged={handleRelationshipChanged}
+          />
+        </Suspense>
+      )}
 
-      <UserProfileModal
-        userId={profileUid}
-        initialProfile={profileInitial}
-        onClose={() => {
-          setProfileUid(null);
-          setProfileInitial(null);
-        }}
-        onOpenImage={openLightboxForUrl}
-        onOpenGroup={(gid) => {
-          setSelectedId(gid);
-          setMobilePane("chat");
-        }}
-        onStartChat={handleStartChatFromProfile}
-      />
+      {leaveGroupTarget && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-xs"
+          onClick={() => {
+            if (!leaveGroupBusy) {
+              setLeaveGroupTarget(null);
+              setLeaveGroupError(null);
+            }
+          }}
+        >
+          <div
+            className="w-full max-w-md overflow-hidden rounded-2xl p-5 shadow-2xl"
+            style={{
+              background: "var(--bg-sidebar)",
+              border: "1px solid var(--border-subtle)",
+              color: "var(--text-primary)",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex min-w-0 items-center gap-2 font-semibold">
+                <LogOut className="h-4 w-4 shrink-0 text-rose-500" />
+                <span className="truncate text-[15px]">{t("groupLeaveConfirmTitle")}</span>
+              </div>
+              <button
+                type="button"
+                disabled={leaveGroupBusy}
+                onClick={() => {
+                  setLeaveGroupTarget(null);
+                  setLeaveGroupError(null);
+                }}
+                className="hover-menu rounded-lg p-1 transition disabled:opacity-50"
+                style={{ color: "var(--text-secondary)" }}
+                title={t("close")}
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
 
-      <ScreenshotEditorModal
-        open={Boolean(screenshotEditor)}
-        sourceUrl={screenshotEditor?.sourceUrl ?? ""}
-        initialMode={screenshotEditor?.initialMode ?? "crop"}
-        monitors={screenshotEditor?.monitors ?? []}
-        activeMonitorIndex={screenshotEditor?.activeMonitorIndex ?? null}
-        hideWindowOnCapture={hideWindowOnCapture}
-        capturing={capturingScreen}
-        canRecapture={screenshotEditor?.canRecapture ?? false}
-        onToggleHideWindow={(val) => {
-          setHideWindowOnCapture(val);
-          try {
-            localStorage.setItem("teza.screenshotHideWindow", val ? "1" : "0");
-          } catch {
-            // Ignore storage quota errors
-          }
-        }}
-        onRecapture={(opts) => {
-          void handleCaptureScreen({
-            monitorIndex: opts.monitorIndex,
-            captureAll: opts.captureAll,
-          });
-        }}
-        onClose={closeScreenshotEditor}
-        onAttach={(att, cap) => {
-          setPendingAttachment(att);
-          if (selectedId && cap) {
-            setDraftForThread(selectedId, cap);
-          }
-        }}
-        onSend={async (att, cap) => {
-          const sent = await handleSendAttachment(att, cap);
-          if (sent && screenshotEditor?.initialMode === "annotate") {
-            setPendingAttachment(null);
-          }
-          return sent;
-        }}
-        onError={showError}
-      />
+            <p className="mt-3 text-[13px] leading-relaxed" style={{ color: "var(--text-secondary)" }}>
+              {t("groupLeaveConfirmDesc", { name: leaveGroupTarget.title })}
+            </p>
+
+            <label
+              className="mt-3.5 flex cursor-pointer items-start gap-2.5 rounded-xl p-3 text-left transition"
+              style={{ background: "var(--bg-surface)", border: "1px solid var(--border-subtle)" }}
+            >
+              <input
+                type="checkbox"
+                checked={leaveGroupSilent}
+                disabled={leaveGroupBusy}
+                onChange={(e) => setLeaveGroupSilent(e.target.checked)}
+                className="mt-0.5 h-4 w-4 shrink-0 accent-rose-500"
+              />
+              <span className="min-w-0 flex-1">
+                <span className="block text-[13px] font-medium">{t("groupLeaveSilentLabel")}</span>
+                <span
+                  className="mt-0.5 block text-[11.5px] leading-snug"
+                  style={{ color: "var(--text-secondary)" }}
+                >
+                  {t("groupLeaveSilentHint")}
+                </span>
+              </span>
+            </label>
+
+            {leaveGroupError && (
+              <div
+                role="alert"
+                className="mt-3 rounded-xl px-3 py-2 text-xs leading-snug"
+                style={{
+                  background: "var(--danger-bg)",
+                  color: "var(--danger-text)",
+                  border: "1px solid rgba(244, 63, 94, 0.35)",
+                }}
+              >
+                {leaveGroupError}
+              </div>
+            )}
+
+            <div className="mt-5 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                disabled={leaveGroupBusy}
+                onClick={() => {
+                  setLeaveGroupTarget(null);
+                  setLeaveGroupError(null);
+                }}
+                className="hover-menu rounded-xl px-4 py-2 text-xs font-medium transition disabled:opacity-50"
+                style={{ background: "var(--bg-surface)", color: "var(--text-primary)" }}
+              >
+                {t("socialCancelBtn")}
+              </button>
+              <button
+                type="button"
+                disabled={leaveGroupBusy}
+                onClick={() => void handleConfirmLeaveGroup()}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-rose-600 px-4 py-2 text-xs font-semibold text-white transition hover:bg-rose-500 disabled:opacity-50"
+              >
+                {leaveGroupBusy ? (
+                  <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <LogOut className="h-3.5 w-3.5" />
+                )}
+                <span>{t("groupLeaveBtn")}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {screenshotEditor && (
+        <Suspense fallback={null}>
+          <ScreenshotEditorModal
+            open
+            sourceUrl={screenshotEditor.sourceUrl}
+            initialMode={screenshotEditor.initialMode}
+            monitors={screenshotEditor.monitors}
+            activeMonitorIndex={screenshotEditor.activeMonitorIndex}
+            hideWindowOnCapture={hideWindowOnCapture}
+            capturing={capturingScreen}
+            canRecapture={screenshotEditor.canRecapture}
+            onToggleHideWindow={(val) => {
+              setHideWindowOnCapture(val);
+              try {
+                localStorage.setItem("teza.screenshotHideWindow", val ? "1" : "0");
+              } catch {
+                // Ignore storage quota errors
+              }
+            }}
+            onRecapture={(opts) => {
+              void handleCaptureScreen({
+                monitorIndex: opts.monitorIndex,
+                captureAll: opts.captureAll,
+              });
+            }}
+            onClose={closeScreenshotEditor}
+            onAttach={(att, cap) => {
+              updatePendingAttachment(att);
+              if (selectedId && cap) {
+                setDraftForThread(selectedId, cap);
+              }
+            }}
+            onSend={async (att, cap) => {
+              const sent = await handleSendAttachment(att, cap);
+              if (sent && screenshotEditor.initialMode === "annotate") {
+                updatePendingAttachment(null);
+              }
+              return sent;
+            }}
+            onError={showError}
+          />
+        </Suspense>
+      )}
 
       {!isLocked && (
         <DownloadOverlay
@@ -5895,6 +7731,7 @@ export default function App() {
                   e.stopPropagation();
                   setWebNotifyToast(null);
                 }}
+                onKeyDown={(e) => e.stopPropagation()}
                 className="hover-menu -mr-1 shrink-0 rounded-md p-0.5 transition"
                 style={{ color: "var(--text-secondary)" }}
                 title={t("notifyCloseTitle")}
@@ -5922,20 +7759,54 @@ export default function App() {
         !isLocked &&
         callState.active &&
         callState.phase !== "idle" &&
-        callState.phase !== "incoming_ringing" && (
+        callState.phase !== "incoming_ringing" &&
+        (showVideoOverlay ? (
+          <Suspense fallback={null}>
+            <VideoCallOverlay
+              active={callState.active}
+              telemetry={callTelemetry}
+              devices={callDevices}
+              devicesLoading={callDevicesLoading}
+              cameraDevices={cameraDevices}
+              selectedCameraId={selectedCameraId}
+              localStream={localVideoStream}
+              localCameraStatus={localCameraStatus}
+              localCameraError={localCameraError}
+              hasRemoteVideoFrame={hasRemoteVideoFrame}
+              remoteVideoDims={remoteVideoDims}
+              busy={callActionBusy}
+              hangupBusy={callHangupBusy}
+              onRemoteCanvasChange={handleRemoteCanvasChange}
+              onToggleMute={(nextMuted) => void handleToggleCallMute(nextMuted)}
+              onToggleCamera={(nextEnabled) => void handleToggleCallCamera(nextEnabled)}
+              onHangup={() => void handleHangupCall()}
+              onMinimize={() => setVideoOverlayMinimized(true)}
+              onSelectThread={(partnerId) => openThreadById(partnerId)}
+              onRefreshDevices={refreshCallDevices}
+              onRefreshCameras={refreshCameraDevices}
+              onSelectDevices={(inp, out) => void handleSelectCallDevices(inp, out)}
+              onSelectCamera={handleSelectCameraDevice}
+            />
+          </Suspense>
+        ) : (
           <ActiveCallBar
             active={callState.active}
             telemetry={callTelemetry}
             devices={callDevices}
             devicesLoading={callDevicesLoading}
             busy={callActionBusy}
+            hangupBusy={callHangupBusy}
+            localCameraStatus={localCameraStatus}
             onToggleMute={(nextMuted) => void handleToggleCallMute(nextMuted)}
+            onToggleCamera={(nextEnabled) => void handleToggleCallCamera(nextEnabled)}
+            onExpandVideo={() => setVideoOverlayMinimized(false)}
             onHangup={() => void handleHangupCall()}
             onSelectThread={(partnerId) => openThreadById(partnerId)}
             onRefreshDevices={refreshCallDevices}
             onSelectDevices={(inp, out) => void handleSelectCallDevices(inp, out)}
+            onDevicesPopoverChange={setActiveCallDevicesOpen}
           />
-        )}
+        ))}
 
       {authed &&
         !isLocked &&
@@ -5978,8 +7849,57 @@ export default function App() {
                     : "var(--text-primary)",
             }}
           >
-            <Phone className="h-3.5 w-3.5 shrink-0" />
+            {callState.active?.call_type === "DirectVideo" ? (
+              <Video className="h-3.5 w-3.5 shrink-0" />
+            ) : (
+              <Phone className="h-3.5 w-3.5 shrink-0" />
+            )}
             <span>{callNotice.text}</span>
+          </button>
+        </div>
+      )}
+
+      {socialNotice && !isLocked && (
+        <div
+          className={`fixed right-4 z-[85] max-w-sm ${callNotice ? "top-32" : "top-20"}`}
+        >
+          <button
+            type="button"
+            onClick={() => setSocialNotice(null)}
+            className="flex items-center gap-2 rounded-xl px-3.5 py-2 text-left text-xs font-medium shadow-2xl transition hover:opacity-90"
+            style={{
+              background:
+                socialNotice.tone === "error"
+                  ? "var(--danger-bg)"
+                  : "var(--bg-sidebar)",
+              border:
+                socialNotice.tone === "error"
+                  ? "1px solid rgba(244, 63, 94, 0.45)"
+                  : socialNotice.tone === "warn"
+                    ? "1px solid rgba(245, 158, 11, 0.5)"
+                    : socialNotice.tone === "success"
+                      ? "1px solid rgba(16, 185, 129, 0.5)"
+                      : "1px solid var(--border-subtle)",
+              color:
+                socialNotice.tone === "error"
+                  ? "var(--danger-text)"
+                  : "var(--text-primary)",
+            }}
+          >
+            <UserCheck
+              className="h-3.5 w-3.5 shrink-0"
+              style={{
+                color:
+                  socialNotice.tone === "error"
+                    ? "var(--danger-text)"
+                    : socialNotice.tone === "warn"
+                      ? "#f59e0b"
+                      : socialNotice.tone === "success"
+                        ? "#10b981"
+                        : "var(--accent)",
+              }}
+            />
+            <span>{socialNotice.text}</span>
           </button>
         </div>
       )}

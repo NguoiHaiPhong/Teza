@@ -34,10 +34,23 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Install frontend dependencies
         working-directory: apps/desktop
-        run: pnpm install --frozen-lockfile || pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: Pre-build checks
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --workspace
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm --dir apps/desktop exec tsc --noEmit
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm --dir apps/desktop test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build and release Tauri app
         uses: tauri-apps/tauri-action@v0
@@ -45,6 +58,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TEZA_GDRIVE_CLIENT_ID: ${{ secrets.TEZA_GDRIVE_CLIENT_ID }}
+          TEZA_GDRIVE_CLIENT_SECRET: ${{ secrets.TEZA_GDRIVE_CLIENT_SECRET }}
+          TEZA_GDRIVE_TOKEN_BROKER_URL: ${{ secrets.TEZA_GDRIVE_TOKEN_BROKER_URL }}
         with:
           projectPath: apps/desktop
           tagName: v__VERSION__

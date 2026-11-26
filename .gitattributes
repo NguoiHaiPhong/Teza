@@ -1,0 +1,31 @@
+# Normalize line endings across platforms
+* text=auto eol=lf
+
+# Windows scripts require CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary images, icons, fonts, media, and executables
+*.png -text
+*.jpg -text
+*.jpeg -text
+*.gif -text
+*.webp -text
+*.bmp -text
+*.ico -text
+*.icns -text
+*.woff -text
+*.woff2 -text
+*.ttf -text
+*.otf -text
+*.eot -text
+*.exe -text
+*.dll -text
+*.msi -text
+*.pdb -text
+*.mp3 -text
+*.mp4 -text
+*.wav -text
+*.ogg -text
+*.zip -text

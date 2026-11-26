@@ -211,3 +211,71 @@ test("formatNotificationContent and computeTotalUnreadBadge support privacy & ba
     3,
   );
 });
+
+test("isMessageMentioningMe handles boundaries, emails, Vietnamese folding/NFD, @everyone, and @tất cả", () => {
+  // Email addresses must NOT trigger @all or user mentions
+  assert.equal(
+    isMessageMentioningMe(
+      makeMsg({ text: "Liên hệ contact@allianz.com hoặc foo@an.com nhé" }),
+      "u-an",
+      "An",
+    ),
+    false,
+  );
+  assert.equal(
+    isMessageMentioningMe(makeMsg({ text: "Send to team@everyone.org" }), "u-an", "An"),
+    false,
+  );
+
+  // Prefix word-boundary guard: @Anh must NOT match user named "An"
+  assert.equal(
+    isMessageMentioningMe(makeMsg({ text: "@Anh xem giúp PR nhé" }), "u-an", "An"),
+    false,
+  );
+  assert.equal(
+    isMessageMentioningMe(makeMsg({ text: "Chào @An, xem giúp nhé" }), "u-an", "An"),
+    true,
+  );
+
+  // Vietnamese accent-folding and NFD decomposed input match identically
+  assert.equal(
+    isMessageMentioningMe(makeMsg({ text: "@Dao Nu please check" }), "u-nu", "Đào Nụ"),
+    true,
+  );
+  assert.equal(
+    isMessageMentioningMe(makeMsg({ text: "@Lo\u0302\u0323c xem báo cáo" }), "u-loc", "Lộc"),
+    true,
+  );
+  assert.equal(
+    isMessageMentioningMe(makeMsg({ text: "@Lộc xem báo cáo" }), "u-loc", "Lo\u0302\u0323c"),
+    true,
+  );
+
+  // All-mention aliases: @All, @everyone, @Mọi người, @tất cả, @tat ca
+  for (const text of [
+    "@All họp 3h nhé",
+    "@everyone please join",
+    "@Mọi người kiểm tra mail",
+    "@tất cả vào phòng họp",
+    "@tat ca xem lịch mới",
+  ]) {
+    assert.equal(
+      isMessageMentioningMe(makeMsg({ text }), "u-an", "An"),
+      true,
+      `expected "${text}" to mention me`,
+    );
+  }
+
+  // Quoted reply to me still triggers mention override
+  assert.equal(
+    isMessageMentioningMe(
+      makeMsg({
+        text: "Ok anh",
+        quote: { msg_id: "q1", sender_name: "Bạn", snippet: "Nhớ gửi file" },
+      }),
+      "u-an",
+      "An",
+    ),
+    true,
+  );
+});

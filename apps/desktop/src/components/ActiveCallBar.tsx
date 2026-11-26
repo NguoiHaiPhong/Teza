@@ -1,20 +1,25 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   Headphones,
+  Maximize2,
   Mic,
   MicOff,
   PhoneOff,
   RefreshCw,
+  Video,
+  VideoOff,
   Volume2,
 } from "lucide-react";
 import { useI18n } from "../i18n";
 import type { CallDevicesDto, CallSnapshotDto, CallTelemetryDto } from "../types";
 import {
   formatCallDuration,
+  isCameraFailureStatus,
   normalizeLevelPercent,
   resolveEffectiveCallDevices,
 } from "../utils/callState";
+import type { LocalCameraStatus } from "../utils/videoCallMedia";
 import { ThreadAvatar } from "./ThreadAvatar";
 
 interface Props {
@@ -23,11 +28,16 @@ interface Props {
   devices: CallDevicesDto | null;
   devicesLoading: boolean;
   busy: boolean;
+  hangupBusy?: boolean;
+  localCameraStatus?: LocalCameraStatus;
   onToggleMute: (nextMuted: boolean) => void;
+  onToggleCamera?: (nextEnabled: boolean) => void;
+  onExpandVideo?: () => void;
   onHangup: () => void;
   onSelectThread: (partnerId: string) => void;
   onRefreshDevices: () => void;
   onSelectDevices: (input: string | null, output: string | null) => void;
+  onDevicesPopoverChange?: (open: boolean) => void;
 }
 
 export function ActiveCallBar({
@@ -36,19 +46,31 @@ export function ActiveCallBar({
   devices,
   devicesLoading,
   busy,
+  hangupBusy,
+  localCameraStatus = "idle",
   onToggleMute,
+  onToggleCamera,
+  onExpandVideo,
   onHangup,
   onSelectThread,
   onRefreshDevices,
   onSelectDevices,
+  onDevicesPopoverChange,
 }: Props) {
   const { t } = useI18n();
   const [devicesOpen, setDevicesOpen] = useState(false);
   const [localElapsed, setLocalElapsed] = useState(0);
+  const onDevicesPopoverChangeRef = useRef(onDevicesPopoverChange);
+  onDevicesPopoverChangeRef.current = onDevicesPopoverChange;
+  const effectiveHangupBusy = hangupBusy ?? busy;
 
+  const isVideoCall = active.call_type === "DirectVideo";
   const isConnected = active.phase === "connected";
   const isCancellingStage = active.phase === "dialing" || active.phase === "ringing_outgoing";
   const effectiveMuted = telemetry?.mic_muted ?? active.mic_muted;
+  const effectiveCamEnabled = active.cam_enabled;
+  const cameraHasIssue = isCameraFailureStatus(localCameraStatus);
+  const cameraStarting = localCameraStatus === "starting";
 
   useEffect(() => {
     if (!isConnected) {
@@ -82,12 +104,24 @@ export function ActiveCallBar({
   const effectiveDevices = resolveEffectiveCallDevices(devices);
 
   useEffect(() => {
+    onDevicesPopoverChangeRef.current?.(devicesOpen);
+  }, [devicesOpen]);
+
+  useEffect(() => {
+    return () => {
+      onDevicesPopoverChangeRef.current?.(false);
+    };
+  }, []);
+
+  useEffect(() => {
     if (!devicesOpen) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setDevicesOpen(false);
+      if (e.defaultPrevented || e.key !== "Escape") return;
+      e.preventDefault();
+      setDevicesOpen(false);
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
   }, [devicesOpen]);
 
   const phaseText =
@@ -96,7 +130,9 @@ export function ActiveCallBar({
       : active.phase === "ringing_outgoing"
         ? t("callPhaseRingingOutgoing")
         : active.phase === "connecting"
-          ? t("callPhaseConnecting")
+          ? isVideoCall
+            ? t("callPhaseVideoConnecting")
+            : t("callPhaseConnecting")
           : `${t("callPhaseConnected")} · ${formatCallDuration(effectiveDuration)}`;
 
   return (
@@ -133,6 +169,15 @@ export function ActiveCallBar({
               >
                 {active.partner_name || active.partner_id}
               </button>
+              {isVideoCall && (
+                <span
+                  className="inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[10.5px] font-semibold"
+                  style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
+                >
+                  <Video className="h-3 w-3" />
+                  <span>{t("callVideoBadge")}</span>
+                </span>
+              )}
               {active.peer_mic_muted && (
                 <span
                   className="inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[10.5px] font-medium"
@@ -140,6 +185,15 @@ export function ActiveCallBar({
                 >
                   <MicOff className="h-3 w-3" />
                   <span>{t("callPeerMutedBadge")}</span>
+                </span>
+              )}
+              {isVideoCall && isConnected && !active.peer_cam_enabled && (
+                <span
+                  className="inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[10.5px] font-medium"
+                  style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
+                >
+                  <VideoOff className="h-3 w-3" />
+                  <span>{t("callVideoPeerCamOffBadge")}</span>
                 </span>
               )}
               {missingMic && (
@@ -229,6 +283,65 @@ export function ActiveCallBar({
             </span>
           </button>
 
+          {isVideoCall && onToggleCamera && (
+            <button
+              type="button"
+              disabled={busy || cameraStarting}
+              onClick={() => onToggleCamera(!effectiveCamEnabled)}
+              title={
+                effectiveCamEnabled
+                  ? t("callVideoCameraOffBtn")
+                  : cameraHasIssue
+                    ? t("callVideoCameraRetryBtn")
+                    : t("callVideoCameraOnBtn")
+              }
+              className="hover-menu relative inline-flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-xs font-semibold transition disabled:opacity-45"
+              style={{
+                background: !effectiveCamEnabled
+                  ? cameraHasIssue
+                    ? "rgba(245, 158, 11, 0.16)"
+                    : "var(--danger-bg)"
+                  : "var(--bg-surface)",
+                color: !effectiveCamEnabled
+                  ? cameraHasIssue
+                    ? "#f59e0b"
+                    : "var(--danger-text)"
+                  : "var(--text-primary)",
+              }}
+            >
+              {effectiveCamEnabled ? (
+                <Video className="h-3.5 w-3.5" />
+              ) : (
+                <VideoOff className="h-3.5 w-3.5" />
+              )}
+              <span className="hidden md:inline">
+                {effectiveCamEnabled ? t("callVideoCameraOffBtn") : t("callVideoCameraOnBtn")}
+              </span>
+              {cameraHasIssue && (
+                <span
+                  aria-hidden="true"
+                  className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-amber-400"
+                />
+              )}
+            </button>
+          )}
+
+          {isVideoCall && onExpandVideo && (
+            <button
+              type="button"
+              onClick={onExpandVideo}
+              title={t("callVideoExpandBtn")}
+              className="hover-menu inline-flex items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-xs font-semibold transition"
+              style={{
+                background: "var(--accent-soft)",
+                color: "var(--accent)",
+              }}
+            >
+              <Maximize2 className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">{t("callVideoExpandBtn")}</span>
+            </button>
+          )}
+
           <button
             type="button"
             onClick={() => {
@@ -248,7 +361,7 @@ export function ActiveCallBar({
 
           <button
             type="button"
-            disabled={busy}
+            disabled={effectiveHangupBusy}
             onClick={onHangup}
             className="inline-flex items-center gap-1.5 rounded-xl bg-rose-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-rose-500 disabled:opacity-50"
           >
@@ -303,6 +416,14 @@ export function ActiveCallBar({
                   TX: {telemetry.tx_packets} · RX: {telemetry.rx_packets}
                   {telemetry.tx_errors > 0 ? ` · TX err: ${telemetry.tx_errors}` : ""}
                 </div>
+                {isVideoCall &&
+                  (telemetry.video_tx_frames !== undefined ||
+                    telemetry.video_rx_frames !== undefined) && (
+                    <div className="tabular-nums">
+                      Video TX: {telemetry.video_tx_frames ?? 0} · RX:{" "}
+                      {telemetry.video_rx_frames ?? 0}
+                    </div>
+                  )}
                 {usingVirtualAudio && <div>{t("callVirtualAudioWarningShort")}</div>}
                 {effectiveDuration >= 4 && telemetry.rx_packets === 0 && (
                   <div style={{ color: "#fbbf24" }}>{t("callNoRemotePacketsHint")}</div>

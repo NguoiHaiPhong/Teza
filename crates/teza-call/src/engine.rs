@@ -20,6 +20,7 @@ use zalo_core::session::Session;
 use crate::audio::TestAudioFault;
 use crate::audio::{AudioDeviceSelection, AudioMediaConfig, AudioMediaSession, AudioTelemetry};
 use crate::error::{CallError, CallResult};
+use crate::media_hook::{AuxiliaryMediaHook, AuxiliaryMediaSession, MediaTransportContext};
 use crate::signaling::{
     build_callee_extend_data, build_caller_invite_fields, generate_call_session, AnswerParams,
     CallType, LogEndCallParams, MediaConfParams, RequestCallParams, RequestMediaParams,
@@ -73,6 +74,10 @@ pub struct CallSnapshot {
     pub mic_muted: bool,
     #[serde(default)]
     pub peer_mic_muted: bool,
+    #[serde(default)]
+    pub cam_enabled: bool,
+    #[serde(default)]
+    pub peer_cam_enabled: bool,
     pub rtp_ip: String,
     pub rtcp_ip: String,
     pub relay_token: u32,
@@ -119,6 +124,14 @@ pub enum CallEvent {
         call_id: i64,
         mic_muted: bool,
     },
+    CameraStateChanged {
+        call_id: i64,
+        cam_enabled: bool,
+    },
+    PeerCameraChanged {
+        call_id: i64,
+        cam_enabled: bool,
+    },
     MediaWarning {
         call_id: i64,
         message: String,
@@ -148,6 +161,8 @@ pub struct ActiveCallRecord {
     pub relay_token: u32,
     pub mic_muted: bool,
     pub peer_mic_muted: bool,
+    pub cam_enabled: bool,
+    pub peer_cam_enabled: bool,
     pub started_at_ms: i64,
     pub connected_at_ms: Option<i64>,
     pub invite_payload: Value,
@@ -170,6 +185,8 @@ impl ActiveCallRecord {
             phase: self.phase,
             mic_muted: self.mic_muted,
             peer_mic_muted: self.peer_mic_muted,
+            cam_enabled: self.cam_enabled,
+            peer_cam_enabled: self.peer_cam_enabled,
             rtp_ip: self.rtp_ip.clone(),
             rtcp_ip: self.rtcp_ip.clone(),
             relay_token: self.relay_token,
@@ -221,6 +238,10 @@ pub enum CallEffect {
         sess_id: String,
     },
     ApplyLocalMute(bool),
+    ApplyLocalCam(bool),
+    RequestRemoteKeyframe {
+        call_id: i64,
+    },
     ScheduleIncomingTimeout {
         call_id: i64,
         secs: u64,
@@ -339,6 +360,8 @@ impl CallStateMachine {
             relay_token: 0,
             mic_muted: false,
             peer_mic_muted: false,
+            cam_enabled: call_type.is_video(),
+            peer_cam_enabled: call_type.is_video(),
             started_at_ms: now_ms,
             connected_at_ms: None,
             invite_payload: Value::Null,
@@ -416,10 +439,11 @@ impl CallStateMachine {
     /// Abort a failed outgoing dial attempt cleanly (`Dialing -> Idle`).
     pub fn fail_outgoing(&mut self, call_id: i64, reason: CallEndReason) -> TransitionOutput {
         let mut out = TransitionOutput::default();
-        let matches = self
-            .active
-            .as_ref()
-            .is_some_and(|st| st.is_caller && (call_id == 0 || st.call_id == call_id));
+        let matches = self.active.as_ref().is_some_and(|st| {
+            st.is_caller
+                && st.phase == CallPhase::Dialing
+                && (call_id == 0 || st.call_id == call_id)
+        });
         if matches {
             if let Some(st) = self.active.take() {
                 self.mark_dismissed(st.call_id);
@@ -666,12 +690,37 @@ impl CallStateMachine {
                     callee_id: st.partner_id.clone(),
                     call_id: st.call_id,
                     is_on_mic: !muted,
-                    is_on_cam: false,
+                    is_on_cam: st.cam_enabled,
                 });
             }
             out.events.push(CallEvent::MediaStateChanged {
                 call_id: st.call_id,
                 mic_muted: muted,
+            });
+        }
+        out
+    }
+
+    /// Update local camera state during an active call.
+    pub fn set_cam_enabled(&mut self, enabled: bool) -> TransitionOutput {
+        let mut out = TransitionOutput::default();
+        if let Some(st) = self.active.as_mut() {
+            if !st.call_type.is_video() {
+                return out;
+            }
+            st.cam_enabled = enabled;
+            out.effects.push(CallEffect::ApplyLocalCam(enabled));
+            if st.phase != CallPhase::IncomingRinging {
+                out.effects.push(CallEffect::SendMediaConf12006 {
+                    callee_id: st.partner_id.clone(),
+                    call_id: st.call_id,
+                    is_on_mic: !st.mic_muted,
+                    is_on_cam: enabled,
+                });
+            }
+            out.events.push(CallEvent::CameraStateChanged {
+                call_id: st.call_id,
+                cam_enabled: enabled,
             });
         }
         out
@@ -716,12 +765,18 @@ impl CallStateMachine {
             "end_call" | "cancel" => self.on_remote_end(act, ev_call_id, now_ms),
             "request" => self.on_incoming_request(ev, ev_call_id, data, now_ms),
             "mute_audio" => self.on_peer_mute_audio(ev, ev_call_id),
+            "onoff_camera" | "onoff_cam" => self.on_peer_cam_state(ev, ev_call_id),
             _ => TransitionOutput::default(),
         }
     }
 
-    fn on_peer_mute_audio(&mut self, ev: &VoipControlEvent, ev_call_id: i64) -> TransitionOutput {
+    fn on_peer_cam_state(&mut self, ev: &VoipControlEvent, ev_call_id: i64) -> TransitionOutput {
         let mut out = TransitionOutput::default();
+        let uid_n = value_as_string(ev.data.get("uidN"));
+        let uid_from = value_as_string(ev.data.get("uidFrom"));
+        if self.is_self_id(&uid_n) || self.is_self_id(&uid_from) {
+            return out;
+        }
         let Some(st) = self.active.as_mut() else {
             return out;
         };
@@ -731,28 +786,84 @@ impl CallStateMachine {
             return out;
         }
         let mp = ev.media_params();
-        let raw_muted = mp
-            .get("type")
-            .or_else(|| ev.data.get("type"))
-            .and_then(|v| {
-                v.as_i64()
-                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
-            })
-            .map(|t| t != 0)
-            .or_else(|| {
-                mp.get("isOnMic")
-                    .or_else(|| ev.data.get("isOnMic"))
-                    .and_then(|v| {
-                        v.as_i64()
-                            .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
-                            .or_else(|| v.as_bool().map(i64::from))
-                    })
-                    .map(|on| on == 0)
-            })
-            .or_else(|| {
-                mp.get("mute")
-                    .or_else(|| ev.data.get("mute"))
-                    .and_then(|v| {
+        let parse_cam = |src: &Value| -> Option<bool> {
+            src.get("type")
+                .and_then(|v| {
+                    v.as_i64()
+                        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+                        .or_else(|| v.as_bool().map(i64::from))
+                })
+                // Mobile clients send `type: 1` when camera is on/resumed, `type: 0` when turned off,
+                // and `type: 2` (e.g. `reason: 2`) when camera is paused/backgrounded.
+                .map(|t| t == 1)
+                .or_else(|| {
+                    src.get("isOnCam")
+                        .or_else(|| src.get("cameraState"))
+                        .and_then(|v| {
+                            v.as_bool()
+                                .or_else(|| v.as_i64().map(|n| n != 0))
+                                .or_else(|| {
+                                    v.as_str()
+                                        .and_then(|s| s.trim().parse::<i64>().ok())
+                                        .map(|n| n != 0)
+                                })
+                        })
+                })
+        };
+        let raw_enabled = parse_cam(&mp).or_else(|| parse_cam(&ev.data));
+        let Some(cam_enabled) = raw_enabled else {
+            return out;
+        };
+        if st.peer_cam_enabled != cam_enabled {
+            let resumed = !st.peer_cam_enabled && cam_enabled;
+            st.peer_cam_enabled = cam_enabled;
+            if resumed {
+                out.effects.push(CallEffect::RequestRemoteKeyframe {
+                    call_id: st.call_id,
+                });
+            }
+            out.events.push(CallEvent::PeerCameraChanged {
+                call_id: st.call_id,
+                cam_enabled,
+            });
+        }
+        out
+    }
+
+    fn on_peer_mute_audio(&mut self, ev: &VoipControlEvent, ev_call_id: i64) -> TransitionOutput {
+        let mut out = TransitionOutput::default();
+        let uid_n = value_as_string(ev.data.get("uidN"));
+        let uid_from = value_as_string(ev.data.get("uidFrom"));
+        if self.is_self_id(&uid_n) || self.is_self_id(&uid_from) {
+            return out;
+        }
+        let Some(st) = self.active.as_mut() else {
+            return out;
+        };
+        if (ev_call_id != 0 && ev_call_id != st.call_id)
+            || !matches!(st.phase, CallPhase::Connecting | CallPhase::Connected)
+        {
+            return out;
+        }
+        let mp = ev.media_params();
+        let parse_muted = |src: &Value| -> Option<bool> {
+            src.get("type")
+                .and_then(|v| {
+                    v.as_i64()
+                        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+                })
+                .map(|t| t != 0)
+                .or_else(|| {
+                    src.get("isOnMic")
+                        .and_then(|v| {
+                            v.as_i64()
+                                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+                                .or_else(|| v.as_bool().map(i64::from))
+                        })
+                        .map(|on| on == 0)
+                })
+                .or_else(|| {
+                    src.get("mute").and_then(|v| {
                         v.as_bool()
                             .or_else(|| v.as_i64().map(|n| n != 0))
                             .or_else(|| {
@@ -761,7 +872,9 @@ impl CallStateMachine {
                                     .map(|n| n != 0)
                             })
                     })
-            });
+                })
+        };
+        let raw_muted = parse_muted(&mp).or_else(|| parse_muted(&ev.data));
         let Some(muted) = raw_muted else {
             return out;
         };
@@ -945,6 +1058,14 @@ impl CallStateMachine {
                     callee_id: st.partner_id.clone(),
                     call_id: st.call_id,
                 });
+                if st.call_type.is_video() {
+                    out.effects.push(CallEffect::SendMediaConf12006 {
+                        callee_id: st.partner_id.clone(),
+                        call_id: st.call_id,
+                        is_on_mic: !st.mic_muted,
+                        is_on_cam: st.cam_enabled,
+                    });
+                }
                 out.effects.push(CallEffect::StartCallerMedia {
                     call_id: st.call_id,
                     rtp_ip: st.rtp_ip.clone(),
@@ -1099,19 +1220,22 @@ impl CallStateMachine {
         let ext_parsed: Value = media
             .get("extendData")
             .or_else(|| data.get("extendData"))
-            .and_then(Value::as_str)
-            .and_then(|s| serde_json::from_str::<Value>(s.trim()).ok())
+            .and_then(|v| match v {
+                Value::String(s) => serde_json::from_str::<Value>(s.trim()).ok(),
+                Value::Object(_) => Some(v.clone()),
+                _ => None,
+            })
             .unwrap_or(Value::Null);
         let raw_call_type = media
             .pointer("/zrtc_config/callType")
             .or_else(|| data.get("callType"))
-            .and_then(Value::as_u64)
+            .and_then(value_as_i64)
             .unwrap_or(1);
         let is_video = raw_call_type == 3
-            || ext_parsed.get("callType").and_then(Value::as_i64) == Some(1)
+            || ext_parsed.get("callType").and_then(value_as_i64) == Some(1)
             || media
                 .pointer("/zrtc_config/video/enable")
-                .and_then(Value::as_i64)
+                .and_then(value_as_i64)
                 == Some(1);
         let call_type = CallType::from_video_flag(is_video);
 
@@ -1150,6 +1274,8 @@ impl CallStateMachine {
                         || (cur_ext == new_ext && new_srvs > cur_srvs)
                         || (!cur_ext && cur_srvs == 0 && relay_source.is_object());
                     if should_upgrade {
+                        let prev_call_type = st.call_type;
+                        let prev_partner_name = st.partner_name.clone();
                         st.invite_payload = relay_source;
                         if !init_rtp.is_empty() {
                             st.rtp_ip = init_rtp;
@@ -1163,12 +1289,20 @@ impl CallStateMachine {
                         }
                         if is_video {
                             st.call_type = CallType::DirectVideo;
+                            st.cam_enabled = true;
+                            st.peer_cam_enabled = true;
                         }
                         if let Some(u) = parsed_from_uid_u32.filter(|&v| v != 0) {
                             st.from_uid_u32 = u;
                         }
                         if let Some(u) = parsed_partner_uid_u32.filter(|&v| v != 0) {
                             st.partner_uid_u32 = u;
+                        }
+                        if st.call_type != prev_call_type || st.partner_name != prev_partner_name {
+                            out.events.push(CallEvent::StateChanged {
+                                phase: st.phase,
+                                call_id: Some(st.call_id),
+                            });
                         }
                     } else if st.sess_id.is_empty() && !sess_id.is_empty() {
                         st.sess_id = sess_id;
@@ -1203,6 +1337,8 @@ impl CallStateMachine {
             relay_token: 0,
             mic_muted: false,
             peer_mic_muted: false,
+            cam_enabled: call_type.is_video(),
+            peer_cam_enabled: call_type.is_video(),
             started_at_ms: now_ms,
             connected_at_ms: None,
             invite_payload: relay_source,
@@ -1269,6 +1405,21 @@ fn value_as_u32(v: &Value) -> Option<u32> {
         .map(|n| n as u32)
 }
 
+fn value_as_i64(v: &Value) -> Option<i64> {
+    v.as_i64()
+        .or_else(|| v.as_u64().and_then(|n| i64::try_from(n).ok()))
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+        .or_else(|| v.as_bool().map(i64::from))
+}
+
+async fn stop_audio_session_blocking(session: AudioMediaSession) {
+    let _ = tokio::task::spawn_blocking(move || session.stop()).await;
+}
+
+async fn stop_aux_session_blocking(aux: Arc<dyn AuxiliaryMediaSession>) {
+    let _ = tokio::task::spawn_blocking(move || aux.stop()).await;
+}
+
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -1331,6 +1482,8 @@ pub(crate) fn format_virtual_audio_warning(telem: &AudioTelemetry) -> Option<Str
     }
 }
 
+type AuxMediaSlot = Arc<Mutex<Option<(i64, Arc<dyn AuxiliaryMediaSession>)>>>;
+
 /// Live 1-1 VoIP call engine orchestrating signaling, UDP ZRTP relay, and Opus audio pipeline.
 pub struct CallEngine {
     transport: Arc<dyn SignalingTransport>,
@@ -1339,6 +1492,8 @@ pub struct CallEngine {
     sm: Arc<Mutex<CallStateMachine>>,
     zrtp: Arc<Mutex<Option<(i64, ZrtpRelaySession)>>>,
     media: Arc<Mutex<Option<(i64, AudioMediaSession)>>>,
+    aux_media_hook: Option<Arc<dyn AuxiliaryMediaHook>>,
+    aux_media: AuxMediaSlot,
     events_tx: broadcast::Sender<CallEvent>,
     #[cfg(test)]
     audio_fault: TestAudioFault,
@@ -1380,10 +1535,18 @@ impl CallEngine {
             sm: Arc::new(Mutex::new(CallStateMachine::new(uid_str, uid_u32))),
             zrtp: Arc::new(Mutex::new(None)),
             media: Arc::new(Mutex::new(None)),
+            aux_media_hook: None,
+            aux_media: Arc::new(Mutex::new(None)),
             events_tx,
             #[cfg(test)]
             audio_fault: TestAudioFault::None,
         })
+    }
+
+    /// Attach an auxiliary media factory hook (such as `VideoMediaHook` from `teza-video`).
+    pub fn with_aux_media_hook(mut self, hook: Arc<dyn AuxiliaryMediaHook>) -> Self {
+        self.aux_media_hook = Some(hook);
+        self
     }
 
     #[cfg(test)]
@@ -1439,6 +1602,11 @@ impl CallEngine {
         self.media.lock().await.is_some()
     }
 
+    /// Diagnostic helper: returns `true` when an auxiliary media session (e.g. video) is attached.
+    pub async fn has_active_aux_media(&self) -> bool {
+        self.aux_media.lock().await.is_some()
+    }
+
     fn emit_events(&self, events: Vec<CallEvent>) {
         for ev in events {
             let _ = self.events_tx.send(ev);
@@ -1466,7 +1634,11 @@ impl CallEngine {
     async fn stop_media_and_zrtp(&self) {
         let old_media = self.media.lock().await.take();
         if let Some((_, m)) = old_media {
-            m.stop();
+            stop_audio_session_blocking(m).await;
+        }
+        let old_aux = self.aux_media.lock().await.take();
+        if let Some((_, aux)) = old_aux {
+            stop_aux_session_blocking(aux).await;
         }
         let old_zrtp = self.zrtp.lock().await.take();
         if let Some((_, z)) = old_zrtp {
@@ -1484,7 +1656,18 @@ impl CallEngine {
             }
         };
         if let Some((_, m)) = old_media {
-            m.stop();
+            stop_audio_session_blocking(m).await;
+        }
+        let old_aux = {
+            let mut g = self.aux_media.lock().await;
+            if g.as_ref().is_some_and(|(cid, _)| *cid == call_id) {
+                g.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, aux)) = old_aux {
+            stop_aux_session_blocking(aux).await;
         }
         let old_zrtp = {
             let mut g = self.zrtp.lock().await;
@@ -1505,7 +1688,8 @@ impl CallEngine {
             _ => None,
         });
         let media_call_id = out.events.iter().find_map(|ev| match ev {
-            CallEvent::MediaStateChanged { call_id, .. } => Some(*call_id),
+            CallEvent::MediaStateChanged { call_id, .. }
+            | CallEvent::CameraStateChanged { call_id, .. } => Some(*call_id),
             _ => None,
         });
         self.execute_effects(out.effects, ended_call_id, media_call_id)
@@ -1613,6 +1797,20 @@ impl CallEngine {
                         }
                     }
                 }
+                CallEffect::ApplyLocalCam(enabled) => {
+                    if let Some((cid, ref aux)) = *self.aux_media.lock().await {
+                        if media_call_id.is_none_or(|target| target == cid) {
+                            aux.set_cam_enabled(enabled);
+                        }
+                    }
+                }
+                CallEffect::RequestRemoteKeyframe { call_id } => {
+                    if let Some((cid, ref aux)) = *self.aux_media.lock().await {
+                        if cid == call_id {
+                            aux.request_remote_keyframe();
+                        }
+                    }
+                }
                 CallEffect::StartCallerMedia {
                     call_id,
                     rtp_ip,
@@ -1695,20 +1893,31 @@ impl CallEngine {
             )
         };
 
-        let (initial_mic_muted, still_active) = {
+        let (
+            call_type,
+            is_caller,
+            partner_uid_u32,
+            initial_mic_muted,
+            initial_cam_enabled,
+            still_active,
+        ) = {
             let mut sm_g = self.sm.lock().await;
             if let Some(st) = sm_g.active_mut() {
                 if st.call_id == call_id {
                     st.relay_token = token;
                     (
+                        st.call_type,
+                        st.is_caller,
+                        st.partner_uid_u32,
                         st.mic_muted,
+                        st.cam_enabled,
                         matches!(st.phase, CallPhase::Connected | CallPhase::Connecting),
                     )
                 } else {
-                    (false, false)
+                    (CallType::DirectVoice, false, 0, false, false, false)
                 }
             } else {
-                (false, false)
+                (CallType::DirectVoice, false, 0, false, false, false)
             }
         };
         if !still_active {
@@ -1722,51 +1931,162 @@ impl CallEngine {
             let _ = rtp_sock.send_to(&ping, rtp_target).await;
         }
 
-        if !self.config.enable_audio {
+        let existing_aux = {
+            let g = self.aux_media.lock().await;
+            g.as_ref()
+                .and_then(|(cid, aux)| (*cid == call_id).then(|| aux.clone()))
+        };
+        let mut created_aux = false;
+        let aux_session = match existing_aux {
+            Some(aux) => Some(aux),
+            None => {
+                let created = match self.aux_media_hook.clone() {
+                    Some(hook) => {
+                        let ctx = MediaTransportContext {
+                            call_id,
+                            call_type,
+                            is_caller,
+                            from_uid_u32,
+                            partner_uid_u32,
+                            ssrc: from_uid_u32,
+                            rtp_target,
+                            rtcp_target,
+                            relay_token: token,
+                            live_relay_token: Some(live_token_arc.clone()),
+                            live_rtcp_relay_token: live_rtcp_token_arc.clone(),
+                            udp_rtp_sock: std_rtp_sock.clone(),
+                            udp_rtcp_sock: Some(std_rtcp_sock.clone()),
+                            initial_cam_enabled,
+                        };
+                        tokio::task::spawn_blocking(move || hook.on_media_start(ctx))
+                            .await
+                            .ok()
+                            .flatten()
+                    }
+                    None => None,
+                };
+                created_aux = created.is_some();
+                created
+            }
+        };
+
+        if !self.config.enable_audio && aux_session.is_none() {
             return;
         }
         let selected_devices = self.devices.lock().await.clone();
-        let cfg = AudioMediaConfig {
+        let make_cfg = || AudioMediaConfig {
             rtp_target,
             rtcp_target,
             ssrc: from_uid_u32,
             relay_token: token,
-            live_relay_token: Some(live_token_arc),
-            live_rtcp_relay_token: live_rtcp_token_arc,
-            media_attached: Some(media_attached),
-            media_attached_notify: Some(media_attached_notify),
+            live_relay_token: Some(live_token_arc.clone()),
+            live_rtcp_relay_token: live_rtcp_token_arc.clone(),
+            media_attached: Some(media_attached.clone()),
+            media_attached_notify: Some(media_attached_notify.clone()),
             initial_mic_muted,
-            udp_rtp_sock: std_rtp_sock,
-            udp_rtcp_sock: Some(std_rtcp_sock),
-            rtcp_inbox: Some(rtcp_inbox),
-            devices: selected_devices,
+            udp_rtp_sock: std_rtp_sock.clone(),
+            udp_rtcp_sock: Some(std_rtcp_sock.clone()),
+            rtcp_inbox: Some(rtcp_inbox.clone()),
+            devices: selected_devices.clone(),
+            aux_session: aux_session.clone(),
         };
-        #[cfg(test)]
-        let start_res = AudioMediaSession::start_with_fault(cfg, self.audio_fault);
-        #[cfg(not(test))]
-        let start_res = AudioMediaSession::start(cfg);
+
+        let (start_res, pump_only) = if self.config.enable_audio {
+            let cfg = make_cfg();
+            #[cfg(test)]
+            let fault = self.audio_fault;
+            let res = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                {
+                    AudioMediaSession::start_with_fault(cfg, fault)
+                }
+                #[cfg(not(test))]
+                {
+                    AudioMediaSession::start(cfg)
+                }
+            })
+            .await
+            .map_err(|e| CallError::Audio(format!("Lỗi tác vụ khởi động audio: {e}")))
+            .and_then(|r| r);
+            match res {
+                Ok(s) => (Ok(s), false),
+                Err(err) if aux_session.is_some() => {
+                    let msg = format!("Không khởi động được audio media: {err}");
+                    eprintln!("[teza-call][engine] call_id={call_id}: {msg}");
+                    self.emit_events(vec![CallEvent::MediaWarning {
+                        call_id,
+                        message: msg,
+                    }]);
+                    let pump_cfg = make_cfg();
+                    let pump_res = tokio::task::spawn_blocking(move || {
+                        AudioMediaSession::start_aux_pump_only(pump_cfg)
+                    })
+                    .await
+                    .map_err(|e| CallError::Audio(format!("Lỗi tác vụ khởi động UDP aux pump: {e}")))
+                    .and_then(|r| r);
+                    (pump_res, true)
+                }
+                Err(err) => (Err(err), false),
+            }
+        } else {
+            let pump_cfg = make_cfg();
+            let pump_res = tokio::task::spawn_blocking(move || {
+                AudioMediaSession::start_aux_pump_only(pump_cfg)
+            })
+            .await
+            .map_err(|e| CallError::Audio(format!("Lỗi tác vụ khởi động UDP aux pump: {e}")))
+            .and_then(|r| r);
+            (pump_res, true)
+        };
+
         match start_res {
             Ok(session) => {
                 let telem = session.telemetry();
-                let receive_only = !telem.has_input_device;
-                let virtual_warn = format_virtual_audio_warning(&telem);
+                let receive_only = !pump_only && !telem.has_input_device;
+                let virtual_warn = (!pump_only)
+                    .then(|| format_virtual_audio_warning(&telem))
+                    .flatten();
                 // Re-verify the call wasn't ended or replaced while OS audio devices were opening,
-                // storing `(call_id, session)` atomically under `sm` -> `media`.
-                let prev = {
+                // re-syncing latest mute/cam flags and storing `(call_id, session)` / `(call_id, aux)`
+                // atomically under `sm` so toggles made during `Connecting -> Connected` are never lost.
+                let (prev, prev_aux) = {
                     let sm_g = self.sm.lock().await;
-                    let still_live = sm_g.active().is_some_and(|st| {
-                        st.call_id == call_id
-                            && matches!(st.phase, CallPhase::Connected | CallPhase::Connecting)
+                    let live_flags = sm_g.active().and_then(|st| {
+                        (st.call_id == call_id
+                            && matches!(st.phase, CallPhase::Connected | CallPhase::Connecting))
+                        .then_some((st.mic_muted, st.cam_enabled))
                     });
-                    if !still_live {
+                    let Some((cur_mic_muted, cur_cam_enabled)) = live_flags else {
                         drop(sm_g);
-                        session.stop();
+                        stop_audio_session_blocking(session).await;
+                        if created_aux {
+                            if let Some(aux) = aux_session {
+                                stop_aux_session_blocking(aux).await;
+                            }
+                        }
                         return;
+                    };
+                    session.set_mic_muted(cur_mic_muted);
+                    if let Some(ref aux) = aux_session {
+                        aux.set_cam_enabled(cur_cam_enabled);
                     }
-                    self.media.lock().await.replace((call_id, session))
+                    let prev_m = self.media.lock().await.replace((call_id, session));
+                    let prev_aux_slot = if created_aux {
+                        if let Some(aux) = aux_session.clone() {
+                            self.aux_media.lock().await.replace((call_id, aux))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    (prev_m, prev_aux_slot)
                 };
                 if let Some((_, old)) = prev {
-                    old.stop();
+                    stop_audio_session_blocking(old).await;
+                }
+                if let Some((_, old_aux)) = prev_aux {
+                    stop_aux_session_blocking(old_aux).await;
                 }
                 if receive_only {
                     let msg =
@@ -1787,6 +2107,11 @@ impl CallEngine {
                 }
             }
             Err(err) => {
+                if created_aux {
+                    if let Some(aux) = aux_session {
+                        stop_aux_session_blocking(aux).await;
+                    }
+                }
                 let msg = format!("Không khởi động được audio media: {err}");
                 eprintln!("[teza-call][engine] call_id={call_id}: {msg}");
                 self.emit_events(vec![CallEvent::MediaWarning {
@@ -2007,12 +2332,21 @@ impl CallEngine {
         let resp_416 = match self.transport.request_416(&req_416).await {
             Ok(v) => v,
             Err(e) => {
-                let out = self
-                    .sm
-                    .lock()
-                    .await
-                    .fail_outgoing(real_call_id, CallEndReason::Error(e.to_string()));
+                let (out, already_live) = {
+                    let mut sm_g = self.sm.lock().await;
+                    let already_live = sm_g.active().is_some_and(|st| {
+                        st.is_caller
+                            && st.call_id == real_call_id
+                            && matches!(st.phase, CallPhase::RingingOutgoing | CallPhase::Connected)
+                    });
+                    let out =
+                        sm_g.fail_outgoing(real_call_id, CallEndReason::Error(e.to_string()));
+                    (out, already_live)
+                };
                 self.apply_transition(out).await;
+                if already_live {
+                    return Ok(real_call_id);
+                }
                 self.stop_media_and_zrtp_for_call(real_call_id).await;
                 return Err(e);
             }
@@ -2026,14 +2360,26 @@ impl CallEngine {
             .unwrap_or(0);
         if status_416 != 0 {
             let msg = response_error_msg(&resp_416, "Không thể đổ chuông tới người nhận");
-            let out = self.sm.lock().await.fail_outgoing(
-                real_call_id,
-                CallEndReason::RemoteRejected {
-                    code: status_416,
-                    message: msg.clone(),
-                },
-            );
+            let (out, already_live) = {
+                let mut sm_g = self.sm.lock().await;
+                let already_live = sm_g.active().is_some_and(|st| {
+                    st.is_caller
+                        && st.call_id == real_call_id
+                        && matches!(st.phase, CallPhase::RingingOutgoing | CallPhase::Connected)
+                });
+                let out = sm_g.fail_outgoing(
+                    real_call_id,
+                    CallEndReason::RemoteRejected {
+                        code: status_416,
+                        message: msg.clone(),
+                    },
+                );
+                (out, already_live)
+            };
             self.apply_transition(out).await;
+            if already_live {
+                return Ok(real_call_id);
+            }
             self.stop_media_and_zrtp_for_call(real_call_id).await;
             return Err(CallError::Signaling {
                 code: status_416,
@@ -2286,9 +2632,14 @@ impl CallEngine {
             return Ok(());
         }
 
-        self.emit_events(done_out.events);
         self.start_audio_on_active_zrtp(rec.call_id, &rtp_ip, &rtcp_ip, rec.from_uid_u32, &sess_id)
             .await;
+        let still_connected = self.sm.lock().await.active().is_some_and(|st| {
+            st.call_id == rec.call_id && st.phase == CallPhase::Connected
+        });
+        if still_connected {
+            self.emit_events(done_out.events);
+        }
         Ok(())
     }
 
@@ -2296,6 +2647,14 @@ impl CallEngine {
     pub async fn set_mic_muted(&self, muted: bool) -> CallResult<()> {
         self.transport.check_callable()?;
         let out = self.sm.lock().await.set_mic_muted(muted);
+        self.apply_transition(out).await;
+        Ok(())
+    }
+
+    /// Toggle local camera transmission and notify the peer via `12006` `/api/voicecall/conf`.
+    pub async fn set_cam_enabled(&self, enabled: bool) -> CallResult<()> {
+        self.transport.check_callable()?;
+        let out = self.sm.lock().await.set_cam_enabled(enabled);
         self.apply_transition(out).await;
         Ok(())
     }
@@ -2344,7 +2703,7 @@ impl CallEngine {
                 }
             };
             if let Some((_, m)) = old_media {
-                m.stop();
+                stop_audio_session_blocking(m).await;
                 self.start_audio_on_active_zrtp(call_id, &rtp_ip, &rtcp_ip, from_uid_u32, &sess_id)
                     .await;
             }
@@ -4446,7 +4805,23 @@ mod tests {
         let _ = sm.handle_voip_event(&stub_first, now);
         assert_eq!(sm.active().unwrap().rtp_ip, "");
         let o_up = sm.handle_voip_event(&rich_second, now + 150);
-        assert!(o_up.events.is_empty());
+        assert!(
+            o_up.events.iter().any(|e| matches!(
+                e,
+                CallEvent::StateChanged {
+                    phase: CallPhase::IncomingRinging,
+                    call_id: Some(700_002)
+                }
+            )),
+            "upgrading stub invite call_type/partner_name must emit StateChanged so UI refreshes"
+        );
+        assert!(
+            !o_up
+                .events
+                .iter()
+                .any(|e| matches!(e, CallEvent::IncomingCall { .. })),
+            "upgrading stub invite must NOT re-emit IncomingCall"
+        );
         let st2 = sm.active().unwrap();
         assert_eq!(st2.partner_id, "2000000000000000002");
         assert_eq!(st2.partner_name, "Bob Upgraded");
@@ -4773,5 +5148,788 @@ mod tests {
             ..Default::default()
         };
         assert!(format_virtual_audio_warning(&clean).is_none());
+    }
+
+    #[test]
+    fn direct_video_sm_emits_12006_cam_states_and_handles_peer_onoff_camera() {
+        let mut sm = CallStateMachine::new("1000", 1000);
+        let t0 = 1_700_000_100_000_i64;
+        sm.begin_outgoing(
+            555_001,
+            "2000".into(),
+            "Bob".into(),
+            CallType::DirectVideo,
+            t0,
+        )
+        .unwrap();
+        let snap0 = sm.snapshot(t0).unwrap();
+        assert!(snap0.cam_enabled);
+        assert!(snap0.peer_cam_enabled);
+
+        let ans_ev = voip_event_from_parts(
+            "answer",
+            json!({
+                "callId": 555_001,
+                "status": 0,
+                "params": r#"{"rtpSerIp":"171.244.128.62:4200"}"#
+            }),
+        );
+        let o_ans = sm.handle_voip_event(&ans_ev, t0 + 1000);
+        assert!(o_ans.effects.iter().any(|e| matches!(
+            e,
+            CallEffect::SendMediaConf12006 {
+                callee_id,
+                call_id: 555_001,
+                is_on_mic: true,
+                is_on_cam: true,
+            } if callee_id == "2000"
+        )));
+
+        let o_mute = sm.set_mic_muted(true);
+        assert!(o_mute.effects.iter().any(|e| matches!(
+            e,
+            CallEffect::SendMediaConf12006 {
+                is_on_mic: false,
+                is_on_cam: true,
+                ..
+            }
+        )));
+
+        let o_cam_off = sm.set_cam_enabled(false);
+        assert!(o_cam_off
+            .effects
+            .contains(&CallEffect::ApplyLocalCam(false)));
+        assert!(o_cam_off.effects.iter().any(|e| matches!(
+            e,
+            CallEffect::SendMediaConf12006 {
+                is_on_mic: false,
+                is_on_cam: false,
+                ..
+            }
+        )));
+        assert!(o_cam_off.events.iter().any(|ev| matches!(
+            ev,
+            CallEvent::CameraStateChanged {
+                call_id: 555_001,
+                cam_enabled: false
+            }
+        )));
+
+        let peer_cam_off = voip_event_from_parts(
+            "onoff_camera",
+            json!({
+                "callId": 555_001,
+                "params": r#"{"type":0}"#,
+            }),
+        );
+        let o_pc_off = sm.handle_voip_event(&peer_cam_off, t0 + 2000);
+        assert!(!sm.snapshot(t0 + 2000).unwrap().peer_cam_enabled);
+        assert!(o_pc_off.events.iter().any(|ev| matches!(
+            ev,
+            CallEvent::PeerCameraChanged {
+                call_id: 555_001,
+                cam_enabled: false
+            }
+        )));
+
+        let peer_cam_on = voip_event_from_parts(
+            "onoff_camera",
+            json!({
+                "callId": 555_001,
+                "params": r#"{"type":1}"#,
+            }),
+        );
+        let o_pc_on = sm.handle_voip_event(&peer_cam_on, t0 + 3000);
+        assert!(sm.snapshot(t0 + 3000).unwrap().peer_cam_enabled);
+        assert!(o_pc_on.events.iter().any(|ev| matches!(
+            ev,
+            CallEvent::PeerCameraChanged {
+                call_id: 555_001,
+                cam_enabled: true
+            }
+        )));
+
+        // Mobile sends `type: 2, reason: 2` when camera pauses/backgrounds; must disable peer cam.
+        let peer_cam_paused = voip_event_from_parts(
+            "onoff_camera",
+            json!({
+                "callId": 555_001,
+                "params": r#"{"type":2,"reason":2}"#,
+            }),
+        );
+        let o_pc_paused = sm.handle_voip_event(&peer_cam_paused, t0 + 4000);
+        assert!(!sm.snapshot(t0 + 4000).unwrap().peer_cam_enabled);
+        assert!(o_pc_paused.events.iter().any(|ev| matches!(
+            ev,
+            CallEvent::PeerCameraChanged {
+                call_id: 555_001,
+                cam_enabled: false
+            }
+        )));
+
+        // Resuming with `type: 1` restores `peer_cam_enabled = true`.
+        let o_pc_resumed = sm.handle_voip_event(&peer_cam_on, t0 + 5000);
+        assert!(sm.snapshot(t0 + 5000).unwrap().peer_cam_enabled);
+        assert!(o_pc_resumed.events.iter().any(|ev| matches!(
+            ev,
+            CallEvent::PeerCameraChanged {
+                call_id: 555_001,
+                cam_enabled: true
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn aux_media_hook_attaches_receives_video_rtp_rtcp_and_stops_on_hangup() {
+        use crate::media_hook::{AuxiliaryMediaHook, AuxiliaryMediaSession, MediaTransportContext};
+        use crate::rtp::{build_rtp_packet, OPUS_AUDIO_PT};
+        use crate::zrtp::{wrap_relay_audio_rtp, RELAY_INCOMING_VIDEO_RTP};
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        struct StubAuxSession {
+            rtp_rx: Arc<AtomicUsize>,
+            rtcp_rx: Arc<AtomicUsize>,
+            cam_flag: Arc<AtomicBool>,
+            stopped: Arc<AtomicBool>,
+        }
+
+        impl AuxiliaryMediaSession for StubAuxSession {
+            fn on_incoming_rtp(&self, outer_byte: u8, inner_rtp: &[u8]) {
+                assert_eq!(outer_byte, RELAY_INCOMING_VIDEO_RTP);
+                assert!(inner_rtp.len() >= 12);
+                self.rtp_rx.fetch_add(1, Ordering::Relaxed);
+            }
+
+            fn on_incoming_rtcp(&self, _outer_byte: u8, inner_rtcp: &[u8]) {
+                assert!(inner_rtcp.len() >= 8);
+                self.rtcp_rx.fetch_add(1, Ordering::Relaxed);
+            }
+
+            fn set_cam_enabled(&self, enabled: bool) {
+                self.cam_flag.store(enabled, Ordering::Relaxed);
+            }
+
+            fn stop(&self) {
+                self.stopped.store(true, Ordering::Relaxed);
+            }
+        }
+
+        struct StubAuxHook {
+            rtp_rx: Arc<AtomicUsize>,
+            rtcp_rx: Arc<AtomicUsize>,
+            cam_flag: Arc<AtomicBool>,
+            stopped: Arc<AtomicBool>,
+            seen_call_type: Arc<std::sync::Mutex<Option<CallType>>>,
+        }
+
+        impl AuxiliaryMediaHook for StubAuxHook {
+            fn on_media_start(
+                &self,
+                ctx: MediaTransportContext,
+            ) -> Option<Arc<dyn AuxiliaryMediaSession>> {
+                *self.seen_call_type.lock().unwrap() = Some(ctx.call_type);
+                self.cam_flag
+                    .store(ctx.initial_cam_enabled, Ordering::Relaxed);
+                let vid_rtp = build_rtp_packet(98, true, 1, 9000, 0x2222_3333, &[0, 0, 0, 1, 0x65]);
+                let mut down_vid = vec![RELAY_INCOMING_VIDEO_RTP];
+                down_vid.extend_from_slice(&vid_rtp);
+                let _ = ctx.udp_rtp_sock.send_to(&down_vid, ctx.rtp_target);
+
+                let opus_rtp = build_rtp_packet(OPUS_AUDIO_PT, false, 1, 320, 0x2222_3333, &[0xFC]);
+                let down_aud = wrap_relay_audio_rtp(ctx.active_relay_token(), &opus_rtp);
+                let _ = ctx.udp_rtp_sock.send_to(&down_aud, ctx.rtp_target);
+
+                Some(Arc::new(StubAuxSession {
+                    rtp_rx: self.rtp_rx.clone(),
+                    rtcp_rx: self.rtcp_rx.clone(),
+                    cam_flag: self.cam_flag.clone(),
+                    stopped: self.stopped.clone(),
+                }))
+            }
+        }
+
+        let (rtp_addr, rtcp_addr, stop_tx, relay_task) = spawn_mock_zrtp_relay().await;
+        // Wrap relay echo in this test by spinning a small reflector so down_vid + RR echo back
+        let reflector = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ref_addr = reflector.local_addr().unwrap();
+        let ref_stop = stop_tx.clone();
+        let mut ref_stop_rx = ref_stop.subscribe();
+        let ref_task = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            loop {
+                tokio::select! {
+                    _ = ref_stop_rx.changed() => break,
+                    Ok((n, peer)) = reflector.recv_from(&mut buf) => {
+                        if n >= 1 && buf[0] == RELAY_INCOMING_VIDEO_RTP {
+                            let _ = reflector.send_to(&buf[..n], peer).await;
+                            // Also echo an RTCP RR packet back
+                            let rr = [0x05u8, 1, 2, 3, 4, 0x80, 201, 0x00, 0x01, 0x22, 0x22, 0x33, 0x33];
+                            let _ = reflector.send_to(&rr, peer).await;
+                        }
+                    }
+                }
+            }
+        });
+
+        let rtp_rx = Arc::new(AtomicUsize::new(0));
+        let rtcp_rx = Arc::new(AtomicUsize::new(0));
+        let cam_flag = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let seen_call_type = Arc::new(std::sync::Mutex::new(None));
+        let hook = Arc::new(StubAuxHook {
+            rtp_rx: rtp_rx.clone(),
+            rtcp_rx: rtcp_rx.clone(),
+            cam_flag: cam_flag.clone(),
+            stopped: stopped.clone(),
+            seen_call_type: seen_call_type.clone(),
+        });
+
+        let transport = Arc::new(MockSignalingTransport::new(json!({
+            "id": 999_123,
+            "status": 0,
+            "fromId": 1000,
+            "toId": 2000,
+            "sessId": "sess_999123",
+            "servers": [{ "rtpaddr": rtp_addr, "rtcpaddr": rtcp_addr }]
+        })));
+        let engine = CallEngine::with_transport(
+            transport,
+            CallEngineConfig {
+                enable_audio: false,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .with_aux_media_hook(hook);
+
+        let cid = engine
+            .make_call("2000", "VideoBob", CallType::DirectVideo)
+            .await
+            .unwrap();
+        assert_eq!(cid, 999_123);
+
+        let ans = voip_event_from_parts(
+            "answer",
+            json!({
+                "callId": 999_123,
+                "status": 0,
+                "params": json!({ "rtpSerIp": ref_addr.to_string() }).to_string(),
+            }),
+        );
+        engine.handle_voip_event(&ans).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        assert!(engine.has_active_aux_media().await);
+        assert_eq!(*seen_call_type.lock().unwrap(), Some(CallType::DirectVideo));
+        assert!(cam_flag.load(Ordering::Relaxed));
+        assert!(rtp_rx.load(Ordering::Relaxed) >= 1);
+        assert!(rtcp_rx.load(Ordering::Relaxed) >= 1);
+
+        engine.set_cam_enabled(false).await.unwrap();
+        assert!(!cam_flag.load(Ordering::Relaxed));
+
+        engine.end_call().await.unwrap();
+        assert!(stopped.load(Ordering::Relaxed));
+        assert!(!engine.has_active_aux_media().await);
+
+        let _ = stop_tx.send(true);
+        let _ = ref_task.await;
+        let _ = relay_task.await;
+    }
+
+    #[test]
+    fn peer_cam_and_mute_ignore_self_echo_prefer_params_and_request_keyframe_on_resume() {
+        let mut sm = CallStateMachine::new("1000000000000000001", 435_550_501);
+        let t0 = 1_700_000_200_000_i64;
+        sm.begin_outgoing(
+            880_001,
+            "2000".into(),
+            "Bob".into(),
+            CallType::DirectVideo,
+            t0,
+        )
+        .unwrap();
+        let ans = voip_event_from_parts(
+            "answer",
+            json!({
+                "callId": 880_001,
+                "status": 0,
+                "params": r#"{"rtpSerIp":"171.244.128.62:4200"}"#
+            }),
+        );
+        let _ = sm.handle_voip_event(&ans, t0 + 500);
+        assert!(sm.snapshot(t0 + 500).unwrap().peer_cam_enabled);
+        assert!(!sm.snapshot(t0 + 500).unwrap().peer_mic_muted);
+
+        // 1. Self-originated echoes (by 19-digit uidN or 32-bit uidFrom) must be ignored
+        let self_cam_off_n = voip_event_from_parts(
+            "onoff_camera",
+            json!({
+                "callId": 880_001,
+                "uidN": "1000000000000000001",
+                "params": r#"{"type":0}"#
+            }),
+        );
+        let self_cam_off_u32 = voip_event_from_parts(
+            "onoff_camera",
+            json!({
+                "callId": 880_001,
+                "uidFrom": 435_550_501,
+                "params": r#"{"type":0}"#
+            }),
+        );
+        let self_mute_n = voip_event_from_parts(
+            "mute_audio",
+            json!({
+                "callId": 880_001,
+                "uidN": "1000000000000000001",
+                "params": r#"{"type":1}"#
+            }),
+        );
+        let self_mute_u32 = voip_event_from_parts(
+            "mute_audio",
+            json!({
+                "callId": 880_001,
+                "uidFrom": "435550501",
+                "params": r#"{"type":1}"#
+            }),
+        );
+        assert!(sm.handle_voip_event(&self_cam_off_n, t0 + 600).events.is_empty());
+        assert!(sm.handle_voip_event(&self_cam_off_u32, t0 + 700).events.is_empty());
+        assert!(sm.handle_voip_event(&self_mute_n, t0 + 800).events.is_empty());
+        assert!(sm.handle_voip_event(&self_mute_u32, t0 + 900).events.is_empty());
+        assert!(sm.snapshot(t0 + 900).unwrap().peer_cam_enabled);
+        assert!(!sm.snapshot(t0 + 900).unwrap().peer_mic_muted);
+
+        // 2. Peer turns camera OFF -> PeerCameraChanged(false), NO RequestRemoteKeyframe
+        let peer_cam_off = voip_event_from_parts(
+            "onoff_camera",
+            json!({
+                "callId": 880_001,
+                "uidFrom": "2000",
+                "params": r#"{"type":0}"#
+            }),
+        );
+        let o_off = sm.handle_voip_event(&peer_cam_off, t0 + 1000);
+        assert!(!sm.snapshot(t0 + 1000).unwrap().peer_cam_enabled);
+        assert!(o_off.effects.is_empty());
+        assert!(o_off.events.iter().any(|e| matches!(
+            e,
+            CallEvent::PeerCameraChanged {
+                call_id: 880_001,
+                cam_enabled: false
+            }
+        )));
+
+        // 3. Outer `ev.data.type: 3` must NOT shadow `params.isOnCam: 1`, AND false->true
+        //    transition must emit `CallEffect::RequestRemoteKeyframe`!
+        let peer_cam_on_shadow = voip_event_from_parts(
+            "onoff_camera",
+            json!({
+                "callId": 880_001,
+                "uidFrom": "2000",
+                "type": 3,
+                "params": r#"{"isOnCam":1}"#
+            }),
+        );
+        let o_on = sm.handle_voip_event(&peer_cam_on_shadow, t0 + 1100);
+        assert!(sm.snapshot(t0 + 1100).unwrap().peer_cam_enabled);
+        assert!(
+            o_on.effects
+                .contains(&CallEffect::RequestRemoteKeyframe { call_id: 880_001 }),
+            "peer camera false->true resume must emit RequestRemoteKeyframe"
+        );
+        assert!(o_on.events.iter().any(|e| matches!(
+            e,
+            CallEvent::PeerCameraChanged {
+                call_id: 880_001,
+                cam_enabled: true
+            }
+        )));
+
+        // 4. Outer `ev.data.type: 3` must NOT shadow `params.isOnMic: 1` (unmuted) or `params.mute: false`
+        let peer_mute_on = voip_event_from_parts(
+            "mute_audio",
+            json!({
+                "callId": 880_001,
+                "uidFrom": "2000",
+                "params": r#"{"type":1}"#
+            }),
+        );
+        let _ = sm.handle_voip_event(&peer_mute_on, t0 + 1200);
+        assert!(sm.snapshot(t0 + 1200).unwrap().peer_mic_muted);
+
+        let peer_unmute_shadow = voip_event_from_parts(
+            "mute_audio",
+            json!({
+                "callId": 880_001,
+                "uidFrom": "2000",
+                "type": 3,
+                "params": r#"{"isOnMic":1}"#
+            }),
+        );
+        let o_unmute = sm.handle_voip_event(&peer_unmute_shadow, t0 + 1300);
+        assert!(
+            !sm.snapshot(t0 + 1300).unwrap().peer_mic_muted,
+            "outer data.type=3 must not shadow params.isOnMic=1"
+        );
+        assert!(o_unmute.events.iter().any(|e| matches!(
+            e,
+            CallEvent::PeerMediaChanged {
+                call_id: 880_001,
+                mic_muted: false
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn callee_answer_starts_media_before_connected_resyncs_privacy_race_and_requests_keyframe() {
+        use crate::media_hook::{AuxiliaryMediaHook, AuxiliaryMediaSession, MediaTransportContext};
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        struct RaceProbeAuxSession {
+            cam_flag: Arc<AtomicBool>,
+            keyframe_reqs: Arc<AtomicUsize>,
+            stopped: Arc<AtomicBool>,
+        }
+
+        impl AuxiliaryMediaSession for RaceProbeAuxSession {
+            fn on_incoming_rtp(&self, _outer_byte: u8, _inner_rtp: &[u8]) {}
+            fn on_incoming_rtcp(&self, _outer_byte: u8, _inner_rtcp: &[u8]) {}
+            fn set_cam_enabled(&self, enabled: bool) {
+                self.cam_flag.store(enabled, Ordering::Relaxed);
+            }
+            fn request_remote_keyframe(&self) {
+                self.keyframe_reqs.fetch_add(1, Ordering::Relaxed);
+            }
+            fn stop(&self) {
+                self.stopped.store(true, Ordering::Relaxed);
+            }
+        }
+
+        struct RaceProbeAuxHook {
+            cam_flag: Arc<AtomicBool>,
+            keyframe_reqs: Arc<AtomicUsize>,
+            stopped: Arc<AtomicBool>,
+            connected_seen_before_media_start: Arc<AtomicBool>,
+            rx_for_check: Arc<std::sync::Mutex<broadcast::Receiver<CallEvent>>>,
+            engine_slot: Arc<std::sync::Mutex<Option<Arc<CallEngine>>>>,
+        }
+
+        impl AuxiliaryMediaHook for RaceProbeAuxHook {
+            fn on_media_start(
+                &self,
+                ctx: MediaTransportContext,
+            ) -> Option<Arc<dyn AuxiliaryMediaSession>> {
+                // Verify CallEvent::Connected has NOT been emitted yet when callee media starts!
+                if let Ok(mut rx) = self.rx_for_check.lock() {
+                    while let Ok(ev) = rx.try_recv() {
+                        if matches!(ev, CallEvent::Connected { .. }) {
+                            self.connected_seen_before_media_start
+                                .store(true, Ordering::Relaxed);
+                        }
+                    }
+                }
+                self.cam_flag
+                    .store(ctx.initial_cam_enabled, Ordering::Relaxed);
+
+                // Toggle mic mute + cam off concurrently on a dedicated thread BEFORE self.media /
+                // self.aux_media are inserted, reproducing the Connecting->Connected privacy race.
+                if let Some(eng) = self.engine_slot.lock().unwrap().clone() {
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap();
+                        rt.block_on(async move {
+                            eng.set_mic_muted(true).await.unwrap();
+                            eng.set_cam_enabled(false).await.unwrap();
+                        });
+                    })
+                    .join()
+                    .unwrap();
+                }
+
+                Some(Arc::new(RaceProbeAuxSession {
+                    cam_flag: self.cam_flag.clone(),
+                    keyframe_reqs: self.keyframe_reqs.clone(),
+                    stopped: self.stopped.clone(),
+                }))
+            }
+        }
+
+        let (rtp_addr, rtcp_addr, stop_tx, relay_task) = spawn_mock_zrtp_relay().await;
+        let transport = Arc::new(MockSignalingTransport::new(json!({})));
+        let engine = CallEngine::with_transport(
+            transport,
+            CallEngineConfig {
+                enable_audio: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut rx_after = engine.subscribe();
+        let rx_hook = engine.subscribe();
+
+        let cam_flag = Arc::new(AtomicBool::new(true));
+        let keyframe_reqs = Arc::new(AtomicUsize::new(0));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let connected_before_media = Arc::new(AtomicBool::new(false));
+        let engine_slot: Arc<std::sync::Mutex<Option<Arc<CallEngine>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        let hook = Arc::new(RaceProbeAuxHook {
+            cam_flag: cam_flag.clone(),
+            keyframe_reqs: keyframe_reqs.clone(),
+            stopped: stopped.clone(),
+            connected_seen_before_media_start: connected_before_media.clone(),
+            rx_for_check: Arc::new(std::sync::Mutex::new(rx_hook)),
+            engine_slot: engine_slot.clone(),
+        });
+
+        let engine = Arc::new(engine.with_aux_media_hook(hook));
+        *engine_slot.lock().unwrap() = Some(engine.clone());
+
+        let invite = VoipControlEvent {
+            act: "request".into(),
+            data: json!({
+                "callId": 995_100,
+                "uidN": "2000",
+                "uidFrom": "2000",
+                "Dname": "VideoAlice",
+                "ts": now_ms(),
+                "params": json!({
+                    "sessId": "sess_race_995100",
+                    "extendData": json!({
+                        "callType": 1,
+                        "serverAddr": [{ "rtp": rtp_addr, "rtcp": rtcp_addr }]
+                    }).to_string()
+                }).to_string()
+            }),
+        };
+        engine.handle_voip_event(&invite).await.unwrap();
+        engine.answer_call_by_id(Some(995_100), true).await.unwrap();
+        let _ = engine_slot.lock().unwrap().take();
+
+        assert!(
+            !connected_before_media.load(Ordering::Relaxed),
+            "callee answer_call_by_id must start media BEFORE emitting CallEvent::Connected"
+        );
+        let mut saw_connected = false;
+        while let Ok(ev) = rx_after.try_recv() {
+            if matches!(ev, CallEvent::Connected { call_id: 995_100, .. }) {
+                saw_connected = true;
+            }
+        }
+        assert!(saw_connected, "CallEvent::Connected must be emitted after media start");
+
+        assert!(
+            !cam_flag.load(Ordering::Relaxed),
+            "camera-off toggle made during media init must be re-applied under sm_g"
+        );
+        assert!(
+            engine.audio_telemetry().await.unwrap().mic_muted,
+            "mic-mute toggle made during media init must be re-applied under sm_g"
+        );
+
+        // Peer turns camera off then back on -> must invoke aux.request_remote_keyframe()
+        let peer_off = voip_event_from_parts(
+            "onoff_camera",
+            json!({ "callId": 995_100, "uidFrom": "2000", "params": r#"{"type":0}"# }),
+        );
+        let peer_on = voip_event_from_parts(
+            "onoff_camera",
+            json!({ "callId": 995_100, "uidFrom": "2000", "params": r#"{"type":1}"# }),
+        );
+        engine.handle_voip_event(&peer_off).await.unwrap();
+        assert_eq!(keyframe_reqs.load(Ordering::Relaxed), 0);
+        engine.handle_voip_event(&peer_on).await.unwrap();
+        assert_eq!(
+            keyframe_reqs.load(Ordering::Relaxed),
+            1,
+            "peer camera false->true must invoke aux.request_remote_keyframe()"
+        );
+
+        engine.end_call().await.unwrap();
+        assert!(stopped.load(Ordering::Relaxed));
+        let _ = stop_tx.send(true);
+        let _ = relay_task.await;
+    }
+
+    #[test]
+    fn fail_outgoing_only_tears_down_dialing_and_ignores_ringing_or_connected() {
+        let mut sm = CallStateMachine::new("1000", 1000);
+        let t0 = 1_700_000_500_000_i64;
+
+        // 1. In Dialing, fail_outgoing cleanly aborts Dialing -> Idle
+        sm.begin_outgoing(700_001, "2000".into(), "Alice".into(), CallType::DirectVoice, t0)
+            .unwrap();
+        let out_fail = sm.fail_outgoing(700_001, CallEndReason::Error("416 timeout".into()));
+        assert_eq!(sm.phase(), CallPhase::Idle);
+        assert!(out_fail.effects.contains(&CallEffect::StopMediaAndZrtp));
+        assert!(out_fail.events.iter().any(|e| matches!(
+            e,
+            CallEvent::CallEnded {
+                call_id: 700_001,
+                ..
+            }
+        )));
+
+        // 2. Once early WS `ring_ring` moves the call to RingingOutgoing, fail_outgoing is a no-op
+        sm.begin_outgoing(700_002, "2000".into(), "Alice".into(), CallType::DirectVoice, t0)
+            .unwrap();
+        let ring_ev = voip_event_from_parts("ring_ring", json!({ "callId": 700_002 }));
+        let _ = sm.handle_voip_event(&ring_ev, t0 + 100);
+        assert_eq!(sm.phase(), CallPhase::RingingOutgoing);
+
+        let out_ring_noop =
+            sm.fail_outgoing(700_002, CallEndReason::Error("late 416 timeout".into()));
+        assert!(out_ring_noop.events.is_empty());
+        assert!(out_ring_noop.effects.is_empty());
+        assert_eq!(sm.phase(), CallPhase::RingingOutgoing);
+
+        // 3. Once early WS `answer` moves the call to Connected, late fail_outgoing MUST NOT kill it
+        let ans_ev = voip_event_from_parts(
+            "answer",
+            json!({
+                "callId": 700_002,
+                "status": 0,
+                "params": r#"{"rtpSerIp":"127.0.0.1:4200"}"#
+            }),
+        );
+        let _ = sm.handle_voip_event(&ans_ev, t0 + 200);
+        assert_eq!(sm.phase(), CallPhase::Connected);
+
+        let out_conn_noop =
+            sm.fail_outgoing(700_002, CallEndReason::Error("late 416 timeout".into()));
+        assert!(out_conn_noop.events.is_empty());
+        assert!(out_conn_noop.effects.is_empty());
+        assert_eq!(sm.phase(), CallPhase::Connected);
+        assert_eq!(sm.active().map(|s| s.call_id), Some(700_002));
+    }
+
+    #[test]
+    fn set_cam_enabled_is_clean_noop_on_voice_calls() {
+        let mut sm = CallStateMachine::new("1000", 1000);
+        let t0 = 1_700_000_600_000_i64;
+
+        sm.begin_outgoing(710_001, "2000".into(), "Bob".into(), CallType::DirectVoice, t0)
+            .unwrap();
+        let ans_ev = voip_event_from_parts(
+            "answer",
+            json!({ "callId": 710_001, "status": 0, "params": "{}" }),
+        );
+        let _ = sm.handle_voip_event(&ans_ev, t0 + 500);
+        assert_eq!(sm.phase(), CallPhase::Connected);
+
+        let out_enable = sm.set_cam_enabled(true);
+        assert!(out_enable.events.is_empty());
+        assert!(out_enable.effects.is_empty());
+        assert!(!sm.snapshot(t0 + 600).unwrap().cam_enabled);
+
+        let out_disable = sm.set_cam_enabled(false);
+        assert!(out_disable.events.is_empty());
+        assert!(out_disable.effects.is_empty());
+        assert!(!sm.snapshot(t0 + 700).unwrap().cam_enabled);
+    }
+
+    #[test]
+    fn incoming_request_parses_numeric_string_call_type_and_video_enable() {
+        let t0 = 1_700_000_700_000_i64;
+
+        // 1. data.callType as numeric string "3" -> DirectVideo
+        let mut sm1 = CallStateMachine::new("1000", 1000);
+        let ev1 = voip_event_from_parts(
+            "request",
+            json!({
+                "callId": 720_001,
+                "uidN": "2000",
+                "callType": "3",
+                "ts": t0,
+                "params": "{}"
+            }),
+        );
+        let out1 = sm1.handle_voip_event(&ev1, t0);
+        assert_eq!(sm1.snapshot(t0).unwrap().call_type, CallType::DirectVideo);
+        assert!(out1.events.iter().any(|e| matches!(
+            e,
+            CallEvent::IncomingCall {
+                call_id: 720_001,
+                call_type: CallType::DirectVideo,
+                ..
+            }
+        )));
+
+        // 2. extendData.callType as numeric string "1" -> DirectVideo
+        let mut sm2 = CallStateMachine::new("1000", 1000);
+        let ev2 = voip_event_from_parts(
+            "request",
+            json!({
+                "callId": 720_002,
+                "uidN": "2000",
+                "ts": t0,
+                "params": json!({
+                    "extendData": r#"{"callType":"1"}"#
+                }).to_string()
+            }),
+        );
+        let _ = sm2.handle_voip_event(&ev2, t0);
+        assert_eq!(sm2.snapshot(t0).unwrap().call_type, CallType::DirectVideo);
+
+        // 3. zrtc_config.video.enable as numeric string "1" -> DirectVideo
+        let mut sm3 = CallStateMachine::new("1000", 1000);
+        let ev3 = voip_event_from_parts(
+            "request",
+            json!({
+                "callId": 720_003,
+                "uidN": "2000",
+                "ts": t0,
+                "params": json!({
+                    "zrtc_config": {
+                        "callType": "1",
+                        "video": { "enable": "1" }
+                    }
+                }).to_string()
+            }),
+        );
+        let _ = sm3.handle_voip_event(&ev3, t0);
+        assert_eq!(sm3.snapshot(t0).unwrap().call_type, CallType::DirectVideo);
+
+        // 4. zrtc_config.callType as numeric string "3" -> DirectVideo
+        let mut sm4 = CallStateMachine::new("1000", 1000);
+        let ev4 = voip_event_from_parts(
+            "request",
+            json!({
+                "callId": 720_004,
+                "uidN": "2000",
+                "ts": t0,
+                "params": json!({
+                    "zrtc_config": { "callType": "3" }
+                }).to_string()
+            }),
+        );
+        let _ = sm4.handle_voip_event(&ev4, t0);
+        assert_eq!(sm4.snapshot(t0).unwrap().call_type, CallType::DirectVideo);
+
+        // 5. Numeric strings indicating voice ("1" / "0" / "0") stay DirectVoice
+        let mut sm5 = CallStateMachine::new("1000", 1000);
+        let ev5 = voip_event_from_parts(
+            "request",
+            json!({
+                "callId": 720_005,
+                "uidN": "2000",
+                "callType": "2",
+                "ts": t0,
+                "params": json!({
+                    "extendData": r#"{"callType":"0"}"#,
+                    "zrtc_config": {
+                        "callType": "1",
+                        "video": { "enable": "0" }
+                    }
+                }).to_string()
+            }),
+        );
+        let _ = sm5.handle_voip_event(&ev5, t0);
+        assert_eq!(sm5.snapshot(t0).unwrap().call_type, CallType::DirectVoice);
     }
 }

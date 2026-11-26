@@ -29,7 +29,7 @@ pub enum RelayMode {
     Http,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RelayConfig {
     pub enabled: bool,
     pub mode: RelayMode,
@@ -38,6 +38,27 @@ pub struct RelayConfig {
     pub username: String,
     pub password: String,
     pub route_webview_media: bool,
+}
+
+impl std::fmt::Debug for RelayConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayConfig")
+            .field("enabled", &self.enabled)
+            .field("mode", &self.mode)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field(
+                "password",
+                &if self.password.is_empty() {
+                    ""
+                } else {
+                    "[REDACTED]"
+                },
+            )
+            .field("route_webview_media", &self.route_webview_media)
+            .finish()
+    }
 }
 
 impl Default for RelayConfig {
@@ -66,7 +87,7 @@ pub struct RelayConfigSummary {
     pub route_webview_media: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct RelayConfigUpdate {
     pub enabled: bool,
     pub mode: RelayMode,
@@ -82,11 +103,35 @@ pub struct RelayConfigUpdate {
     pub route_webview_media: bool,
 }
 
+impl std::fmt::Debug for RelayConfigUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayConfigUpdate")
+            .field("enabled", &self.enabled)
+            .field("mode", &self.mode)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field(
+                "password",
+                &self.password.as_deref().map(|p| {
+                    if p.is_empty() {
+                        ""
+                    } else {
+                        "[REDACTED]"
+                    }
+                }),
+            )
+            .field("clear_password", &self.clear_password)
+            .field("route_webview_media", &self.route_webview_media)
+            .finish()
+    }
+}
+
 fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct StoredRelayConfig {
     enabled: bool,
     mode: RelayMode,
@@ -106,11 +151,13 @@ fn mask_secret(s: &str) -> String {
     }
 }
 
-fn seal_opt(raw: &str) -> String {
-    if raw.trim().is_empty() {
-        String::new()
+fn seal_opt(raw: &str) -> Result<Option<String>> {
+    if raw.is_empty() {
+        Ok(None)
     } else {
-        dpapi::protect_secret(raw).unwrap_or_default()
+        dpapi::protect_secret(raw)
+            .context("Không thể mã hóa mật khẩu Relay bằng DPAPI")
+            .map(Some)
     }
 }
 
@@ -169,6 +216,7 @@ impl RelayConfig {
         if self.enabled {
             self.validate()?;
         }
+        let sealed_password = seal_opt(&self.password)?.unwrap_or_default();
         let stored = StoredRelayConfig {
             enabled: self.enabled,
             mode: self.mode,
@@ -179,7 +227,7 @@ impl RelayConfig {
                 self.port
             },
             username: self.username.trim().to_string(),
-            sealed_password: seal_opt(&self.password),
+            sealed_password,
             route_webview_media: self.route_webview_media,
         };
         let json = serde_json::to_string_pretty(&stored)?;
@@ -491,6 +539,23 @@ async fn socks5_connect(
     Ok(())
 }
 
+fn validate_http_connect_host(target_host: &str) -> Result<&str> {
+    if target_host.is_empty() || target_host.len() > 255 {
+        bail!("Tên miền đích HTTP CONNECT không hợp lệ");
+    }
+    if target_host.bytes().any(|b| {
+        b == b'\r'
+            || b == b'\n'
+            || b.is_ascii_whitespace()
+            || b.is_ascii_control()
+            || !b.is_ascii()
+    }) || target_host.contains(['/', '?', '#', '@'])
+    {
+        bail!("Tên miền đích HTTP CONNECT chứa ký tự không hợp lệ");
+    }
+    Ok(target_host)
+}
+
 async fn http_connect(
     stream: &mut TcpStream,
     target_host: &str,
@@ -498,6 +563,7 @@ async fn http_connect(
     username: &str,
     password: &str,
 ) -> Result<()> {
+    let target_host = validate_http_connect_host(target_host)?;
     tokio::time::timeout(RELAY_HANDSHAKE_TIMEOUT, async {
         let mut req = format!(
             "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\nProxy-Connection: Keep-Alive\r\n"
@@ -673,5 +739,90 @@ mod tests {
         let mut back2 = [0u8; 5];
         hst.read_exact(&mut back2).await.unwrap();
         assert_eq!(&back2, b"world");
+    }
+
+    #[test]
+    fn debug_impls_redact_relay_password_and_seal_opt_returns_result() {
+        let cfg = RelayConfig {
+            enabled: true,
+            mode: RelayMode::Socks5,
+            host: "10.7.12.233".into(),
+            port: 1088,
+            username: "litechat".into(),
+            password: "relay_top_secret_pw!".into(),
+            route_webview_media: true,
+        };
+        let cfg_dbg = format!("{cfg:?}");
+        assert!(!cfg_dbg.contains("relay_top_secret_pw!"));
+        assert!(cfg_dbg.contains("[REDACTED]"));
+        assert!(cfg_dbg.contains("10.7.12.233"));
+
+        let upd = RelayConfigUpdate {
+            enabled: true,
+            mode: RelayMode::Http,
+            host: "10.7.12.233".into(),
+            port: 1088,
+            username: "litechat".into(),
+            password: Some("update_top_secret_pw!".into()),
+            clear_password: false,
+            route_webview_media: true,
+        };
+        let upd_dbg = format!("{upd:?}");
+        assert!(!upd_dbg.contains("update_top_secret_pw!"));
+        assert!(upd_dbg.contains("[REDACTED]"));
+
+        assert_eq!(seal_opt("").unwrap(), None);
+        let sealed = seal_opt("relay_top_secret_pw!").unwrap().unwrap();
+        assert!(!sealed.contains("relay_top_secret_pw!"));
+        assert_eq!(unseal_opt(&sealed), "relay_top_secret_pw!");
+    }
+
+    #[tokio::test]
+    async fn http_connect_rejects_crlf_whitespace_and_control_chars_in_target_host() {
+        assert_eq!(
+            validate_http_connect_host("chat.zalo.me").unwrap(),
+            "chat.zalo.me"
+        );
+        assert_eq!(
+            validate_http_connect_host("127.0.0.1").unwrap(),
+            "127.0.0.1"
+        );
+        assert_eq!(validate_http_connect_host("[::1]").unwrap(), "[::1]");
+
+        for bad in [
+            "",
+            "chat.zalo.me\r\nX-Injected: 1",
+            "chat.zalo.me\nHost: evil.example",
+            "chat.zalo.me\rHost: evil.example",
+            "chat.zalo.me HTTP/1.1",
+            "chat.zalo.me\t443",
+            "chat.zalo.me\x00evil",
+            "chat.zalo.me\x7f",
+            "chat.zalo.me/path",
+            "chat.zalo.me?q=1",
+            "user@chat.zalo.me",
+        ] {
+            assert!(
+                validate_http_connect_host(bad).is_err(),
+                "expected http_connect host rejection for {bad:?}"
+            );
+        }
+
+        // Verify `http_connect` rejects malicious target_host before writing any bytes on the wire
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            s.read(&mut buf).await.unwrap()
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let err = http_connect(&mut client, "chat.zalo.me\r\nInjected: 1", 443, "", "")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("không hợp lệ"));
+        drop(client);
+        assert_eq!(srv.await.unwrap(), 0);
     }
 }

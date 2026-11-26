@@ -36,7 +36,7 @@ pub fn provider_name(p: TranslateProvider) -> &'static str {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TranslateConfig {
     pub provider: TranslateProvider,
     pub detect_mode: TranslateDetectMode,
@@ -46,6 +46,22 @@ pub struct TranslateConfig {
     pub gemini_model: String,
     pub azure_key: String,
     pub azure_region: String,
+}
+
+impl std::fmt::Debug for TranslateConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |s: &str| if s.trim().is_empty() { "" } else { "[REDACTED]" };
+        f.debug_struct("TranslateConfig")
+            .field("provider", &self.provider)
+            .field("detect_mode", &self.detect_mode)
+            .field("target_lang", &self.target_lang)
+            .field("deepl_key", &redact(&self.deepl_key))
+            .field("gemini_key", &redact(&self.gemini_key))
+            .field("gemini_model", &self.gemini_model)
+            .field("azure_key", &redact(&self.azure_key))
+            .field("azure_region", &self.azure_region)
+            .finish()
+    }
 }
 
 impl Default for TranslateConfig {
@@ -63,7 +79,7 @@ impl Default for TranslateConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct SealedTranslateFile {
     #[serde(default)]
     provider: TranslateProvider,
@@ -110,7 +126,7 @@ pub struct TranslateConfigSummary {
     pub azure_preview: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct TranslateConfigUpdate {
     pub provider: TranslateProvider,
     pub target_lang: String,
@@ -120,6 +136,25 @@ pub struct TranslateConfigUpdate {
     pub gemini_model: Option<String>,
     pub azure_key: Option<String>,
     pub azure_region: Option<String>,
+}
+
+impl std::fmt::Debug for TranslateConfigUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact_opt = |opt: &Option<String>| {
+            opt.as_deref()
+                .map(|s| if s.trim().is_empty() { "" } else { "[REDACTED]" })
+        };
+        f.debug_struct("TranslateConfigUpdate")
+            .field("provider", &self.provider)
+            .field("target_lang", &self.target_lang)
+            .field("detect_mode", &self.detect_mode)
+            .field("deepl_key", &redact_opt(&self.deepl_key))
+            .field("gemini_key", &redact_opt(&self.gemini_key))
+            .field("gemini_model", &self.gemini_model)
+            .field("azure_key", &redact_opt(&self.azure_key))
+            .field("azure_region", &self.azure_region)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,6 +306,26 @@ fn normalize_azure_lang(lang: &str) -> String {
         "ZH-HANT" => "zh-Hant".into(),
         other => other.to_ascii_lowercase(),
     }
+}
+
+fn validate_azure_to_lang(target_lang: &str) -> Result<String> {
+    let to_lang = normalize_azure_lang(target_lang);
+    if to_lang.is_empty()
+        || to_lang.len() > 16
+        || !to_lang
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        bail!("Mã ngôn ngữ đích Azure không hợp lệ");
+    }
+    Ok(to_lang)
+}
+
+fn build_azure_translate_url(target_lang: &str) -> Result<String> {
+    let to_lang = validate_azure_to_lang(target_lang)?;
+    Ok(format!(
+        "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to={to_lang}"
+    ))
 }
 
 fn target_language_label(code: &str) -> &str {
@@ -1712,10 +1767,7 @@ async fn translate_azure(
     if key.is_empty() {
         bail!("Chưa cấu hình Azure Translator key trong Cài đặt dịch thuật");
     }
-    let to_lang = normalize_azure_lang(target_lang);
-    let url = format!(
-        "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to={to_lang}"
-    );
+    let url = build_azure_translate_url(target_lang)?;
     let payload: Vec<Value> = items.iter().map(|it| json!({ "Text": it.text })).collect();
 
     let mut req = client
@@ -2086,5 +2138,91 @@ mod tests {
         assert_eq!(idless_res.len(), 2);
         assert_eq!(idless_res[0].translated_text, "Xin chào");
         assert_eq!(idless_res[1].translated_text, "Tạm biệt");
+    }
+
+    #[test]
+    fn debug_impls_redact_translation_api_keys() {
+        let cfg = TranslateConfig {
+            provider: TranslateProvider::Gemini,
+            detect_mode: TranslateDetectMode::ApiCache,
+            target_lang: "VI".into(),
+            deepl_key: "secret-deepl-key-xyz:fx".into(),
+            gemini_key: "secret-gemini-key-abc".into(),
+            gemini_model: "gemini-2.0-flash".into(),
+            azure_key: "secret-azure-key-999".into(),
+            azure_region: "southeastasia".into(),
+        };
+        let cfg_dbg = format!("{cfg:?}");
+        assert!(!cfg_dbg.contains("secret-deepl-key-xyz:fx"));
+        assert!(!cfg_dbg.contains("secret-gemini-key-abc"));
+        assert!(!cfg_dbg.contains("secret-azure-key-999"));
+        assert!(cfg_dbg.contains("[REDACTED]"));
+        assert!(cfg_dbg.contains("gemini-2.0-flash"));
+
+        let upd = TranslateConfigUpdate {
+            provider: TranslateProvider::Azure,
+            target_lang: "EN".into(),
+            detect_mode: Some(TranslateDetectMode::LocalSmartSkip),
+            deepl_key: Some("upd-deepl-secret".into()),
+            gemini_key: Some("upd-gemini-secret".into()),
+            gemini_model: Some("gemini-2.0-flash".into()),
+            azure_key: Some("upd-azure-secret".into()),
+            azure_region: Some("eastasia".into()),
+        };
+        let upd_dbg = format!("{upd:?}");
+        assert!(!upd_dbg.contains("upd-deepl-secret"));
+        assert!(!upd_dbg.contains("upd-gemini-secret"));
+        assert!(!upd_dbg.contains("upd-azure-secret"));
+        assert!(upd_dbg.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn azure_translate_validates_to_lang_against_query_injection() {
+        assert_eq!(
+            build_azure_translate_url("VI").unwrap(),
+            "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=vi"
+        );
+        assert_eq!(
+            build_azure_translate_url("EN-US").unwrap(),
+            "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=en"
+        );
+        assert_eq!(
+            build_azure_translate_url("ZH-HANS").unwrap(),
+            "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=zh-Hans"
+        );
+        assert_eq!(
+            build_azure_translate_url("sr_Latn").unwrap(),
+            "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=sr_latn"
+        );
+
+        let too_long = "a".repeat(17);
+        for bad in [
+            "",
+            "   ",
+            "vi&from=en",
+            "en?extra=1",
+            "en#fragment",
+            "en\r\nX-Injected: 1",
+            "vi/../../etc",
+            "en vi",
+            "vi%26from%3Den",
+            too_long.as_str(),
+        ] {
+            assert!(
+                build_azure_translate_url(bad).is_err(),
+                "expected invalid Azure target_lang to be rejected: {bad:?}"
+            );
+        }
+
+        // `translate_azure` must fail immediately before attempting any network I/O
+        let client = Client::new();
+        let items = vec![TranslateInputItem {
+            msg_id: "m1".into(),
+            text: "Hello".into(),
+        }];
+        let err = translate_azure(&client, "dummy-key", "eastasia", &items, "vi&from=en")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("không hợp lệ"));
     }
 }

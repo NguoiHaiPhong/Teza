@@ -1,16 +1,17 @@
 import { useEffect, useRef, useState } from "react";
-import { Loader2, MessageSquare, Phone, Search, User, X } from "lucide-react";
+import { Ban, Check, Loader2, MessageSquare, Phone, Search, User, UserPlus, X } from "lucide-react";
 import { bridge } from "../bridge";
 import { useI18n } from "../i18n";
 import type { UserProfileDto } from "../types";
 import { ThreadAvatar } from "./ThreadAvatar";
 
-interface Props {
+export interface FindUserModalProps {
   open: boolean;
   initialPhone?: string;
   onClose: () => void;
   onOpenProfile: (profile: UserProfileDto) => void;
   onStartChat: (profile: UserProfileDto) => void;
+  onRelationshipChanged?: () => void;
 }
 
 export function FindUserModal({
@@ -19,12 +20,17 @@ export function FindUserModal({
   onClose,
   onOpenProfile,
   onStartChat,
-}: Props) {
+  onRelationshipChanged,
+}: FindUserModalProps) {
   const { t } = useI18n();
   const [phone, setPhone] = useState("");
   const [searching, setSearching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<UserProfileDto | null>(null);
+  const [sendingRequest, setSendingRequest] = useState(false);
+  const [requestSent, setRequestSent] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   const runSearch = async (raw: string) => {
@@ -37,6 +43,10 @@ export function FindUserModal({
     setSearching(true);
     setError(null);
     setResult(null);
+    setSendingRequest(false);
+    setRequestSent(false);
+    setActionError(null);
+    setActionNotice(null);
     try {
       const found = await bridge.findUserByPhone(query);
       setResult(found);
@@ -53,12 +63,20 @@ export function FindUserModal({
       setError(null);
       setResult(null);
       setSearching(false);
+      setSendingRequest(false);
+      setRequestSent(false);
+      setActionError(null);
+      setActionNotice(null);
       return;
     }
     const init = initialPhone.trim();
     setPhone(init);
     setError(null);
     setResult(null);
+    setSendingRequest(false);
+    setRequestSent(false);
+    setActionError(null);
+    setActionNotice(null);
     setTimeout(() => inputRef.current?.focus(), 20);
     if (init) {
       void runSearch(init);
@@ -75,6 +93,35 @@ export function FindUserModal({
   }, [open, onClose]);
 
   if (!open) return null;
+
+  const handleQuickAddFriend = async () => {
+    if (!result || result.is_self || result.is_friend || sendingRequest || requestSent) return;
+    setSendingRequest(true);
+    setActionError(null);
+    setActionNotice(null);
+    try {
+      const res = await bridge.friendSendRequest(result.uid, t("friendRequestDefaultGreeting"));
+      if (!res.ok) {
+        setActionError(res.message || t("friendAddBtn"));
+        return;
+      }
+      if (res.already_friends) {
+        setResult((prev) => (prev ? { ...prev, is_friend: true } : prev));
+        setActionNotice(t("friendAlreadyFriends"));
+      } else if (res.auto_accepted) {
+        setResult((prev) => (prev ? { ...prev, is_friend: true } : prev));
+        setActionNotice(t("friendRequestAutoAccepted"));
+      } else {
+        setRequestSent(true);
+        setActionNotice(t("friendRequestSentSuccess"));
+      }
+      onRelationshipChanged?.();
+    } catch (err) {
+      setActionError(String(err).replace(/^Error:\s*/i, ""));
+    } finally {
+      setSendingRequest(false);
+    }
+  };
 
   return (
     <div
@@ -157,7 +204,7 @@ export function FindUserModal({
                   size="md"
                 />
                 <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-1.5">
                     <span className="truncate text-[15px] font-semibold">
                       {result.display_name}
                     </span>
@@ -174,6 +221,21 @@ export function FindUserModal({
                           ? t("badgeFriend")
                           : t("badgeNotFriend")}
                     </span>
+                    {!result.is_self && result.is_blocked === true && (
+                      <span
+                        className="inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium"
+                        style={{ background: "var(--danger-bg)", color: "var(--danger-text)" }}
+                      >
+                        <Ban className="h-3 w-3" />
+                        <span>{t("friendBlockedBadge")}</span>
+                      </span>
+                    )}
+                    {!result.is_self && !result.is_friend && requestSent && (
+                      <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[11px] font-medium text-emerald-400">
+                        <Check className="h-3 w-3" />
+                        <span>{t("friendRequestSentBadge")}</span>
+                      </span>
+                    )}
                   </div>
                   {result.phone_number && (
                     <div className="text-xs" style={{ color: "var(--text-secondary)" }}>
@@ -183,14 +245,30 @@ export function FindUserModal({
                 </div>
               </div>
 
-              <div className="mt-3 flex items-center gap-2">
+              {actionError && (
+                <div
+                  role="alert"
+                  className="mt-2.5 rounded-xl px-3 py-2 text-xs"
+                  style={{ background: "var(--danger-bg)", color: "var(--danger-text)" }}
+                >
+                  {actionError}
+                </div>
+              )}
+
+              {actionNotice && (
+                <div className="mt-2.5 rounded-xl bg-emerald-500/15 px-3 py-2 text-xs text-emerald-400">
+                  {actionNotice}
+                </div>
+              )}
+
+              <div className="mt-3 flex flex-wrap items-center gap-2">
                 <button
                   type="button"
                   onClick={() => {
                     onOpenProfile(result);
                     onClose();
                   }}
-                  className="hover-menu flex flex-1 items-center justify-center gap-1.5 rounded-xl px-3 py-2 text-[13.5px] font-medium transition"
+                  className="hover-menu flex min-w-[100px] flex-1 items-center justify-center gap-1.5 rounded-xl px-3 py-2 text-[13px] font-medium transition"
                   style={{
                     background: "var(--bg-sidebar)",
                     border: "1px solid var(--border-subtle)",
@@ -199,6 +277,28 @@ export function FindUserModal({
                   <User className="h-4 w-4" />
                   <span>{t("viewProfileBtn")}</span>
                 </button>
+                {!result.is_self && !result.is_friend && (
+                  <button
+                    type="button"
+                    disabled={sendingRequest || requestSent}
+                    onClick={() => void handleQuickAddFriend()}
+                    className="hover-menu flex min-w-[100px] flex-1 items-center justify-center gap-1.5 rounded-xl px-3 py-2 text-[13px] font-medium transition disabled:opacity-65"
+                    style={{
+                      background: requestSent ? "rgba(16, 185, 129, 0.15)" : "var(--accent-soft)",
+                      border: "1px solid var(--border-subtle)",
+                      color: requestSent ? "#34d399" : "var(--accent)",
+                    }}
+                  >
+                    {sendingRequest ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : requestSent ? (
+                      <Check className="h-4 w-4" />
+                    ) : (
+                      <UserPlus className="h-4 w-4" />
+                    )}
+                    <span>{requestSent ? t("friendRequestSentBadge") : t("friendAddBtn")}</span>
+                  </button>
+                )}
                 {!result.is_self && (
                   <button
                     type="button"
@@ -206,7 +306,7 @@ export function FindUserModal({
                       onStartChat(result);
                       onClose();
                     }}
-                    className="tf-btn flex flex-1 items-center justify-center gap-1.5 rounded-xl px-3 py-2 text-[13.5px] font-semibold"
+                    className="tf-btn flex min-w-[100px] flex-1 items-center justify-center gap-1.5 rounded-xl px-3 py-2 text-[13px] font-semibold"
                   >
                     <MessageSquare className="h-4 w-4" />
                     <span>{t("startChatBtn")}</span>

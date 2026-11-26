@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Isolated pure-Rust VoIP signaling, UDP ZRTP relay, Opus/RTP audio pipeline, and 1-1 call engine for Teza"
 
+[features]
+default = []
+lab = ["tokio/rt-multi-thread", "tokio/signal"]
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
@@ -15,9 +19,10 @@ opus-pure = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "signal"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "net", "sync"] }
 zalo-core = { path = "../zalo-core" }
 
 [[bin]]
 name = "call_lab"
 path = "src/bin/call_lab.rs"
+required-features = ["lab"]

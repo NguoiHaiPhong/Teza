@@ -1,9 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  buildTezaMediaUrl,
   classifyDrawerFileAction,
   classifyNonMediaAttachment,
   extractLinkHost,
+  getMediaProtocolToken,
   isBlobUrl,
   isDataImageUrl,
   isDataMediaUrl,
@@ -11,6 +13,7 @@ import {
   isExplicitFileMessageType,
   isExternalLinkMessageType,
   isRemoteMediaUrl,
+  isTezaMediaUrl,
   normalizeMediaRequestUrl,
   sanitizeUrlForLog,
 } from "../src/utils/mediaCache.ts";
@@ -211,4 +214,114 @@ test("classifyDrawerFileAction separates external links from downloadable files 
     }),
     "jump",
   );
+});
+
+test("buildTezaMediaUrl formats Windows vs macOS/Linux hosts and encodes url/kind/t/tid/mid", () => {
+  const raw = "https://cdn.example.com/path/video.mp4?sig=a+b&exp=123#t=5";
+
+  for (const winPlatform of ["win32", "Win32", "windows", "Windows"]) {
+    const built = buildTezaMediaUrl(raw, "video", "tok-abc-123", {
+      threadId: "grp/100 200+x",
+      msgId: "msg:42&v=1",
+      platform: winPlatform,
+    });
+    assert.ok(
+      built.startsWith("http://teza-media.localhost/resolve?"),
+      `expected Windows host for platform=${winPlatform}, got ${built}`,
+    );
+    assert.equal(isTezaMediaUrl(built), true);
+    const parsed = new URL(built);
+    assert.equal(parsed.pathname, "/resolve");
+    assert.equal(parsed.searchParams.get("url"), raw);
+    assert.equal(parsed.searchParams.get("kind"), "video");
+    assert.equal(parsed.searchParams.get("t"), "tok-abc-123");
+    assert.equal(parsed.searchParams.get("tid"), "grp/100 200+x");
+    assert.equal(parsed.searchParams.get("mid"), "msg:42&v=1");
+  }
+
+  for (const unixPlatform of ["darwin", "macos", "MacIntel", "linux", "Linux x86_64"]) {
+    const built = buildTezaMediaUrl(raw, "audio", "tok-unix", {
+      threadId: "dm-7",
+      msgId: "m-9",
+      platform: unixPlatform,
+    });
+    assert.ok(
+      built.startsWith("teza-media://localhost/resolve?"),
+      `expected custom scheme host for platform=${unixPlatform}, got ${built}`,
+    );
+    assert.equal(isTezaMediaUrl(built), true);
+    const parsed = new URL(built);
+    assert.equal(parsed.searchParams.get("url"), raw);
+    assert.equal(parsed.searchParams.get("kind"), "audio");
+    assert.equal(parsed.searchParams.get("t"), "tok-unix");
+    assert.equal(parsed.searchParams.get("tid"), "dm-7");
+    assert.equal(parsed.searchParams.get("mid"), "m-9");
+  }
+
+  // Normalizes escaped slashes, protocol-relative //, and uppercase HTTP://
+  const fromRelative = buildTezaMediaUrl("//f10-zpc.zdn.vn/photo.jpg", "image", "t1", {
+    platform: "win32",
+  });
+  assert.equal(
+    new URL(fromRelative).searchParams.get("url"),
+    "https://f10-zpc.zdn.vn/photo.jpg",
+  );
+  assert.equal(new URL(fromRelative).searchParams.has("tid"), false);
+  assert.equal(new URL(fromRelative).searchParams.has("mid"), false);
+
+  const fromEscapedHttp = buildTezaMediaUrl("HTTP:\\/\\/media.example.org\\/doc.pdf", "file", "t2", {
+    threadId: "   ",
+    msgId: "",
+    platform: "linux",
+  });
+  assert.equal(
+    new URL(fromEscapedHttp).searchParams.get("url"),
+    "http://media.example.org/doc.pdf",
+  );
+  assert.equal(new URL(fromEscapedHttp).searchParams.get("kind"), "file");
+  assert.equal(new URL(fromEscapedHttp).searchParams.has("tid"), false);
+  assert.equal(new URL(fromEscapedHttp).searchParams.has("mid"), false);
+});
+
+test("buildTezaMediaUrl passes data:/blob:/existing teza-media unchanged and blocks non-http schemes", () => {
+  const dataUrl = "data:image/png;base64,iVBORw0KGgo=";
+  assert.equal(buildTezaMediaUrl(dataUrl, "image", "tok", { platform: "win32" }), dataUrl);
+
+  const blobUrl = "blob:http://localhost:1420/550e8400-e29b-41d4-a716-446655440000";
+  assert.equal(buildTezaMediaUrl(blobUrl, "video", "tok", { platform: "darwin" }), blobUrl);
+
+  const existingWin = "http://teza-media.localhost/resolve?url=https%3A%2F%2Fcdn.example.com%2Fa.jpg&kind=image&t=tok";
+  assert.equal(buildTezaMediaUrl(existingWin, "image", "tok", { platform: "win32" }), existingWin);
+
+  const existingUnix = "teza-media://localhost/resolve?url=https%3A%2F%2Fcdn.example.com%2Fa.jpg&kind=image&t=tok";
+  assert.equal(buildTezaMediaUrl(existingUnix, "image", "tok", { platform: "linux" }), existingUnix);
+
+  // Non-http / unsafe / local path inputs MUST NOT be wrapped in teza-media
+  for (const unsafe of [
+    "",
+    "   ",
+    "file:///C:/Users/secret.txt",
+    "C:\\Windows\\win.ini",
+    "\\\\server\\share\\secret.docx",
+    "javascript:alert(1)",
+    "ftp://files.example.com/archive.zip",
+    "http://",
+    "https://",
+    "/etc/passwd",
+  ]) {
+    const out = buildTezaMediaUrl(unsafe, "file", "tok", { platform: "win32" });
+    assert.equal(out, "", `expected unsafe non-http input ${JSON.stringify(unsafe)} to be rejected`);
+    assert.equal(out.includes("teza-media"), false);
+  }
+
+  // Empty token falls back to normalized http(s) URL rather than emitting unauthenticated teza-media URL
+  assert.equal(
+    buildTezaMediaUrl("https://cdn.example.com/a.jpg", "image", "  ", { platform: "win32" }),
+    "https://cdn.example.com/a.jpg",
+  );
+});
+
+test("getMediaProtocolToken returns null outside Tauri runtime", async () => {
+  const token = await getMediaProtocolToken();
+  assert.equal(token, null);
 });

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Headphones, Mic, Phone, PhoneIncoming, PhoneOff, RefreshCw } from "lucide-react";
+import { Headphones, Mic, Phone, PhoneIncoming, PhoneOff, RefreshCw, Video } from "lucide-react";
 import { useI18n } from "../i18n";
 import type { CallDevicesDto, CallSnapshotDto } from "../types";
 import { ThreadAvatar } from "./ThreadAvatar";
@@ -27,13 +27,15 @@ export function IncomingCallModal({
 }: Props) {
   const { t } = useI18n();
   const [showDevices, setShowDevices] = useState(false);
+  const isVideo = active.call_type === "DirectVideo";
+  const badgeLabel = isVideo ? t("callIncomingVideoBadge") : t("callIncomingBadge");
 
   return (
     <div className="fixed inset-0 z-[85] flex items-center justify-center bg-black/55 p-4 backdrop-blur-xs">
       <div
         role="dialog"
         aria-modal="true"
-        aria-label={t("callIncomingBadge")}
+        aria-label={badgeLabel}
         className="w-full max-w-sm overflow-hidden rounded-2xl p-6 text-center shadow-2xl"
         style={{
           background: "var(--bg-sidebar)",
@@ -45,8 +47,12 @@ export function IncomingCallModal({
           className="mx-auto mb-3 inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-semibold"
           style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
         >
-          <PhoneIncoming className="h-3.5 w-3.5 animate-pulse" />
-          <span>{t("callIncomingBadge")}</span>
+          {isVideo ? (
+            <Video className="h-3.5 w-3.5 animate-pulse" />
+          ) : (
+            <PhoneIncoming className="h-3.5 w-3.5 animate-pulse" />
+          )}
+          <span>{badgeLabel}</span>
         </div>
 
         <div className="relative mx-auto my-2 flex h-20 w-20 items-center justify-center">
@@ -88,7 +94,7 @@ export function IncomingCallModal({
             onClick={() => onAnswer(active.call_id)}
             className="flex min-w-[112px] items-center justify-center gap-2 rounded-full bg-emerald-600 px-5 py-2.5 text-sm font-semibold text-white shadow-lg transition hover:bg-emerald-500 disabled:opacity-50"
           >
-            <Phone className="h-4 w-4" />
+            {isVideo ? <Video className="h-4 w-4" /> : <Phone className="h-4 w-4" />}
             <span>{t("callAnswerBtn")}</span>
           </button>
         </div>

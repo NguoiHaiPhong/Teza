@@ -106,7 +106,7 @@ interface Props {
   onOpenThread?: (msg: MessageDto) => void;
   onRetrySend?: (msg: MessageDto) => void;
   onDiscardFailed?: (msgId: string) => void;
-  onSaveFile?: (url: string, name: string) => void;
+  onSaveFile?: (url: string, name: string, opts?: { threadId?: string; msgId?: string }) => void;
   onOpenExternal?: (url: string) => void;
   onCopyError?: (err: unknown) => void;
   onVotePoll?: (msg: MessageDto, optionIds: number[]) => Promise<void> | void;
@@ -426,7 +426,10 @@ export const MessageBubble = memo(function MessageBubble({
       setPickerPos(null);
     };
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") close();
+      if (e.key === "Escape" && !e.defaultPrevented) {
+        e.preventDefault();
+        close();
+      }
     };
     window.addEventListener("click", close);
     window.addEventListener("contextmenu", close);
@@ -682,6 +685,7 @@ export const MessageBubble = memo(function MessageBubble({
         typeof document !== "undefined" &&
         createPortal(
           <div
+            data-teza-floating-popup="true"
             onClick={(e) => e.stopPropagation()}
             className="fixed z-[80] flex items-center gap-1 rounded-full px-2 py-1 shadow-xl"
             style={{
@@ -725,8 +729,8 @@ export const MessageBubble = memo(function MessageBubble({
           e.stopPropagation();
           setPickerPos(null);
           setMenuPos({
-            x: Math.min(e.clientX, window.innerWidth - 210),
-            y: Math.min(e.clientY, window.innerHeight - 390),
+            x: Math.max(8, Math.min(e.clientX, window.innerWidth - 210)),
+            y: Math.max(8, Math.min(e.clientY, window.innerHeight - 390)),
           });
         }}
         onDoubleClick={(e) => {
@@ -799,6 +803,8 @@ export const MessageBubble = memo(function MessageBubble({
           <RelayImage
             key={mediaRetryKey}
             src={normalizedAttachmentUrl}
+            threadId={msg.thread_id}
+            msgId={msg.msg_id}
             alt={t("stickerAlt")}
             referrerPolicy="no-referrer"
             onFallbackFail={() => setMediaError(true)}
@@ -813,6 +819,8 @@ export const MessageBubble = memo(function MessageBubble({
             controls
             preload="none"
             src={normalizedAttachmentUrl}
+            threadId={msg.thread_id}
+            msgId={msg.msg_id}
             onFallbackFail={() => setMediaError(true)}
             className="mb-1 max-w-full"
           />
@@ -824,6 +832,8 @@ export const MessageBubble = memo(function MessageBubble({
             controls
             preload="metadata"
             src={normalizedAttachmentUrl}
+            threadId={msg.thread_id}
+            msgId={msg.msg_id}
             onFallbackFail={() => setMediaError(true)}
             className="mb-1 max-h-72 w-full rounded-xl bg-black/40"
           />
@@ -840,6 +850,8 @@ export const MessageBubble = memo(function MessageBubble({
             <RelayImage
               key={mediaRetryKey}
               src={normalizedAttachmentUrl}
+              threadId={msg.thread_id}
+              msgId={msg.msg_id}
               alt={msg.attachment_name || t("photoAlt")}
               referrerPolicy="no-referrer"
               onFallbackFail={() => setMediaError(true)}
@@ -929,7 +941,12 @@ export const MessageBubble = memo(function MessageBubble({
           (safeDownloadUrl && onSaveFile ? (
             <button
               type="button"
-              onClick={() => onSaveFile(safeDownloadUrl, msg.attachment_name || "download")}
+              onClick={() =>
+                onSaveFile(safeDownloadUrl, msg.attachment_name || "download", {
+                  threadId: msg.thread_id,
+                  msgId: msg.msg_id,
+                })
+              }
               title={t("clickToDownloadFile")}
               className="mb-1 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left transition hover:brightness-95"
               style={{ background: "var(--card-bg)" }}
@@ -1472,6 +1489,7 @@ export const MessageBubble = memo(function MessageBubble({
           typeof document !== "undefined" &&
           createPortal(
             <div
+              data-teza-floating-popup="true"
               onClick={(e) => e.stopPropagation()}
               className="fixed z-[80] w-52 rounded-xl py-1 shadow-2xl"
               style={{
