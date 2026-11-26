@@ -68,7 +68,10 @@ pub const ALLOWED_MEDIA_HOST_SUFFIXES: &[&str] = &[
     "dlfl.vn",
     "dlfl.me",
     "flchat.vn",
+    "flchat.me",
+    "dlmd.vn",
     "dlmd.me",
+    "mdchat.vn",
     "mdchat.me",
 ];
 
@@ -97,6 +100,165 @@ fn sanitize_url_origin_for_log(url: &reqwest::Url) -> String {
             None => format!("{}://{host}", url.scheme()),
         },
         _ => format!("{}:", url.scheme()),
+    }
+}
+
+fn scrub_urls_in_text(input: &str) -> String {
+    const SCHEMES: &[&str] = &[
+        "https://",
+        "http://",
+        "socks5h://",
+        "socks5://",
+        "socks4a://",
+        "socks4://",
+        "wss://",
+        "ws://",
+    ];
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while !rest.is_empty() {
+        let lower = rest.to_ascii_lowercase();
+        let next_match = SCHEMES
+            .iter()
+            .filter_map(|scheme| lower.find(scheme))
+            .min();
+        let Some(idx) = next_match else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx..];
+        let end = after
+            .find(|c: char| {
+                c.is_whitespace() || matches!(c, ')' | ']' | '>' | '"' | '\'' | ',' | ';')
+            })
+            .unwrap_or(after.len());
+        let token = &after[..end];
+        if let Ok(parsed) = reqwest::Url::parse(token) {
+            out.push_str(&sanitize_url_origin_for_log(&parsed));
+        } else {
+            out.push_str("[redacted-url]");
+        }
+        rest = &after[end..];
+    }
+    out
+}
+
+fn scrub_sensitive_text(raw: &str, relay: &RelayConfig) -> String {
+    let mut cleaned = scrub_urls_in_text(raw);
+    let user = relay.username.trim();
+    if !user.is_empty() && !relay.password.is_empty() {
+        let pair = format!("{user}:{}", relay.password);
+        cleaned = cleaned.replace(&pair, "[REDACTED]");
+        let encoded_pair = format!("{}:{}", urlencode(user), urlencode(&relay.password));
+        if encoded_pair != pair {
+            cleaned = cleaned.replace(&encoded_pair, "[REDACTED]");
+        }
+    }
+    if relay.password.len() >= 4 {
+        cleaned = cleaned.replace(&relay.password, "[REDACTED]");
+        let encoded_pw = urlencode(&relay.password);
+        if encoded_pw != relay.password {
+            cleaned = cleaned.replace(&encoded_pw, "[REDACTED]");
+        }
+    }
+    cleaned
+}
+
+fn collect_sanitized_error_chain(err: &dyn std::error::Error, relay: &RelayConfig) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current: Option<&dyn std::error::Error> = Some(err);
+    let mut depth = 0usize;
+    while let Some(node) = current {
+        if depth >= 16 {
+            break;
+        }
+        let raw = node.to_string();
+        let trimmed = raw.trim();
+        let skip_outer_url_wrapper = depth == 0
+            && node.source().is_some()
+            && trimmed
+                .to_ascii_lowercase()
+                .starts_with("error sending request for url");
+        if !skip_outer_url_wrapper && !trimmed.is_empty() {
+            let cleaned = scrub_sensitive_text(trimmed, relay);
+            if parts.last().is_none_or(|prev| prev != &cleaned) {
+                parts.push(cleaned);
+            }
+        }
+        current = node.source();
+        depth += 1;
+    }
+    if parts.is_empty() {
+        let fallback = scrub_sensitive_text(err.to_string().trim(), relay);
+        if fallback.is_empty() {
+            "unknown network error".to_string()
+        } else {
+            fallback
+        }
+    } else {
+        parts.join(": ")
+    }
+}
+
+fn is_relay_auth_error(chain_lower: &str) -> bool {
+    chain_lower.contains("407")
+        || chain_lower.contains("proxy authorization required")
+        || chain_lower.contains("proxy authentication required")
+        || chain_lower.contains("credentials not accepted")
+        || chain_lower.contains("does not support user/pass")
+        || chain_lower.contains("authentication failed")
+}
+
+fn is_relay_policy_block(chain_lower: &str) -> bool {
+    if is_relay_auth_error(chain_lower) {
+        return false;
+    }
+    chain_lower.contains("not allowed by ruleset")
+        || chain_lower.contains("connection not allowed")
+        || chain_lower.contains("0x02")
+        || chain_lower.contains("403")
+        || chain_lower.contains("forbidden")
+        || chain_lower.contains("unsuccessful")
+}
+
+fn should_retry_media_send_error(relay: &RelayConfig, err: &reqwest::Error) -> bool {
+    if err.is_builder() {
+        return false;
+    }
+    let chain_lower = collect_sanitized_error_chain(err, relay).to_ascii_lowercase();
+    if is_relay_policy_block(&chain_lower) || is_relay_auth_error(&chain_lower) {
+        return false;
+    }
+    if relay.enabled {
+        return true;
+    }
+    err.is_connect()
+        || chain_lower.contains("reset")
+        || chain_lower.contains("eof")
+        || chain_lower.contains("closed")
+        || chain_lower.contains("incomplete message")
+        || chain_lower.contains("broken pipe")
+        || chain_lower.contains("aborted")
+}
+
+fn format_media_network_error(
+    url: &reqwest::Url,
+    relay: &RelayConfig,
+    err: &dyn std::error::Error,
+) -> String {
+    let origin = sanitize_url_origin_for_log(url);
+    let chain = collect_sanitized_error_chain(err, relay);
+    let chain_lower = chain.to_ascii_lowercase();
+    if relay.enabled && is_relay_policy_block(&chain_lower) {
+        let relay_host = relay.host.trim();
+        let relay_port = relay.port;
+        let host_only = url.host_str().unwrap_or(&origin);
+        format!(
+            "Máy chủ Relay ({relay_host}:{relay_port}) từ chối kết nối tới {origin} ({chain}). Hãy cập nhật litechat-relay lên bản mới nhất hoặc thêm --extra-host {host_only}"
+        )
+    } else {
+        format!("Không tải được từ {origin} ({chain})")
     }
 }
 
@@ -1219,7 +1381,19 @@ impl Session {
     }
 
     async fn send_media_get(&self, url: &str) -> Result<reqwest::Response> {
-        let mut current_url = match normalize_allowed_media_url(url) {
+        self.send_media_get_with_validator(url, normalize_allowed_media_url)
+            .await
+    }
+
+    async fn send_media_get_with_validator<F>(
+        &self,
+        url: &str,
+        validate_url: F,
+    ) -> Result<reqwest::Response>
+    where
+        F: Fn(&str) -> std::result::Result<reqwest::Url, String>,
+    {
+        let mut current_url = match validate_url(url) {
             Ok(u) => u,
             Err(origin) => {
                 eprintln!("[litechat][media] blocked untrusted media URL: {origin}");
@@ -1227,16 +1401,35 @@ impl Session {
             }
         };
 
-        const MAX_MANUAL_REDIRECT_HOPS: usize = 3;
+        const MAX_MANUAL_REDIRECT_HOPS: usize = 5;
         let mut hops = 0usize;
         loop {
-            let r = self
-                .media_http
-                .get(current_url.clone())
-                .header(REFERER, "https://chat.zalo.me/")
-                .send()
-                .await
-                .map_err(|e| SessionError::Network(e.to_string()))?;
+            let mut retried = false;
+            let r = loop {
+                match self
+                    .media_http
+                    .get(current_url.clone())
+                    .header(REFERER, "https://chat.zalo.me/")
+                    .header(ORIGIN, "https://chat.zalo.me")
+                    .send()
+                    .await
+                {
+                    Ok(resp) => break resp,
+                    Err(e) => {
+                        if !retried && should_retry_media_send_error(&self.relay, &e) {
+                            retried = true;
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                            continue;
+                        }
+                        return Err(SessionError::Network(format_media_network_error(
+                            &current_url,
+                            &self.relay,
+                            &e,
+                        ))
+                        .into());
+                    }
+                }
+            };
 
             if r.status().is_redirection() {
                 let Some(loc) = r
@@ -1257,7 +1450,7 @@ impl Session {
                     eprintln!("[litechat][media] too many redirects -> {target_origin}");
                     anyhow::bail!("Tải tệp thất bại: quá nhiều chuyển hướng ({target_origin})");
                 }
-                match normalize_allowed_media_url(&resolved_raw) {
+                match validate_url(&resolved_raw) {
                     Ok(next_url) => {
                         current_url = next_url;
                         hops += 1;
@@ -1299,7 +1492,8 @@ impl Session {
             }
         }
 
-        let final_url = resp.url().to_string();
+        let resp_url = resp.url().clone();
+        let final_url = resp_url.to_string();
         let content_disposition_filename = resp
             .headers()
             .get(reqwest::header::CONTENT_DISPOSITION)
@@ -1319,11 +1513,9 @@ impl Session {
         on_progress(0, total_bytes);
         let mut buf = Vec::new();
         let mut last_emit = std::time::Instant::now();
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .map_err(|e| SessionError::Network(e.to_string()))?
-        {
+        while let Some(chunk) = resp.chunk().await.map_err(|e| {
+            SessionError::Network(format_media_network_error(&resp_url, &self.relay, &e))
+        })? {
             if buf.len().saturating_add(chunk.len()) > max_bytes {
                 anyhow::bail!("Kích thước tệp vượt quá giới hạn cho phép");
             }
@@ -1355,7 +1547,7 @@ impl Session {
         F: FnMut(u64, Option<u64>),
     {
         let resp = self.send_media_get(url).await?;
-        stream_response_to_temp_file(resp, tmp_path, on_progress).await
+        stream_response_to_temp_file(resp, tmp_path, &self.relay, on_progress).await
     }
 
     pub async fn download_media_data_url(&self, url: &str, max_bytes: usize) -> Result<String> {
@@ -1505,6 +1697,7 @@ pub fn infer_streamed_media_mime(
 pub(crate) async fn stream_response_to_temp_file<F>(
     mut resp: reqwest::Response,
     tmp_path: &Path,
+    relay: &RelayConfig,
     mut on_progress: F,
 ) -> Result<StreamedMediaMeta>
 where
@@ -1540,7 +1733,8 @@ where
         .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
         .and_then(parse_content_disposition_filename);
 
-    let mime = infer_streamed_media_mime(resp.url().as_str(), file_name.as_deref(), &raw_ct);
+    let resp_url = resp.url().clone();
+    let mime = infer_streamed_media_mime(resp_url.as_str(), file_name.as_deref(), &raw_ct);
     if is_forbidden_svg_mime(&mime) {
         return Err(MediaDownloadError::ForbiddenSvg.into());
     }
@@ -1568,11 +1762,9 @@ where
     let mut last_emit = std::time::Instant::now();
 
     let stream_res: Result<()> = async {
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .map_err(|e| SessionError::Network(e.to_string()))?
-        {
+        while let Some(chunk) = resp.chunk().await.map_err(|e| {
+            SessionError::Network(format_media_network_error(&resp_url, relay, &e))
+        })? {
             hasher.update(&chunk);
             writer
                 .write_all(&chunk)
@@ -1798,6 +1990,8 @@ fn value_as_nonempty_str(v: Option<&Value>) -> Option<String> {
     }
 }
 
+const ZALO_CLIENT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) ZaloPC/26.10.11 Chrome/122.0.0.0 Electron/29.0.0 Safari/537.36";
+
 fn build_http_client(jar: Arc<Jar>, relay: &RelayConfig) -> Result<Client> {
     let mut headers = HeaderMap::new();
     headers.insert(ORIGIN, HeaderValue::from_static("https://chat.zalo.me"));
@@ -1815,7 +2009,7 @@ fn build_http_client(jar: Arc<Jar>, relay: &RelayConfig) -> Result<Client> {
         .cookie_provider(jar)
         .default_headers(headers)
         .redirect(redirect_policy)
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) ZaloPC/26.10.11 Chrome/122.0.0.0 Electron/29.0.0 Safari/537.36")
+        .user_agent(ZALO_CLIENT_USER_AGENT)
         .timeout(std::time::Duration::from_secs(35));
     relay
         .apply_to_client_builder(builder)?
@@ -1824,24 +2018,14 @@ fn build_http_client(jar: Arc<Jar>, relay: &RelayConfig) -> Result<Client> {
 }
 
 fn build_media_http_client(relay: &RelayConfig) -> Result<Client> {
-    let redirect_policy = redirect::Policy::custom(|attempt| {
-        if attempt.previous().len() >= 5 {
-            attempt.stop()
-        } else if is_allowed_media_url(attempt.url().as_str()) {
-            attempt.follow()
-        } else {
-            attempt.stop()
-        }
-    });
-    let builder = Client::builder()
-        .redirect(redirect_policy)
-        .user_agent(concat!(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) LiteChat/",
-            env!("CARGO_PKG_VERSION"),
-            " Safari/537.36"
-        ))
+    let mut builder = Client::builder()
+        .redirect(redirect::Policy::none())
+        .user_agent(ZALO_CLIENT_USER_AGENT)
         .connect_timeout(std::time::Duration::from_secs(30))
         .read_timeout(std::time::Duration::from_secs(60));
+    if relay.enabled {
+        builder = builder.http1_only().pool_max_idle_per_host(0);
+    }
     relay
         .apply_to_client_builder(builder)?
         .build()
@@ -2152,7 +2336,10 @@ mod tests {
             "file-stal-1.dlfl.me",
             "file-stal-9.flchat.vn",
             "file-stal-9-te-vnso-pt-25.flchat.vn",
+            "file-stal-9-te-vnso-pt-25.flchat.me",
+            "video-stal-20.dlmd.vn",
             "video-stal-20.dlmd.me",
+            "video-stal-20-te-vnno-cm-1.mdchat.vn",
             "video-stal-20-te-vnno-cm-1.mdchat.me",
             "FILES.ZALO.CLOUD.",
         ] {
@@ -2170,6 +2357,9 @@ mod tests {
             "evildlfl.vn",
             "dlfl.vn.evil.com",
             "evilflchat.vn",
+            "evilflchat.me",
+            "dlmd.vn.evil.com",
+            "mdchat.vn.evil.com",
             "mdchat.me.evil.com",
             ".zdn.vn",
             "",
@@ -2565,9 +2755,14 @@ mod tests {
         let ok_path = dir.join("ok.part");
         let resp_ok = client.get(format!("http://{addr}/ok")).send().await.unwrap();
         let mut progress_calls = Vec::new();
-        let meta = stream_response_to_temp_file(resp_ok, &ok_path, |got, total| {
-            progress_calls.push((got, total));
-        })
+        let meta = stream_response_to_temp_file(
+            resp_ok,
+            &ok_path,
+            &RelayConfig::default(),
+            |got, total| {
+                progress_calls.push((got, total));
+            },
+        )
         .await
         .unwrap();
         assert_eq!(meta.status_code, 200);
@@ -2582,9 +2777,10 @@ mod tests {
         // 2. Rejects image/svg+xml without creating temp file
         let svg_path = dir.join("svg.part");
         let resp_svg = client.get(format!("http://{addr}/svg")).send().await.unwrap();
-        let svg_err = stream_response_to_temp_file(resp_svg, &svg_path, |_, _| {})
-            .await
-            .unwrap_err();
+        let svg_err =
+            stream_response_to_temp_file(resp_svg, &svg_path, &RelayConfig::default(), |_, _| {})
+                .await
+                .unwrap_err();
         assert!(matches!(
             svg_err.downcast_ref::<MediaDownloadError>(),
             Some(MediaDownloadError::ForbiddenSvg)
@@ -2595,9 +2791,10 @@ mod tests {
         for (route, expected_code) in [("/gone", 410u16), ("/forbidden", 403u16)] {
             let p = dir.join(format!("exp_{expected_code}.part"));
             let r = client.get(format!("http://{addr}{route}")).send().await.unwrap();
-            let err = stream_response_to_temp_file(r, &p, |_, _| {})
-                .await
-                .unwrap_err();
+            let err =
+                stream_response_to_temp_file(r, &p, &RelayConfig::default(), |_, _| {})
+                    .await
+                    .unwrap_err();
             let dl_err = err.downcast_ref::<MediaDownloadError>().unwrap();
             assert!(dl_err.is_cdn_expired());
             assert!(matches!(
@@ -2609,5 +2806,310 @@ mod tests {
 
         server.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[derive(Debug)]
+    struct TestChainError {
+        msg: String,
+        source: Option<Box<TestChainError>>,
+    }
+
+    impl fmt::Display for TestChainError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(&self.msg)
+        }
+    }
+
+    impl std::error::Error for TestChainError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source.as_deref().map(|s| s as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn format_media_network_error_distinguishes_policy_block_and_scrubs_secrets() {
+        let url = reqwest::Url::parse(
+            "https://file-stal-9.flchat.me/private/report.xlsx?token=TOP_SECRET_TOK&sig=999",
+        )
+        .unwrap();
+        let relay = RelayConfig {
+            enabled: true,
+            mode: crate::relay::RelayMode::Socks5,
+            host: "10.7.12.233".into(),
+            port: 1088,
+            username: "corp_user".into(),
+            password: "RelaySecretPassword!42".into(),
+            route_webview_media: true,
+        };
+
+        // 1. Relay policy block walks full source() chain and scrubs URL paths/tokens & relay credentials
+        let policy_err = TestChainError {
+            msg: "error sending request for url (https://file-stal-9.flchat.me/private/report.xlsx?token=TOP_SECRET_TOK)".into(),
+            source: Some(Box::new(TestChainError {
+                msg: "error connecting to socks proxy socks5h://corp_user:RelaySecretPassword!42@10.7.12.233:1088".into(),
+                source: Some(Box::new(TestChainError {
+                    msg: "SOCKS error: connection not allowed by ruleset (0x02)".into(),
+                    source: None,
+                })),
+            })),
+        };
+        let policy_msg = format_media_network_error(&url, &relay, &policy_err);
+        assert!(policy_msg.contains("Máy chủ Relay (10.7.12.233:1088) từ chối kết nối tới https://file-stal-9.flchat.me"));
+        assert!(policy_msg.contains("--extra-host file-stal-9.flchat.me"));
+        assert!(policy_msg.contains("connection not allowed by ruleset"));
+        assert!(!policy_msg.contains("private"));
+        assert!(!policy_msg.contains("report.xlsx"));
+        assert!(!policy_msg.contains("TOP_SECRET_TOK"));
+        assert!(!policy_msg.contains("corp_user"));
+        assert!(!policy_msg.contains("RelaySecretPassword!42"));
+
+        // 2. HTTP CONNECT unsuccessful tunnel also reports Relay policy block cleanly
+        let tunnel_err = TestChainError {
+            msg: "client error (Connect)".into(),
+            source: Some(Box::new(TestChainError {
+                msg: "tunnel error: unsuccessful".into(),
+                source: None,
+            })),
+        };
+        let tunnel_msg = format_media_network_error(&url, &relay, &tunnel_err);
+        assert!(tunnel_msg.contains("Máy chủ Relay (10.7.12.233:1088) từ chối kết nối tới https://file-stal-9.flchat.me"));
+        assert!(tunnel_msg.contains("tunnel error: unsuccessful"));
+
+        // 3. Generic transport error (e.g. host unreachable / connection reset) uses generic message
+        let generic_err = TestChainError {
+            msg: "client error (Connect)".into(),
+            source: Some(Box::new(TestChainError {
+                msg: "connection reset while reading https://file-stal-9.flchat.me/secret?k=leaked with RelaySecretPassword!42".into(),
+                source: None,
+            })),
+        };
+        let generic_msg = format_media_network_error(&url, &relay, &generic_err);
+        assert!(generic_msg.starts_with("Không tải được từ https://file-stal-9.flchat.me ("));
+        assert!(generic_msg.contains("connection reset"));
+        assert!(!generic_msg.contains("từ chối kết nối"));
+        assert!(!generic_msg.contains("leaked"));
+        assert!(!generic_msg.contains("RelaySecretPassword!42"));
+
+        // 4. Proxy auth failure (407) is NOT misclassified as policy block
+        let auth_err = TestChainError {
+            msg: "tunnel error: proxy authorization required (407)".into(),
+            source: None,
+        };
+        let auth_msg = format_media_network_error(&url, &relay, &auth_err);
+        assert!(auth_msg.starts_with("Không tải được từ https://file-stal-9.flchat.me ("));
+        assert!(!auth_msg.contains("--extra-host"));
+
+        // 5. With relay disabled, even a 403-like transport text uses generic format
+        let disabled_relay = RelayConfig::default();
+        let disabled_msg = format_media_network_error(&url, &disabled_relay, &policy_err);
+        assert!(disabled_msg.starts_with("Không tải được từ https://file-stal-9.flchat.me ("));
+        assert!(!disabled_msg.contains("Máy chủ Relay"));
+    }
+
+    #[tokio::test]
+    async fn send_media_get_follows_manual_redirects_with_headers_and_retries_transient_eof() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let transient_hits = Arc::new(AtomicUsize::new(0));
+        let transient_hits_srv = transient_hits.clone();
+        let observed_headers = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let observed_headers_srv = observed_headers.clone();
+
+        let server = tokio::spawn(async move {
+            // Serve 5 redirect-chain requests (/r0..=/r4 -> /final) + 2 transient-retry requests
+            // + 6 too-many-redirect requests (/loop0..=/loop5)
+            for _ in 0..13 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut req_buf = [0u8; 2048];
+                let n = sock.read(&mut req_buf).await.unwrap();
+                let req_str = String::from_utf8_lossy(&req_buf[..n]).into_owned();
+                let path = req_str
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                match path.as_str() {
+                    "/r0" | "/r1" | "/r2" | "/r3" => {
+                        observed_headers_srv.lock().await.push(req_str);
+                        let next_idx: usize = path[2..].parse::<usize>().unwrap() + 1;
+                        let hdr = format!(
+                            "HTTP/1.1 302 Found\r\nLocation: http://{addr}/r{next_idx}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        sock.write_all(hdr.as_bytes()).await.unwrap();
+                    }
+                    "/r4" => {
+                        observed_headers_srv.lock().await.push(req_str);
+                        let body = b"redirect-ok";
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        sock.write_all(hdr.as_bytes()).await.unwrap();
+                        sock.write_all(body).await.unwrap();
+                    }
+                    "/flaky" => {
+                        let attempt = transient_hits_srv.fetch_add(1, Ordering::SeqCst);
+                        if attempt == 0 {
+                            // Drop immediately before writing any response bytes to trigger EOF retry.
+                            drop(sock);
+                        } else {
+                            let body = b"retry-ok";
+                            let hdr = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            sock.write_all(hdr.as_bytes()).await.unwrap();
+                            sock.write_all(body).await.unwrap();
+                        }
+                    }
+                    p if p.starts_with("/loop") => {
+                        let next_idx: usize = p[5..].parse::<usize>().unwrap() + 1;
+                        let hdr = format!(
+                            "HTTP/1.1 302 Found\r\nLocation: http://{addr}/loop{next_idx}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        sock.write_all(hdr.as_bytes()).await.unwrap();
+                    }
+                    _ => {
+                        sock.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+        });
+
+        let session = Session::new().unwrap();
+        let allow_local = |raw: &str| {
+            reqwest::Url::parse(raw).map_err(|_| "invalid".to_string())
+        };
+
+        // 1. 4 manual redirects succeed (above old cap of 3) and send Referer + Origin + ZaloPC UA on every hop
+        let resp = session
+            .send_media_get_with_validator(&format!("http://{addr}/r0"), allow_local)
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(resp.bytes().await.unwrap().as_ref(), b"redirect-ok");
+        let hdrs = observed_headers.lock().await;
+        assert_eq!(hdrs.len(), 5);
+        for req in hdrs.iter() {
+            let lower = req.to_ascii_lowercase();
+            assert!(lower.contains("referer: https://chat.zalo.me/"), "missing Referer: {req}");
+            assert!(lower.contains("origin: https://chat.zalo.me"), "missing Origin: {req}");
+            assert!(req.contains("ZaloPC/"), "expected ZaloPC user agent: {req}");
+        }
+        drop(hdrs);
+
+        // 2. Transient EOF on first attempt retries once and succeeds
+        let flaky = session
+            .send_media_get_with_validator(&format!("http://{addr}/flaky"), allow_local)
+            .await
+            .unwrap();
+        assert_eq!(flaky.bytes().await.unwrap().as_ref(), b"retry-ok");
+        assert_eq!(transient_hits.load(Ordering::SeqCst), 2);
+
+        // 3. Exceeding MAX_MANUAL_REDIRECT_HOPS (5) fails cleanly
+        let too_many = session
+            .send_media_get_with_validator(&format!("http://{addr}/loop0"), allow_local)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(too_many.contains("quá nhiều chuyển hướng"));
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_media_get_does_not_retry_relay_policy_block_or_auth_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // 1. Mock SOCKS5 relay returning 0x02 (Connection not allowed by ruleset)
+        let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_addr = socks_listener.local_addr().unwrap();
+        let socks_attempts = Arc::new(AtomicUsize::new(0));
+        let socks_attempts_srv = socks_attempts.clone();
+        let socks_srv = tokio::spawn(async move {
+            let (mut s, _) = socks_listener.accept().await.unwrap();
+            socks_attempts_srv.fetch_add(1, Ordering::SeqCst);
+            let mut hello = [0u8; 4];
+            let _ = s.read(&mut hello).await.unwrap();
+            s.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut req = [0u8; 128];
+            let _ = s.read(&mut req).await.unwrap();
+            s.write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+        });
+
+        let socks_session = Session::new_with_relay(RelayConfig {
+            enabled: true,
+            mode: crate::relay::RelayMode::Socks5,
+            host: "127.0.0.1".into(),
+            port: socks_addr.port(),
+            username: String::new(),
+            password: String::new(),
+            route_webview_media: true,
+        })
+        .unwrap();
+
+        let err = socks_session
+            .send_media_get("https://file-stal-9.flchat.me/secret/doc.pdf?token=TOPSECRET")
+            .await
+            .unwrap_err()
+            .to_string();
+        socks_srv.await.unwrap();
+        assert_eq!(socks_attempts.load(Ordering::SeqCst), 1);
+        assert!(err.contains("Máy chủ Relay"));
+        assert!(err.contains("https://file-stal-9.flchat.me"));
+        assert!(err.contains("--extra-host file-stal-9.flchat.me"));
+        assert!(!err.contains("TOPSECRET"));
+        assert!(!err.contains("doc.pdf"));
+
+        // 2. Mock HTTP CONNECT relay returning 407 Proxy Authentication Required
+        let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_addr = http_listener.local_addr().unwrap();
+        let http_attempts = Arc::new(AtomicUsize::new(0));
+        let http_attempts_srv = http_attempts.clone();
+        let http_srv = tokio::spawn(async move {
+            let (mut s, _) = http_listener.accept().await.unwrap();
+            http_attempts_srv.fetch_add(1, Ordering::SeqCst);
+            let mut req = [0u8; 512];
+            let _ = s.read(&mut req).await.unwrap();
+            s.write_all(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Relay\"\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        });
+
+        let http_session = Session::new_with_relay(RelayConfig {
+            enabled: true,
+            mode: crate::relay::RelayMode::Http,
+            host: "127.0.0.1".into(),
+            port: http_addr.port(),
+            username: "user1".into(),
+            password: "SuperSecretRelayPw99".into(),
+            route_webview_media: true,
+        })
+        .unwrap();
+
+        let err407 = http_session
+            .send_media_get("https://video-stal-20.dlmd.vn/priv/clip.mp4?sig=LEAKED")
+            .await
+            .unwrap_err()
+            .to_string();
+        http_srv.await.unwrap();
+        assert_eq!(http_attempts.load(Ordering::SeqCst), 1);
+        assert!(err407.contains("Không tải được từ https://video-stal-20.dlmd.vn"));
+        assert!(!err407.contains("--extra-host"));
+        assert!(!err407.contains("LEAKED"));
+        assert!(!err407.contains("SuperSecretRelayPw99"));
     }
 }

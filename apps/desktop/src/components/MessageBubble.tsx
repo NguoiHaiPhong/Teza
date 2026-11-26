@@ -1,4 +1,4 @@
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   BarChart3,
@@ -15,18 +15,21 @@ import {
   Image as ImageIcon,
   Languages,
   Loader2,
+  Lock,
   MessagesSquare,
   Phone,
   PhoneIncoming,
   PhoneMissed,
   PhoneOutgoing,
   Pin,
+  Plus,
   RefreshCw,
   Repeat,
   RotateCcw,
   Smile,
   Trash2,
   Video,
+  X,
   Zap,
 } from "lucide-react";
 import { bridge } from "../bridge";
@@ -58,6 +61,7 @@ import {
   parseReminderPayload,
 } from "../utils/richMessage";
 import { tokenizeMentions, type MentionCandidate } from "../utils/mentions";
+import { isImeComposingEvent } from "../utils/searchNormalize";
 import {
   QUICK_REACTION_EMOJIS,
   getDisplayBodyText,
@@ -100,7 +104,7 @@ interface Props {
   onRecall: (msg: MessageDto) => void;
   onDeleteLocal: (msg: MessageDto) => void;
   onJumpToMsg: (msgId: string) => void;
-  onOpenImage: (url: string, title: string) => void;
+  onOpenImage: (url: string, title: string, opts?: { threadId?: string; msgId?: string }) => void;
   onOpenProfile?: (userId: string) => void;
   mentionMembers?: MentionCandidate[];
   onForward?: (msg: MessageDto) => void;
@@ -113,6 +117,12 @@ interface Props {
   onOpenExternal?: (url: string) => void;
   onCopyError?: (err: unknown) => void;
   onVotePoll?: (msg: MessageDto, optionIds: number[]) => Promise<void> | void;
+  onAddPollOption?: (
+    msg: MessageDto,
+    optionText: string,
+    votedOptionIds: number[],
+  ) => Promise<boolean | void> | void;
+  onLockPoll?: (msg: MessageDto) => Promise<boolean | void> | void;
   onRefreshPoll?: (msg: MessageDto) => Promise<void> | void;
   onStartVoiceCall?: (partnerId: string, partnerName?: string) => void;
   callDisabledReason?: CallStartDisabledReason | null;
@@ -122,6 +132,49 @@ function formatClock(ts: number): string {
   if (!ts) return "";
   const d = new Date(ts > 1e12 ? ts : ts * 1000);
   return d.toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" });
+}
+
+async function blobUrlToDataUrl(blobUrl: string): Promise<string> {
+  try {
+    const res = await fetch(blobUrl);
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const blob = await res.blob();
+    return await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (typeof reader.result === "string" && reader.result.length > 0) {
+          resolve(reader.result);
+        } else {
+          reject(new Error("Không chuyển đổi được dữ liệu media cục bộ"));
+        }
+      };
+      reader.onerror = () => reject(new Error("Không đọc được dữ liệu media cục bộ"));
+      reader.readAsDataURL(blob);
+    });
+  } catch {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const el = new Image();
+      el.onload = () => resolve(el);
+      el.onerror = () => reject(new Error("Không đọc được ảnh cục bộ để lưu"));
+      el.src = blobUrl;
+    });
+    const w = img.naturalWidth || img.width;
+    const h = img.naturalHeight || img.height;
+    if (!w || !h) {
+      throw new Error("Ảnh cục bộ không có kích thước hợp lệ");
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      throw new Error("Không khởi tạo được bộ đệm ảnh");
+    }
+    ctx.drawImage(img, 0, 0);
+    return canvas.toDataURL("image/png");
+  }
 }
 
 function isStickerMessage(msg: MessageDto, normalizedUrl: string): boolean {
@@ -339,6 +392,8 @@ export const MessageBubble = memo(function MessageBubble({
   onOpenExternal,
   onCopyError,
   onVotePoll,
+  onAddPollOption,
+  onLockPoll,
   onRefreshPoll,
   onStartVoiceCall,
   callDisabledReason = null,
@@ -351,6 +406,9 @@ export const MessageBubble = memo(function MessageBubble({
   const [mediaRetryKey, setMediaRetryKey] = useState(0);
   const [showOriginal, setShowOriginal] = useState(false);
   const [pollBusy, setPollBusy] = useState(false);
+  const [newPollOption, setNewPollOption] = useState("");
+  const [confirmLockPoll, setConfirmLockPoll] = useState(false);
+  const hydratedPollIdsRef = useRef<Set<number>>(new Set());
 
   useEffect(() => {
     setMediaError(false);
@@ -361,6 +419,26 @@ export const MessageBubble = memo(function MessageBubble({
   const isReplaced = Boolean(replaceWithTranslation && hasVisibleTranslation && !showOriginal);
   const reminderData = !msg.is_recalled ? parseReminderPayload(msg) : null;
   const pollData = !msg.is_recalled && !reminderData ? parsePollPayload(msg) : null;
+  const sparsePollId =
+    pollData && pollData.poll_id > 0 && pollData.options.length === 0 ? pollData.poll_id : 0;
+  const pollClosedFlag = Boolean(
+    pollData && (pollData.closed || (pollData.expired_time > 0 && pollData.expired_time < Date.now())),
+  );
+
+  useEffect(() => {
+    if (sparsePollId <= 0 || !onRefreshPoll) return;
+    if (hydratedPollIdsRef.current.has(sparsePollId)) return;
+    hydratedPollIdsRef.current.add(sparsePollId);
+    setPollBusy(true);
+    void Promise.resolve(onRefreshPoll(msg)).finally(() => setPollBusy(false));
+  }, [sparsePollId, onRefreshPoll, msg]);
+
+  useEffect(() => {
+    if (pollClosedFlag) {
+      setConfirmLockPoll(false);
+      setNewPollOption("");
+    }
+  }, [pollClosedFlag, pollData?.poll_id]);
   const callData = !msg.is_recalled && !reminderData && !pollData ? parseCallPayload(msg) : null;
   const isRichCard = Boolean(reminderData || pollData || callData);
   const isBuzz = !isRichCard && isBuzzMessage(msg);
@@ -421,6 +499,30 @@ export const MessageBubble = memo(function MessageBubble({
     (isRemoteMediaUrl(normalizedAttachmentUrl) ||
       isDataImageUrl(normalizedAttachmentUrl) ||
       isBlobUrl(normalizedAttachmentUrl));
+  const canSaveMedia = Boolean(
+    onSaveFile &&
+      !msg.is_recalled &&
+      (isImage || isVideo || isVoice || isSticker) &&
+      (isRemoteMediaUrl(normalizedAttachmentUrl) ||
+        isDataUrl(normalizedAttachmentUrl) ||
+        isBlobUrl(normalizedAttachmentUrl)),
+  );
+  const saveMediaLabel = isVideo
+    ? t("saveVideoMenu")
+    : isVoice
+      ? t("saveVoiceMenu")
+      : isSticker
+        ? t("saveStickerMenu")
+        : t("saveImageMenu");
+  const suggestedMediaName =
+    msg.attachment_name?.trim() ||
+    (isVideo
+      ? "teza-video"
+      : isVoice
+        ? "teza-voice"
+        : isSticker
+          ? "teza-sticker"
+          : "teza-image");
 
   useEffect(() => {
     if (!menuPos && !pickerPos) return;
@@ -456,6 +558,21 @@ export const MessageBubble = memo(function MessageBubble({
     if (!canCopyImage) return;
     setMenuPos(null);
     void copyImageReliable(normalizedAttachmentUrl).catch((err) => onCopyError?.(err));
+  };
+
+  const handleSaveMedia = () => {
+    if (!canSaveMedia || !onSaveFile) return;
+    setMenuPos(null);
+    const run = async () => {
+      const targetUrl = isBlobUrl(normalizedAttachmentUrl)
+        ? await blobUrlToDataUrl(normalizedAttachmentUrl)
+        : normalizedAttachmentUrl;
+      onSaveFile(targetUrl, suggestedMediaName, {
+        threadId: msg.thread_id,
+        msgId: msg.msg_id,
+      });
+    };
+    void run().catch((err) => onCopyError?.(err));
   };
 
   const handleOpenExternalLink = (url: string) => {
@@ -850,7 +967,10 @@ export const MessageBubble = memo(function MessageBubble({
           <button
             type="button"
             onClick={() =>
-              onOpenImage(normalizedAttachmentUrl, msg.attachment_name || t("photoAlt"))
+              onOpenImage(normalizedAttachmentUrl, msg.attachment_name || t("photoAlt"), {
+                threadId: msg.thread_id,
+                msgId: msg.msg_id,
+              })
             }
             className="mb-1 block overflow-hidden rounded-xl"
           >
@@ -1087,117 +1207,271 @@ export const MessageBubble = memo(function MessageBubble({
             </div>
           </div>
         ) : pollData ? (
-          <div
-            className="my-0.5 min-w-[250px] max-w-[340px] rounded-xl p-2.5"
-            style={{
-              background: msg.is_outgoing ? "rgba(0,0,0,0.16)" : "var(--bg-surface)",
-              border: "1px solid var(--border-subtle)",
-            }}
-          >
-            <div className="flex items-start justify-between gap-2">
+          (() => {
+            const isPollClosed = Boolean(
+              pollData.closed || (pollData.expired_time > 0 && pollData.expired_time < Date.now()),
+            );
+            const totalVotes = pollData.options.reduce((s, o) => s + (o.votes || 0), 0);
+            const canVote = Boolean(onVotePoll && pollData.poll_id > 0 && !isPollClosed);
+            const canAddOption = Boolean(
+              !isPollClosed && pollData.allow_add_option && pollData.poll_id > 0 && onAddPollOption,
+            );
+            const canLockPoll = Boolean(!isPollClosed && pollData.poll_id > 0 && onLockPoll);
+
+            const submitNewPollOption = async () => {
+              if (!canAddOption || !onAddPollOption || pollBusy) return;
+              const trimmed = newPollOption.trim();
+              if (!trimmed) return;
+              const votedIds = pollData.allow_multi
+                ? pollData.options.filter((o) => o.voted).map((o) => o.id)
+                : [];
+              setPollBusy(true);
+              try {
+                const ok = await onAddPollOption(msg, trimmed, votedIds);
+                if (ok !== false) {
+                  setNewPollOption("");
+                }
+              } finally {
+                setPollBusy(false);
+              }
+            };
+
+            return (
               <div
-                className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider"
-                style={{ color: msg.is_outgoing ? "var(--link-out)" : "var(--accent)" }}
+                className="my-0.5 min-w-[250px] max-w-[340px] rounded-xl p-2.5"
+                style={{
+                  background: msg.is_outgoing ? "rgba(0,0,0,0.16)" : "var(--bg-surface)",
+                  border: "1px solid var(--border-subtle)",
+                }}
               >
-                <BarChart3 className="h-3.5 w-3.5 shrink-0" />
-                <span>{t("pollTitleLabel")}</span>
-              </div>
-              {onRefreshPoll && pollData.poll_id > 0 && (
-                <button
-                  type="button"
-                  disabled={pollBusy}
-                  onClick={() => {
-                    if (pollBusy) return;
-                    setPollBusy(true);
-                    void Promise.resolve(onRefreshPoll(msg)).finally(() => setPollBusy(false));
-                  }}
-                  title={t("pollRefreshTitle")}
-                  className="hover-menu rounded p-1 opacity-75 hover:opacity-100 disabled:opacity-40"
-                >
-                  <RefreshCw className={`h-3 w-3 ${pollBusy ? "animate-spin" : ""}`} />
-                </button>
-              )}
-            </div>
-            <div className="mt-1 text-[14px] font-semibold leading-snug">{pollData.question}</div>
-            <div
-              className="mt-1 flex flex-wrap gap-1 text-[10.5px]"
-              style={{ color: "var(--text-secondary)" }}
-            >
-              <span>{pollData.allow_multi ? t("pollMultiChoice") : t("pollSingleChoice")}</span>
-              {pollData.is_anonymous && <span>{t("pollAnonymous")}</span>}
-              {pollData.closed && <span className="text-rose-400">{t("pollClosed")}</span>}
-            </div>
-            <div className="mt-2 space-y-1.5">
-              {pollData.options.length === 0 ? (
-                <div className="text-xs italic opacity-70">
-                  {t("pollNoOptionsHint")}
+                <div className="flex items-start justify-between gap-2">
+                  <div
+                    className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider"
+                    style={{ color: msg.is_outgoing ? "var(--link-out)" : "var(--accent)" }}
+                  >
+                    <BarChart3 className="h-3.5 w-3.5 shrink-0" />
+                    <span>{t("pollTitleLabel")}</span>
+                  </div>
+                  {onRefreshPoll && pollData.poll_id > 0 && (
+                    <button
+                      type="button"
+                      disabled={pollBusy}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (pollBusy) return;
+                        setPollBusy(true);
+                        void Promise.resolve(onRefreshPoll(msg)).finally(() => setPollBusy(false));
+                      }}
+                      title={t("pollRefreshTitle")}
+                      className="hover-menu rounded p-1 opacity-75 hover:opacity-100 disabled:opacity-40"
+                    >
+                      <RefreshCw className={`h-3 w-3 ${pollBusy ? "animate-spin" : ""}`} />
+                    </button>
+                  )}
                 </div>
-              ) : (
-                (() => {
-                  const totalVotes = pollData.options.reduce((s, o) => s + (o.votes || 0), 0);
-                  return pollData.options.map((opt) => {
-                    const pct = totalVotes > 0 ? Math.round((opt.votes / totalVotes) * 100) : 0;
-                    const canVote = Boolean(onVotePoll && pollData.poll_id > 0 && !pollData.closed);
-                    return (
-                      <button
-                        key={opt.id}
-                        type="button"
-                        disabled={!canVote || pollBusy}
-                        onClick={() => {
-                          if (!canVote || !onVotePoll || pollBusy) return;
-                          const nextIds = pollData.allow_multi
-                            ? opt.voted
-                              ? pollData.options.filter((o) => o.voted && o.id !== opt.id).map((o) => o.id)
-                              : [...pollData.options.filter((o) => o.voted).map((o) => o.id), opt.id]
-                            : opt.voted
-                              ? []
-                              : [opt.id];
-                          setPollBusy(true);
-                          void Promise.resolve(onVotePoll(msg, nextIds)).finally(() =>
-                            setPollBusy(false),
-                          );
-                        }}
-                        className="relative block w-full overflow-hidden rounded-lg px-2.5 py-1.5 text-left text-xs transition hover:brightness-95 disabled:cursor-default"
-                        style={{
-                          background: "var(--bg-sidebar)",
-                          border: opt.voted
-                            ? "1px solid var(--accent)"
-                            : "1px solid var(--border-subtle)",
-                        }}
-                      >
-                        <div
-                          aria-hidden="true"
-                          className="pointer-events-none absolute inset-y-0 left-0 opacity-20 transition-all"
-                          style={{
-                            width: `${pct}%`,
-                            background: "var(--accent)",
+                <div className="mt-1 text-[14px] font-semibold leading-snug">{pollData.question}</div>
+                <div
+                  className="mt-1 flex flex-wrap gap-1 text-[10.5px]"
+                  style={{ color: "var(--text-secondary)" }}
+                >
+                  <span>{pollData.allow_multi ? t("pollMultiChoice") : t("pollSingleChoice")}</span>
+                  {pollData.is_anonymous && <span>{t("pollAnonymous")}</span>}
+                  {isPollClosed && <span className="font-medium text-rose-400">{t("pollClosed")}</span>}
+                </div>
+                <div className="mt-2 space-y-1.5">
+                  {pollData.options.length === 0 ? (
+                    <div className="flex items-center gap-1.5 text-xs italic opacity-70">
+                      {pollBusy && <Loader2 className="h-3 w-3 animate-spin" />}
+                      <span>{pollBusy ? t("pollLoadingOptionsHint") : t("pollNoOptionsHint")}</span>
+                    </div>
+                  ) : (
+                    pollData.options.map((opt) => {
+                      const pct = totalVotes > 0 ? Math.round((opt.votes / totalVotes) * 100) : 0;
+                      return (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          disabled={!canVote || pollBusy}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (!canVote || !onVotePoll || pollBusy) return;
+                            const nextIds = pollData.allow_multi
+                              ? opt.voted
+                                ? pollData.options
+                                    .filter((o) => o.voted && o.id !== opt.id)
+                                    .map((o) => o.id)
+                                : [...pollData.options.filter((o) => o.voted).map((o) => o.id), opt.id]
+                              : opt.voted
+                                ? []
+                                : [opt.id];
+                            setPollBusy(true);
+                            void Promise.resolve(onVotePoll(msg, nextIds)).finally(() =>
+                              setPollBusy(false),
+                            );
                           }}
-                        />
-                        <div className="relative flex items-center justify-between gap-2">
-                          <span className="flex min-w-0 items-center gap-1.5 font-medium">
-                            {opt.voted && (
-                              <Check
-                                className="h-3.5 w-3.5 shrink-0"
-                                style={{ color: "var(--accent)" }}
-                              />
-                            )}
-                            <span className="truncate">{opt.content}</span>
+                          className={`relative block w-full overflow-hidden rounded-lg px-2.5 py-1.5 text-left text-xs transition hover:brightness-95 disabled:cursor-default ${
+                            pollBusy ? "opacity-70" : ""
+                          }`}
+                          style={{
+                            background: "var(--bg-sidebar)",
+                            border: opt.voted
+                              ? "1px solid var(--accent)"
+                              : "1px solid var(--border-subtle)",
+                          }}
+                        >
+                          <div
+                            aria-hidden="true"
+                            className="pointer-events-none absolute inset-y-0 left-0 opacity-20 transition-all"
+                            style={{
+                              width: `${pct}%`,
+                              background: "var(--accent)",
+                            }}
+                          />
+                          <div className="relative flex items-center justify-between gap-2">
+                            <span className="flex min-w-0 items-center gap-1.5 font-medium">
+                              {opt.voted && (
+                                <Check
+                                  className="h-3.5 w-3.5 shrink-0"
+                                  style={{ color: "var(--accent)" }}
+                                />
+                              )}
+                              <span className="truncate">{opt.content}</span>
+                            </span>
+                            <span
+                              className="shrink-0 text-[11px] font-semibold tabular-nums"
+                              style={{ color: "var(--text-secondary)" }}
+                            >
+                              {opt.votes}
+                              {totalVotes > 0 ? ` (${pct}%)` : ""}
+                            </span>
+                          </div>
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
+
+                {canAddOption && (
+                  <div
+                    className="mt-2 flex items-center gap-1.5"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <input
+                      type="text"
+                      value={newPollOption}
+                      disabled={pollBusy}
+                      onChange={(e) => setNewPollOption(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (isImeComposingEvent(e)) return;
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          void submitNewPollOption();
+                        } else if (e.key === "Escape") {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setNewPollOption("");
+                        }
+                      }}
+                      placeholder={t("pollAddOptionPlaceholder")}
+                      className="min-w-0 flex-1 rounded-lg px-2.5 py-1 text-xs outline-none disabled:opacity-55"
+                      style={{
+                        background: "var(--bg-sidebar)",
+                        border: "1px solid var(--border-subtle)",
+                        color: "var(--text-primary)",
+                      }}
+                    />
+                    <button
+                      type="button"
+                      disabled={pollBusy || !newPollOption.trim()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void submitNewPollOption();
+                      }}
+                      className="hover-menu inline-flex shrink-0 items-center gap-1 rounded-lg px-2 py-1 text-xs font-semibold transition disabled:opacity-45"
+                      style={{
+                        background: "var(--accent-soft)",
+                        color: "var(--accent)",
+                      }}
+                      title={t("addOptionBtn")}
+                    >
+                      {pollBusy ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : (
+                        <Plus className="h-3 w-3" />
+                      )}
+                      <span>{t("pollAddOptionSubmitBtn")}</span>
+                    </button>
+                  </div>
+                )}
+
+                {(totalVotes > 0 || canLockPoll) && (
+                  <div
+                    className="mt-2 flex flex-wrap items-center justify-between gap-2 border-t pt-1.5 text-[11px]"
+                    style={{
+                      borderColor: msg.is_outgoing
+                        ? "rgba(255,255,255,0.12)"
+                        : "var(--border-subtle)",
+                      color: "var(--text-secondary)",
+                    }}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <span className="tabular-nums">
+                      {totalVotes > 0 ? t("pollTotalVotes", { count: totalVotes }) : ""}
+                    </span>
+                    {canLockPoll &&
+                      (confirmLockPoll ? (
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-[11px] font-medium text-rose-400">
+                            {t("pollLockConfirmPrompt")}
                           </span>
-                          <span
-                            className="shrink-0 text-[11px] font-semibold tabular-nums"
-                            style={{ color: "var(--text-secondary)" }}
+                          <button
+                            type="button"
+                            disabled={pollBusy}
+                            onClick={() => {
+                              if (!onLockPoll || pollBusy) return;
+                              setPollBusy(true);
+                              void Promise.resolve(onLockPoll(msg))
+                                .then((ok) => {
+                                  if (ok !== false) setConfirmLockPoll(false);
+                                })
+                                .finally(() => setPollBusy(false));
+                            }}
+                            className="inline-flex items-center gap-1 rounded-md bg-rose-600 px-2 py-0.5 text-[11px] font-semibold text-white transition hover:bg-rose-500 disabled:opacity-50"
                           >
-                            {opt.votes}
-                            {totalVotes > 0 ? ` (${pct}%)` : ""}
-                          </span>
+                            {pollBusy ? (
+                              <Loader2 className="h-3 w-3 animate-spin" />
+                            ) : (
+                              <Lock className="h-3 w-3" />
+                            )}
+                            <span>{t("pollLockConfirmBtn")}</span>
+                          </button>
+                          <button
+                            type="button"
+                            disabled={pollBusy}
+                            onClick={() => setConfirmLockPoll(false)}
+                            className="hover-menu rounded-md p-0.5 transition disabled:opacity-45"
+                            title={t("cancel")}
+                          >
+                            <X className="h-3.5 w-3.5" />
+                          </button>
                         </div>
-                      </button>
-                    );
-                  });
-                })()
-              )}
-            </div>
-          </div>
+                      ) : (
+                        <button
+                          type="button"
+                          disabled={pollBusy}
+                          onClick={() => setConfirmLockPoll(true)}
+                          className="hover-menu inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-medium transition hover:text-rose-400 disabled:opacity-45"
+                        >
+                          <Lock className="h-3 w-3" />
+                          <span>{t("pollLockBtn")}</span>
+                        </button>
+                      ))}
+                  </div>
+                )}
+              </div>
+            );
+          })()
         ) : callData ? (
           <div
             className="my-0.5 flex min-w-[220px] max-w-[320px] items-center gap-3 rounded-xl px-3 py-2"
@@ -1602,6 +1876,14 @@ export const MessageBubble = memo(function MessageBubble({
                 className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
               >
                 <CheckSquare className="h-3.5 w-3.5" /> {t("selectMultiple")}
+              </button>
+            )}
+            {canSaveMedia && (
+              <button
+                onClick={handleSaveMedia}
+                className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
+              >
+                <Download className="h-3.5 w-3.5" /> {saveMediaLabel}
               </button>
             )}
             {canCopyImage && (

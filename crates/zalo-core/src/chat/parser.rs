@@ -12,8 +12,9 @@ use crate::socket::{
     CMD_DELIVERED_1_1, CMD_DELIVERED_GROUP, CMD_E2EE_DELIVER_SEEN_1_1,
     CMD_E2EE_DELIVER_SEEN_GROUP, CMD_GET_MSG, CMD_PING, CMD_PULL_ACK_GROUP, CMD_PULL_MSG_1_1,
     CMD_PULL_MSG_513, CMD_PULL_MSG_514, CMD_PULL_MSG_515, CMD_PULL_MSG_517, CMD_PULL_MSG_518,
-    CMD_PULL_MSG_GROUP, CMD_PUSH_MISS_MSG, CMD_PUSH_MSG_1_1, CMD_PUSH_MSG_GROUP, CMD_SEEN_1_1,
-    CMD_SEEN_GROUP,
+    CMD_PULL_MSG_E2EE_1_1, CMD_PULL_MSG_E2EE_GROUP, CMD_PULL_MSG_GROUP, CMD_PUSH_MISS_MSG,
+    CMD_PUSH_MSG_1_1, CMD_PUSH_MSG_E2EE_1_1, CMD_PUSH_MSG_E2EE_GROUP, CMD_PUSH_MSG_GROUP,
+    CMD_SEEN_1_1, CMD_SEEN_GROUP,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +101,10 @@ pub enum WsParsedAction {
         thread_id: Option<String>,
         user_id: Option<String>,
         self_removed: bool,
+    },
+    PollUpdated {
+        thread_id: String,
+        poll_id: Option<i64>,
     },
 }
 
@@ -265,7 +270,13 @@ fn unwrap_json_object(v: &Value) -> Option<Value> {
 
 fn value_as_bool_flag(v: &Value) -> bool {
     v.as_bool()
-        .unwrap_or_else(|| v.as_i64().map(|n| n != 0).unwrap_or(false))
+        .or_else(|| v.as_i64().map(|n| n != 0))
+        .or_else(|| match v.as_str().map(str::trim) {
+            Some("true") | Some("TRUE") | Some("1") => Some(true),
+            Some("false") | Some("FALSE") | Some("0") => Some(false),
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 
 fn is_reminder_thumb_url(url: &str) -> bool {
@@ -538,14 +549,152 @@ fn extract_reminder_meta(
     Some((title, start_time, repeat, reminder_id, schedule_text))
 }
 
+fn collect_poll_nodes_inner(obj: &Value, depth: u8, out: &mut Vec<Value>) {
+    if depth > 0 {
+        for key in [
+            "pollDetail",
+            "poll_detail",
+            "pollInfo",
+            "poll",
+            "topic",
+            "params",
+            "extra",
+            "data",
+        ] {
+            if let Some(child) = obj.get(key).and_then(unwrap_json_object) {
+                collect_poll_nodes_inner(&child, depth - 1, out);
+            }
+        }
+    }
+    out.push(obj.clone());
+}
+
+fn collect_poll_nodes(v: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    if let Some(root) = unwrap_json_object(v) {
+        collect_poll_nodes_inner(&root, 3, &mut out);
+    }
+    out
+}
+
+/// Returns `true` when `raw` looks like a Zalo poll vote / update / lock / add-option activity
+/// status notification (NOT a poll creation notice and NOT a real poll question).
+pub fn is_poll_update_activity_text(raw: &str) -> bool {
+    let lower = raw.trim().to_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    const UPDATE_PATTERNS: &[&str] = &[
+        "đã tham gia bình chọn",
+        "da tham gia binh chon",
+        "đã bình chọn",
+        "da binh chon",
+        "bình chọn đã kết thúc",
+        "binh chon da ket thuc",
+        "kết thúc bình chọn",
+        "ket thuc binh chon",
+        "đã khóa bình chọn",
+        "da khoa binh chon",
+        "khóa bình chọn",
+        "khoa binh chon",
+        "đã đóng bình chọn",
+        "da dong binh chon",
+        "đóng bình chọn",
+        "dong binh chon",
+        "thêm phương án",
+        "them phuong an",
+        "thêm lựa chọn",
+        "them lua chon",
+        "cập nhật bình chọn",
+        "cap nhat binh chon",
+        "voted",
+        "poll ended",
+        "poll closed",
+        "poll locked",
+        "added an option",
+        "added option",
+        "updated the poll",
+        "updated poll",
+    ];
+    UPDATE_PATTERNS.iter().any(|pat| lower.contains(pat))
+}
+
+fn is_poll_creation_banner_text(raw: &str) -> bool {
+    let lower = raw.trim().to_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    const CREATION_PATTERNS: &[&str] = &[
+        "đã tạo bình chọn",
+        "da tao binh chon",
+        "tạo bình chọn mới",
+        "tao binh chon moi",
+        "created a poll",
+        "created poll",
+    ];
+    CREATION_PATTERNS.iter().any(|pat| lower.contains(pat))
+}
+
+/// Returns `true` when `raw` is a poll system/activity notification string rather than a real
+/// poll question (used by `parse_poll_value` and `merge_poll_dto` to prevent question clobbering).
+pub fn is_poll_activity_text(raw: &str) -> bool {
+    is_poll_update_activity_text(raw) || is_poll_creation_banner_text(raw)
+}
+
+fn is_poll_closing_text(raw: &str) -> bool {
+    let lower = raw.trim().to_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    const CLOSE_PATTERNS: &[&str] = &[
+        "bình chọn đã kết thúc",
+        "binh chon da ket thuc",
+        "kết thúc bình chọn",
+        "ket thuc binh chon",
+        "đã khóa bình chọn",
+        "da khoa binh chon",
+        "khóa bình chọn",
+        "khoa binh chon",
+        "đã đóng bình chọn",
+        "da dong binh chon",
+        "đóng bình chọn",
+        "dong binh chon",
+        "poll ended",
+        "poll closed",
+        "poll locked",
+    ];
+    CLOSE_PATTERNS.iter().any(|pat| lower.contains(pat))
+}
+
+fn parse_json_i64(val: &Value) -> Option<i64> {
+    val.as_i64()
+        .or_else(|| val.as_u64().and_then(|u| i64::try_from(u).ok()))
+        .or_else(|| val.as_str()?.trim().parse::<i64>().ok())
+}
+
 pub fn parse_poll_value(v: &Value, fallback_poll_id: i64) -> Option<PollDto> {
-    let inner_params = v.get("params").and_then(unwrap_json_object);
-    let src = inner_params.as_ref().unwrap_or(v);
+    let nodes = collect_poll_nodes(v);
+    if nodes.is_empty() {
+        return None;
+    }
+
     let read_i64 = |keys: &[&str]| -> Option<i64> {
         for key in keys {
-            for node in [Some(src), Some(v)].into_iter().flatten() {
+            for node in &nodes {
                 if let Some(val) = node.get(*key) {
-                    if let Some(n) = val.as_i64().or_else(|| val.as_str()?.trim().parse().ok()) {
+                    if let Some(n) = parse_json_i64(val) {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+        None
+    };
+    let read_pos_i64 = |keys: &[&str]| -> Option<i64> {
+        for key in keys {
+            for node in &nodes {
+                if let Some(val) = node.get(*key) {
+                    if let Some(n) = parse_json_i64(val).filter(|&x| x > 0) {
                         return Some(n);
                     }
                 }
@@ -555,29 +704,52 @@ pub fn parse_poll_value(v: &Value, fallback_poll_id: i64) -> Option<PollDto> {
     };
     let read_bool = |keys: &[&str]| -> bool {
         for key in keys {
-            for node in [Some(src), Some(v)].into_iter().flatten() {
+            for node in &nodes {
                 if let Some(val) = node.get(*key) {
-                    return value_as_bool_flag(val);
+                    if !val.is_null() {
+                        return value_as_bool_flag(val);
+                    }
                 }
             }
         }
         false
     };
+    let read_question = || -> Option<String> {
+        for key in ["question", "title", "content"] {
+            for node in &nodes {
+                if let Some(s) = pick_str(node, &[key]) {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty()
+                        && !(trimmed.starts_with('{') && trimmed.ends_with('}'))
+                        && !(trimmed.starts_with('[') && trimmed.ends_with(']'))
+                        && !is_poll_activity_text(trimmed)
+                    {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+        }
+        None
+    };
 
-    let poll_id = read_i64(&["poll_id", "pollId", "id"]).unwrap_or(fallback_poll_id);
-    let question = pick_str(src, &["question", "title", "content"])
-        .or_else(|| pick_str(v, &["question", "title", "content"]))
-        .unwrap_or_else(|| "Bình chọn".to_string());
+    let poll_id = read_pos_i64(&["poll_id", "pollId"])
+        .or_else(|| read_pos_i64(&["topicId", "topic_id", "id"]))
+        .unwrap_or_else(|| fallback_poll_id.max(0));
+    let question = read_question().unwrap_or_else(|| "Bình chọn".to_string());
 
-    let raw_options = src
-        .get("options")
-        .or_else(|| v.get("options"))
-        .and_then(|o| match o {
+    let mut raw_options: Vec<Value> = Vec::new();
+    for node in &nodes {
+        if let Some(opts) = node.get("options").and_then(|o| match o {
             Value::Array(arr) => Some(arr.clone()),
             Value::String(s) => serde_json::from_str::<Vec<Value>>(s.trim()).ok(),
             _ => None,
-        })
-        .unwrap_or_default();
+        }) {
+            if !opts.is_empty() {
+                raw_options = opts;
+                break;
+            }
+        }
+    }
 
     let mut options = Vec::new();
     for (idx, item) in raw_options.into_iter().enumerate() {
@@ -598,29 +770,36 @@ pub fn parse_poll_value(v: &Value, fallback_poll_id: i64) -> Option<PollDto> {
                     .get("option_id")
                     .or_else(|| o.get("optionId"))
                     .or_else(|| o.get("id"))
-                    .and_then(|x| x.as_i64().or_else(|| x.as_str()?.parse().ok()))
+                    .and_then(parse_json_i64)
                     .unwrap_or((idx + 1) as i64);
                 let content = pick_str(&item, &["content", "title", "label", "name"])
                     .unwrap_or_else(|| format!("Lựa chọn {}", idx + 1));
-                let votes = o
-                    .get("total_vote")
-                    .or_else(|| o.get("totalVote"))
-                    .or_else(|| o.get("votes"))
-                    .or_else(|| o.get("voteCount"))
-                    .and_then(|x| {
+                let explicit_votes = [
+                    "total_vote",
+                    "totalVote",
+                    "vote_count",
+                    "voteCount",
+                    "votes",
+                ]
+                .iter()
+                .find_map(|k| {
+                    o.get(*k).and_then(|x| {
                         x.as_u64()
-                            .or_else(|| x.as_str()?.parse().ok())
+                            .or_else(|| x.as_i64().filter(|n| *n >= 0).map(|n| n as u64))
+                            .or_else(|| x.as_str()?.trim().parse::<u64>().ok())
                             .or_else(|| x.as_array().map(|a| a.len() as u64))
                     })
-                    .or_else(|| {
-                        o.get("voters")
-                            .and_then(Value::as_array)
-                            .map(|a| a.len() as u64)
-                    })
-                    .unwrap_or(0) as u32;
+                });
+                let voters_count = o
+                    .get("voters")
+                    .map(unwrap_json_value)
+                    .and_then(|v| v.as_array().map(|a| a.len() as u64))
+                    .unwrap_or(0);
+                let votes = explicit_votes.unwrap_or(0).max(voters_count) as u32;
                 let voted = o
                     .get("voted")
                     .or_else(|| o.get("is_voted"))
+                    .or_else(|| o.get("isVoted"))
                     .map(value_as_bool_flag)
                     .unwrap_or(false);
                 options.push(PollOptionDto {
@@ -638,20 +817,38 @@ pub fn parse_poll_value(v: &Value, fallback_poll_id: i64) -> Option<PollDto> {
         return None;
     }
 
-    let expired_time = read_i64(&["expired_time", "expiredTime", "expiried_time"])
-        .map(normalize_ts_ms)
-        .unwrap_or(0);
-    let closed = read_bool(&["closed", "is_closed", "isClosed"]);
+    let expired_time = read_i64(&[
+        "expired_time",
+        "expiredTime",
+        "expiried_time",
+        "expired_at",
+        "expiredAt",
+    ])
+    .filter(|&t| t > 0)
+    .map(normalize_ts_ms)
+    .unwrap_or(0);
+    let status = read_i64(&["status"]);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let is_expired = expired_time > 0 && expired_time < now_ms;
+    let closed = read_bool(&["closed", "is_closed", "isClosed", "is_locked", "isLocked"])
+        || status == Some(2)
+        || is_expired;
 
     Some(PollDto {
         poll_id,
         question,
         options,
-        allow_multi: read_bool(&["allow_multi_choices", "allowMultiChoices", "allow_multi"]),
+        allow_multi: read_bool(&[
+            "allow_multi_choices",
+            "allowMultiChoices",
+            "allow_multi",
+            "allowMulti",
+        ]),
         allow_add_option: read_bool(&[
             "allow_add_new_option",
             "allowAddNewOption",
             "allow_add_option",
+            "allowAddOption",
         ]),
         is_anonymous: read_bool(&["is_anonymous", "isAnonymous"]),
         expired_time,
@@ -659,37 +856,363 @@ pub fn parse_poll_value(v: &Value, fallback_poll_id: i64) -> Option<PollDto> {
     })
 }
 
-fn extract_poll_meta(raw: Option<&Value>, msg_type: &str, fallback_msg_id: &str) -> Option<PollDto> {
+fn extract_poll_meta(
+    raw: Option<&Value>,
+    msg_type: &str,
+    outer_action: Option<&str>,
+) -> Option<PollDto> {
     let lower_type = msg_type.to_ascii_lowercase();
-    let explicit = matches!(lower_type.as_str(), "chat.poll" | "group.poll" | "poll");
+    let explicit_type = lower_type.contains("poll");
     let obj = raw.and_then(unwrap_json_object);
+    let nodes = obj.as_ref().map(collect_poll_nodes).unwrap_or_default();
+
+    let action_is_poll = outer_action.is_some_and(|a| a.to_ascii_lowercase().contains("poll"))
+        || nodes.iter().any(|node| {
+            pick_str(
+                node,
+                &["action", "msgAction", "subType", "type", "board_type", "boardType"],
+            )
+            .is_some_and(|s| s.to_ascii_lowercase().contains("poll"))
+        });
+
+    let is_actionlist = lower_type.contains("msginfo.actionlist")
+        || outer_action.is_some_and(|a| a.to_ascii_lowercase().contains("msginfo.actionlist"))
+        || nodes.iter().any(|node| {
+            pick_str(node, &["action", "msgAction"])
+                .is_some_and(|s| s.to_ascii_lowercase().contains("msginfo.actionlist"))
+        });
+
+    let explicit = explicit_type || action_is_poll;
     if !explicit {
-        let looks_like_poll = obj.as_ref().is_some_and(|o| {
-            o.get("poll_id").is_some()
-                || o.get("pollId").is_some()
-                || (o.get("question").is_some() && o.get("options").is_some())
+        let looks_like_poll = nodes.iter().any(|node| {
+            node.get("poll_id").is_some()
+                || node.get("pollId").is_some()
+                || node.get("pollDetail").is_some()
+                || node.get("poll_detail").is_some()
+                || node.get("pollInfo").is_some()
+                || (node.get("question").is_some() && node.get("options").is_some())
+                || (is_actionlist
+                    && node.get("options").is_some()
+                    && (node.get("title").is_some() || node.get("id").is_some()))
         });
         if !looks_like_poll {
             return None;
         }
     }
-    let fallback_id = fallback_msg_id.trim().parse::<i64>().unwrap_or(0);
-    obj.as_ref().and_then(|o| parse_poll_value(o, fallback_id)).or_else(|| {
-        if explicit {
-            Some(PollDto {
-                poll_id: fallback_id,
-                question: "Bình chọn".to_string(),
-                options: Vec::new(),
-                allow_multi: false,
-                allow_add_option: false,
-                is_anonymous: false,
-                expired_time: 0,
-                closed: false,
-            })
-        } else {
-            None
+
+    // Never fabricate `poll_id = msg_id`; leave `poll_id = 0` or return `None` when neither a
+    // real poll ID nor options/question are present so vote notices never invent fake IDs.
+    obj.as_ref().and_then(|o| parse_poll_value(o, 0))
+}
+
+fn is_poll_creation_action_token(tok: &str) -> bool {
+    matches!(
+        tok,
+        "new_poll"
+            | "create_poll"
+            | "poll_create"
+            | "poll.create"
+            | "group.poll.create"
+            | "chat.poll.create"
+            | "newpoll"
+            | "createpoll"
+    ) || tok.contains("new_poll")
+        || tok.contains("create_poll")
+        || tok.contains("poll_create")
+        || tok.contains("poll.create")
+}
+
+fn is_explicit_poll_update_action_token(tok: &str, has_poll_context: bool) -> bool {
+    const EXPLICIT_TOKENS: &[&str] = &[
+        "vote_poll",
+        "poll_vote",
+        "poll.vote",
+        "votepoll",
+        "update_poll",
+        "poll_update",
+        "poll.update",
+        "updatepoll",
+        "end_poll",
+        "poll_end",
+        "poll.end",
+        "endpoll",
+        "close_poll",
+        "poll_close",
+        "poll.close",
+        "closepoll",
+        "lock_poll",
+        "poll_lock",
+        "poll.lock",
+        "lockpoll",
+        "add_option",
+        "add_poll_option",
+        "poll_add_option",
+        "poll.add_option",
+        "addoption",
+    ];
+    if EXPLICIT_TOKENS.iter().any(|p| tok.contains(p)) {
+        return true;
+    }
+    has_poll_context
+        && (tok.contains("vote")
+            || matches!(
+                tok,
+                "update" | "end" | "close" | "lock" | "add_opt" | "new_option"
+            ))
+}
+
+fn is_poll_closing_action_token(tok: &str) -> bool {
+    const CLOSE_TOKENS: &[&str] = &[
+        "end_poll",
+        "poll_end",
+        "poll.end",
+        "endpoll",
+        "close_poll",
+        "poll_close",
+        "poll.close",
+        "closepoll",
+        "lock_poll",
+        "poll_lock",
+        "poll.lock",
+        "lockpoll",
+    ];
+    CLOSE_TOKENS.iter().any(|p| tok.contains(p)) || matches!(tok, "end" | "close" | "lock")
+}
+
+/// Detect whether a raw group/chat message item represents a poll **vote / update / add-option /
+/// end / lock** activity notice rather than an original poll creation card.
+///
+/// Returns `Some((thread_id, poll_id))` for activity notices so WebSocket ingestion emits
+/// `WsParsedAction::PollUpdated` instead of spawning duplicate poll messages, and remote history
+/// parsing folds or skips them cleanly.
+pub(crate) fn extract_poll_activity_update(
+    item: &Value,
+    in_group_bucket: bool,
+    my_uid: &str,
+    send2me_id: &str,
+) -> Option<(String, Option<i64>)> {
+    let raw_content = item
+        .get("content")
+        .or_else(|| item.get("message").and_then(|m| m.get("content")))
+        .or_else(|| item.get("message"))
+        .or_else(|| item.get("msg"));
+    let content_obj = raw_content.and_then(unwrap_json_object);
+    let nodes = content_obj
+        .as_ref()
+        .map(collect_poll_nodes)
+        .unwrap_or_default();
+
+    let mut action_tokens: Vec<String> = Vec::new();
+    for key in [
+        "msgType",
+        "type",
+        "action",
+        "msgAction",
+        "act_type",
+        "act",
+        "subType",
+        "eventType",
+    ] {
+        if let Some(s) = pick_str(item, &[key]) {
+            action_tokens.push(s.to_ascii_lowercase());
         }
-    })
+    }
+    for node in &nodes {
+        for key in [
+            "action",
+            "msgAction",
+            "act_type",
+            "act",
+            "subType",
+            "msgType",
+            "type",
+            "board_type",
+            "boardType",
+            "eventType",
+        ] {
+            if let Some(s) = pick_str(node, &[key]) {
+                action_tokens.push(s.to_ascii_lowercase());
+            }
+        }
+    }
+
+    if action_tokens.iter().any(|t| is_poll_creation_action_token(t)) {
+        return None;
+    }
+
+    let lower_msg_type = normalize_msg_type(item).to_ascii_lowercase();
+    let has_poll_field = item.get("poll_id").is_some()
+        || item.get("pollId").is_some()
+        || nodes.iter().any(|node| {
+            node.get("poll_id").is_some()
+                || node.get("pollId").is_some()
+                || node.get("pollDetail").is_some()
+                || node.get("poll_detail").is_some()
+                || node.get("pollInfo").is_some()
+        });
+    let has_poll_token = action_tokens.iter().any(|t| t.contains("poll"));
+    let has_poll_context = has_poll_field || has_poll_token;
+
+    let is_action_envelope = lower_msg_type.contains("group.action")
+        || lower_msg_type.contains("actionlist")
+        || action_tokens
+            .iter()
+            .any(|t| t.contains("msginfo.actionlist") || t.contains("group.action"));
+    let is_group_action_or_poll_envelope =
+        has_poll_context || is_action_envelope || lower_msg_type.starts_with("group.");
+
+    let has_poll_update_action = action_tokens
+        .iter()
+        .any(|t| is_explicit_poll_update_action_token(t, has_poll_context));
+
+    let mut notice_texts: Vec<String> = Vec::new();
+    if let Some(Value::String(s)) = raw_content {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() && !(trimmed.starts_with('{') && trimmed.ends_with('}')) {
+            notice_texts.push(trimmed.to_string());
+        }
+    }
+    for node in &nodes {
+        for key in ["title", "description", "msg", "text"] {
+            if let Some(s) = pick_str(node, &[key]) {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() && !(trimmed.starts_with('{') && trimmed.ends_with('}')) {
+                    notice_texts.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    let has_poll_update_text = notice_texts.iter().any(|t| is_poll_update_activity_text(t));
+    let has_creation_text = notice_texts.iter().any(|t| is_poll_creation_banner_text(t));
+
+    let parsed_poll = content_obj.as_ref().and_then(|o| parse_poll_value(o, 0));
+    let has_creation_payload = parsed_poll.as_ref().is_some_and(|p| {
+        !p.options.is_empty()
+            || (!p.question.trim().is_empty()
+                && p.question != "Bình chọn"
+                && !is_poll_activity_text(&p.question))
+    });
+
+    let is_poll_activity = has_poll_update_action
+        || (is_group_action_or_poll_envelope && has_poll_update_text && !has_creation_text)
+        || (is_action_envelope
+            && has_poll_context
+            && !has_creation_text
+            && !has_creation_payload);
+
+    if !is_poll_activity {
+        return None;
+    }
+
+    let gid_keys = [
+        "grid",
+        "groupId",
+        "group_id",
+        "idTo",
+        "toid",
+        "toId",
+        "threadId",
+        "conversId",
+    ];
+    let thread_id = extract_thread_id(item, in_group_bucket, my_uid, send2me_id)
+        .map(|(t, _)| t)
+        .or_else(|| {
+            nodes
+                .iter()
+                .find_map(|n| pick_str(n, &gid_keys))
+                .map(|raw| clean_group_id(&raw).to_string())
+        })
+        .filter(|t| !t.is_empty() && t != "0")?;
+
+    let poll_id = ["poll_id", "pollId"]
+        .iter()
+        .find_map(|key| {
+            nodes
+                .iter()
+                .chain(std::iter::once(item))
+                .find_map(|n| n.get(*key).and_then(parse_json_i64))
+                .filter(|&id| id > 0)
+        })
+        .or_else(|| {
+            ["topicId", "topic_id", "id"].iter().find_map(|key| {
+                nodes
+                    .iter()
+                    .find_map(|n| n.get(*key).and_then(parse_json_i64))
+                    .filter(|&id| id > 0 && id.to_string() != thread_id)
+            })
+        });
+
+    Some((thread_id, poll_id))
+}
+
+/// Extract any partial `PollDto` update (updated options, `closed` flag, etc.) carried inside a
+/// poll activity notification item so remote history folding can apply it to the canonical card.
+pub(crate) fn extract_poll_activity_dto(item: &Value, known_poll_id: Option<i64>) -> Option<PollDto> {
+    let raw_content = item
+        .get("content")
+        .or_else(|| item.get("message").and_then(|m| m.get("content")))
+        .or_else(|| item.get("message"))
+        .or_else(|| item.get("msg"));
+    let content_obj = raw_content.and_then(unwrap_json_object);
+    let nodes = content_obj
+        .as_ref()
+        .map(collect_poll_nodes)
+        .unwrap_or_default();
+
+    let mut is_closing = ["msgType", "type", "action", "msgAction", "act_type", "act", "subType"]
+        .iter()
+        .filter_map(|k| pick_str(item, &[k]))
+        .any(|s| is_poll_closing_action_token(&s.to_ascii_lowercase()))
+        || nodes.iter().any(|node| {
+            ["action", "msgAction", "act_type", "act", "subType", "msgType", "type"]
+                .iter()
+                .filter_map(|k| pick_str(node, &[k]))
+                .any(|s| is_poll_closing_action_token(&s.to_ascii_lowercase()))
+        });
+    if !is_closing {
+        if let Some(Value::String(s)) = raw_content {
+            if is_poll_closing_text(s) {
+                is_closing = true;
+            }
+        }
+    }
+    if !is_closing {
+        is_closing = nodes.iter().any(|node| {
+            ["title", "description", "msg", "text"]
+                .iter()
+                .filter_map(|k| pick_str(node, &[k]))
+                .any(|s| is_poll_closing_text(&s))
+        });
+    }
+
+    let fallback_id = known_poll_id.unwrap_or(0).max(0);
+    let mut dto = content_obj
+        .as_ref()
+        .and_then(|o| parse_poll_value(o, fallback_id))
+        .or_else(|| {
+            if fallback_id > 0 && is_closing {
+                Some(PollDto {
+                    poll_id: fallback_id,
+                    question: "Bình chọn".to_string(),
+                    options: Vec::new(),
+                    allow_multi: false,
+                    allow_add_option: false,
+                    is_anonymous: false,
+                    expired_time: 0,
+                    closed: true,
+                })
+            } else {
+                None
+            }
+        })?;
+    if is_closing {
+        dto.closed = true;
+    }
+    if dto.poll_id <= 0 {
+        return None;
+    }
+    Some(dto)
 }
 
 fn normalize_msg_type(it: &Value) -> String {
@@ -1108,31 +1631,71 @@ pub fn extract_thread_id(
 ) -> Option<(String, bool)> {
     let is_group = in_group_bucket || is_group_flag(entry);
     if let Some(grid) = pick_str(entry, &["grid", "groupId"]).filter(|s| s != "0") {
-        return Some((clean_group_id(&grid).to_string(), true));
+        let clean = clean_group_id(&grid);
+        let clean = clean.split('_').next().unwrap_or(clean).trim();
+        if !clean.is_empty() && clean != "0" {
+            return Some((clean.to_string(), true));
+        }
     }
     if is_group {
         if let Some(gid) = pick_str(entry, &["idTo", "toid", "toId", "threadId", "conversId"])
             .filter(|s| s != "0")
         {
-            return Some((clean_group_id(&gid).to_string(), true));
+            let clean = clean_group_id(&gid);
+            let clean = clean.split('_').next().unwrap_or(clean).trim();
+            if !clean.is_empty() && clean != "0" {
+                return Some((clean.to_string(), true));
+            }
         }
     }
-    let uid_from = pick_str(entry, &["uidFrom", "fromUid", "fromId", "senderId"]).unwrap_or_default();
-    let id_to = pick_str(entry, &["idTo", "toid", "toId"]).unwrap_or_default();
+    let raw_uid_from =
+        pick_str(entry, &["uidFrom", "fromUid", "fromId", "senderId"]).unwrap_or_default();
+    let raw_id_to = pick_str(entry, &["idTo", "toid", "toId"]).unwrap_or_default();
 
     if !send2me_id.is_empty()
-        && ((id_to == "0" && uid_from == "0") || id_to == send2me_id || uid_from == send2me_id)
+        && ((raw_id_to == "0" && raw_uid_from == "0")
+            || raw_id_to == send2me_id
+            || raw_uid_from == send2me_id)
     {
         return Some((send2me_id.to_string(), false));
     }
-    if !uid_from.is_empty() && uid_from != "0" && uid_from != my_uid && (id_to.is_empty() || id_to == "0" || id_to == my_uid) {
+
+    let clean_my_uid = clean_bare_uid(my_uid);
+    let uid_from = clean_bare_uid(&raw_uid_from);
+    let id_to = clean_bare_uid(&raw_id_to);
+
+    if !send2me_id.is_empty() && (id_to == "0" && uid_from == "0") {
+        return Some((send2me_id.to_string(), false));
+    }
+
+    let is_self_from = !my_uid.is_empty() && (raw_uid_from == my_uid || uid_from == clean_my_uid);
+    let is_self_to = !my_uid.is_empty() && (raw_id_to == my_uid || id_to == clean_my_uid);
+
+    if !uid_from.is_empty()
+        && uid_from != "0"
+        && !is_self_from
+        && (id_to.is_empty() || id_to == "0" || is_self_to)
+    {
         Some((uid_from, false))
-    } else if !id_to.is_empty() && id_to != "0" && id_to != my_uid {
+    } else if !id_to.is_empty() && id_to != "0" && !is_self_to {
         Some((id_to, false))
     } else {
-        pick_str(entry, &["threadId", "conversId", "userId", "friendId"])
-            .filter(|s| s != "0")
-            .map(|s| (s, is_group))
+        pick_str(entry, &["threadId", "conversId", "userId", "friendId"]).and_then(|s| {
+            if !send2me_id.is_empty() && s == send2me_id {
+                return Some((send2me_id.to_string(), false));
+            }
+            let cleaned = if is_group {
+                let g = clean_group_id(&s);
+                g.split('_').next().unwrap_or(g).trim().to_string()
+            } else {
+                clean_bare_uid(&s)
+            };
+            if cleaned.is_empty() || cleaned == "0" {
+                None
+            } else {
+                Some((cleaned, is_group))
+            }
+        })
     }
 }
 
@@ -1173,10 +1736,10 @@ pub fn parse_chat_message(
         || (!my_uid.is_empty() && (uid_from_hint == my_uid || clean_uid_from_hint == my_uid))
         || (!send2me_id.is_empty() && clean_uid_from_hint == send2me_id);
 
-    let raw_msg_id = pick_str(it, &["msgId", "globalMsgId", "cliMsgId", "id"]);
     let reminder_meta = extract_reminder_meta(raw_content, &msg_type);
+    let outer_action = pick_str(it, &["action", "msgAction", "subType"]);
     let poll_meta = if reminder_meta.is_none() {
-        extract_poll_meta(raw_content, &msg_type, raw_msg_id.as_deref().unwrap_or(""))
+        extract_poll_meta(raw_content, &msg_type, outer_action.as_deref())
     } else {
         None
     };
@@ -1417,15 +1980,25 @@ pub fn parse_ws_event(ev: &WsEvent, my_uid: &str, send2me_id: &str) -> Vec<WsPar
             | CMD_PUSH_MSG_GROUP
             | CMD_PULL_MSG_1_1
             | CMD_PULL_MSG_GROUP
+            | CMD_PULL_MSG_E2EE_1_1
             | CMD_PULL_MSG_513
             | CMD_PULL_MSG_514
             | CMD_PULL_MSG_515
+            | CMD_PULL_MSG_E2EE_GROUP
             | CMD_PULL_MSG_517
             | CMD_PULL_MSG_518
             | CMD_PUSH_MISS_MSG
+            | CMD_PUSH_MSG_E2EE_1_1
+            | CMD_PUSH_MSG_E2EE_GROUP
             | CMD_GET_MSG
     ) {
-        let is_group_cmd = matches!(ev.cmd, CMD_PUSH_MSG_GROUP | CMD_PULL_MSG_GROUP);
+        let is_group_cmd = matches!(
+            ev.cmd,
+            CMD_PUSH_MSG_GROUP
+                | CMD_PULL_MSG_GROUP
+                | CMD_PULL_MSG_E2EE_GROUP
+                | CMD_PUSH_MSG_E2EE_GROUP
+        );
         let unwrapped = unwrap_json_value(data);
         collect_messages_from_node(&unwrapped, is_group_cmd, my_uid, send2me_id, &mut actions);
         collect_clear_unreads_from_node(
@@ -1438,7 +2011,10 @@ pub fn parse_ws_event(ev: &WsEvent, my_uid: &str, send2me_id: &str) -> Vec<WsPar
     } else if matches!(ev.cmd, CMD_CLEAR_UNREAD_1_1 | CMD_CLEAR_UNREAD_GROUP) {
         let is_group_cmd = ev.cmd == CMD_CLEAR_UNREAD_GROUP;
         let unwrapped = unwrap_json_value(data);
-        if unwrapped.get("msgs").is_some() || unwrapped.get("groupMsgs").is_some() {
+        if ev.has_chat_message_payload()
+            || unwrapped.get("msgs").is_some()
+            || unwrapped.get("groupMsgs").is_some()
+        {
             collect_messages_from_node(&unwrapped, is_group_cmd, my_uid, send2me_id, &mut actions);
         }
         collect_clear_unreads_from_node(
@@ -1509,6 +2085,11 @@ pub fn parse_ws_event(ev: &WsEvent, my_uid: &str, send2me_id: &str) -> Vec<WsPar
             &mut actions,
         );
     } else if ev.cmd != CMD_AUTHEN && ev.cmd != CMD_PING {
+        if ev.has_chat_message_payload() {
+            let unwrapped = unwrap_json_value(data);
+            collect_messages_from_node(&unwrapped, false, my_uid, send2me_id, &mut actions);
+            collect_clear_unreads_from_node(&unwrapped, false, my_uid, send2me_id, &mut actions);
+        }
         for voip_ev in extract_voip_controls(&ev.payload) {
             actions.push(WsParsedAction::Voip(voip_ev));
         }
@@ -2016,24 +2597,68 @@ fn collect_messages_from_node(
     send2me_id: &str,
     out: &mut Vec<WsParsedAction>,
 ) {
-    if let Some(arr) = node.get("msgs").and_then(Value::as_array) {
-        for item in arr {
-            push_single_item(item, in_group_bucket, my_uid, send2me_id, out);
+    collect_messages_from_node_inner(node, in_group_bucket, my_uid, send2me_id, 3, out);
+}
+
+fn collect_messages_from_node_inner(
+    node: &Value,
+    in_group_bucket: bool,
+    my_uid: &str,
+    send2me_id: &str,
+    depth: u8,
+    out: &mut Vec<WsParsedAction>,
+) {
+    let unwrapped = unwrap_json_value(node);
+    let mut found_bucket = false;
+    for (key, bucket_group) in [
+        ("msgs", in_group_bucket),
+        ("strangerMsgs", false),
+        ("strangers", false),
+        ("otherMsgs", false),
+        ("lastMsgs", in_group_bucket),
+        ("groupMsgs", true),
+    ] {
+        if let Some(raw) = unwrapped.get(key) {
+            let bucket_val = unwrap_json_value(raw);
+            if let Some(arr) = bucket_val.as_array() {
+                found_bucket = true;
+                for item in arr {
+                    push_single_item(item, bucket_group, my_uid, send2me_id, out);
+                }
+            }
         }
     }
-    if let Some(arr) = node.get("groupMsgs").and_then(Value::as_array) {
-        for item in arr {
-            push_single_item(item, true, my_uid, send2me_id, out);
+    if depth > 0 {
+        if let Some(inner_data) = unwrapped.get("data") {
+            let inner_unwrapped = unwrap_json_value(inner_data);
+            let is_single_msg = unwrapped.get("msgId").is_some()
+                || unwrapped.get("cliMsgId").is_some()
+                || unwrapped.get("content").is_some();
+            if !is_single_msg && (inner_unwrapped.is_object() || inner_unwrapped.is_array()) {
+                let before = out.len();
+                collect_messages_from_node_inner(
+                    &inner_unwrapped,
+                    in_group_bucket,
+                    my_uid,
+                    send2me_id,
+                    depth - 1,
+                    out,
+                );
+                if out.len() > before {
+                    found_bucket = true;
+                }
+            }
         }
     }
-    if node.is_object()
-        && (node.get("msgId").is_some()
-            || node.get("cliMsgId").is_some()
-            || node.get("content").is_some())
+    if !found_bucket
+        && unwrapped.is_object()
+        && (unwrapped.get("msgId").is_some()
+            || unwrapped.get("cliMsgId").is_some()
+            || unwrapped.get("content").is_some())
     {
-        push_single_item(node, in_group_bucket, my_uid, send2me_id, out);
+        push_single_item(&unwrapped, in_group_bucket, my_uid, send2me_id, out);
     }
-    if let Some(arr) = node.as_array() {
+    if let Some(arr) = unwrapped.as_array() {
         for item in arr {
             push_single_item(item, in_group_bucket, my_uid, send2me_id, out);
         }
@@ -2060,11 +2685,24 @@ fn push_single_item(
     send2me_id: &str,
     out: &mut Vec<WsParsedAction>,
 ) {
-    if is_reaction_message_item(item) {
-        parse_reaction_item(item, in_group_bucket, my_uid, send2me_id, out);
+    let owned_item;
+    let effective = if item.is_string() {
+        owned_item = unwrap_json_value(item);
+        &owned_item
+    } else {
+        item
+    };
+    if is_reaction_message_item(effective) {
+        parse_reaction_item(effective, in_group_bucket, my_uid, send2me_id, out);
         return;
     }
-    if let Some(msg) = parse_chat_message(item, None, my_uid, send2me_id, in_group_bucket) {
+    if let Some((thread_id, poll_id)) =
+        extract_poll_activity_update(effective, in_group_bucket, my_uid, send2me_id)
+    {
+        out.push(WsParsedAction::PollUpdated { thread_id, poll_id });
+        return;
+    }
+    if let Some(msg) = parse_chat_message(effective, None, my_uid, send2me_id, in_group_bucket) {
         if msg.is_recalled {
             out.push(WsParsedAction::Recalled {
                 thread_id: msg.thread_id,
@@ -2668,6 +3306,83 @@ fn extract_update_member_ids(data_node: &Value) -> Vec<String> {
     ids
 }
 
+fn parse_poll_control_event(
+    act_type: &str,
+    sub_act: &str,
+    data_node: &Value,
+    outer_item: &Value,
+) -> Option<WsParsedAction> {
+    let resolved_sub = if !sub_act.is_empty() {
+        sub_act.to_string()
+    } else {
+        data_node
+            .get("act")
+            .or_else(|| data_node.get("action"))
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_ascii_lowercase())
+            .unwrap_or_default()
+    };
+
+    let is_poll_event = (act_type == "group" && resolved_sub.contains("poll"))
+        || matches!(
+            act_type,
+            "poll" | "group_poll" | "new_poll" | "vote_poll" | "end_poll" | "update_poll"
+        )
+        || (matches!(act_type, "groupboard" | "group_board" | "board")
+            && resolved_sub.contains("poll"));
+    if !is_poll_event {
+        return None;
+    }
+
+    let mut nodes = collect_poll_nodes(data_node);
+    if let Some(topic) = data_node.get("topic").and_then(unwrap_json_object) {
+        let mut topic_nodes = collect_poll_nodes(&topic);
+        topic_nodes.extend(nodes);
+        nodes = topic_nodes;
+    }
+
+    let outer_content = outer_item.get("content").and_then(unwrap_json_object);
+    let gid_keys = [
+        "groupId",
+        "grid",
+        "group_id",
+        "idTo",
+        "toid",
+        "toId",
+        "threadId",
+        "conversId",
+    ];
+    let raw_gid = nodes
+        .iter()
+        .find_map(|n| pick_str(n, &gid_keys))
+        .or_else(|| outer_content.as_ref().and_then(|c| pick_str(c, &gid_keys)))
+        .or_else(|| pick_str(outer_item, &gid_keys))?;
+    let thread_id = clean_group_id(&raw_gid).to_string();
+    if thread_id.is_empty() || thread_id == "0" {
+        return None;
+    }
+
+    let poll_id = ["poll_id", "pollId"]
+        .iter()
+        .find_map(|key| {
+            nodes
+                .iter()
+                .chain(std::iter::once(outer_item))
+                .find_map(|n| n.get(*key).and_then(parse_json_i64))
+                .filter(|&id| id > 0)
+        })
+        .or_else(|| {
+            ["topicId", "topic_id", "id"].iter().find_map(|key| {
+                nodes
+                    .iter()
+                    .find_map(|n| n.get(*key).and_then(parse_json_i64))
+                    .filter(|&id| id > 0 && id.to_string() != thread_id)
+            })
+        });
+
+    Some(WsParsedAction::PollUpdated { thread_id, poll_id })
+}
+
 fn parse_social_control_event(
     act_type: &str,
     sub_act: &str,
@@ -2777,6 +3492,12 @@ fn collect_controls_from_node(
             continue;
         }
         let (act_type, sub_act, data_node) = extract_control_act_and_data(item);
+        if let Some(poll_action) =
+            parse_poll_control_event(&act_type, &sub_act, &data_node, item)
+        {
+            out.push(poll_action);
+            continue;
+        }
         if matches!(act_type.as_str(), "fr" | "group") {
             if let Some(social_action) =
                 parse_social_control_event(&act_type, &sub_act, &data_node, my_uid)
@@ -4720,6 +5441,464 @@ mod tests {
             &a_510[1],
             WsParsedAction::Read { thread_id, is_unread, last_msg_id }
                 if thread_id == "999" && !*is_unread && last_msg_id.as_deref() == Some("7001")
+        ));
+    }
+
+    #[test]
+    fn extract_poll_meta_parses_nested_params_actionlist_expiry_and_status() {
+        // 1. Group message with `msginfo.actionlist` and poll details inside stringified `content.params`
+        let nested_msg = json!({
+            "msgId": "88001",
+            "uidFrom": "100",
+            "grid": "g888111",
+            "msgType": "group.action",
+            "ts": 1_750_000_000_000_i64,
+            "content": {
+                "title": "An đã tạo bình chọn mới",
+                "action": "msginfo.actionlist",
+                "params": "{\"poll_id\":654321,\"question\":\"Tối nay đi đâu?\",\"allow_multi_choices\":true,\"allow_add_new_option\":true,\"options\":[{\"option_id\":11,\"content\":\"Café\",\"vote_count\":2,\"voters\":[\"u1\",\"u2\"],\"voted\":true},{\"option_id\":12,\"content\":\"Xem phim\",\"voters\":[\"u3\"]}]}"
+            }
+        });
+        let parsed = parse_chat_message(&nested_msg, None, "999", "", true).unwrap();
+        assert_eq!(parsed.msg_type, "chat.poll");
+        assert!(parsed.attachment_url.is_none());
+        assert_eq!(parsed.text, "Bình chọn: Tối nay đi đâu?");
+        let dto: PollDto = serde_json::from_str(
+            parsed
+                .attachment_name
+                .as_deref()
+                .unwrap()
+                .strip_prefix("teza-poll:")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(dto.poll_id, 654321);
+        assert_eq!(dto.question, "Tối nay đi đâu?");
+        assert!(dto.allow_multi);
+        assert!(dto.allow_add_option);
+        assert!(!dto.closed);
+        assert_eq!(dto.options.len(), 2);
+        assert_eq!(dto.options[0].id, 11);
+        assert_eq!(dto.options[0].votes, 2);
+        assert!(dto.options[0].voted);
+        assert_eq!(dto.options[1].votes, 1);
+
+        // 2. Non-poll `msginfo.actionlist` (e.g. group note) must NOT be misclassified as a poll
+        let non_poll = json!({
+            "msgId": "88002",
+            "uidFrom": "100",
+            "grid": "888111",
+            "msgType": "group.action",
+            "ts": 1_750_000_001_000_i64,
+            "content": {
+                "title": "Ghi chú nhóm",
+                "action": "msginfo.actionlist",
+                "params": "{\"topicId\":\"note-1\",\"title\":\"Ghi chú nội quy\"}"
+            }
+        });
+        let parsed_note = parse_chat_message(&non_poll, None, "999", "", true).unwrap();
+        assert_ne!(parsed_note.msg_type, "chat.poll");
+
+        // 3. `status == 2` and past `expired_time` mark poll as closed; nested `data` unwrapped
+        let closed_by_status = json!({
+            "data": {
+                "poll_id": 1001,
+                "question": "Đã khóa",
+                "status": 2,
+                "closed": false,
+                "options": [{ "option_id": 1, "content": "A", "votes": 1 }]
+            }
+        });
+        let p_status = parse_poll_value(&closed_by_status, 0).unwrap();
+        assert_eq!(p_status.poll_id, 1001);
+        assert!(p_status.closed);
+
+        let expired_past = json!({
+            "poll_id": 1002,
+            "question": "Đã hết hạn",
+            "expired_time": 1_700_000_000_i64,
+            "closed": false,
+            "options": [{ "option_id": 1, "content": "A", "votes": 0 }]
+        });
+        let p_expired = parse_poll_value(&expired_past, 0).unwrap();
+        assert!(p_expired.closed);
+
+        let future_ms = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        let active_future = json!({
+            "poll_id": 1003,
+            "question": "Đang mở",
+            "expired_time": future_ms,
+            "status": 1,
+            "closed": false,
+            "options": [{ "option_id": 1, "content": "A", "votes": 0 }]
+        });
+        let p_active = parse_poll_value(&active_future, 0).unwrap();
+        assert!(!p_active.closed);
+    }
+
+    #[test]
+    fn parses_ws_group_poll_control_events_into_poll_updated() {
+        let ev = WsEvent {
+            cmd: CMD_CTRL_PUSH_CTRL,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "controls": [
+                    {
+                        "act_type": "group",
+                        "content": {
+                            "act": "new_poll",
+                            "data": "{\"groupId\":\"g888111\",\"topic\":{\"id\":50101,\"type\":1}}"
+                        }
+                    },
+                    {
+                        "act_type": "group",
+                        "content": {
+                            "act": "vote_poll",
+                            "data": "{\"groupId\":\"group_888222\",\"poll_id\":50102}"
+                        }
+                    },
+                    {
+                        "content": {
+                            "act_type": "group",
+                            "act": "end_poll",
+                            "data": "{\"grid\":\"888333\",\"params\":\"{\\\"pollId\\\":\\\"50103\\\"}\"}"
+                        }
+                    },
+                    {
+                        "act_type": "group",
+                        "act": "update_poll",
+                        "data": { "groupId": "888444" }
+                    }
+                ]
+            }),
+        };
+
+        let actions = parse_ws_event(&ev, "999", "");
+        assert_eq!(actions.len(), 4);
+        assert!(matches!(
+            &actions[0],
+            WsParsedAction::PollUpdated { thread_id, poll_id }
+                if thread_id == "888111" && *poll_id == Some(50101)
+        ));
+        assert!(matches!(
+            &actions[1],
+            WsParsedAction::PollUpdated { thread_id, poll_id }
+                if thread_id == "888222" && *poll_id == Some(50102)
+        ));
+        assert!(matches!(
+            &actions[2],
+            WsParsedAction::PollUpdated { thread_id, poll_id }
+                if thread_id == "888333" && *poll_id == Some(50103)
+        ));
+        assert!(matches!(
+            &actions[3],
+            WsParsedAction::PollUpdated { thread_id, poll_id }
+                if thread_id == "888444" && poll_id.is_none()
+        ));
+    }
+
+    #[test]
+    fn ws_poll_vote_update_end_and_add_option_emit_poll_updated_never_duplicate_message() {
+        let ev = WsEvent {
+            cmd: CMD_PUSH_MSG_GROUP,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "groupMsgs": [
+                        {
+                            "msgId": "90001",
+                            "uidFrom": "100",
+                            "grid": "g888111",
+                            "msgType": "group.poll",
+                            "ts": 1_760_000_001_000_i64,
+                            "content": {
+                                "poll_id": 777111_i64,
+                                "question": "Cuối tuần đi đâu?",
+                                "options": [
+                                    { "option_id": 1, "content": "Đà Lạt", "votes": 1 },
+                                    { "option_id": 2, "content": "Vũng Tàu", "votes": 0 }
+                                ]
+                            }
+                        },
+                        {
+                            "msgId": "90002",
+                            "uidFrom": "200",
+                            "grid": "g888111",
+                            "msgType": "group.poll",
+                            "action": "vote_poll",
+                            "ts": 1_760_000_002_000_i64,
+                            "content": {
+                                "poll_id": 777111_i64,
+                                "title": "Bình đã tham gia bình chọn"
+                            }
+                        },
+                        {
+                            "msgId": "90003",
+                            "uidFrom": "300",
+                            "grid": "g888111",
+                            "msgType": "group.action",
+                            "ts": 1_760_000_003_000_i64,
+                            "content": {
+                                "action": "msginfo.actionlist",
+                                "title": "Chi đã bình chọn",
+                                "params": "{\"topic\":{\"id\":777111,\"type\":1}}"
+                            }
+                        },
+                        {
+                            "msgId": "90004",
+                            "uidFrom": "300",
+                            "grid": "888111",
+                            "msgType": "group.action",
+                            "subType": "add_option",
+                            "ts": 1_760_000_004_000_i64,
+                            "content": {
+                                "pollInfo": { "poll_id": 777111_i64 }
+                            }
+                        },
+                        {
+                            "msgId": "90005",
+                            "uidFrom": "100",
+                            "grid": "888111",
+                            "msgType": "group.action",
+                            "ts": 1_760_000_005_000_i64,
+                            "content": {
+                                "action": "end_poll",
+                                "extra": "{\"pollId\":\"777111\"}"
+                            }
+                        },
+                        {
+                            "msgId": "90006",
+                            "uidFrom": "200",
+                            "grid": "888111",
+                            "msgType": "group.action",
+                            "ts": 1_760_000_006_000_i64,
+                            "content": {
+                                "action": "msginfo.actionlist",
+                                "params": "{\"poll_id\":777111}"
+                            }
+                        },
+                        {
+                            "msgId": "90007",
+                            "uidFrom": "200",
+                            "grid": "888111",
+                            "msgType": "chat.text",
+                            "ts": 1_760_000_007_000_i64,
+                            "content": "Mình đã bình chọn xong rồi nhé!"
+                        }
+                    ]
+                }
+            }),
+        };
+
+        let actions = parse_ws_event(&ev, "999", "");
+        assert_eq!(actions.len(), 7);
+        assert!(matches!(
+            &actions[0],
+            WsParsedAction::Message(m) if m.msg_id == "90001" && m.msg_type == "chat.poll"
+        ));
+        for (idx, act) in actions.iter().enumerate().take(6).skip(1) {
+            assert!(
+                matches!(
+                    act,
+                    WsParsedAction::PollUpdated { thread_id, poll_id }
+                        if thread_id == "888111" && *poll_id == Some(777111)
+                ),
+                "index {idx} should emit PollUpdated, got {act:?}"
+            );
+        }
+        assert!(matches!(
+            &actions[6],
+            WsParsedAction::Message(m)
+                if m.msg_id == "90007"
+                    && m.msg_type == "chat.text"
+                    && m.text == "Mình đã bình chọn xong rồi nhé!"
+        ));
+    }
+
+    #[test]
+    fn poll_parser_unwraps_topic_pollinfo_extra_avoids_fake_poll_id_and_guards_vote_question() {
+        // 1. Nested `topic`, `pollInfo`, and `extra` are unwrapped
+        let nested_topic = json!({
+            "topic": {
+                "id": 445566_i64,
+                "pollInfo": {
+                    "question": "Chốt giờ họp",
+                    "extra": "{\"allow_multi_choices\":true,\"options\":[{\"option_id\":1,\"content\":\"9h\",\"votes\":2}]}"
+                }
+            }
+        });
+        let p = parse_poll_value(&nested_topic, 0).unwrap();
+        assert_eq!(p.poll_id, 445566);
+        assert_eq!(p.question, "Chốt giờ họp");
+        assert!(p.allow_multi);
+        assert_eq!(p.options.len(), 1);
+        assert_eq!(p.options[0].votes, 2);
+
+        // 2. Vote-only notice with NO real `poll_id` and NO options must NOT fabricate `poll_id = msgId`
+        let no_id_vote_notice = json!({
+            "msgId": "9988776655",
+            "uidFrom": "200",
+            "grid": "888111",
+            "msgType": "group.poll",
+            "ts": 1_760_000_010_000_i64,
+            "content": {
+                "title": "An đã tham gia bình chọn"
+            }
+        });
+        assert!(extract_poll_meta(no_id_vote_notice.get("content"), "group.poll", None).is_none());
+        let parsed = parse_chat_message(&no_id_vote_notice, None, "999", "", true).unwrap();
+        assert_ne!(parsed.msg_type, "chat.poll");
+        assert!(
+            !parsed
+                .attachment_name
+                .as_deref()
+                .is_some_and(|s| s.starts_with("teza-poll:"))
+        );
+
+        // 3. Real `poll_id` with vote-activity `title` falls back to generic "Bình chọn"
+        let vote_title_with_id = json!({
+            "poll_id": 888999_i64,
+            "title": "Bình chọn đã kết thúc",
+            "options": [{ "option_id": 1, "content": "OK", "votes": 5 }]
+        });
+        let partial = parse_poll_value(&vote_title_with_id, 0).unwrap();
+        assert_eq!(partial.poll_id, 888999);
+        assert_eq!(partial.question, "Bình chọn");
+
+        // 4. Poll with real question + options but no `poll_id` leaves `poll_id == 0` (never msgId)
+        let missing_poll_id_creation = json!({
+            "msgId": "1234567890123",
+            "uidFrom": "100",
+            "grid": "888111",
+            "msgType": "group.poll",
+            "ts": 1_760_000_020_000_i64,
+            "content": {
+                "question": "Ăn trưa ở đâu?",
+                "options": ["Phở", "Cơm"]
+            }
+        });
+        let created = parse_chat_message(&missing_poll_id_creation, None, "999", "", true).unwrap();
+        assert_eq!(created.msg_type, "chat.poll");
+        let dto: PollDto = serde_json::from_str(
+            created
+                .attachment_name
+                .as_deref()
+                .unwrap()
+                .strip_prefix("teza-poll:")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(dto.poll_id, 0);
+        assert_eq!(dto.question, "Ăn trưa ở đâu?");
+    }
+
+    #[test]
+    fn ws_e2ee_551_552_unknown_qcmd_fallback_stranger_buckets_and_uid_suffix_normalization() {
+        // 1. `_0` suffix normalization in `extract_thread_id` (incoming & outgoing + send2me intact)
+        let incoming_suffix = json!({ "uidFrom": "777888999_0", "idTo": "456_0" });
+        assert_eq!(
+            extract_thread_id(&incoming_suffix, false, "456", "send2me_77"),
+            Some(("777888999".to_string(), false))
+        );
+        let outgoing_suffix = json!({ "uidFrom": "456_0", "idTo": "777888999_0" });
+        assert_eq!(
+            extract_thread_id(&outgoing_suffix, false, "456", "send2me_77"),
+            Some(("777888999".to_string(), false))
+        );
+        let cloud_entry = json!({ "uidFrom": "send2me_77", "idTo": "456_0" });
+        assert_eq!(
+            extract_thread_id(&cloud_entry, false, "456", "send2me_77"),
+            Some(("send2me_77".to_string(), false))
+        );
+
+        // 2. CMD_PUSH_MSG_E2EE_1_1 (551) & CMD_PUSH_MSG_E2EE_GROUP (552)
+        let ev_551 = WsEvent {
+            cmd: CMD_PUSH_MSG_E2EE_1_1,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "msgs": [{
+                        "msgId": "e2ee-1",
+                        "uidFrom": "666555444_0",
+                        "idTo": "456_0",
+                        "dName": "Người lạ E2EE",
+                        "msgType": "chat.text",
+                        "content": "Chào bạn (E2EE)",
+                        "ts": 1_760_000_100_000_i64
+                    }]
+                }
+            }),
+        };
+        let a_551 = parse_ws_event(&ev_551, "456", "send2me_77");
+        assert_eq!(a_551.len(), 1);
+        assert!(matches!(
+            &a_551[0],
+            WsParsedAction::Message(m)
+                if m.thread_id == "666555444" && m.text == "Chào bạn (E2EE)"
+        ));
+
+        let ev_552 = WsEvent {
+            cmd: CMD_PUSH_MSG_E2EE_GROUP,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "groupMsgs": [{
+                        "msgId": "e2ee-g1",
+                        "uidFrom": "222_0",
+                        "idTo": "g999888",
+                        "msgType": "chat.text",
+                        "content": "Tin nhóm E2EE",
+                        "ts": 1_760_000_101_000_i64
+                    }]
+                }
+            }),
+        };
+        let a_552 = parse_ws_event(&ev_552, "456", "");
+        assert_eq!(a_552.len(), 1);
+        assert!(matches!(
+            &a_552[0],
+            WsParsedAction::Message(m)
+                if m.thread_id == "999888" && m.text == "Tin nhóm E2EE"
+        ));
+
+        // 3. Unknown qCmd (e.g., 599) with nested `data.data.strangerMsgs` + stringified `otherMsgs`
+        let ev_unknown = WsEvent {
+            cmd: 599,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "data": {
+                        "strangerMsgs": [{
+                            "msgId": "str-1",
+                            "uidFrom": "333222111_0",
+                            "idTo": "456_0",
+                            "dName": "Khách lạ 1",
+                            "msgType": "chat.text",
+                            "content": "Mình hỏi mua hàng",
+                            "ts": 1_760_000_200_000_i64
+                        }],
+                        "otherMsgs": "[{\"msgId\":\"str-2\",\"uidFrom\":\"444333222_0\",\"idTo\":\"456\",\"dName\":\"Khách lạ 2\",\"msgType\":\"chat.text\",\"content\":\"Alo shop ơi\",\"ts\":1760000201000}]"
+                    }
+                }
+            }),
+        };
+        assert!(ev_unknown.has_chat_message_payload());
+        let a_unknown = parse_ws_event(&ev_unknown, "456", "");
+        assert_eq!(a_unknown.len(), 2);
+        assert!(matches!(
+            &a_unknown[0],
+            WsParsedAction::Message(m)
+                if m.thread_id == "333222111" && m.text == "Mình hỏi mua hàng"
+        ));
+        assert!(matches!(
+            &a_unknown[1],
+            WsParsedAction::Message(m)
+                if m.thread_id == "444333222" && m.text == "Alo shop ơi"
         ));
     }
 }

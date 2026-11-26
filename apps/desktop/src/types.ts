@@ -667,3 +667,36 @@ export interface SocialWsEventDto {
   user_id: string | null;
   self_removed: boolean;
 }
+
+export type {
+  AiBackendKind,
+  AiCliProbeDto,
+  AiConfigDto,
+  AiConfigUpdateDto,
+  AiStoredMessageDto,
+  AiSummaryDto,
+  ApiAuditLogDto,
+  ApiClientDto,
+  ApiClientScope,
+  CreateApiClientInput,
+  CreateScheduledMessageInput,
+  CreatedApiClientDto,
+  LocalApiConfigDto,
+  LocalApiStatusDto,
+  ScheduleMisfirePolicy,
+  ScheduleRecurrence,
+  ScheduleStatus,
+  ScheduledMessageDto,
+  UpdateApiClientInput,
+  UpdateScheduledMessageInput,
+} from "./utils/automationHelpers";
+
+export interface AiStreamDeltaEvent {
+  session_id: string;
+  delta: string;
+}
+
+export interface AiSummaryDeltaEvent {
+  thread_id: string;
+  delta: string;
+}

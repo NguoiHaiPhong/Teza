@@ -34,13 +34,13 @@ interface Props {
   sendOnEnter?: boolean;
   hasBlockingOverlay?: boolean;
   getSenderAvatar?: (senderId: string) => string | undefined;
-  onSaveFile?: (url: string, name: string) => void;
+  onSaveFile?: (url: string, name: string, opts?: { threadId?: string; msgId?: string }) => void;
   onRetrySend?: (msg: MessageDto) => void;
   onDiscardFailed?: (msgId: string) => void;
   onReact: (msg: MessageDto, emoji: string) => void;
   onRecall: (msg: MessageDto) => void;
   onDeleteLocal: (msg: MessageDto) => void;
-  onOpenImage: (url: string, title: string) => void;
+  onOpenImage: (url: string, title: string, opts?: { threadId?: string; msgId?: string }) => void;
   onOpenProfile: (userId: string) => void;
   onForward: (msg: MessageDto) => void;
   onTranslate: (msg: MessageDto) => void;
@@ -259,12 +259,15 @@ export function ReplyThreadPanel({
                 onOpenImage(
                   rootMessage.attachment_url!,
                   rootMessage.attachment_name || t("photoAlt"),
+                  { threadId: rootMessage.thread_id, msgId: rootMessage.msg_id },
                 )
               }
               className="h-12 w-12 shrink-0 overflow-hidden rounded-lg"
             >
               <RelayImage
                 src={rootMessage.attachment_url}
+                threadId={rootMessage.thread_id}
+                msgId={rootMessage.msg_id}
                 alt={rootMessage.attachment_name || t("photoAlt")}
                 referrerPolicy="no-referrer"
                 className="h-full w-full object-cover"

@@ -1,6 +1,8 @@
-import type { ChatFolderDto, MessageDto, ReactionSummary, ThreadDto } from "../types.ts";
+import type { ChatFolderDto, MessageDto, PollDto, ReactionSummary, ThreadDto } from "../types.ts";
 import type { UiLanguage } from "../i18n/types.ts";
 import { uiLanguageToLocale } from "../i18n/types.ts";
+import { POLL_PREFIX, parsePollPayload } from "./richMessage.ts";
+import { looksLikeInternationalPhoneQuery } from "./searchNormalize.ts";
 
 export function dayKey(ts: number): string {
   const d = new Date(ts > 1e12 ? ts : ts * 1000);
@@ -36,29 +38,386 @@ export function formatThreadTime(ts: number, lang: UiLanguage = "vi"): string {
   return d.toLocaleDateString(locale, { day: "2-digit", month: "2-digit" });
 }
 
+export function isOptimisticPollMsgId(msgId: string): boolean {
+  return msgId.startsWith("poll-") || msgId.startsWith("local-poll-");
+}
+
+export function isPollVoteActivityQuestion(raw: string): boolean {
+  const q = raw.trim();
+  if (!q) return true;
+  const low = q.toLowerCase();
+  if (
+    low === "bình chọn" ||
+    low === "[bình chọn]" ||
+    low === "poll" ||
+    low === "[poll]" ||
+    low === "투표"
+  ) {
+    return true;
+  }
+  if (q.endsWith("?")) return false;
+  return (
+    /(?:^|\s)đã\s+(?:tham\s+gia\s+bình\s+chọn|bình\s+chọn|bỏ\s+phiếu|khóa\s+bình\s+chọn|kết\s+thúc\s+bình\s+chọn|tạo\s+bình\s+chọn|cập\s+nhật\s+bình\s+chọn|thêm\s+(?:lựa\s+chọn|phương\s+án))/i.test(
+      low,
+    ) ||
+    /^(?:.*?\s+)?(?:voted(?:\s+(?:in|on|for)\b.*)?|closed\s+the\s+poll|locked\s+the\s+poll|created\s+a\s+poll|added\s+an?\s+option\b.*)[.!]?$/i.test(
+      low,
+    )
+  );
+}
+
+export function mergePollDto(existing: PollDto, incoming: PollDto): PollDto {
+  const incomingHasOptions = incoming.options.length > 0;
+  const existingHasOptions = existing.options.length > 0;
+  const incomingQ = (incoming.question || "").trim();
+  const existingQ = (existing.question || "").trim();
+  const incomingHasRealQuestion = Boolean(incomingQ && !isPollVoteActivityQuestion(incomingQ));
+  const existingHasRealQuestion = Boolean(existingQ && !isPollVoteActivityQuestion(existingQ));
+  const isPartial =
+    (!incomingHasRealQuestion && existingHasRealQuestion) ||
+    (!incomingHasOptions && existingHasOptions);
+  const question = incomingHasRealQuestion
+    ? incomingQ
+    : existingHasRealQuestion
+      ? existingQ
+      : incomingQ || existingQ || "Bình chọn";
+  return {
+    poll_id: incoming.poll_id > 0 ? incoming.poll_id : existing.poll_id,
+    question,
+    options: incomingHasOptions ? incoming.options : existing.options,
+    allow_multi: isPartial
+      ? existing.allow_multi || incoming.allow_multi
+      : incoming.allow_multi,
+    allow_add_option: isPartial
+      ? existing.allow_add_option || incoming.allow_add_option
+      : incoming.allow_add_option,
+    is_anonymous: isPartial
+      ? existing.is_anonymous || incoming.is_anonymous
+      : incoming.is_anonymous,
+    expired_time: incoming.expired_time > 0 ? incoming.expired_time : existing.expired_time,
+    closed: existing.closed || incoming.closed,
+  };
+}
+
+function withMergedPollPayload(target: MessageDto, merged: PollDto): MessageDto {
+  return {
+    ...target,
+    msg_type: "chat.poll",
+    attachment_url: null,
+    attachment_name: `${POLL_PREFIX}${JSON.stringify(merged)}`,
+  };
+}
+
+function extractPollIdForDedupe(m: MessageDto): { pollId: number; poll: PollDto | null } {
+  const poll = parsePollPayload(m);
+  if (poll && poll.poll_id > 0) {
+    return { pollId: poll.poll_id, poll };
+  }
+  if (isOptimisticPollMsgId(m.msg_id)) {
+    const match = /^(?:local-)?poll-(\d+)$/.exec(m.msg_id);
+    if (match) {
+      const parsed = Number.parseInt(match[1], 10);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        return { pollId: parsed, poll };
+      }
+    }
+  }
+  return { pollId: 0, poll };
+}
+
+interface PollDedupeEntry {
+  idx: number;
+  msg: MessageDto;
+  poll: PollDto | null;
+  isOptimistic: boolean;
+}
+
+function dedupePollGroups(
+  list: MessageDto[],
+  filter?: { threadId?: string; pollId?: number },
+): MessageDto[] {
+  const groups = new Map<string, PollDedupeEntry[]>();
+  for (let i = 0; i < list.length; i++) {
+    const m = list[i];
+    if (filter?.threadId !== undefined && m.thread_id !== filter.threadId) continue;
+    const { pollId, poll } = extractPollIdForDedupe(m);
+    if (pollId <= 0) continue;
+    if (filter?.pollId !== undefined && pollId !== filter.pollId) continue;
+    const key = `${m.thread_id}:${pollId}`;
+    let entries = groups.get(key);
+    if (!entries) {
+      entries = [];
+      groups.set(key, entries);
+    }
+    entries.push({
+      idx: i,
+      msg: m,
+      poll,
+      isOptimistic: isOptimisticPollMsgId(m.msg_id),
+    });
+  }
+
+  let hasDuplicates = false;
+  for (const entries of groups.values()) {
+    if (entries.length > 1) {
+      hasDuplicates = true;
+      break;
+    }
+  }
+  if (!hasDuplicates) return list;
+
+  const droppedIndices = new Set<number>();
+  const replacementByIdx = new Map<number, MessageDto>();
+
+  for (const entries of groups.values()) {
+    if (entries.length <= 1) continue;
+    const optimistics = entries
+      .filter((e) => e.isOptimistic)
+      .sort((a, b) => a.msg.ts - b.msg.ts || a.idx - b.idx);
+    const reals = entries
+      .filter((e) => !e.isOptimistic)
+      .sort((a, b) => a.msg.ts - b.msg.ts || a.idx - b.idx);
+
+    const canonical = reals.length > 0 ? reals[0] : optimistics[0];
+    let mergedPoll: PollDto | null = null;
+    for (const entry of [...optimistics, ...reals]) {
+      if (!entry.poll) continue;
+      mergedPoll = mergedPoll ? mergePollDto(mergedPoll, entry.poll) : entry.poll;
+    }
+
+    for (const entry of entries) {
+      if (entry.idx !== canonical.idx) {
+        droppedIndices.add(entry.idx);
+      }
+    }
+    replacementByIdx.set(
+      canonical.idx,
+      mergedPoll ? withMergedPollPayload(canonical.msg, mergedPoll) : canonical.msg,
+    );
+  }
+
+  const next: MessageDto[] = [];
+  for (let i = 0; i < list.length; i++) {
+    if (droppedIndices.has(i)) continue;
+    next.push(replacementByIdx.get(i) ?? list[i]);
+  }
+  return next;
+}
+
+export function dedupeOptimisticPollMessages(list: MessageDto[]): MessageDto[] {
+  return dedupePollGroups(list);
+}
+
+export const dedupePollMessages = dedupeOptimisticPollMessages;
+
+export function applyPollUpdateToMessages(
+  list: MessageDto[],
+  pollId: number,
+  updated: PollDto,
+  preferredMsgId?: string,
+): MessageDto[] {
+  if (pollId <= 0) return list;
+  const normalizedUpdate: PollDto =
+    updated.poll_id > 0 ? updated : { ...updated, poll_id: pollId };
+
+  const groupsByThread = new Map<string, PollDedupeEntry[]>();
+  for (let i = 0; i < list.length; i++) {
+    const m = list[i];
+    const { pollId: rowPollId, poll } = extractPollIdForDedupe(m);
+    const matches =
+      rowPollId === pollId || (Boolean(preferredMsgId) && m.msg_id === preferredMsgId);
+    if (!matches) continue;
+    let entries = groupsByThread.get(m.thread_id);
+    if (!entries) {
+      entries = [];
+      groupsByThread.set(m.thread_id, entries);
+    }
+    entries.push({
+      idx: i,
+      msg: m,
+      poll,
+      isOptimistic: isOptimisticPollMsgId(m.msg_id),
+    });
+  }
+
+  if (groupsByThread.size === 0) return list;
+
+  const droppedIndices = new Set<number>();
+  const replacementByIdx = new Map<number, MessageDto>();
+
+  for (const entries of groupsByThread.values()) {
+    const optimistics = entries
+      .filter((e) => e.isOptimistic)
+      .sort((a, b) => a.msg.ts - b.msg.ts || a.idx - b.idx);
+    const reals = entries
+      .filter((e) => !e.isOptimistic)
+      .sort((a, b) => a.msg.ts - b.msg.ts || a.idx - b.idx);
+
+    const canonical = reals.length > 0 ? reals[0] : optimistics[0];
+    let mergedExisting: PollDto | null = null;
+    for (const entry of [...optimistics, ...reals]) {
+      if (!entry.poll) continue;
+      mergedExisting = mergedExisting ? mergePollDto(mergedExisting, entry.poll) : entry.poll;
+    }
+    const merged = mergedExisting
+      ? mergePollDto(mergedExisting, normalizedUpdate)
+      : normalizedUpdate;
+
+    for (const entry of entries) {
+      if (entry.idx !== canonical.idx) {
+        droppedIndices.add(entry.idx);
+      }
+    }
+    replacementByIdx.set(canonical.idx, withMergedPollPayload(canonical.msg, merged));
+  }
+
+  const next: MessageDto[] = [];
+  for (let i = 0; i < list.length; i++) {
+    if (droppedIndices.has(i)) continue;
+    next.push(replacementByIdx.get(i) ?? list[i]);
+  }
+  return next;
+}
+
 export function upsertMsg(list: MessageDto[], incoming: MessageDto): MessageDto[] {
+  const { pollId: incomingPollId, poll: incomingPoll } = extractPollIdForDedupe(incoming);
+
   const idx = list.findIndex((m) => m.msg_id === incoming.msg_id);
   if (idx >= 0) {
     const next = [...list];
-    next[idx] = incoming;
-    return next;
+    const existing = list[idx];
+    let replacement = incoming;
+    if (incomingPollId > 0 && incomingPoll) {
+      const existingPoll = parsePollPayload(existing);
+      if (existingPoll && existingPoll.poll_id === incomingPollId) {
+        replacement = withMergedPollPayload(incoming, mergePollDto(existingPoll, incomingPoll));
+      }
+    }
+    next[idx] = replacement;
+    return incomingPollId > 0
+      ? dedupePollGroups(next, { threadId: incoming.thread_id, pollId: incomingPollId })
+      : next;
   }
+
   let base = list;
-  if (incoming.is_outgoing && !incoming.msg_id.startsWith("opt-")) {
-    const incomingText = incoming.text.trim();
+  let toInsert = incoming;
+
+  if (incomingPollId > 0 && incomingPoll) {
+    if (!isOptimisticPollMsgId(incoming.msg_id)) {
+      const matchingRealIndices: number[] = [];
+      const matchingOptIndices: number[] = [];
+      for (let i = 0; i < base.length; i++) {
+        const m = base[i];
+        if (m.thread_id !== incoming.thread_id) continue;
+        const { pollId } = extractPollIdForDedupe(m);
+        if (pollId !== incomingPollId) continue;
+        if (isOptimisticPollMsgId(m.msg_id)) {
+          matchingOptIndices.push(i);
+        } else {
+          matchingRealIndices.push(i);
+        }
+      }
+
+      if (matchingRealIndices.length > 0) {
+        matchingRealIndices.sort((a, b) => base[a].ts - base[b].ts || a - b);
+        matchingOptIndices.sort((a, b) => base[a].ts - base[b].ts || a - b);
+        const canonicalIdx = matchingRealIndices[0];
+        const canonicalMsg = base[canonicalIdx];
+
+        let mergedPoll: PollDto | null = null;
+        for (const optIdx of matchingOptIndices) {
+          const optPoll = parsePollPayload(base[optIdx]);
+          if (optPoll) {
+            mergedPoll = mergedPoll ? mergePollDto(mergedPoll, optPoll) : optPoll;
+          }
+        }
+        const realPayloads: Array<{ ts: number; order: number; poll: PollDto }> = [];
+        for (let k = 0; k < matchingRealIndices.length; k++) {
+          const rIdx = matchingRealIndices[k];
+          const p = parsePollPayload(base[rIdx]);
+          if (p) {
+            realPayloads.push({ ts: base[rIdx].ts, order: k, poll: p });
+          }
+        }
+        realPayloads.push({
+          ts: incoming.ts,
+          order: matchingRealIndices.length,
+          poll: incomingPoll,
+        });
+        realPayloads.sort((a, b) => a.ts - b.ts || a.order - b.order);
+        for (const item of realPayloads) {
+          mergedPoll = mergedPoll ? mergePollDto(mergedPoll, item.poll) : item.poll;
+        }
+
+        const dropped = new Set<number>([
+          ...matchingOptIndices,
+          ...matchingRealIndices.slice(1),
+        ]);
+        const next: MessageDto[] = [];
+        for (let i = 0; i < base.length; i++) {
+          if (dropped.has(i)) continue;
+          next.push(
+            i === canonicalIdx
+              ? withMergedPollPayload(canonicalMsg, mergedPoll ?? incomingPoll)
+              : base[i],
+          );
+        }
+        return next;
+      }
+
+      if (matchingOptIndices.length > 0) {
+        matchingOptIndices.sort((a, b) => base[a].ts - base[b].ts || a - b);
+        let mergedOptPoll: PollDto | null = null;
+        const dropped = new Set<number>(matchingOptIndices);
+        for (const optIdx of matchingOptIndices) {
+          const optPoll = parsePollPayload(base[optIdx]);
+          if (optPoll) {
+            mergedOptPoll = mergedOptPoll ? mergePollDto(mergedOptPoll, optPoll) : optPoll;
+          }
+        }
+        base = base.filter((_, i) => !dropped.has(i));
+        if (mergedOptPoll) {
+          toInsert = withMergedPollPayload(incoming, mergePollDto(mergedOptPoll, incomingPoll));
+        }
+      }
+    } else {
+      const realIdx = base.findIndex(
+        (m) =>
+          m.thread_id === incoming.thread_id &&
+          !isOptimisticPollMsgId(m.msg_id) &&
+          extractPollIdForDedupe(m).pollId === incomingPollId,
+      );
+      if (realIdx >= 0) {
+        const realMsg = base[realIdx];
+        const realPoll = parsePollPayload(realMsg);
+        if (
+          realPoll &&
+          (realPoll.options.length === 0 || isPollVoteActivityQuestion(realPoll.question))
+        ) {
+          const next = [...base];
+          next[realIdx] = withMergedPollPayload(realMsg, mergePollDto(incomingPoll, realPoll));
+          return next;
+        }
+        return base;
+      }
+    }
+  }
+
+  if (toInsert.is_outgoing && !toInsert.msg_id.startsWith("opt-")) {
+    const incomingText = toInsert.text.trim();
     const optIdx = base.findIndex(
       (m) =>
         m.is_outgoing &&
         m.msg_id.startsWith("opt-") &&
-        m.thread_id === incoming.thread_id &&
+        m.thread_id === toInsert.thread_id &&
         m.text.trim() === incomingText &&
-        Math.abs(incoming.ts - m.ts) < 30_000,
+        Math.abs(toInsert.ts - m.ts) < 30_000,
     );
     if (optIdx >= 0) {
       base = [...base.slice(0, optIdx), ...base.slice(optIdx + 1)];
     }
   }
-  return [...base, incoming].sort((a, b) => a.ts - b.ts);
+  return [...base, toInsert].sort((a, b) => a.ts - b.ts);
 }
 
 export function compareThreads(a: ThreadDto, b: ThreadDto): number {
@@ -168,8 +527,7 @@ export function computeLayoutMode(
 }
 
 export function looksLikePhoneQuery(query: string): boolean {
-  const cleaned = query.trim().replace(/[\s\-().\t]/g, "");
-  return /^(?:\+?84\d{8,10}|0\d{8,10}|[1-9]\d{8})$/.test(cleaned);
+  return looksLikeInternationalPhoneQuery(query);
 }
 
 export function extractFirstUrl(text: string): string | null {
@@ -626,8 +984,41 @@ export function reconcileUpdatedMessage(
   const idx = list.findIndex((m) => m.msg_id === normalized.msg_id);
   if (idx >= 0) {
     const next = [...list];
+    const existingPoll = parsePollPayload(list[idx]);
+    const incomingPoll = parsePollPayload(normalized);
+    if (existingPoll && incomingPoll && existingPoll.poll_id > 0 && existingPoll.poll_id === incomingPoll.poll_id) {
+      next[idx] = withMergedPollPayload(normalized, mergePollDto(existingPoll, incomingPoll));
+      return dedupePollGroups(next, { threadId: normalized.thread_id, pollId: incomingPoll.poll_id });
+    }
     next[idx] = normalized;
     return next;
+  }
+  const { pollId: incomingPollId, poll: incomingPoll } = extractPollIdForDedupe(normalized);
+  if (incomingPoll && incomingPollId > 0) {
+    const byPollIdx = list.findIndex(
+      (m) =>
+        m.thread_id === normalized.thread_id &&
+        extractPollIdForDedupe(m).pollId === incomingPollId,
+    );
+    if (byPollIdx >= 0) {
+      const existing = list[byPollIdx];
+      const existingPoll = parsePollPayload(existing);
+      const existingIsOpt = isOptimisticPollMsgId(existing.msg_id);
+      const incomingIsOpt = isOptimisticPollMsgId(normalized.msg_id);
+      const upgradeOptToReal = existingIsOpt && !incomingIsOpt;
+      const incomingOlderThanReal =
+        !existingIsOpt &&
+        (incomingIsOpt || (normalized.ts > 0 && existing.ts > 0 && normalized.ts < existing.ts));
+      const merged = existingPoll
+        ? incomingOlderThanReal
+          ? mergePollDto(incomingPoll, existingPoll)
+          : mergePollDto(existingPoll, incomingPoll)
+        : incomingPoll;
+      const baseMsg = upgradeOptToReal ? normalized : existing;
+      const next = [...list];
+      next[byPollIdx] = withMergedPollPayload(baseMsg, merged);
+      return dedupePollGroups(next, { threadId: normalized.thread_id, pollId: incomingPollId });
+    }
   }
   if (list.length > 0 && normalized.ts < list[0].ts) {
     return list;

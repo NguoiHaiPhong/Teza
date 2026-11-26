@@ -3,12 +3,24 @@ import { listen } from "@tauri-apps/api/event";
 import type {
   AccountProfile,
   AddGroupMembersResultDto,
+  AiCliProbeDto,
+  AiConfigDto,
+  AiConfigUpdateDto,
+  AiStoredMessageDto,
+  AiStreamDeltaEvent,
+  AiSummaryDeltaEvent,
+  AiSummaryDto,
+  ApiAuditLogDto,
+  ApiClientDto,
   AppUpdateInfo,
   AttachmentMeta,
   CallAudioTestResultDto,
   CallDevicesDto,
   CallStateDto,
   ChatFolderDto,
+  CreateApiClientInput,
+  CreateScheduledMessageInput,
+  CreatedApiClientDto,
   FolderFilter,
   FriendActionResultDto,
   FriendRequestItemDto,
@@ -22,6 +34,8 @@ import type {
   GDriveThreadUsageDto,
   KickGroupMembersResultDto,
   LeaveGroupResultDto,
+  LocalApiConfigDto,
+  LocalApiStatusDto,
   MediaVaultConfigDto,
   MediaVaultStatsDto,
   MessageDto,
@@ -31,6 +45,7 @@ import type {
   RelayConfigUpdate,
   RelayTestResult,
   SavedFileResultDto,
+  ScheduledMessageDto,
   ScreenCaptureDto,
   SocialWsEventDto,
   StickerItem,
@@ -41,15 +56,119 @@ import type {
   TranslateConfigUpdate,
   TranslateProvider,
   TranslationResult,
+  UpdateApiClientInput,
+  UpdateScheduledMessageInput,
   UserProfileDto,
   WebAppAccountDto,
   WebAppAccountInput,
 } from "./types";
+import {
+  DEFAULT_AI_SYSTEM_PROMPT,
+  DEFAULT_LOCAL_API_MIN_INTERVAL_MS,
+  DEFAULT_LOCAL_API_PORT,
+} from "./utils/automationHelpers.ts";
+import { matchesSearchQuery } from "./utils/searchNormalize.ts";
 import { filterDemoWebAppAccounts, upsertDemoWebAppAccount } from "./utils/webappAccounts.ts";
+
+function inferDownloadExtension(targetUrl: string): string | null {
+  const dataMatch = targetUrl.match(/^data:([a-z0-9.+-]+)\/([a-z0-9.+-]+)(?:;|,)/i);
+  if (dataMatch) {
+    const type = dataMatch[1].toLowerCase();
+    const sub = dataMatch[2].toLowerCase();
+    if (sub === "jpeg" || sub === "jpg" || sub === "jfif") return "jpg";
+    if (sub === "x-png" || sub === "apng") return "png";
+    if (sub === "svg+xml") return "svg";
+    if (sub === "mpeg") return type === "audio" ? "mp3" : "mpg";
+    if (sub === "quicktime") return "mov";
+    if (sub === "x-matroska") return "mkv";
+    if (sub === "x-msvideo") return "avi";
+    if (sub === "x-wav") return "wav";
+    if (sub === "mp4") return type === "audio" ? "m4a" : "mp4";
+    if (/^[a-z0-9]{2,8}$/.test(sub)) return sub;
+  }
+  try {
+    let urlToInspect = targetUrl;
+    if (/^(?:teza-media:\/\/|https?:\/\/teza-media\.localhost\/)/i.test(urlToInspect)) {
+      const parsed = new URL(urlToInspect);
+      const inner = parsed.searchParams.get("url");
+      if (inner) urlToInspect = inner;
+    }
+    const parsed = new URL(urlToInspect);
+    const decodedPath = decodeURIComponent(parsed.pathname || "");
+    const extMatch = decodedPath.match(/\.([A-Za-z0-9]{2,8})$/);
+    if (extMatch) {
+      const ext = extMatch[1].toLowerCase();
+      return ext === "jpeg" || ext === "jfif" ? "jpg" : ext;
+    }
+  } catch {
+    // Ignore malformed URLs in browser fallback
+  }
+  return null;
+}
+
+function ensureDownloadFileName(suggestedName: string, targetUrl: string): string {
+  const clean = (suggestedName || "").trim() || "download";
+  if (/\.[A-Za-z0-9]{2,8}$/.test(clean)) return clean;
+  const inferred = inferDownloadExtension(targetUrl);
+  return inferred ? `${clean}.${inferred}` : clean;
+}
+
+let DEMO_AI_CONFIG: AiConfigDto = {
+  enabled: false,
+  backend: "gemini_api",
+  gemini_model: "gemini-2.5-flash",
+  cli_path: "gemini",
+  cli_model: "",
+  system_prompt: DEFAULT_AI_SYSTEM_PROMPT,
+  summary_language: "vi",
+  max_summary_messages: 40,
+  has_api_key: false,
+  api_key_preview: "",
+  has_translate_fallback_key: false,
+  translate_fallback_preview: "",
+};
+let DEMO_AI_MESSAGES: AiStoredMessageDto[] = [];
+const DEMO_AI_STREAM_LISTENERS = new Set<(ev: AiStreamDeltaEvent) => void>();
+const DEMO_AI_SUMMARY_LISTENERS = new Set<(ev: AiSummaryDeltaEvent) => void>();
+
+let DEMO_SCHEDULES: ScheduledMessageDto[] = [];
+const DEMO_SCHEDULE_LISTENERS = new Set<(ev: ScheduledMessageDto | null) => void>();
+
+let DEMO_LOCAL_API_CONFIG: LocalApiConfigDto = {
+  enabled: false,
+  port: DEFAULT_LOCAL_API_PORT,
+  min_send_interval_ms: DEFAULT_LOCAL_API_MIN_INTERVAL_MS,
+};
+let DEMO_API_CLIENTS: ApiClientDto[] = [];
+let DEMO_API_AUDIT_LOGS: ApiAuditLogDto[] = [];
+const DEMO_LOCAL_API_AUDIT_LISTENERS = new Set<(ev: ApiAuditLogDto) => void>();
+
+function emitDemoScheduleUpdated(item: ScheduledMessageDto | null) {
+  for (const fn of DEMO_SCHEDULE_LISTENERS) {
+    try {
+      fn(item);
+    } catch {
+      // Ignore demo listener error
+    }
+  }
+}
 
 export const isTauri = () => typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 export const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
+const RAW_IPC_SINGLE_SHOT_MAX_BYTES = 2 * 1024 * 1024;
+const RAW_IPC_CHUNK_BYTES = 2 * 1024 * 1024;
+const BASE64_CHUNK_SIZE = 0x8000;
+
+function uint8ArrayToBase64(bytes: Uint8Array): string {
+  if (bytes.byteLength === 0) return "";
+  const chunks: string[] = [];
+  for (let offset = 0; offset < bytes.byteLength; offset += BASE64_CHUNK_SIZE) {
+    const slice = bytes.subarray(offset, Math.min(offset + BASE64_CHUNK_SIZE, bytes.byteLength));
+    chunks.push(String.fromCharCode(...slice));
+  }
+  return btoa(chunks.join(""));
+}
 
 export type AuthStatusResponse =
   | { status: "needs_qr" }
@@ -454,6 +573,45 @@ export const bridge = {
     if (!isTauri()) return this.listThreads(folder);
     return invoke<ThreadDto[]>("threads_sync", { folder });
   },
+  async ensureDirectThread(threadId: string, title: string, avatar?: string): Promise<ThreadDto> {
+    if (!isTauri()) {
+      const cleanId = threadId.trim();
+      const cleanTitle = title.trim() || cleanId;
+      const cleanAvatar = (avatar ?? "").trim();
+      const existing = DEMO_THREADS.find((t) => t.id === cleanId);
+      if (existing) {
+        if (cleanTitle && (!existing.title || existing.title === existing.id)) {
+          existing.title = cleanTitle;
+        }
+        if (cleanAvatar && !existing.avatar) {
+          existing.avatar = cleanAvatar;
+        }
+        return { ...existing };
+      }
+      const created: ThreadDto = {
+        id: cleanId,
+        title: cleanTitle,
+        avatar: cleanAvatar,
+        kind: "direct",
+        last_preview: "",
+        last_ts: 0,
+        unread_count: 0,
+        is_pinned: false,
+        is_muted: false,
+        last_read_in_ts: 0,
+        peer_read_ts: 0,
+        muted_until_ts: 0,
+        is_archived: false,
+      };
+      DEMO_THREADS.unshift(created);
+      return { ...created };
+    }
+    return invoke<ThreadDto>("thread_ensure_direct", {
+      threadId,
+      title,
+      avatar: avatar ?? null,
+    });
+  },
   async setActiveThread(threadId: string | null): Promise<void> {
     if (!isTauri()) return;
     return invoke("thread_set_active", { threadId });
@@ -614,24 +772,36 @@ export const bridge = {
     }
     return invoke<UserProfileDto>("user_get_profile", { userId });
   },
-  async findUserByPhone(phone: string): Promise<UserProfileDto> {
+  async findUserByPhone(phone: string, countryCode?: string): Promise<UserProfileDto> {
     if (!isTauri()) {
-      const cleaned = phone.trim().replace(/[\s\-().\t+]/g, "");
-      if (!/^\d{9,15}$/.test(cleaned)) {
-        throw new Error("Số điện thoại không hợp lệ");
+      const trimmed = phone.trim();
+      const hasPlus = trimmed.startsWith("+");
+      const cleaned = trimmed.replace(/[\s\-().\t+]/g, "");
+      if (!/^\d{7,15}$/.test(cleaned)) {
+        throw new Error("Invalid phone number");
       }
-      const norm = cleaned.startsWith("0") ? `84${cleaned.slice(1)}` : cleaned;
+      const cc = (countryCode || "84").replace(/\D/g, "") || "84";
+      let norm = cleaned;
+      if (hasPlus) {
+        if ((norm.startsWith("82") || norm.startsWith("84")) && norm[2] === "0") {
+          norm = norm.slice(0, 2) + norm.slice(3);
+        }
+      } else if (norm.startsWith("0")) {
+        norm = `${cc}${norm.slice(1)}`;
+      } else if (!norm.startsWith(cc) && !norm.startsWith("84") && !norm.startsWith("82")) {
+        norm = `${cc}${norm}`;
+      }
       const uid = `phone-${norm}`;
       return {
         uid,
-        display_name: `Liên hệ ${norm}`,
-        account_name: `Liên hệ ${norm}`,
+        display_name: `Contact +${norm}`,
+        account_name: `Contact +${norm}`,
         avatar: "",
         cover: "",
-        status: "Tìm kiếm qua số điện thoại (Chế độ xem trước)",
+        status: "Phone lookup (Preview mode)",
         gender: null,
         sdob: "",
-        phone_number: norm,
+        phone_number: `+${norm}`,
         is_friend: DEMO_FRIENDS.has(uid),
         is_blocked: DEMO_BLOCKED.has(uid),
         is_self: false,
@@ -641,7 +811,11 @@ export const bridge = {
         last_interaction_ts: 0,
       };
     }
-    return invoke<UserProfileDto>("user_find_by_phone", { phone });
+    const cleanCountry = countryCode?.trim();
+    return invoke<UserProfileDto>("user_find_by_phone", {
+      phone,
+      ...(cleanCountry ? { countryCode: cleanCountry } : {}),
+    });
   },
   async listPinnedMessages(threadId: string): Promise<MessageDto[]> {
     if (!isTauri()) {
@@ -732,6 +906,72 @@ export const bridge = {
       threadId,
       text,
       quotedMsgId: quoted.msg_id,
+    });
+  },
+  async forwardMessage(
+    sourceThreadId: string,
+    sourceMsgId: string,
+    targetThreadId: string,
+    fallback?: {
+      text?: string;
+      msgType?: string;
+      attachmentUrl?: string | null;
+      attachmentName?: string | null;
+    },
+  ): Promise<MessageDto> {
+    if (!isTauri()) {
+      const sourceList = DEMO_MESSAGES[sourceThreadId] ?? [];
+      const source =
+        sourceList.find((m) => m.msg_id === sourceMsgId) ??
+        Object.values(DEMO_MESSAGES)
+          .flat()
+          .find((m) => m.msg_id === sourceMsgId) ??
+        null;
+      const msgType = source?.msg_type || fallback?.msgType || "chat.text";
+      const attachmentUrl = source?.attachment_url ?? fallback?.attachmentUrl ?? null;
+      const attachmentName = source?.attachment_name ?? fallback?.attachmentName ?? null;
+      const text = source?.text ?? fallback?.text ?? "";
+      const now = Date.now();
+      const msg: MessageDto = {
+        msg_id: `preview-fwd-${now}-${Math.random().toString(36).slice(2, 7)}`,
+        thread_id: targetThreadId,
+        sender_id: "me",
+        sender_name: "Bạn",
+        text,
+        msg_type: msgType,
+        ts: now,
+        is_outgoing: true,
+        is_recalled: false,
+        is_pinned: false,
+        quote: null,
+        reactions: [],
+        attachment_url: attachmentUrl,
+        attachment_name: attachmentName,
+      };
+      DEMO_MESSAGES[targetThreadId] = [...(DEMO_MESSAGES[targetThreadId] ?? []), msg];
+      const preview =
+        text.trim() ||
+        (attachmentName ? `[Tập tin] ${attachmentName}` : "") ||
+        (msgType.includes("sticker")
+          ? "[Nhãn dán]"
+          : msgType.includes("photo") || msgType.includes("gif")
+            ? "[Hình ảnh]"
+            : msgType.includes("video")
+              ? "[Video]"
+              : msgType.includes("voice")
+                ? "[Tin nhắn thoại]"
+                : "[Tập tin]");
+      touchDemoThread(targetThreadId, preview, msg.ts);
+      return msg;
+    }
+    return invoke<MessageDto>("message_forward", {
+      sourceThreadId,
+      sourceMsgId,
+      targetThreadId,
+      fallbackText: fallback?.text ?? null,
+      fallbackMsgType: fallback?.msgType ?? null,
+      fallbackAttachmentUrl: fallback?.attachmentUrl ?? null,
+      fallbackAttachmentName: fallback?.attachmentName ?? null,
     });
   },
   async reactMessage(threadId: string, msgId: string, emoji: string): Promise<MessageDto> {
@@ -875,21 +1115,43 @@ export const bridge = {
       touchDemoThread(threadId, msg.text, msg.ts);
       return msg;
     }
-    return invoke<MessageDto>("message_send_raw_attachment", bytes, {
-      headers: {
-        "x-thread-id": encodeURIComponent(threadId),
-        "x-file-name": encodeURIComponent(fileName),
-        "x-caption": encodeURIComponent(caption),
-      },
-    });
+    if (bytes.byteLength <= RAW_IPC_SINGLE_SHOT_MAX_BYTES) {
+      return invoke<MessageDto>("message_send_base64_attachment", {
+        threadId,
+        fileName,
+        caption,
+        dataBase64: uint8ArrayToBase64(bytes),
+      });
+    }
+    const uploadId = await invoke<string>("raw_attachment_stage_begin", { fileName });
+    try {
+      for (let offset = 0; offset < bytes.byteLength; offset += RAW_IPC_CHUNK_BYTES) {
+        const slice = bytes.subarray(
+          offset,
+          Math.min(offset + RAW_IPC_CHUNK_BYTES, bytes.byteLength),
+        );
+        await invoke<number>("raw_attachment_stage_chunk", {
+          uploadId,
+          chunkBase64: uint8ArrayToBase64(slice),
+        });
+      }
+      return await invoke<MessageDto>("raw_attachment_stage_send", {
+        uploadId,
+        threadId,
+        caption,
+      });
+    } catch (err) {
+      void invoke("raw_attachment_stage_abort", { uploadId }).catch(() => undefined);
+      throw err;
+    }
   },
   async searchGlobal(query: string): Promise<MessageDto[]> {
     if (!isTauri()) {
-      const q = query.trim().toLowerCase();
+      const q = query.trim();
       if (!q) return [];
       return Object.values(DEMO_MESSAGES)
         .flat()
-        .filter((m) => m.text.toLowerCase().includes(q));
+        .filter((m) => matchesSearchQuery(`${m.text}\n${m.sender_name}`, q));
     }
     return invoke<MessageDto[]>("search_global", { query, limit: 30 });
   },
@@ -970,7 +1232,7 @@ export const bridge = {
     if (!isTauri()) {
       const a = document.createElement("a");
       a.href = targetUrl;
-      a.download = suggestedName || "download";
+      a.download = ensureDownloadFileName(suggestedName, targetUrl);
       a.target = "_blank";
       a.rel = "noreferrer";
       document.body.appendChild(a);
@@ -1334,8 +1596,17 @@ export const bridge = {
     msgId?: string,
   ): Promise<PollDto> {
     if (!isTauri()) {
-      const list = threadId ? DEMO_MESSAGES[threadId] ?? [] : [];
-      const found = list.find((m) => m.msg_id === msgId);
+      const list = threadId ? DEMO_MESSAGES[threadId] ?? [] : Object.values(DEMO_MESSAGES).flat();
+      const found = list.find((m) => {
+        if (msgId && m.msg_id === msgId) return true;
+        const raw = m.attachment_name?.replace(/^teza-poll:/, "");
+        if (!raw || !m.attachment_name?.startsWith("teza-poll:")) return false;
+        try {
+          return (JSON.parse(raw) as Partial<PollDto>).poll_id === pollId;
+        } catch {
+          return false;
+        }
+      });
       const raw = found?.attachment_name?.replace(/^teza-poll:/, "");
       if (raw) return JSON.parse(raw) as PollDto;
       throw new Error("Không tìm thấy bình chọn");
@@ -1353,8 +1624,17 @@ export const bridge = {
     msgId?: string,
   ): Promise<PollDto> {
     if (!isTauri()) {
-      const list = threadId ? DEMO_MESSAGES[threadId] ?? [] : [];
-      const found = list.find((m) => m.msg_id === msgId);
+      const list = threadId ? DEMO_MESSAGES[threadId] ?? [] : Object.values(DEMO_MESSAGES).flat();
+      const found = list.find((m) => {
+        if (msgId && m.msg_id === msgId) return true;
+        const raw = m.attachment_name?.replace(/^teza-poll:/, "");
+        if (!raw || !m.attachment_name?.startsWith("teza-poll:")) return false;
+        try {
+          return (JSON.parse(raw) as Partial<PollDto>).poll_id === pollId;
+        } catch {
+          return false;
+        }
+      });
       const raw = found?.attachment_name?.replace(/^teza-poll:/, "");
       if (!found || !raw) throw new Error("Không tìm thấy bình chọn");
       const poll = JSON.parse(raw) as PollDto;
@@ -1379,6 +1659,82 @@ export const bridge = {
       optionIds,
       threadId: threadId ?? null,
       msgId: msgId ?? null,
+    });
+  },
+  async addPollOptions(
+    threadId: string,
+    pollId: number,
+    newOptions: string[],
+    votedOptionIds: number[],
+  ): Promise<PollDto> {
+    if (!isTauri()) {
+      const list = DEMO_MESSAGES[threadId] ?? [];
+      const found = list.find((m) => {
+        if (!m.attachment_name?.startsWith("teza-poll:")) return false;
+        try {
+          return (JSON.parse(m.attachment_name.slice("teza-poll:".length)) as Partial<PollDto>).poll_id === pollId;
+        } catch {
+          return false;
+        }
+      });
+      if (!found || !found.attachment_name?.startsWith("teza-poll:")) {
+        throw new Error("Không tìm thấy bình chọn");
+      }
+      const poll = JSON.parse(found.attachment_name.slice("teza-poll:".length)) as PollDto;
+      const cleaned = newOptions.map((o) => o.trim()).filter(Boolean);
+      const maxId = poll.options.reduce((acc, o) => Math.max(acc, o.id), 0);
+      const keepVoted = new Set(poll.allow_multi ? votedOptionIds : []);
+      const existingUpdated = poll.options.map((opt) => {
+        const willVote = keepVoted.has(opt.id);
+        const delta = (willVote ? 1 : 0) - (opt.voted ? 1 : 0);
+        return {
+          ...opt,
+          voted: willVote,
+          votes: Math.max(0, opt.votes + delta),
+        };
+      });
+      const appended = cleaned.map((content, idx) => ({
+        id: maxId + idx + 1,
+        content,
+        votes: 1,
+        voted: true,
+      }));
+      const next: PollDto = {
+        ...poll,
+        options: [...existingUpdated, ...appended],
+      };
+      found.attachment_name = `teza-poll:${JSON.stringify(next)}`;
+      return next;
+    }
+    return invoke<PollDto>("poll_add_options", {
+      threadId,
+      pollId,
+      newOptions,
+      votedOptionIds,
+    });
+  },
+  async lockPoll(threadId: string, pollId: number): Promise<PollDto> {
+    if (!isTauri()) {
+      const list = DEMO_MESSAGES[threadId] ?? [];
+      const found = list.find((m) => {
+        if (!m.attachment_name?.startsWith("teza-poll:")) return false;
+        try {
+          return (JSON.parse(m.attachment_name.slice("teza-poll:".length)) as Partial<PollDto>).poll_id === pollId;
+        } catch {
+          return false;
+        }
+      });
+      if (!found || !found.attachment_name?.startsWith("teza-poll:")) {
+        throw new Error("Không tìm thấy bình chọn");
+      }
+      const poll = JSON.parse(found.attachment_name.slice("teza-poll:".length)) as PollDto;
+      const next: PollDto = { ...poll, closed: true };
+      found.attachment_name = `teza-poll:${JSON.stringify(next)}`;
+      return next;
+    }
+    return invoke<PollDto>("poll_lock", {
+      threadId,
+      pollId,
     });
   },
   async captureScreen(opts?: {
@@ -2157,6 +2513,460 @@ export const bridge = {
       };
     }
     return listen<SocialWsEventDto>("core://social-event", (event) => {
+      handler(event.payload);
+    });
+  },
+
+  // ==================== Item #1: Optional AI Assistant ====================
+  async aiGetConfig(): Promise<AiConfigDto> {
+    if (!isTauri()) {
+      return { ...DEMO_AI_CONFIG };
+    }
+    return invoke<AiConfigDto>("ai_get_config");
+  },
+  async aiUpdateConfig(update: AiConfigUpdateDto): Promise<AiConfigDto> {
+    if (!isTauri()) {
+      const next: AiConfigDto = { ...DEMO_AI_CONFIG };
+      if (typeof update.enabled === "boolean") next.enabled = update.enabled;
+      if (update.backend) next.backend = update.backend;
+      if (typeof update.gemini_model === "string") {
+        next.gemini_model = update.gemini_model.trim() || "gemini-2.5-flash";
+      }
+      if (typeof update.cli_path === "string") {
+        next.cli_path = update.cli_path.trim() || "gemini";
+      }
+      if (typeof update.cli_model === "string") {
+        next.cli_model = update.cli_model.trim();
+      }
+      if (typeof update.system_prompt === "string") {
+        next.system_prompt = update.system_prompt;
+      }
+      if (typeof update.summary_language === "string") {
+        next.summary_language = update.summary_language;
+      }
+      if (typeof update.max_summary_messages === "number") {
+        next.max_summary_messages = update.max_summary_messages;
+      }
+      if (update.clear_api_key) {
+        next.has_api_key = false;
+        next.api_key_preview = "";
+      } else if (typeof update.api_key === "string" && update.api_key.trim()) {
+        const cleanKey = update.api_key.trim();
+        next.has_api_key = true;
+        next.api_key_preview =
+          cleanKey.length > 8 ? `${cleanKey.slice(0, 4)}••••${cleanKey.slice(-4)}` : "••••";
+      }
+      DEMO_AI_CONFIG = next;
+      return { ...next };
+    }
+    return invoke<AiConfigDto>("ai_update_config", {
+      update: {
+        ...update,
+        clear_api_key: Boolean(update.clear_api_key),
+      },
+    });
+  },
+  async aiProbeCli(cliPath?: string): Promise<AiCliProbeDto> {
+    if (!isTauri()) {
+      return {
+        available: false,
+        resolved_path: null,
+        version: null,
+        error: "Gemini CLI chỉ khả dụng trong ứng dụng desktop Tauri.",
+      };
+    }
+    return invoke<AiCliProbeDto>("ai_probe_cli", {
+      cliPath: cliPath ?? null,
+    });
+  },
+  async aiListMessages(sessionId?: string, limit?: number): Promise<AiStoredMessageDto[]> {
+    if (!isTauri()) {
+      const sid = sessionId || "default";
+      const list = DEMO_AI_MESSAGES.filter((m) => m.session_id === sid);
+      return (limit ? list.slice(-limit) : list).map((m) => ({ ...m }));
+    }
+    return invoke<AiStoredMessageDto[]>("ai_list_messages", {
+      sessionId: sessionId ?? null,
+      limit: limit ?? null,
+    });
+  },
+  async aiClearMessages(sessionId?: string): Promise<number> {
+    if (!isTauri()) {
+      const sid = sessionId || "default";
+      const before = DEMO_AI_MESSAGES.length;
+      DEMO_AI_MESSAGES = DEMO_AI_MESSAGES.filter((m) => m.session_id !== sid);
+      return before - DEMO_AI_MESSAGES.length;
+    }
+    return invoke<number>("ai_clear_messages", {
+      sessionId: sessionId ?? null,
+    });
+  },
+  async aiChatSend(prompt: string, sessionId?: string): Promise<AiStoredMessageDto> {
+    if (!isTauri()) {
+      if (!DEMO_AI_CONFIG.enabled) {
+        throw new Error("Trợ lý AI đang tắt. Hãy bật trong Cài đặt → Trợ lý AI.");
+      }
+      const sid = sessionId || "default";
+      const now = Date.now();
+      const userMsg: AiStoredMessageDto = {
+        id: `demo-ai-u-${now}`,
+        session_id: sid,
+        role: "user",
+        content: prompt,
+        model: DEMO_AI_CONFIG.gemini_model,
+        backend: DEMO_AI_CONFIG.backend,
+        ts: now,
+      };
+      DEMO_AI_MESSAGES = [...DEMO_AI_MESSAGES, userMsg];
+      const replyText = `[Chế độ demo] Đã nhận câu hỏi: "${prompt.trim().slice(0, 140)}".\n\n- Đây là phản hồi mô phỏng cục bộ khi chạy ngoài Tauri.\n- Khi chạy trên ứng dụng desktop, Trợ lý AI sẽ gọi trực tiếp **${DEMO_AI_CONFIG.backend === "gemini_cli" ? "Gemini CLI" : DEMO_AI_CONFIG.gemini_model}**.`;
+      for (const fn of DEMO_AI_STREAM_LISTENERS) {
+        try {
+          fn({ session_id: sid, delta: replyText });
+        } catch {
+          // Ignore demo listener error
+        }
+      }
+      const modelMsg: AiStoredMessageDto = {
+        id: `demo-ai-m-${now + 1}`,
+        session_id: sid,
+        role: "model",
+        content: replyText,
+        model: DEMO_AI_CONFIG.gemini_model,
+        backend: DEMO_AI_CONFIG.backend,
+        ts: now + 1,
+      };
+      DEMO_AI_MESSAGES = [...DEMO_AI_MESSAGES, modelMsg];
+      return { ...modelMsg };
+    }
+    return invoke<AiStoredMessageDto>("ai_chat_send", {
+      prompt,
+      sessionId: sessionId ?? null,
+    });
+  },
+  async aiSummarizeUnread(threadId: string): Promise<AiSummaryDto> {
+    if (!isTauri()) {
+      if (!DEMO_AI_CONFIG.enabled) {
+        throw new Error("Trợ lý AI đang tắt. Hãy bật trong Cài đặt → Trợ lý AI.");
+      }
+      const list = (DEMO_MESSAGES[threadId] ?? []).slice(-DEMO_AI_CONFIG.max_summary_messages);
+      const summaryText =
+        list.length > 0
+          ? `Tóm tắt nhanh ${list.length} tin nhắn gần đây trong hội thoại (chế độ demo).`
+          : "Không có tin nhắn chưa đọc nào cần tóm tắt.";
+      for (const fn of DEMO_AI_SUMMARY_LISTENERS) {
+        try {
+          fn({ thread_id: threadId, delta: summaryText });
+        } catch {
+          // Ignore demo listener error
+        }
+      }
+      return {
+        summary: summaryText,
+        bullet_points: list
+          .slice(-3)
+          .map((m) => `${m.sender_name}: ${(m.text || m.attachment_name || "").slice(0, 80)}`),
+        action_items: list.length > 0 ? ["Xem lại tin nhắn mới nhất và phản hồi khi thuận tiện."] : [],
+        message_count: list.length,
+        backend: DEMO_AI_CONFIG.backend,
+        model: DEMO_AI_CONFIG.gemini_model,
+      };
+    }
+    return invoke<AiSummaryDto>("ai_summarize_unread", { threadId });
+  },
+  async aiTranslateText(text: string, targetLang: string): Promise<string> {
+    if (!isTauri()) {
+      return `[AI Demo -> ${targetLang}] ${text}`;
+    }
+    return invoke<string>("ai_translate_text", { text, targetLang });
+  },
+  async onAiStreamDelta(handler: (ev: AiStreamDeltaEvent) => void): Promise<() => void> {
+    if (!isTauri()) {
+      DEMO_AI_STREAM_LISTENERS.add(handler);
+      return () => {
+        DEMO_AI_STREAM_LISTENERS.delete(handler);
+      };
+    }
+    return listen<AiStreamDeltaEvent>("core://ai-stream-delta", (event) => {
+      handler(event.payload);
+    });
+  },
+  async onAiSummaryDelta(handler: (ev: AiSummaryDeltaEvent) => void): Promise<() => void> {
+    if (!isTauri()) {
+      DEMO_AI_SUMMARY_LISTENERS.add(handler);
+      return () => {
+        DEMO_AI_SUMMARY_LISTENERS.delete(handler);
+      };
+    }
+    return listen<AiSummaryDeltaEvent>("core://ai-summary-delta", (event) => {
+      handler(event.payload);
+    });
+  },
+
+  // ==================== Item #2: Scheduled Messages ====================
+  async scheduleList(statusFilter?: string, limit?: number): Promise<ScheduledMessageDto[]> {
+    if (!isTauri()) {
+      let items = DEMO_SCHEDULES;
+      if (statusFilter && statusFilter !== "all") {
+        const wanted = new Set(statusFilter.split(",").map((s) => s.trim()));
+        items = items.filter((it) => wanted.has(it.status));
+      }
+      return (limit ? items.slice(0, limit) : items).map((it) => ({ ...it }));
+    }
+    return invoke<ScheduledMessageDto[]>("schedule_list", {
+      statusFilter: statusFilter ?? null,
+      limit: limit ?? null,
+    });
+  },
+  async scheduleCreate(input: CreateScheduledMessageInput): Promise<ScheduledMessageDto> {
+    const payload = {
+      thread_id: input.thread_id,
+      thread_title: input.thread_title,
+      thread_kind: input.thread_kind,
+      text: input.text,
+      attachment_path: input.attachment_path ?? "",
+      send_at_ts: input.send_at_ts,
+      recurrence: input.recurrence,
+      misfire_policy: input.misfire_policy,
+      misfire_grace_secs: input.misfire_grace_secs ?? 600,
+    };
+    if (!isTauri()) {
+      const now = Date.now();
+      const created: ScheduledMessageDto = {
+        id: `demo-sched-${now}-${Math.random().toString(36).slice(2, 6)}`,
+        thread_id: payload.thread_id,
+        thread_title: payload.thread_title || payload.thread_id,
+        thread_kind: payload.thread_kind,
+        text: payload.text,
+        attachment_path: payload.attachment_path,
+        send_at_ts: payload.send_at_ts,
+        recurrence: payload.recurrence,
+        misfire_policy: payload.misfire_policy,
+        misfire_grace_secs: payload.misfire_grace_secs,
+        status: "pending",
+        retry_count: 0,
+        last_error: "",
+        created_at: now,
+        updated_at: now,
+        sent_at_ts: 0,
+      };
+      DEMO_SCHEDULES = [created, ...DEMO_SCHEDULES];
+      emitDemoScheduleUpdated(created);
+      return { ...created };
+    }
+    return invoke<ScheduledMessageDto>("schedule_create", { input: payload });
+  },
+  async scheduleUpdate(
+    id: string,
+    input: UpdateScheduledMessageInput,
+  ): Promise<ScheduledMessageDto | null> {
+    if (!isTauri()) {
+      const idx = DEMO_SCHEDULES.findIndex((s) => s.id === id);
+      if (idx < 0) return null;
+      const updated: ScheduledMessageDto = {
+        ...DEMO_SCHEDULES[idx],
+        ...(input.thread_title !== undefined ? { thread_title: input.thread_title } : {}),
+        ...(input.thread_kind !== undefined ? { thread_kind: input.thread_kind } : {}),
+        ...(input.text !== undefined ? { text: input.text } : {}),
+        ...(input.attachment_path !== undefined ? { attachment_path: input.attachment_path } : {}),
+        ...(input.send_at_ts !== undefined ? { send_at_ts: input.send_at_ts } : {}),
+        ...(input.recurrence !== undefined ? { recurrence: input.recurrence } : {}),
+        ...(input.misfire_policy !== undefined ? { misfire_policy: input.misfire_policy } : {}),
+        ...(input.misfire_grace_secs !== undefined
+          ? { misfire_grace_secs: input.misfire_grace_secs }
+          : {}),
+        updated_at: Date.now(),
+      };
+      DEMO_SCHEDULES = DEMO_SCHEDULES.map((s) => (s.id === id ? updated : s));
+      emitDemoScheduleUpdated(updated);
+      return { ...updated };
+    }
+    return invoke<ScheduledMessageDto | null>("schedule_update", { id, input });
+  },
+  async scheduleCancel(id: string): Promise<boolean> {
+    if (!isTauri()) {
+      const target = DEMO_SCHEDULES.find((s) => s.id === id);
+      if (!target) return false;
+      const updated: ScheduledMessageDto = {
+        ...target,
+        status: "cancelled",
+        updated_at: Date.now(),
+      };
+      DEMO_SCHEDULES = DEMO_SCHEDULES.map((s) => (s.id === id ? updated : s));
+      emitDemoScheduleUpdated(updated);
+      return true;
+    }
+    return invoke<boolean>("schedule_cancel", { id });
+  },
+  async scheduleDelete(id: string): Promise<boolean> {
+    if (!isTauri()) {
+      const before = DEMO_SCHEDULES.length;
+      DEMO_SCHEDULES = DEMO_SCHEDULES.filter((s) => s.id !== id);
+      if (DEMO_SCHEDULES.length !== before) {
+        emitDemoScheduleUpdated(null);
+        return true;
+      }
+      return false;
+    }
+    return invoke<boolean>("schedule_delete", { id });
+  },
+  async scheduleSendNow(id: string): Promise<ScheduledMessageDto | null> {
+    if (!isTauri()) {
+      const target = DEMO_SCHEDULES.find((s) => s.id === id);
+      if (!target) return null;
+      const now = Date.now();
+      const updated: ScheduledMessageDto = {
+        ...target,
+        status: "sent",
+        sent_at_ts: now,
+        updated_at: now,
+      };
+      DEMO_SCHEDULES = DEMO_SCHEDULES.map((s) => (s.id === id ? updated : s));
+      emitDemoScheduleUpdated(updated);
+      return { ...updated };
+    }
+    return invoke<ScheduledMessageDto | null>("schedule_send_now", { id });
+  },
+  async onScheduleUpdated(
+    handler: (ev: ScheduledMessageDto | null) => void,
+  ): Promise<() => void> {
+    if (!isTauri()) {
+      DEMO_SCHEDULE_LISTENERS.add(handler);
+      return () => {
+        DEMO_SCHEDULE_LISTENERS.delete(handler);
+      };
+    }
+    return listen<ScheduledMessageDto | null>("core://schedule-updated", (event) => {
+      handler(event.payload);
+    });
+  },
+
+  // ==================== Item #3: Local Automation API ====================
+  async localApiGetConfig(): Promise<LocalApiConfigDto> {
+    if (!isTauri()) {
+      return { ...DEMO_LOCAL_API_CONFIG };
+    }
+    return invoke<LocalApiConfigDto>("local_api_get_config");
+  },
+  async localApiGetStatus(): Promise<LocalApiStatusDto> {
+    if (!isTauri()) {
+      return {
+        enabled: DEMO_LOCAL_API_CONFIG.enabled,
+        running: DEMO_LOCAL_API_CONFIG.enabled,
+        bind_addr: `127.0.0.1:${DEMO_LOCAL_API_CONFIG.port}`,
+        port: DEMO_LOCAL_API_CONFIG.port,
+        active_clients: DEMO_API_CLIENTS.filter((c) => c.enabled).length,
+      };
+    }
+    return invoke<LocalApiStatusDto>("local_api_get_status");
+  },
+  async localApiUpdateConfig(config: LocalApiConfigDto): Promise<LocalApiStatusDto> {
+    if (!isTauri()) {
+      DEMO_LOCAL_API_CONFIG = { ...config };
+      return this.localApiGetStatus();
+    }
+    return invoke<LocalApiStatusDto>("local_api_update_config", { config });
+  },
+  async localApiKillSwitch(): Promise<LocalApiStatusDto> {
+    if (!isTauri()) {
+      DEMO_LOCAL_API_CONFIG = { ...DEMO_LOCAL_API_CONFIG, enabled: false };
+      return this.localApiGetStatus();
+    }
+    return invoke<LocalApiStatusDto>("local_api_kill_switch");
+  },
+  async localApiListClients(): Promise<ApiClientDto[]> {
+    if (!isTauri()) {
+      return DEMO_API_CLIENTS.map((c) => ({ ...c }));
+    }
+    return invoke<ApiClientDto[]>("local_api_list_clients");
+  },
+  async localApiCreateClient(input: CreateApiClientInput): Promise<CreatedApiClientDto> {
+    if (!isTauri()) {
+      const now = Date.now();
+      const rawToken = `teza_demo_${Math.random().toString(36).slice(2)}${now.toString(36)}`;
+      const client: ApiClientDto = {
+        id: `demo-client-${now}`,
+        name: input.name,
+        token_prefix: rawToken.slice(0, 12),
+        scopes: [...input.scopes],
+        allowed_thread_ids: [...input.allowed_thread_ids],
+        rate_limit_per_min: input.rate_limit_per_min,
+        enabled: true,
+        created_at: now,
+        last_used_at: 0,
+      };
+      DEMO_API_CLIENTS = [client, ...DEMO_API_CLIENTS];
+      return { client: { ...client }, raw_token: rawToken };
+    }
+    return invoke<CreatedApiClientDto>("local_api_create_client", {
+      name: input.name,
+      scopes: input.scopes,
+      allowedThreadIds: input.allowed_thread_ids,
+      rateLimitPerMin: input.rate_limit_per_min,
+    });
+  },
+  async localApiUpdateClient(
+    id: string,
+    input: UpdateApiClientInput,
+  ): Promise<ApiClientDto | null> {
+    if (!isTauri()) {
+      const idx = DEMO_API_CLIENTS.findIndex((c) => c.id === id);
+      if (idx < 0) return null;
+      const updated: ApiClientDto = {
+        ...DEMO_API_CLIENTS[idx],
+        ...(typeof input.enabled === "boolean" ? { enabled: input.enabled } : {}),
+        ...(input.scopes !== undefined ? { scopes: [...input.scopes] } : {}),
+        ...(input.allowed_thread_ids !== undefined
+          ? { allowed_thread_ids: [...input.allowed_thread_ids] }
+          : {}),
+        ...(typeof input.rate_limit_per_min === "number"
+          ? { rate_limit_per_min: input.rate_limit_per_min }
+          : {}),
+      };
+      DEMO_API_CLIENTS = DEMO_API_CLIENTS.map((c) => (c.id === id ? updated : c));
+      return { ...updated };
+    }
+    return invoke<ApiClientDto | null>("local_api_update_client", {
+      id,
+      enabled: input.enabled ?? null,
+      scopes: input.scopes ?? null,
+      allowedThreadIds: input.allowed_thread_ids ?? null,
+      rateLimitPerMin: input.rate_limit_per_min ?? null,
+    });
+  },
+  async localApiDeleteClient(id: string): Promise<boolean> {
+    if (!isTauri()) {
+      const before = DEMO_API_CLIENTS.length;
+      DEMO_API_CLIENTS = DEMO_API_CLIENTS.filter((c) => c.id !== id);
+      return DEMO_API_CLIENTS.length !== before;
+    }
+    return invoke<boolean>("local_api_delete_client", { id });
+  },
+  async localApiListAuditLogs(limit?: number): Promise<ApiAuditLogDto[]> {
+    if (!isTauri()) {
+      return (limit ? DEMO_API_AUDIT_LOGS.slice(0, limit) : DEMO_API_AUDIT_LOGS).map((row) => ({
+        ...row,
+      }));
+    }
+    return invoke<ApiAuditLogDto[]>("local_api_list_audit_logs", {
+      limit: limit ?? null,
+    });
+  },
+  async localApiClearAuditLogs(): Promise<number> {
+    if (!isTauri()) {
+      const count = DEMO_API_AUDIT_LOGS.length;
+      DEMO_API_AUDIT_LOGS = [];
+      return count;
+    }
+    return invoke<number>("local_api_clear_audit_logs");
+  },
+  async onLocalApiAudit(handler: (ev: ApiAuditLogDto) => void): Promise<() => void> {
+    if (!isTauri()) {
+      DEMO_LOCAL_API_AUDIT_LISTENERS.add(handler);
+      return () => {
+        DEMO_LOCAL_API_AUDIT_LISTENERS.delete(handler);
+      };
+    }
+    return listen<ApiAuditLogDto>("core://local-api-audit", (event) => {
       handler(event.payload);
     });
   },

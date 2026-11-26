@@ -3,6 +3,9 @@
 mod call;
 mod clipboard;
 mod file_dialog;
+mod local_api;
+mod notify_popup;
+mod scheduler;
 mod screen_shake;
 mod screenshot;
 mod webapp_accounts;
@@ -12,18 +15,25 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use base64::{engine::general_purpose::STANDARD as B64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use tauri::ipc::InvokeBody;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{
-    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize,
-    State, WebviewBuilder, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, State, WebviewBuilder, WebviewUrl,
+    WindowEvent,
 };
 use tauri_plugin_updater::UpdaterExt;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 
+use zalo_core::ai::{
+    ai_chat_stream_with_relay, ai_config_file, ai_summarize_unread_with_relay,
+    ai_translate_text_with_relay, probe_gemini_cli, AiChatTurn, AiCliProbeDto, AiConfig,
+    AiConfigPublic, AiConfigUpdate, AiSummaryDto, AiSummaryInputMsg, MAX_CHAT_HISTORY_TURNS,
+};
 use zalo_core::chat::messaging;
 use zalo_core::chat::parser::{
     clean_group_id, format_thread_preview, is_raw_numeric_id, parse_ws_event, pick_str,
@@ -54,8 +64,11 @@ use zalo_core::session::{
 };
 use zalo_core::socket::{self, WsSignal};
 use zalo_core::store::{
-    CloudMediaBreakdown, MediaObjectRecord, MediaVaultStatsDto, MessageStore,
-    MEDIA_CDN_STATUS_EXPIRED, MEDIA_LOCAL_STATE_LOCAL, MEDIA_LOCAL_STATE_MISSING,
+    AiStoredMessageDto, ApiAuditLogDto, ApiClientDto, CloudMediaBreakdown, CreatedApiClientDto,
+    MediaObjectRecord, MediaVaultStatsDto, MessageMediaRecord, MessageStore,
+    NewScheduledMessageInput, ScheduledMessageDto, UpdateScheduledMessageInput,
+    MEDIA_CDN_STATUS_EXPIRED, MEDIA_CDN_STATUS_OK, MEDIA_LOCAL_STATE_LOCAL,
+    MEDIA_LOCAL_STATE_MISSING,
 };
 use zalo_core::translate::{
     classify_skip_reason, classify_skip_reason_for_mode, is_static_non_translatable,
@@ -63,6 +76,17 @@ use zalo_core::translate::{
     TranslateConfigSummary, TranslateConfigUpdate, TranslateDetectMode, TranslateInputItem,
     TranslateProvider, TranslationResult,
 };
+
+const MAX_STAGED_RAW_UPLOADS: usize = 16;
+const STAGED_RAW_UPLOAD_TTL_MS: i64 = 30 * 60 * 1000;
+
+#[derive(Debug, Clone)]
+pub struct StagedRawUpload {
+    pub path: PathBuf,
+    pub file_name: String,
+    pub bytes_written: u64,
+    pub created_ms: i64,
+}
 
 pub struct AppState {
     pub paths: StoragePaths,
@@ -79,8 +103,7 @@ pub struct AppState {
     pub pending_update: Arc<Mutex<Option<tauri_plugin_updater::Update>>>,
     pub close_to_tray: Arc<AtomicBool>,
     pub allow_exit: Arc<AtomicBool>,
-    pub pending_notify: Arc<Mutex<Option<NotifyToastPayload>>>,
-    pub notify_hide_gen: Arc<AtomicU64>,
+    pub notify_popup: notify_popup::NotifyPopupController,
     pub webapp_op_lock: Arc<Mutex<()>>,
     pub webapp_epoch: Arc<AtomicU64>,
     pub webapp_base_urls: Arc<Mutex<HashMap<String, String>>>,
@@ -88,7 +111,11 @@ pub struct AppState {
     pub webapp_accounts: Arc<Mutex<webapp_accounts::WebAppAccountStore>>,
     pub recent_saved_files: Arc<Mutex<VecDeque<PathBuf>>>,
     pub approved_attachment_paths: Arc<std::sync::Mutex<VecDeque<PathBuf>>>,
+    pub staged_raw_uploads: Arc<std::sync::Mutex<HashMap<String, StagedRawUpload>>>,
     pub call_mgr: Arc<call::CallManager>,
+    pub ai_config: Arc<Mutex<AiConfig>>,
+    pub scheduler: scheduler::SchedulerHandle,
+    pub local_api: Arc<local_api::LocalApiManager>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -396,10 +423,61 @@ async fn ensure_ws_worker(
 
 fn should_dispatch_ws_event(ev: &zalo_core::socket::WsEvent) -> bool {
     ev.is_chat_ish()
+        || ev.has_chat_message_payload()
         || ev.is_control_ish()
         || ev.is_receipt_ish()
         || zalo_core::chat::parser::is_reaction_ws_cmd(ev.cmd)
         || !zalo_core::chat::parser::extract_voip_controls(&ev.payload).is_empty()
+}
+
+fn is_direct_peer_thread_id(thread_id: &str, my_uid: &str, send2me_id: &str) -> bool {
+    let trimmed = thread_id.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with('g') || lower.starts_with("cloud_") || lower.starts_with("cloud-") {
+        return false;
+    }
+    if !my_uid.is_empty() && trimmed == my_uid {
+        return false;
+    }
+    if !send2me_id.is_empty() && trimmed == send2me_id {
+        return false;
+    }
+    true
+}
+
+fn is_raw_numeric_uid_like(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if is_raw_numeric_id(t) {
+        return true;
+    }
+    if let Some((head, tail)) = t.split_once('_') {
+        return !head.is_empty()
+            && !tail.is_empty()
+            && head.bytes().all(|b| b.is_ascii_digit())
+            && tail.bytes().all(|b| b.is_ascii_digit());
+    }
+    false
+}
+
+fn ws_message_fallback_title(msg: &MessageDto) -> Option<&str> {
+    if msg.is_outgoing {
+        return None;
+    }
+    let trimmed = msg.sender_name.trim();
+    if trimmed.is_empty()
+        || trimmed == msg.sender_id.trim()
+        || trimmed == msg.thread_id.trim()
+        || is_raw_numeric_uid_like(trimmed)
+    {
+        return None;
+    }
+    Some(trimmed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -438,6 +516,8 @@ async fn restart_ws_worker(
             .unwrap_or_default();
         let ws_name_cache = Arc::new(Mutex::new(initial_titles));
         let in_flight_uids = Arc::new(Mutex::new(std::collections::HashSet::<String>::new()));
+        let in_flight_thread_uids =
+            Arc::new(Mutex::new(std::collections::HashSet::<String>::new()));
         let mut cleared_up_to_msg_id: std::collections::HashMap<String, i64> =
             std::collections::HashMap::new();
 
@@ -496,25 +576,54 @@ async fn restart_ws_worker(
                     let active_id = active_thread_arc.lock().await.clone();
                     let main_focused = is_main_window_focused(&app);
                     let mut pending_resolve_msgs: Vec<MessageDto> = Vec::new();
+                    let mut missing_direct_thread_uids: Vec<String> = Vec::new();
                     let mut auto_cache_jobs: Vec<(String, &'static str, String, String)> =
                         Vec::new();
                     let mut orphaned_media_paths: Vec<String> = Vec::new();
                     let mut voip_events = Vec::new();
                     let mut read_synced_events: Vec<(String, bool)> = Vec::new();
                     let mut social_events: Vec<SocialWsEventDto> = Vec::new();
+                    let mut poll_updated_events: Vec<(String, Option<i64>)> = Vec::new();
+                    let mut poll_detail_refresh_jobs: Vec<(String, i64)> = Vec::new();
                     let mut self_removed_thread_ids: Vec<String> = Vec::new();
                     let mut threads_touched = false;
                     {
                         let mut store = store_arc.lock().await;
+                        let mut unresolved_direct_cache: Option<
+                            std::collections::HashSet<String>,
+                        > = None;
                         for act in actions {
                             match act {
-                                WsParsedAction::Message(msg) => {
+                                WsParsedAction::Message(mut msg) => {
                                     let is_group = store
                                         .get_thread_kind(&msg.thread_id)
                                         .ok()
                                         .flatten()
                                         == Some(ThreadKind::Group);
-                                    let _ = store.upsert_message(&msg);
+                                    let incoming_poll_sparse = parse_message_poll_dto(&msg)
+                                        .is_some_and(|p| {
+                                            p.options.is_empty()
+                                                || p.question.trim().is_empty()
+                                                || p.question.trim() == "Bình chọn"
+                                                || zalo_core::chat::parser::is_poll_activity_text(
+                                                    &p.question,
+                                                )
+                                        });
+                                    let was_updated_existing_poll =
+                                        upsert_incoming_message(&mut store, &mut msg)
+                                            .unwrap_or(false);
+                                    if was_updated_existing_poll {
+                                        let _ = app.emit("core://message-updated", &*msg);
+                                        if let Some(poll) = parse_message_poll_dto(&msg)
+                                            .filter(|p| p.poll_id > 0)
+                                        {
+                                            if poll.options.is_empty() || incoming_poll_sparse {
+                                                poll_detail_refresh_jobs
+                                                    .push((msg.thread_id.clone(), poll.poll_id));
+                                            }
+                                        }
+                                        continue;
+                                    }
                                     let preview = format_thread_preview(
                                         &msg.text,
                                         msg.is_outgoing,
@@ -537,15 +646,45 @@ async fn restart_ws_worker(
                                             main_focused,
                                         )
                                     };
+                                    let fallback_title = ws_message_fallback_title(&msg);
                                     let created = store
-                                        .update_thread_preview_returning_created(
+                                        .update_thread_preview_with_fallback_meta(
                                             &msg.thread_id,
                                             &preview,
                                             msg.ts,
                                             inc_unread,
                                             clear_unread,
+                                            fallback_title,
+                                            None,
                                         )
                                         .unwrap_or(false);
+                                    if !is_group
+                                        && is_direct_peer_thread_id(
+                                            &msg.thread_id,
+                                            &my_uid,
+                                            &send2me_id,
+                                        )
+                                    {
+                                        let needs_profile = created || {
+                                            let set = unresolved_direct_cache.get_or_insert_with(
+                                                || {
+                                                    store
+                                                        .list_unresolved_direct_thread_ids(500)
+                                                        .unwrap_or_default()
+                                                        .into_iter()
+                                                        .collect()
+                                                },
+                                            );
+                                            set.contains(&msg.thread_id)
+                                        };
+                                        if needs_profile
+                                            && !missing_direct_thread_uids
+                                                .iter()
+                                                .any(|u| u == &msg.thread_id)
+                                        {
+                                            missing_direct_thread_uids.push(msg.thread_id.clone());
+                                        }
+                                    }
                                     if already_cleared {
                                         let _ = store.advance_last_read_in_ts(
                                             &msg.thread_id,
@@ -672,6 +811,9 @@ async fn restart_ws_worker(
                                         self_removed,
                                     });
                                 }
+                                WsParsedAction::PollUpdated { thread_id, poll_id } => {
+                                    poll_updated_events.push((thread_id, poll_id));
+                                }
                             }
                         }
                     }
@@ -733,48 +875,145 @@ async fn restart_ws_worker(
                     for social_ev in social_events {
                         let _ = app.emit("core://social-event", &social_ev);
                     }
+                    let mut refreshed_poll_ids = std::collections::HashSet::<i64>::new();
+                    for (thread_id, poll_id) in poll_updated_events {
+                        let _ = app.emit(
+                            "core://poll-updated",
+                            serde_json::json!({
+                                "thread_id": thread_id,
+                                "poll_id": poll_id,
+                            }),
+                        );
+                        if let Some(pid) = poll_id.filter(|&id| id > 0) {
+                            if refreshed_poll_ids.insert(pid) {
+                                poll_detail_refresh_jobs.push((thread_id, pid));
+                            }
+                        }
+                    }
+                    if !poll_detail_refresh_jobs.is_empty() {
+                        let sess_bg_opt = {
+                            let sess = sess_arc_for_ws.lock().await;
+                            if sess.is_authenticated() {
+                                Some(sess.clone_shallow())
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(sess_base) = sess_bg_opt {
+                            let mut seen_refresh = std::collections::HashSet::<i64>::new();
+                            for (tid_bg, pid) in poll_detail_refresh_jobs {
+                                if pid <= 0 || !seen_refresh.insert(pid) {
+                                    continue;
+                                }
+                                let sess_bg = sess_base.clone_shallow();
+                                let app_bg = app.clone();
+                                let store_bg = store_arc.clone();
+                                tokio::spawn(async move {
+                                    if let Ok(poll) = threads::get_poll_detail(&sess_bg, pid).await
+                                    {
+                                        let tid_opt =
+                                            (!tid_bg.trim().is_empty()).then_some(tid_bg.as_str());
+                                        let _ = update_local_poll_message(
+                                            &app_bg,
+                                            &store_bg,
+                                            tid_opt,
+                                            None,
+                                            &poll,
+                                        )
+                                        .await;
+                                    }
+                                });
+                            }
+                        }
+                    }
                     if threads_touched {
                         let _ = app.emit("core://threads-updated", ());
                     }
-                    if !missing_uids.is_empty() {
+                    let mut direct_uids_to_fetch: Vec<String> = Vec::new();
+                    if !missing_direct_thread_uids.is_empty() {
+                        let mut inflight_t = in_flight_thread_uids.lock().await;
+                        for uid in missing_direct_thread_uids {
+                            if inflight_t.insert(uid.clone()) {
+                                direct_uids_to_fetch.push(uid);
+                            }
+                        }
+                    }
+                    if !missing_uids.is_empty() || !direct_uids_to_fetch.is_empty() {
+                        let mut all_uids = missing_uids.clone();
+                        for uid in &direct_uids_to_fetch {
+                            if !all_uids.iter().any(|u| u == uid) {
+                                all_uids.push(uid.clone());
+                            }
+                        }
                         let app_bg = app.clone();
                         let sess_bg = sess_clone.clone_shallow();
                         let store_bg = store_arc.clone();
                         let cache_bg = ws_name_cache.clone();
                         let inflight_bg = in_flight_uids.clone();
+                        let inflight_thread_bg = in_flight_thread_uids.clone();
                         tokio::spawn(async move {
-                            let mut resolved = std::collections::HashMap::<String, String>::new();
-                            if let Ok(profiles) =
-                                threads::get_mini_profiles(&sess_bg, &missing_uids).await
-                            {
-                                for (uid, p) in profiles {
-                                    if let Some(name) = pick_str(
-                                        &p,
-                                        &["displayName", "zaloName", "name", "display_name"],
-                                    ) {
-                                        resolved.insert(uid, name);
-                                    }
-                                }
-                            }
+                            let resolved =
+                                threads::hydrate_unresolved_direct_threads(&sess_bg, &all_uids)
+                                    .await;
                             if !resolved.is_empty() {
                                 {
                                     let mut cache = cache_bg.lock().await;
-                                    for (k, v) in &resolved {
-                                        cache.insert(k.clone(), v.clone());
+                                    for (k, (name, _avatar)) in &resolved {
+                                        if !name.trim().is_empty() && !is_raw_numeric_uid_like(name)
+                                        {
+                                            cache.insert(k.clone(), name.clone());
+                                        }
                                     }
                                 }
-                                let mut store = store_bg.lock().await;
-                                for mut msg in pending_resolve_msgs {
-                                    if let Some(name) = resolved.get(&msg.sender_id) {
-                                        msg.sender_name = name.clone();
-                                        let _ = store.upsert_message(&msg);
-                                        let _ = app_bg.emit("core://message-updated", &msg);
+                                let mut thread_meta_changed = false;
+                                {
+                                    let mut store = store_bg.lock().await;
+                                    for mut msg in pending_resolve_msgs {
+                                        let found = resolved.get(&msg.sender_id).or_else(|| {
+                                            msg.sender_id
+                                                .split('_')
+                                                .next()
+                                                .and_then(|bare| resolved.get(bare))
+                                        });
+                                        if let Some((name, _)) = found {
+                                            if !name.trim().is_empty() {
+                                                msg.sender_name = name.clone();
+                                                let _ = upsert_incoming_message(&mut store, &mut msg);
+                                                let _ = app_bg.emit("core://message-updated", &msg);
+                                            }
+                                        }
                                     }
+                                    for uid in &direct_uids_to_fetch {
+                                        let found = resolved.get(uid).or_else(|| {
+                                            uid.split('_')
+                                                .next()
+                                                .and_then(|bare| resolved.get(bare))
+                                        });
+                                        if let Some((name, avatar)) = found {
+                                            if store
+                                                .upsert_thread_profile_meta(uid, name, avatar)
+                                                .unwrap_or(false)
+                                            {
+                                                thread_meta_changed = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                if thread_meta_changed {
+                                    let _ = app_bg.emit("core://threads-updated", ());
                                 }
                             }
-                            let mut inflight = inflight_bg.lock().await;
-                            for uid in &missing_uids {
-                                inflight.remove(uid);
+                            if !missing_uids.is_empty() {
+                                let mut inflight = inflight_bg.lock().await;
+                                for uid in &missing_uids {
+                                    inflight.remove(uid);
+                                }
+                            }
+                            if !direct_uids_to_fetch.is_empty() {
+                                let mut inflight_t = inflight_thread_bg.lock().await;
+                                for uid in &direct_uids_to_fetch {
+                                    inflight_t.remove(uid);
+                                }
                             }
                         });
                     }
@@ -905,6 +1144,7 @@ async fn auth_start_qr(
     let ws_task_arc = state.ws_task.clone();
     let active_thread_arc = state.active_thread_id.clone();
     let call_mgr_arc = state.call_mgr.clone();
+    let scheduler_for_qr = state.scheduler.clone();
     let paths = state.paths.clone();
 
     let handle = tokio::spawn(async move {
@@ -942,9 +1182,11 @@ async fn auth_start_qr(
                     prev_vault.flush_access_touches(&store_arc).await;
                     let db_path = paths.history_db(Some(&profile.uid));
                     if let Ok(new_store) = MessageStore::open(&db_path) {
+                        let _ = new_store.recover_stuck_sending_schedules(chrono_now_ms());
                         let mut guard = store_arc.lock().await;
                         *guard = new_store;
                     }
+                    scheduler_for_qr.notify_changed();
                     rebind_media_vault_unlocked(&media_vault_arc, &paths, Some(&profile.uid)).await;
                     gdrive_arc
                         .rebind_for_uid_and_emit(
@@ -1012,6 +1254,7 @@ async fn auth_logout(app: AppHandle, state: State<'_, AppState>) -> Result<(), S
         let mut store = state.store.lock().await;
         *store = anon_store;
     }
+    state.scheduler.notify_changed();
     rebind_media_vault_unlocked(&state.media_vault, &state.paths, None).await;
     state
         .gdrive
@@ -1044,16 +1287,57 @@ async fn threads_sync(
             return Err(format!("Đồng bộ danh bạ lỗi: {e}"));
         }
     };
-    let store = state.store.lock().await;
-    for t in &remote.threads {
-        let remote_read_authoritative = remote.is_remote_read_authoritative(&t.id);
-        let _ = store.upsert_thread_synced_with_read_state(
-            t,
-            remote.pinned_synced,
-            remote_read_authoritative,
-        );
+    let unresolved = {
+        let store = state.store.lock().await;
+        for t in &remote.threads {
+            let remote_read_authoritative = remote.is_remote_read_authoritative(&t.id);
+            let _ = store.upsert_thread_synced_with_read_state(
+                t,
+                remote.pinned_synced,
+                remote_read_authoritative,
+            );
+        }
+        store
+            .list_unresolved_direct_thread_ids(60)
+            .unwrap_or_default()
+    };
+    if !unresolved.is_empty() && sess_snapshot.is_authenticated() {
+        let resolved =
+            threads::hydrate_unresolved_direct_threads(&sess_snapshot, &unresolved).await;
+        if !resolved.is_empty() {
+            let store = state.store.lock().await;
+            for uid in &unresolved {
+                let found = resolved.get(uid).or_else(|| {
+                    uid.split('_')
+                        .next()
+                        .and_then(|bare| resolved.get(bare))
+                });
+                if let Some((name, avatar)) = found {
+                    let _ = store.upsert_thread_profile_meta(uid, name, avatar);
+                }
+            }
+        }
     }
+    let store = state.store.lock().await;
     store.list_threads(folder).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn thread_ensure_direct(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    title: String,
+    avatar: Option<String>,
+) -> Result<ThreadDto, String> {
+    let thread = {
+        let store = state.store.lock().await;
+        store
+            .ensure_direct_thread(&thread_id, &title, avatar.as_deref().unwrap_or(""))
+            .map_err(|e| e.to_string())?
+    };
+    let _ = app.emit("core://threads-updated", ());
+    Ok(thread)
 }
 
 #[tauri::command]
@@ -1278,127 +1562,7 @@ async fn notify_show_popup(
     state: State<'_, AppState>,
     payload: NotifyToastPayload,
 ) -> Result<(), String> {
-    *state.pending_notify.lock().await = Some(payload.clone());
-
-    let target_mon = app
-        .get_window("main")
-        .filter(|m| m.is_visible().unwrap_or(false) && !m.is_minimized().unwrap_or(false))
-        .and_then(|m| m.current_monitor().ok().flatten())
-        .or_else(|| app.primary_monitor().ok().flatten());
-
-    let (work_x, work_y, work_w, work_h, scale) = target_mon
-        .map(|mon| {
-            let work = mon.work_area();
-            (
-                work.position.x,
-                work.position.y,
-                work.size.width,
-                work.size.height,
-                mon.scale_factor().max(0.5),
-            )
-        })
-        .unwrap_or((0, 0, 1920, 1040, 1.0));
-
-    let (logical_w, logical_h) = compute_toast_logical_size(&payload.body);
-    let pw = ((logical_w * scale).round() as u32).clamp(1, work_w.max(1));
-    let ph = ((logical_h * scale).round() as u32).clamp(1, work_h.max(1));
-    let (est_x, est_y) = compute_notify_position_for_size(
-        work_x,
-        work_y,
-        work_w,
-        work_h,
-        pw,
-        ph,
-        scale,
-        &payload.position,
-    );
-
-    let win = if let Some(existing) = app.get_webview_window("teza-notify") {
-        existing
-    } else {
-        WebviewWindowBuilder::new(
-            &app,
-            "teza-notify",
-            WebviewUrl::App("index.html?view=notify".into()),
-        )
-        .title("Teza Notification")
-        .inner_size(logical_w, logical_h)
-        .position(est_x as f64 / scale, est_y as f64 / scale)
-        .resizable(false)
-        .decorations(false)
-        .shadow(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .focused(false)
-        .visible(false)
-        .build()
-        .map_err(|e| e.to_string())?
-    };
-
-    let gen = state.notify_hide_gen.fetch_add(1, Ordering::SeqCst) + 1;
-    let _ = win.set_shadow(false);
-    // Move to the target monitor first so DPI and outer_size reflect the destination monitor.
-    let _ = win.set_position(PhysicalPosition::new(est_x, est_y));
-    let _ = win.set_size(PhysicalSize::new(pw, ph));
-    let (actual_w, actual_h) = win
-        .outer_size()
-        .ok()
-        .filter(|s| s.width > 0 && s.height > 0)
-        .map(|s| (s.width, s.height))
-        .unwrap_or((pw, ph));
-    let (px, py) = compute_notify_position_for_size(
-        work_x,
-        work_y,
-        work_w,
-        work_h,
-        actual_w,
-        actual_h,
-        scale,
-        &payload.position,
-    );
-    let _ = win.set_position(PhysicalPosition::new(px, py));
-    let _ = app.emit_to("teza-notify", "core://notify-payload", &payload);
-    let _ = win.show();
-
-    if payload.is_buzz && payload.buzz_streak < 3 {
-        let gen_shake = state.notify_hide_gen.clone();
-        let app_shake = app.clone();
-        let max_x = work_x + (work_w as i32 - actual_w as i32).max(0);
-        let max_y = work_y + (work_h as i32 - actual_h as i32).max(0);
-        let offsets = compute_notify_shake_offsets(scale);
-        tokio::spawn(async move {
-            for (dx, dy) in offsets {
-                if gen_shake.load(Ordering::SeqCst) != gen {
-                    return;
-                }
-                if let Some(w) = app_shake.get_webview_window("teza-notify") {
-                    let sx = (px + dx).clamp(work_x, max_x);
-                    let sy = (py + dy).clamp(work_y, max_y);
-                    let _ = w.set_position(PhysicalPosition::new(sx, sy));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(28)).await;
-            }
-            if gen_shake.load(Ordering::SeqCst) == gen {
-                if let Some(w) = app_shake.get_webview_window("teza-notify") {
-                    let _ = w.set_position(PhysicalPosition::new(px, py));
-                }
-            }
-        });
-    }
-
-    let gen_arc = state.notify_hide_gen.clone();
-    let app_hide = app.clone();
-    let ms = payload.duration_ms.clamp(2500, 15000);
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-        if gen_arc.load(Ordering::SeqCst) == gen {
-            if let Some(w) = app_hide.get_webview_window("teza-notify") {
-                let _ = w.hide();
-            }
-        }
-    });
-
-    Ok(())
+    state.notify_popup.show_popup(&app, payload).await
 }
 
 #[tauri::command]
@@ -1408,16 +1572,12 @@ async fn buzz_shake_screen() -> Result<(), String> {
 
 #[tauri::command]
 async fn notify_get_current(state: State<'_, AppState>) -> Result<Option<NotifyToastPayload>, String> {
-    Ok(state.pending_notify.lock().await.clone())
+    Ok(state.notify_popup.get_current().await)
 }
 
 #[tauri::command]
 async fn notify_dismiss(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    state.notify_hide_gen.fetch_add(1, Ordering::SeqCst);
-    if let Some(w) = app.get_webview_window("teza-notify") {
-        let _ = w.hide();
-    }
-    Ok(())
+    state.notify_popup.dismiss_popup(&app).await
 }
 
 #[tauri::command]
@@ -1426,17 +1586,7 @@ async fn notify_click(
     state: State<'_, AppState>,
     thread_id: String,
 ) -> Result<(), String> {
-    state.notify_hide_gen.fetch_add(1, Ordering::SeqCst);
-    if let Some(w) = app.get_webview_window("teza-notify") {
-        let _ = w.hide();
-    }
-    if let Some(main_win) = app.get_window("main") {
-        let _ = main_win.show();
-        let _ = main_win.unminimize();
-        let _ = main_win.set_focus();
-    }
-    let _ = app.emit_to("main", "core://open-thread", thread_id);
-    Ok(())
+    state.notify_popup.click_popup(&app, thread_id).await
 }
 
 #[tauri::command]
@@ -1639,16 +1789,25 @@ async fn user_get_profile(
     Ok(profile)
 }
 
+fn resolve_phone_country_code(country_code: Option<&str>) -> &str {
+    country_code
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("84")
+}
+
 #[tauri::command]
 async fn user_find_by_phone(
     state: State<'_, AppState>,
     phone: String,
+    country_code: Option<String>,
 ) -> Result<UserProfileDto, String> {
     let sess_snapshot = {
         let sess = state.session.lock().await;
         sess.clone_shallow()
     };
-    threads::find_user_by_phone(&sess_snapshot, &phone)
+    let country = resolve_phone_country_code(country_code.as_deref());
+    threads::find_user_by_phone_with_country(&sess_snapshot, &phone, country)
         .await
         .map_err(|e| e.to_string())
 }
@@ -2289,30 +2448,212 @@ async fn poll_create(
             attachment_name: Some(format!("teza-poll:{poll_json}")),
         }
     };
-    persist_and_emit_sent_message(&app, &state, msg).await
+    let persist_result = {
+        let mut store = state.store.lock().await;
+        persist_created_poll_message_in_store(&mut store, msg)?
+    };
+    match persist_result {
+        PollCreatePersistResult::InsertedNew {
+            msg,
+            thread_created,
+        } => {
+            let _ = app.emit("core://message-new", &msg);
+            if thread_created {
+                let _ = app.emit("core://threads-updated", ());
+            }
+            Ok(msg)
+        }
+        PollCreatePersistResult::MergedIntoReal { msg } => {
+            let _ = app.emit("core://message-updated", &msg);
+            Ok(msg)
+        }
+    }
+}
+
+enum PollCreatePersistResult {
+    InsertedNew {
+        msg: MessageDto,
+        thread_created: bool,
+    },
+    MergedIntoReal {
+        msg: MessageDto,
+    },
+}
+
+fn persist_created_poll_message_in_store(
+    store: &mut MessageStore,
+    msg: MessageDto,
+) -> Result<PollCreatePersistResult, String> {
+    if is_synthetic_poll_msg_id(&msg.msg_id) {
+        if let Some(created_poll) = parse_message_poll_dto(&msg).filter(|p| p.poll_id > 0) {
+            if let Some(existing_real) =
+                find_local_poll_message(store, Some(&msg.thread_id), None, created_poll.poll_id)
+                    .filter(|m| !is_synthetic_poll_msg_id(&m.msg_id))
+            {
+                if let Some((merged_msg, _)) = apply_poll_update_to_store(
+                    store,
+                    Some(&existing_real.thread_id),
+                    Some(&existing_real.msg_id),
+                    &created_poll,
+                ) {
+                    return Ok(PollCreatePersistResult::MergedIntoReal { msg: merged_msg });
+                }
+            }
+        }
+    }
+    store.upsert_message(&msg).map_err(|e| e.to_string())?;
+    let preview = format_thread_preview(&msg.text, true, "", false);
+    let thread_created = store
+        .update_thread_preview_returning_created(&msg.thread_id, &preview, msg.ts, false, true)
+        .unwrap_or(false);
+    Ok(PollCreatePersistResult::InsertedNew {
+        msg,
+        thread_created,
+    })
+}
+
+fn parse_message_poll_dto(msg: &MessageDto) -> Option<PollDto> {
+    let raw = msg
+        .attachment_name
+        .as_deref()
+        .and_then(|s| s.strip_prefix("teza-poll:"))?;
+    serde_json::from_str::<PollDto>(raw).ok()
+}
+
+fn is_synthetic_poll_msg_id(msg_id: &str) -> bool {
+    msg_id.starts_with("poll-") || msg_id.starts_with("local-poll-")
+}
+
+fn real_poll_id_for_dedupe(msg: &MessageDto) -> Option<i64> {
+    if is_synthetic_poll_msg_id(&msg.msg_id) {
+        return None;
+    }
+    parse_message_poll_dto(msg)
+        .map(|p| p.poll_id)
+        .filter(|&id| id > 0)
+}
+
+fn candidate_thread_ids(thread_id: Option<&str>) -> Vec<String> {
+    let mut out = Vec::with_capacity(2);
+    if let Some(raw) = thread_id.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push(raw.to_string());
+        let bare = clean_group_id(raw);
+        if !bare.is_empty() && !out.iter().any(|t| t == bare) {
+            out.push(bare.to_string());
+        }
+    }
+    out
+}
+
+fn upsert_incoming_message(
+    store: &mut MessageStore,
+    msg: &mut MessageDto,
+) -> Result<bool, String> {
+    if let Some(poll_id) = real_poll_id_for_dedupe(msg) {
+        let (merged, was_updated_existing) = store
+            .upsert_or_merge_poll_message(&msg.thread_id, poll_id, msg)
+            .map_err(|e| e.to_string())?;
+        *msg = merged;
+        Ok(was_updated_existing)
+    } else {
+        store.upsert_message(msg).map_err(|e| e.to_string())?;
+        Ok(false)
+    }
+}
+
+fn find_local_poll_message(
+    store: &MessageStore,
+    thread_id: Option<&str>,
+    msg_id: Option<&str>,
+    poll_id: i64,
+) -> Option<MessageDto> {
+    let mut tids = candidate_thread_ids(thread_id);
+    if tids.is_empty() && poll_id > 0 {
+        if let Ok(groups) = store.list_threads(FolderFilter::Group) {
+            tids.extend(groups.into_iter().map(|t| t.id));
+        }
+    }
+
+    if let Some(mid) = msg_id.map(str::trim).filter(|s| !s.is_empty()) {
+        for tid in &tids {
+            if let Ok(Some(msg)) = store.get_message(tid, mid) {
+                return Some(msg);
+            }
+        }
+    }
+
+    if poll_id <= 0 {
+        return None;
+    }
+
+    for tid in &tids {
+        if let Ok(msgs) = store.load_messages(tid, None, 200) {
+            let mut synthetic_match: Option<MessageDto> = None;
+            for m in msgs.into_iter().rev() {
+                if parse_message_poll_dto(&m).is_some_and(|p| p.poll_id == poll_id) {
+                    if !is_synthetic_poll_msg_id(&m.msg_id) {
+                        return Some(m);
+                    }
+                    if synthetic_match.is_none() {
+                        synthetic_match = Some(m);
+                    }
+                }
+            }
+            if let Some(syn) = synthetic_match {
+                return Some(syn);
+            }
+        }
+        for syn_id in [format!("poll-{poll_id}"), format!("local-poll-{poll_id}")] {
+            if let Ok(Some(msg)) = store.get_message(tid, &syn_id) {
+                return Some(msg);
+            }
+        }
+    }
+
+    None
+}
+
+fn apply_poll_update_to_store(
+    store: &mut MessageStore,
+    thread_id: Option<&str>,
+    msg_id: Option<&str>,
+    poll: &PollDto,
+) -> Option<(MessageDto, PollDto)> {
+    let mut msg = find_local_poll_message(store, thread_id, msg_id, poll.poll_id)?;
+    let merged = match parse_message_poll_dto(&msg) {
+        Some(existing) => threads::merge_poll_dto(&existing, poll),
+        None => poll.clone(),
+    };
+    let poll_json = serde_json::to_string(&merged).ok()?;
+    msg.msg_type = "chat.poll".to_string();
+    if (msg.text.trim().is_empty() || msg.text.trim() == "Bình chọn")
+        && !merged.question.trim().is_empty()
+        && merged.question != "Bình chọn"
+    {
+        msg.text = format!("Bình chọn: {}", merged.question);
+    }
+    msg.attachment_url = None;
+    msg.attachment_name = Some(format!("teza-poll:{poll_json}"));
+    store.upsert_message(&msg).ok()?;
+    Some((msg, merged))
 }
 
 async fn update_local_poll_message(
     app: &AppHandle,
-    state: &State<'_, AppState>,
+    store_arc: &Arc<Mutex<MessageStore>>,
     thread_id: Option<&str>,
     msg_id: Option<&str>,
     poll: &PollDto,
-) {
-    let (Some(tid), Some(mid)) = (thread_id, msg_id) else {
-        return;
+) -> Option<PollDto> {
+    let updated = {
+        let mut store = store_arc.lock().await;
+        apply_poll_update_to_store(&mut store, thread_id, msg_id, poll)
     };
-    let Ok(poll_json) = serde_json::to_string(poll) else {
-        return;
-    };
-    let mut store = state.store.lock().await;
-    if let Ok(Some(mut msg)) = store.get_message(tid, mid) {
-        msg.msg_type = "chat.poll".to_string();
-        msg.attachment_url = None;
-        msg.attachment_name = Some(format!("teza-poll:{poll_json}"));
-        if store.upsert_message(&msg).is_ok() {
-            let _ = app.emit("core://message-updated", &msg);
-        }
+    if let Some((msg, merged)) = updated {
+        let _ = app.emit("core://message-updated", &msg);
+        Some(merged)
+    } else {
+        None
     }
 }
 
@@ -2351,8 +2692,15 @@ async fn poll_get_detail(
             return Err(format!("Không tải được bình chọn: {e}"));
         }
     };
-    update_local_poll_message(&app, &state, thread_id.as_deref(), msg_id.as_deref(), &poll).await;
-    Ok(poll)
+    let merged = update_local_poll_message(
+        &app,
+        &state.store,
+        thread_id.as_deref(),
+        msg_id.as_deref(),
+        &poll,
+    )
+    .await;
+    Ok(merged.unwrap_or(poll))
 }
 
 #[tauri::command]
@@ -2391,8 +2739,124 @@ async fn poll_vote(
             return Err(format!("Bình chọn thất bại: {e}"));
         }
     };
-    update_local_poll_message(&app, &state, thread_id.as_deref(), msg_id.as_deref(), &poll).await;
-    Ok(poll)
+    let merged = update_local_poll_message(
+        &app,
+        &state.store,
+        thread_id.as_deref(),
+        msg_id.as_deref(),
+        &poll,
+    )
+    .await;
+    Ok(merged.unwrap_or(poll))
+}
+
+#[tauri::command]
+async fn poll_add_options(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    poll_id: i64,
+    new_options: Vec<String>,
+    voted_option_ids: Vec<i64>,
+    msg_id: Option<String>,
+) -> Result<PollDto, String> {
+    let clean_opts: Vec<String> = new_options
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if clean_opts.is_empty() {
+        return Err("Lựa chọn mới không được để trống".into());
+    }
+    let sess_snapshot = {
+        let sess = state.session.lock().await;
+        sess.clone_shallow()
+    };
+    if !sess_snapshot.is_authenticated() {
+        return Err("Chế độ xem trước không đồng bộ bình chọn máy chủ".into());
+    }
+    let poll = match threads::add_poll_options(
+        &sess_snapshot,
+        poll_id,
+        &clean_opts,
+        &voted_option_ids,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            if let Some(code) = expired_code(&e) {
+                let reason =
+                    format!("Phiên đăng nhập đã hết hạn (mã {code}). Vui lòng quét lại mã QR.");
+                clear_expired_session(
+                    &app,
+                    &state.session,
+                    Some(&state.ws_task),
+                    &state.paths,
+                    reason.clone(),
+                    true,
+                )
+                .await;
+                return Err(reason);
+            }
+            return Err(format!("Không thêm được lựa chọn bình chọn: {e}"));
+        }
+    };
+    let merged = update_local_poll_message(
+        &app,
+        &state.store,
+        Some(thread_id.as_str()),
+        msg_id.as_deref(),
+        &poll,
+    )
+    .await;
+    Ok(merged.unwrap_or(poll))
+}
+
+#[tauri::command]
+async fn poll_lock(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    poll_id: i64,
+    msg_id: Option<String>,
+) -> Result<PollDto, String> {
+    let sess_snapshot = {
+        let sess = state.session.lock().await;
+        sess.clone_shallow()
+    };
+    if !sess_snapshot.is_authenticated() {
+        return Err("Chế độ xem trước không đồng bộ bình chọn máy chủ".into());
+    }
+    let poll = match threads::lock_poll(&sess_snapshot, poll_id).await {
+        Ok(p) => p,
+        Err(e) => {
+            if let Some(code) = expired_code(&e) {
+                let reason =
+                    format!("Phiên đăng nhập đã hết hạn (mã {code}). Vui lòng quét lại mã QR.");
+                clear_expired_session(
+                    &app,
+                    &state.session,
+                    Some(&state.ws_task),
+                    &state.paths,
+                    reason.clone(),
+                    true,
+                )
+                .await;
+                return Err(reason);
+            }
+            return Err(format!("Không khóa được bình chọn: {e}"));
+        }
+    };
+    let merged = update_local_poll_message(
+        &app,
+        &state.store,
+        Some(thread_id.as_str()),
+        msg_id.as_deref(),
+        &poll,
+    )
+    .await;
+    Ok(merged.unwrap_or(poll))
 }
 
 struct RemoteThreadSyncCtx {
@@ -2484,7 +2948,10 @@ async fn resolve_and_upsert_remote_messages(
                 m.sender_name = name.clone();
             }
         }
-        let _ = store.upsert_message(m);
+        let _ = upsert_incoming_message(&mut store, m);
+    }
+    if kind == ThreadKind::Group || thread_id.starts_with('g') {
+        let _ = store.dedupe_duplicate_poll_messages_in_thread(thread_id);
     }
     if let Some(max_out_ts) = remote_msgs.iter().filter(|m| m.is_outgoing).map(|m| m.ts).max() {
         if max_out_ts > 0 {
@@ -2576,6 +3043,12 @@ async fn messages_load(
     let limit = limit.unwrap_or(50).clamp(1, 200);
     let mut cached = {
         let store = state.store.lock().await;
+        if before_ts.is_none()
+            && (thread_id.starts_with('g')
+                || store.get_thread_kind(&thread_id).ok().flatten() == Some(ThreadKind::Group))
+        {
+            let _ = store.dedupe_duplicate_poll_messages_in_thread(&thread_id);
+        }
         store
             .load_messages_before(&thread_id, before_ts, before_msg_id.as_deref(), limit + 1)
             .map_err(|e| e.to_string())?
@@ -2778,6 +3251,11 @@ async fn messages_load_around(
     target_ts: i64,
 ) -> Result<MessagesPageDto, String> {
     let store = state.store.lock().await;
+    if thread_id.starts_with('g')
+        || store.get_thread_kind(&thread_id).ok().flatten() == Some(ThreadKind::Group)
+    {
+        let _ = store.dedupe_duplicate_poll_messages_in_thread(&thread_id);
+    }
     let msgs = store
         .load_messages_around(&thread_id, target_ts, 25, 1000)
         .map_err(|e| e.to_string())?;
@@ -2829,7 +3307,7 @@ async fn messages_list_pinned(
                         let _ = store.set_message_pinned(&thread_id, &pm.msg_id, true);
                     } else if !pm.text.is_empty() || pm.attachment_url.is_some() {
                         pm.is_pinned = true;
-                        let _ = store.upsert_message(&pm);
+                        let _ = upsert_incoming_message(&mut store, &mut pm);
                     }
                 }
             }
@@ -2974,6 +3452,561 @@ async fn message_send_quote(
                 sender_name: quoted.sender_name,
                 snippet: quoted.text,
             }),
+            reactions: Vec::new(),
+            attachment_url: None,
+            attachment_name: None,
+        }
+    };
+
+    persist_and_emit_sent_message(&app, &state, msg).await
+}
+
+static FORWARD_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn effective_forward_attachment_name<'a>(
+    src_attachment_name: Option<&'a str>,
+    source_media_rec: Option<&'a MessageMediaRecord>,
+) -> Option<&'a str> {
+    src_attachment_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            source_media_rec
+                .and_then(|r| r.original_name.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            source_media_rec
+                .and_then(|r| r.sha256.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|_| "attachment.bin")
+        })
+}
+
+async fn resolve_local_vault_media_by_msg(
+    vault: &Arc<MediaVault>,
+    store: &Arc<Mutex<MessageStore>>,
+    msg_ref: Option<(&str, &str)>,
+) -> Option<MediaObjectRecord> {
+    let (tid, mid) = msg_ref?;
+    let sha = {
+        let guard = store.lock().await;
+        guard
+            .lookup_media_by_msg(tid, mid, "primary")
+            .ok()
+            .flatten()
+            .map(|obj| obj.sha256)
+    }?;
+    try_rehydrate_local_hit(vault, store, &sha).await
+}
+
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+async fn message_forward(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    source_thread_id: String,
+    source_msg_id: String,
+    target_thread_id: String,
+    fallback_text: Option<String>,
+    fallback_msg_type: Option<String>,
+    fallback_attachment_url: Option<String>,
+    fallback_attachment_name: Option<String>,
+) -> Result<MessageDto, String> {
+    let target_tid = target_thread_id.trim().to_string();
+    if target_tid.is_empty() {
+        return Err("Mã hội thoại đích không được để trống".into());
+    }
+    let src_tid = source_thread_id.trim();
+    let src_mid = source_msg_id.trim();
+
+    let (stored_src, target_kind, source_media_rec) = {
+        let store = state.store.lock().await;
+        let src = if !src_tid.is_empty() && !src_mid.is_empty() {
+            store.get_message(src_tid, src_mid).ok().flatten()
+        } else {
+            None
+        };
+        let kind = store
+            .get_thread_kind(&target_tid)
+            .ok()
+            .flatten()
+            .unwrap_or(ThreadKind::Direct);
+        let mm = if !src_tid.is_empty() && !src_mid.is_empty() {
+            store
+                .get_message_media_record(src_tid, src_mid, "primary")
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        (src, kind, mm)
+    };
+
+    let clean_fb_text = fallback_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let clean_fb_type = fallback_msg_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let clean_fb_url = fallback_attachment_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let clean_fb_name = fallback_attachment_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let src = match stored_src {
+        Some(mut m) => {
+            if m.text.trim().is_empty() {
+                if let Some(ft) = clean_fb_text {
+                    m.text = ft;
+                }
+            }
+            if m.msg_type.trim().is_empty() {
+                if let Some(fmt) = clean_fb_type {
+                    m.msg_type = fmt;
+                }
+            }
+            if m.attachment_url
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty)
+            {
+                m.attachment_url = clean_fb_url;
+            }
+            if m.attachment_name
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty)
+            {
+                m.attachment_name = clean_fb_name;
+            }
+            m
+        }
+        None => MessageDto {
+            msg_id: src_mid.to_string(),
+            cli_msg_id: None,
+            thread_id: src_tid.to_string(),
+            sender_id: String::new(),
+            sender_name: String::new(),
+            text: clean_fb_text.unwrap_or_default(),
+            msg_type: clean_fb_type.unwrap_or_else(|| "chat.text".to_string()),
+            ts: 0,
+            is_outgoing: false,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
+            reactions: Vec::new(),
+            attachment_url: clean_fb_url,
+            attachment_name: clean_fb_name,
+        },
+    };
+
+    if src.is_recalled {
+        return Err("Không thể chuyển tiếp tin nhắn đã thu hồi".into());
+    }
+
+    let sess_snapshot = {
+        let sess = state.session.lock().await;
+        sess.clone_shallow()
+    };
+
+    let mt_lower = src.msg_type.trim().to_ascii_lowercase();
+    let is_sticker = matches!(
+        mt_lower.as_str(),
+        "chat.sticker" | "sticker" | "5" | "35" | "36"
+    ) || mt_lower.contains("sticker");
+
+    // Branch A — Sticker
+    if is_sticker {
+        if let Some((cate_id, sticker_id)) = messaging::parse_sticker_ids_from_message(
+            src.attachment_name.as_deref(),
+            src.attachment_url.as_deref(),
+        ) {
+            let cid = u64::try_from(cate_id).unwrap_or(0);
+            let sid = u64::try_from(sticker_id).unwrap_or(0);
+            if sid > 0 {
+                let msg = if sess_snapshot.is_authenticated() {
+                    match messaging::send_sticker(
+                        &sess_snapshot,
+                        &target_tid,
+                        target_kind,
+                        sid,
+                        cid,
+                        1,
+                    )
+                    .await
+                    {
+                        Ok(m) => m,
+                        Err(e) => {
+                            if let Some(code) = expired_code(&e) {
+                                let reason = format!(
+                                    "Phiên đăng nhập đã hết hạn (mã {code}). Vui lòng quét lại mã QR."
+                                );
+                                clear_expired_session(
+                                    &app,
+                                    &state.session,
+                                    Some(&state.ws_task),
+                                    &state.paths,
+                                    reason.clone(),
+                                    true,
+                                )
+                                .await;
+                                return Err(reason);
+                            }
+                            return Err(format!("Chuyển tiếp nhãn dán thất bại: {e}"));
+                        }
+                    }
+                } else {
+                    let now_ms = chrono_now_ms();
+                    MessageDto {
+                        msg_id: format!("local-{now_ms}"),
+                        cli_msg_id: None,
+                        thread_id: target_tid.clone(),
+                        sender_id: "me".into(),
+                        sender_name: "Bạn".into(),
+                        text: "[Nhãn dán]".into(),
+                        msg_type: "chat.sticker".into(),
+                        ts: now_ms,
+                        is_outgoing: true,
+                        is_recalled: false,
+                        is_pinned: false,
+                        quote: None,
+                        reactions: Vec::new(),
+                        attachment_url: sticker_image_url(sid, cid)
+                            .or_else(|| src.attachment_url.clone()),
+                        attachment_name: Some(format!("sticker_{cid}_{sid}.png")),
+                    }
+                };
+                return persist_and_emit_sent_message(&app, &state, msg).await;
+            }
+        }
+        return Err("Không xác định được mã nhãn dán để chuyển tiếp".into());
+    }
+
+    // Branch B — Real Media / File Attachment
+    let forward_att_name_for_check =
+        effective_forward_attachment_name(src.attachment_name.as_deref(), source_media_rec.as_ref());
+    if messaging::is_forwardable_media_message(
+        &src.msg_type,
+        src.attachment_url.as_deref(),
+        forward_att_name_for_check,
+    ) {
+        let real_caption = messaging::extract_forward_caption(
+            &src.msg_type,
+            &src.text,
+            src.attachment_name.as_deref(),
+        );
+
+        if !sess_snapshot.is_authenticated() {
+            let file_name = forward_att_name_for_check.unwrap_or("attachment.bin");
+            let mut demo = local_demo_attachment_message(&target_tid, file_name, &real_caption);
+            if !src.msg_type.trim().is_empty() {
+                demo.msg_type = src.msg_type.clone();
+            }
+            demo.attachment_url = src.attachment_url.clone();
+            demo.attachment_name = src
+                .attachment_name
+                .clone()
+                .or_else(|| Some(file_name.to_string()));
+            return persist_and_emit_sent_message(&app, &state, demo).await;
+        }
+
+        let raw_url_opt = src
+            .attachment_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        if raw_url_opt.is_none() && source_media_rec.is_none() {
+            return Err("Không tìm thấy tệp phương tiện gốc để chuyển tiếp".into());
+        }
+
+        let (effective_url, unwrapped_tid, unwrapped_mid) = match raw_url_opt {
+            Some(raw_url) => unwrap_teza_media_url(raw_url)?,
+            None => (String::new(), None, None),
+        };
+        let msg_ref_owned = if !src_tid.is_empty() && !src_mid.is_empty() {
+            Some((src_tid.to_string(), src_mid.to_string()))
+        } else {
+            match (unwrapped_tid, unwrapped_mid) {
+                (Some(t), Some(m)) => Some((t, m)),
+                _ => None,
+            }
+        };
+
+        let raw_att_name = forward_att_name_for_check.unwrap_or("");
+        let kind_hint = {
+            let from_att = infer_media_kind_for_attachment(raw_att_name, &src.msg_type);
+            if from_att != "file" || effective_url.is_empty() {
+                from_att
+            } else {
+                infer_media_kind_for_download(raw_att_name, &effective_url)
+            }
+        };
+
+        let vault = state.media_vault.read().await.clone();
+        let msg_ref_borrowed = msg_ref_owned
+            .as_ref()
+            .map(|(tid, mid)| (tid.as_str(), mid.as_str()));
+        let obj = if let Some(local_obj) =
+            resolve_local_vault_media_by_msg(&vault, &state.store, msg_ref_borrowed).await
+        {
+            local_obj
+        } else if effective_url.is_empty() {
+            let candidate =
+                lookup_cloud_candidate(&state.store, "", kind_hint, msg_ref_borrowed).await;
+            let relay_enabled = state.relay_cfg.lock().await.enabled;
+            if let Some(cand) = candidate {
+                if !relay_enabled && state.gdrive.is_connected_and_unlocked().await {
+                    rehydrate_cloud_object(
+                        Some(&app),
+                        &vault,
+                        &state.store,
+                        &state.gdrive,
+                        &state.relay_cfg,
+                        &cand,
+                        "",
+                        kind_hint,
+                        msg_ref_borrowed,
+                    )
+                    .await
+                    .map_err(|e| {
+                        format!("Không tải được phương tiện từ kho đám mây để chuyển tiếp: {e}")
+                    })?
+                } else {
+                    return Err("Không tìm thấy tệp phương tiện gốc để chuyển tiếp".into());
+                }
+            } else {
+                return Err("Không tìm thấy tệp phương tiện gốc để chuyển tiếp".into());
+            }
+        } else {
+            resolve_media_with_tier2_gdrive(
+                Some(&app),
+                &vault,
+                &sess_snapshot,
+                &state.store,
+                &state.gdrive,
+                &state.relay_cfg,
+                &effective_url,
+                kind_hint,
+                msg_ref_borrowed,
+                |_, _| {},
+            )
+            .await
+            .map_err(|e| format!("Không tải được phương tiện để chuyển tiếp: {e}"))?
+        };
+        messaging::validate_attachment_size(obj.size_bytes).map_err(|e| e.to_string())?;
+
+        let cd_name = if let Some(name) = source_media_rec
+            .as_ref()
+            .and_then(|r| r.original_name.clone())
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(name)
+        } else {
+            let store = state.store.lock().await;
+            let from_msg = msg_ref_owned.as_ref().and_then(|(tid, mid)| {
+                store
+                    .get_message_media_record(tid, mid, "primary")
+                    .ok()
+                    .flatten()
+                    .and_then(|rec| rec.original_name)
+                    .filter(|s| !s.trim().is_empty())
+            });
+            from_msg.or_else(|| {
+                if effective_url.is_empty() {
+                    return None;
+                }
+                let url_hash = MediaVault::sha256_url(&effective_url);
+                store
+                    .get_message_media_record("__url__", &url_hash, "primary")
+                    .ok()
+                    .flatten()
+                    .and_then(|rec| rec.original_name)
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| {
+                        store
+                            .find_media_original_name_by_hash(&url_hash)
+                            .ok()
+                            .flatten()
+                    })
+            })
+        };
+
+        let effective_mime = if zalo_core::media_vault::is_generic_mime(&obj.mime) {
+            vault
+                .sniff_cached_mime(&obj)
+                .await
+                .map(str::to_string)
+                .unwrap_or_else(|| obj.mime.clone())
+        } else {
+            obj.mime.clone()
+        };
+        let probe_bytes = read_vault_probe_bytes(&vault, &obj).await;
+        let suggested_name = src
+            .attachment_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(match kind_hint {
+                "image" => "image",
+                "video" => "video",
+                "audio" => "voice",
+                _ => "attachment",
+            });
+        let (resolved_name, _resolved_ext) = file_dialog::resolve_download_filename_and_ext(
+            suggested_name,
+            cd_name.as_deref(),
+            &effective_url,
+            &effective_url,
+            &effective_mime,
+            &probe_bytes,
+        );
+
+        let tmp_dir = state.paths.root.join("tmp_forward");
+        zalo_core::data_dir::ensure_private_dir(&tmp_dir)
+            .map_err(|e| format!("Không tạo được thư mục tạm chuyển tiếp: {e}"))?;
+        let seq = FORWARD_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = tmp_dir.join(format!(
+            "fwd-{}-{}-{seq}.bin",
+            std::process::id(),
+            chrono_now_ms()
+        ));
+        let tmp_guard = TempFileGuard::new(tmp_path);
+
+        vault
+            .export_to_path(&obj, tmp_guard.path())
+            .await
+            .map_err(|e| format!("Không xuất được phương tiện từ kho cục bộ: {e}"))?;
+
+        let is_photo_or_gif = matches!(
+            mt_lower.as_str(),
+            "chat.photo" | "photo" | "2" | "chat.gif" | "gif"
+        );
+        let force_image = if is_photo_or_gif && messaging::is_image_extension(&resolved_name) {
+            Some(true)
+        } else {
+            None
+        };
+
+        let msg = match messaging::send_attachment_file_named(
+            &sess_snapshot,
+            &target_tid,
+            target_kind,
+            tmp_guard.path(),
+            &resolved_name,
+            &real_caption,
+            force_image,
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                if let Some(code) = expired_code(&e) {
+                    let reason = format!(
+                        "Phiên đăng nhập đã hết hạn (mã {code}). Vui lòng quét lại mã QR."
+                    );
+                    clear_expired_session(
+                        &app,
+                        &state.session,
+                        Some(&state.ws_task),
+                        &state.paths,
+                        reason.clone(),
+                        true,
+                    )
+                    .await;
+                    return Err(reason);
+                }
+                return Err(format!("Chuyển tiếp tệp thất bại: {e}"));
+            }
+        };
+
+        let _ = tokio::fs::remove_file(tmp_guard.path()).await;
+        drop(tmp_guard);
+
+        let saved = persist_and_emit_sent_message(&app, &state, msg).await?;
+        {
+            let store = state.store.lock().await;
+            let url_hash = saved
+                .attachment_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(MediaVault::sha256_url)
+                .unwrap_or_default();
+            let _ = store.link_message_media(&MessageMediaRecord {
+                thread_id: saved.thread_id.clone(),
+                msg_id: saved.msg_id.clone(),
+                variant: "primary".to_string(),
+                url_hash,
+                sha256: Some(obj.sha256.clone()),
+                original_name: Some(resolved_name),
+                saved_user_path: None,
+                cdn_status: MEDIA_CDN_STATUS_OK,
+                updated_ts: chrono_now_ms(),
+            });
+        }
+        if obj.cloud_file_id.is_none() {
+            state.gdrive.notify_sync();
+        }
+        return Ok(saved);
+    }
+
+    // Branch C — Text / Links / Cards (never append CDN thumbnail URLs)
+    let forward_text = src.text.trim();
+    if forward_text.is_empty() {
+        return Err("Tin nhắn không có nội dung để chuyển tiếp".into());
+    }
+
+    let msg = if sess_snapshot.is_authenticated() {
+        match messaging::send_text(&sess_snapshot, &target_tid, target_kind, forward_text).await {
+            Ok(m) => m,
+            Err(e) => {
+                if let Some(code) = expired_code(&e) {
+                    let reason = format!(
+                        "Phiên đăng nhập đã hết hạn (mã {code}). Vui lòng quét lại mã QR."
+                    );
+                    clear_expired_session(
+                        &app,
+                        &state.session,
+                        Some(&state.ws_task),
+                        &state.paths,
+                        reason.clone(),
+                        true,
+                    )
+                    .await;
+                    return Err(reason);
+                }
+                return Err(format!("Chuyển tiếp tin nhắn thất bại: {e}"));
+            }
+        }
+    } else {
+        let now_ms = chrono_now_ms();
+        MessageDto {
+            msg_id: format!("local-{now_ms}"),
+            cli_msg_id: None,
+            thread_id: target_tid,
+            sender_id: "me".into(),
+            sender_name: "Bạn".into(),
+            text: forward_text.to_string(),
+            msg_type: "chat.text".into(),
+            ts: now_ms,
+            is_outgoing: true,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
             reactions: Vec::new(),
             attachment_url: None,
             attachment_name: None,
@@ -3533,7 +4566,7 @@ async fn save_remote_file(
             s.to_string()
         }
     };
-    let msg_ref_owned = match (
+    let mut msg_ref_owned = match (
         thread_id
             .as_deref()
             .map(str::trim)
@@ -3622,12 +4655,36 @@ async fn save_remote_file(
             resolved_ext,
         )
     } else {
+        let (effective_url, unwrapped_tid, unwrapped_mid) = match unwrap_teza_media_url(trimmed) {
+            Ok(v) => v,
+            Err(msg) => {
+                emit_download_progress(
+                    &app,
+                    DownloadProgressPayload {
+                        id: dl_id,
+                        file_name: initial_name,
+                        stage: "error".to_string(),
+                        downloaded_bytes: 0,
+                        total_bytes: None,
+                        saved_path: None,
+                        can_open_directly: false,
+                        error: Some(msg.clone()),
+                    },
+                );
+                return Err(msg);
+            }
+        };
+        if msg_ref_owned.is_none() {
+            if let (Some(tid), Some(mid)) = (unwrapped_tid, unwrapped_mid) {
+                msg_ref_owned = Some((tid, mid));
+            }
+        }
         let vault = state.media_vault.read().await.clone();
         let sess_snapshot = {
             let sess = state.session.lock().await;
             sess.clone_shallow()
         };
-        let kind_hint = infer_media_kind_for_download(&suggested_name, &url);
+        let kind_hint = infer_media_kind_for_download(&suggested_name, &effective_url);
         let app_prog = app.clone();
         let dl_id_prog = dl_id.clone();
         let initial_name_prog = initial_name.clone();
@@ -3642,7 +4699,7 @@ async fn save_remote_file(
             &state.store,
             &state.gdrive,
             &state.relay_cfg,
-            &url,
+            &effective_url,
             kind_hint,
             msg_ref_borrowed,
             move |bytes, total| {
@@ -3706,14 +4763,22 @@ async fn save_remote_file(
                     .ok()
                     .flatten()
                     .and_then(|rec| rec.original_name)
+                    .filter(|s| !s.trim().is_empty())
             });
             from_msg.or_else(|| {
-                let url_hash = MediaVault::sha256_url(&url);
+                let url_hash = MediaVault::sha256_url(&effective_url);
                 store
                     .get_message_media_record("__url__", &url_hash, "primary")
                     .ok()
                     .flatten()
                     .and_then(|rec| rec.original_name)
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| {
+                        store
+                            .find_media_original_name_by_hash(&url_hash)
+                            .ok()
+                            .flatten()
+                    })
             })
         };
 
@@ -3721,8 +4786,8 @@ async fn save_remote_file(
         let (resolved_name, resolved_ext) = file_dialog::resolve_download_filename_and_ext(
             &suggested_name,
             cd_name.as_deref(),
-            &url,
-            &url,
+            &effective_url,
+            &effective_url,
             &obj.mime,
             &probe_bytes,
         );
@@ -4112,6 +5177,164 @@ async fn message_send_attachment_path(
     Ok(saved)
 }
 
+static STAGED_UPLOAD_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn sanitize_staged_upload_filename(raw: &str) -> String {
+    let seg = raw
+        .trim()
+        .rsplit(['/', '\\'])
+        .find(|part| !part.trim().is_empty())
+        .unwrap_or("");
+    let cleaned: String = seg
+        .chars()
+        .filter(|c| !c.is_control() && *c != '\0')
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        "clipboard.png".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn prune_staged_raw_uploads(
+    map: &mut HashMap<String, StagedRawUpload>,
+    now_ms: i64,
+    reserve_slot: bool,
+) -> Vec<PathBuf> {
+    let mut evicted = Vec::new();
+    let expired_keys: Vec<String> = map
+        .iter()
+        .filter(|(_, entry)| now_ms.saturating_sub(entry.created_ms) > STAGED_RAW_UPLOAD_TTL_MS)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for key in expired_keys {
+        if let Some(removed) = map.remove(&key) {
+            evicted.push(removed.path);
+        }
+    }
+    let limit = if reserve_slot {
+        MAX_STAGED_RAW_UPLOADS.saturating_sub(1)
+    } else {
+        MAX_STAGED_RAW_UPLOADS
+    };
+    while map.len() > limit {
+        let Some(oldest_key) = map
+            .iter()
+            .min_by_key(|(_, entry)| entry.created_ms)
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        if let Some(removed) = map.remove(&oldest_key) {
+            evicted.push(removed.path);
+        }
+    }
+    evicted
+}
+
+async fn send_raw_bytes_attachment_inner(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    thread_id: String,
+    file_name: String,
+    caption: String,
+    bytes: Vec<u8>,
+) -> Result<MessageDto, String> {
+    let tid_trimmed = thread_id.trim().to_string();
+    if tid_trimmed.is_empty() {
+        return Err("Thiếu mã hội thoại".into());
+    }
+    if bytes.is_empty() {
+        return Err("Dữ liệu tệp đính kèm trống".into());
+    }
+    messaging::validate_attachment_size(bytes.len() as u64).map_err(|e| e.to_string())?;
+    let safe_name = sanitize_staged_upload_filename(&file_name);
+
+    let kind = {
+        let store = state.store.lock().await;
+        store
+            .get_thread_kind(&tid_trimmed)
+            .ok()
+            .flatten()
+            .unwrap_or(ThreadKind::Direct)
+    };
+    let sess_snapshot = {
+        let sess = state.session.lock().await;
+        sess.clone_shallow()
+    };
+
+    let msg = if sess_snapshot.is_authenticated() {
+        match messaging::send_attachment_bytes(
+            &sess_snapshot,
+            &tid_trimmed,
+            kind,
+            &safe_name,
+            &bytes,
+            &caption,
+        )
+        .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                if let Some(code) = expired_code(&e) {
+                    let reason = format!(
+                        "Phiên đăng nhập đã hết hạn (mã {code}). Vui lòng quét lại mã QR."
+                    );
+                    clear_expired_session(
+                        app,
+                        &state.session,
+                        Some(&state.ws_task),
+                        &state.paths,
+                        reason.clone(),
+                        true,
+                    )
+                    .await;
+                    return Err(reason);
+                }
+                return Err(format!("Gửi tệp thất bại: {e}"));
+            }
+        }
+    } else {
+        local_demo_attachment_message(&tid_trimmed, &safe_name, &caption)
+    };
+
+    let saved = persist_and_emit_sent_message(app, state, msg).await?;
+
+    let vault = state.media_vault.read().await.clone();
+    let store_arc = state.store.clone();
+    let gdrive_arc = state.gdrive.clone();
+    let media_kind = infer_media_kind_for_attachment(&safe_name, &saved.msg_type);
+    let mime = infer_mime_from_filename_and_bytes(&safe_name, Some(&bytes));
+    let url_opt = saved.attachment_url.clone();
+    let tid = saved.thread_id.clone();
+    let mid = saved.msg_id.clone();
+    let orig_name = saved
+        .attachment_name
+        .clone()
+        .or_else(|| Some(safe_name.clone()));
+    tauri::async_runtime::spawn(async move {
+        if let Ok(obj) = vault
+            .ingest_bytes(
+                &store_arc,
+                &bytes,
+                media_kind,
+                mime,
+                url_opt.as_deref(),
+                Some((tid.as_str(), mid.as_str())),
+                orig_name.as_deref(),
+            )
+            .await
+        {
+            if obj.cloud_file_id.is_none() {
+                gdrive_arc.notify_sync();
+            }
+        }
+    });
+
+    Ok(saved)
+}
+
 #[tauri::command]
 async fn message_send_raw_attachment(
     app: AppHandle,
@@ -4126,13 +5349,207 @@ async fn message_send_raw_attachment(
         .unwrap_or_else(|| "clipboard.png".to_string());
     let caption = header_value_utf8(request.headers(), "x-caption").unwrap_or_default();
 
-    let bytes = extract_invoke_body_bytes(request.body(), messaging::MAX_ATTACHMENT_BYTES as usize)?;
-    messaging::validate_attachment_size(bytes.len() as u64).map_err(|e| e.to_string())?;
+    let bytes =
+        extract_invoke_body_bytes(request.body(), messaging::MAX_ATTACHMENT_BYTES as usize)?
+            .into_owned();
+    send_raw_bytes_attachment_inner(&app, &state, thread_id, file_name, caption, bytes).await
+}
+
+#[tauri::command]
+async fn message_send_base64_attachment(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    file_name: String,
+    caption: String,
+    data_base64: String,
+) -> Result<MessageDto, String> {
+    let trimmed = data_base64.trim();
+    if trimmed.is_empty() {
+        return Err("Dữ liệu tệp đính kèm trống".into());
+    }
+    let max_b64_len = (messaging::MAX_ATTACHMENT_BYTES as usize)
+        .div_ceil(3)
+        .saturating_mul(4);
+    if trimmed.len() > max_b64_len {
+        return Err("Tệp vượt quá giới hạn kích thước cho phép".into());
+    }
+    let bytes = B64_STANDARD
+        .decode(trimmed)
+        .map_err(|e| format!("Dữ liệu tệp base64 không hợp lệ: {e}"))?;
+    if bytes.is_empty() {
+        return Err("Dữ liệu tệp đính kèm trống".into());
+    }
+    send_raw_bytes_attachment_inner(&app, &state, thread_id, file_name, caption, bytes).await
+}
+
+#[tauri::command]
+async fn raw_attachment_stage_begin(
+    state: State<'_, AppState>,
+    file_name: String,
+) -> Result<String, String> {
+    let safe_name = sanitize_staged_upload_filename(&file_name);
+    let tmp_dir = state.paths.root.join("tmp_uploads");
+    zalo_core::data_dir::ensure_private_dir(&tmp_dir)
+        .map_err(|e| format!("Không tạo được thư mục tải tệp tạm: {e}"))?;
+
+    let now_ms = chrono_now_ms();
+    let seq = STAGED_UPLOAD_SEQ.fetch_add(1, Ordering::Relaxed);
+    let upload_id = format!("up-{now_ms}-{}-{seq}", std::process::id());
+    let tmp_path = tmp_dir.join(format!("{upload_id}.part"));
+
+    tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp_path)
+        .await
+        .map_err(|e| format!("Không tạo được tệp tạm tải lên: {e}"))?;
+
+    let evicted_paths = {
+        let mut map = state
+            .staged_raw_uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let evicted = prune_staged_raw_uploads(&mut map, now_ms, true);
+        map.insert(
+            upload_id.clone(),
+            StagedRawUpload {
+                path: tmp_path,
+                file_name: safe_name,
+                bytes_written: 0,
+                created_ms: now_ms,
+            },
+        );
+        evicted
+    };
+
+    for path in evicted_paths {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    Ok(upload_id)
+}
+
+#[tauri::command]
+async fn raw_attachment_stage_chunk(
+    state: State<'_, AppState>,
+    upload_id: String,
+    chunk_base64: String,
+) -> Result<u64, String> {
+    let clean_id = upload_id.trim();
+    if clean_id.is_empty() {
+        return Err("Thiếu mã phiên tải tệp tạm".into());
+    }
+    let trimmed = chunk_base64.trim();
+    let max_b64_len = (messaging::MAX_ATTACHMENT_BYTES as usize)
+        .div_ceil(3)
+        .saturating_mul(4);
+    if trimmed.len() > max_b64_len {
+        return Err("Phần dữ liệu tệp vượt quá giới hạn kích thước cho phép".into());
+    }
+    let chunk = B64_STANDARD
+        .decode(trimmed)
+        .map_err(|e| format!("Phần dữ liệu base64 không hợp lệ: {e}"))?;
+
+    let (staged_path, current_bytes) = {
+        let map = state
+            .staged_raw_uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let entry = map
+            .get(clean_id)
+            .ok_or_else(|| "Không tìm thấy phiên tải tệp tạm".to_string())?;
+        (entry.path.clone(), entry.bytes_written)
+    };
+
+    let chunk_len = chunk.len() as u64;
+    let projected = current_bytes
+        .checked_add(chunk_len)
+        .ok_or_else(|| "Kích thước tệp vượt quá giới hạn cho phép".to_string())?;
+    if projected > messaging::MAX_ATTACHMENT_BYTES {
+        return Err("Tệp vượt quá giới hạn kích thước cho phép".into());
+    }
+
+    if chunk.is_empty() {
+        return Ok(current_bytes);
+    }
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .append(true)
+        .open(&staged_path)
+        .await
+        .map_err(|e| format!("Không mở được tệp tạm để ghi dữ liệu: {e}"))?;
+    file.write_all(&chunk)
+        .await
+        .map_err(|e| format!("Không ghi được dữ liệu tệp tạm: {e}"))?;
+    file.flush()
+        .await
+        .map_err(|e| format!("Không đồng bộ được dữ liệu tệp tạm: {e}"))?;
+    drop(file);
+
+    let (updated_total, overflow_path) = {
+        let mut map = state
+            .staged_raw_uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = map.get_mut(clean_id) else {
+            return Err("Phiên tải tệp tạm đã kết thúc hoặc bị hủy".into());
+        };
+        let next = entry.bytes_written.saturating_add(chunk_len);
+        if next > messaging::MAX_ATTACHMENT_BYTES {
+            let removed = map.remove(clean_id).map(|s| s.path);
+            (0, removed)
+        } else {
+            entry.bytes_written = next;
+            (next, None)
+        }
+    };
+
+    if let Some(path) = overflow_path {
+        let _ = tokio::fs::remove_file(path).await;
+        return Err("Tệp vượt quá giới hạn kích thước cho phép".into());
+    }
+
+    Ok(updated_total)
+}
+
+#[tauri::command]
+async fn raw_attachment_stage_send(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    upload_id: String,
+    thread_id: String,
+    caption: String,
+) -> Result<MessageDto, String> {
+    let tid_trimmed = thread_id.trim().to_string();
+    if tid_trimmed.is_empty() {
+        return Err("Thiếu mã hội thoại".into());
+    }
+    let clean_id = upload_id.trim();
+    if clean_id.is_empty() {
+        return Err("Thiếu mã phiên tải tệp tạm".into());
+    }
+
+    let staged = {
+        let mut map = state
+            .staged_raw_uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.remove(clean_id)
+            .ok_or_else(|| "Không tìm thấy phiên tải tệp tạm".to_string())?
+    };
+    let tmp_guard = TempFileGuard::new(staged.path);
+
+    if staged.bytes_written == 0 {
+        return Err("Dữ liệu tệp đính kèm trống".into());
+    }
+    messaging::validate_attachment_size(staged.bytes_written).map_err(|e| e.to_string())?;
 
     let kind = {
         let store = state.store.lock().await;
         store
-            .get_thread_kind(&thread_id)
+            .get_thread_kind(&tid_trimmed)
             .ok()
             .flatten()
             .unwrap_or(ThreadKind::Direct)
@@ -4143,13 +5560,14 @@ async fn message_send_raw_attachment(
     };
 
     let msg = if sess_snapshot.is_authenticated() {
-        match messaging::send_attachment_bytes(
+        match messaging::send_attachment_file_named(
             &sess_snapshot,
-            &thread_id,
+            &tid_trimmed,
             kind,
-            &file_name,
-            &bytes,
+            tmp_guard.path(),
+            &staged.file_name,
             &caption,
+            None,
         )
         .await
         {
@@ -4174,44 +5592,76 @@ async fn message_send_raw_attachment(
             }
         }
     } else {
-        local_demo_attachment_message(&thread_id, &file_name, &caption)
+        local_demo_attachment_message(&tid_trimmed, &staged.file_name, &caption)
     };
 
     let saved = persist_and_emit_sent_message(&app, &state, msg).await?;
 
+    let head_probe = {
+        let mut buf = [0u8; 64];
+        match tokio::fs::File::open(tmp_guard.path()).await {
+            Ok(mut f) => {
+                use tokio::io::AsyncReadExt;
+                let n = f.read(&mut buf).await.unwrap_or(0);
+                buf[..n].to_vec()
+            }
+            Err(_) => Vec::new(),
+        }
+    };
     let vault = state.media_vault.read().await.clone();
-    let store_arc = state.store.clone();
-    let gdrive_arc = state.gdrive.clone();
-    let owned_bytes = bytes.into_owned();
-    let media_kind = infer_media_kind_for_attachment(&file_name, &saved.msg_type);
-    let mime = infer_mime_from_filename_and_bytes(&file_name, Some(&owned_bytes));
+    let media_kind = infer_media_kind_for_attachment(&staged.file_name, &saved.msg_type);
+    let mime = infer_mime_from_filename_and_bytes(
+        &staged.file_name,
+        (!head_probe.is_empty()).then_some(head_probe.as_slice()),
+    );
     let url_opt = saved.attachment_url.clone();
-    let tid = saved.thread_id.clone();
-    let mid = saved.msg_id.clone();
     let orig_name = saved
         .attachment_name
         .clone()
-        .or_else(|| Some(file_name.clone()));
-    tauri::async_runtime::spawn(async move {
-        if let Ok(obj) = vault
-            .ingest_bytes(
-                &store_arc,
-                &owned_bytes,
-                media_kind,
-                mime,
-                url_opt.as_deref(),
-                Some((tid.as_str(), mid.as_str())),
-                orig_name.as_deref(),
-            )
-            .await
-        {
-            if obj.cloud_file_id.is_none() {
-                gdrive_arc.notify_sync();
-            }
+        .or_else(|| Some(staged.file_name.clone()));
+    if let Ok(obj) = vault
+        .ingest_local_file(
+            &state.store,
+            tmp_guard.path(),
+            media_kind,
+            mime,
+            url_opt.as_deref(),
+            Some((saved.thread_id.as_str(), saved.msg_id.as_str())),
+            orig_name.as_deref(),
+        )
+        .await
+    {
+        if obj.cloud_file_id.is_none() {
+            state.gdrive.notify_sync();
         }
-    });
+    }
+
+    let _ = tokio::fs::remove_file(tmp_guard.path()).await;
+    drop(tmp_guard);
 
     Ok(saved)
+}
+
+#[tauri::command]
+async fn raw_attachment_stage_abort(
+    state: State<'_, AppState>,
+    upload_id: String,
+) -> Result<(), String> {
+    let clean_id = upload_id.trim();
+    if clean_id.is_empty() {
+        return Ok(());
+    }
+    let removed = {
+        let mut map = state
+            .staged_raw_uploads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.remove(clean_id)
+    };
+    if let Some(staged) = removed {
+        let _ = tokio::fs::remove_file(staged.path).await;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -4848,6 +6298,42 @@ fn extract_invoke_body_bytes<'a>(
             }
             Ok(std::borrow::Cow::Owned(bytes))
         }
+        InvokeBody::Json(serde_json::Value::Object(map)) => {
+            if map.is_empty() {
+                return Err("Dữ liệu nhị phân IPC không hợp lệ".into());
+            }
+            if map.len() > max_bytes {
+                return Err("Dữ liệu vượt quá giới hạn kích thước cho phép".into());
+            }
+            let mut bytes = Vec::with_capacity(map.len());
+            for idx in 0..map.len() {
+                let key = idx.to_string();
+                let b = map
+                    .get(&key)
+                    .and_then(|v| v.as_u64())
+                    .and_then(|n| u8::try_from(n).ok())
+                    .ok_or_else(|| "Dữ liệu nhị phân IPC không hợp lệ".to_string())?;
+                bytes.push(b);
+            }
+            Ok(std::borrow::Cow::Owned(bytes))
+        }
+        InvokeBody::Json(serde_json::Value::String(b64)) => {
+            let trimmed = b64.trim();
+            if trimmed.is_empty() {
+                return Err("Dữ liệu nhị phân IPC không hợp lệ".into());
+            }
+            let max_b64_len = max_bytes.div_ceil(3).saturating_mul(4);
+            if trimmed.len() > max_b64_len {
+                return Err("Dữ liệu vượt quá giới hạn kích thước cho phép".into());
+            }
+            let bytes = B64_STANDARD
+                .decode(trimmed)
+                .map_err(|_| "Dữ liệu nhị phân IPC không hợp lệ".to_string())?;
+            if bytes.len() > max_bytes {
+                return Err("Dữ liệu vượt quá giới hạn kích thước cho phép".into());
+            }
+            Ok(std::borrow::Cow::Owned(bytes))
+        }
         InvokeBody::Json(_) => Err("Dữ liệu nhị phân IPC không hợp lệ".into()),
     }
 }
@@ -4872,6 +6358,33 @@ async fn clipboard_copy_rgba_image(request: tauri::ipc::Request<'_>) -> Result<(
         .filter(|&n| n <= 128 * 1024 * 1024)
         .ok_or_else(|| "Kích thước ảnh vượt giới hạn".to_string())?;
     let bytes = extract_invoke_body_bytes(request.body(), expected)?.into_owned();
+    tokio::task::spawn_blocking(move || clipboard::copy_rgba_image_native(width, height, &bytes))
+        .await
+        .map_err(|e| format!("Lỗi tác vụ clipboard ảnh: {e}"))?
+}
+
+#[tauri::command]
+async fn clipboard_copy_rgba_image_b64(
+    width: u32,
+    height: u32,
+    rgba_base64: String,
+) -> Result<(), String> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|px| px.checked_mul(4))
+        .filter(|&n| n > 0 && n <= 128 * 1024 * 1024)
+        .ok_or_else(|| "Kích thước ảnh vượt giới hạn".to_string())?;
+    let trimmed = rgba_base64.trim();
+    let max_b64_len = expected.div_ceil(3).saturating_mul(4);
+    if trimmed.is_empty() || trimmed.len() > max_b64_len {
+        return Err("Dữ liệu ảnh base64 không hợp lệ hoặc vượt giới hạn".into());
+    }
+    let bytes = B64_STANDARD
+        .decode(trimmed)
+        .map_err(|e| format!("Dữ liệu ảnh base64 không hợp lệ: {e}"))?;
+    if bytes.len() != expected {
+        return Err("Dữ liệu pixel RGBA không khớp kích thước ảnh".into());
+    }
     tokio::task::spawn_blocking(move || clipboard::copy_rgba_image_native(width, height, &bytes))
         .await
         .map_err(|e| format!("Lỗi tác vụ clipboard ảnh: {e}"))?
@@ -5644,6 +7157,24 @@ fn parse_teza_media_query(
     })
 }
 
+fn unwrap_teza_media_url(raw: &str) -> Result<(String, Option<String>, Option<String>), String> {
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let is_vault_url = lower.starts_with("teza-media://")
+        || lower.starts_with("http://teza-media.localhost/")
+        || lower.starts_with("https://teza-media.localhost/");
+    if !is_vault_url {
+        return Ok((trimmed.to_string(), None, None));
+    }
+    let uri: tauri::http::Uri = trimmed
+        .parse()
+        .map_err(|_| "URL teza-media không hợp lệ".to_string())?;
+    let parsed = parse_teza_media_query(&uri)
+        .map_err(|(_, msg)| format!("URL teza-media không hợp lệ: {msg}"))?;
+    let remote_url = validate_teza_media_remote_url(&parsed.url)?;
+    Ok((remote_url, parsed.tid, parsed.mid))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParsedByteRange {
     Valid { start: u64, end_inclusive: u64 },
@@ -5803,6 +7334,7 @@ fn build_media_success_response(
     content_type: &str,
     content_length: u64,
     content_range: Option<String>,
+    content_disposition: Option<&str>,
     cors_origin: Option<&str>,
     body: Vec<u8>,
 ) -> tauri::http::Response<Vec<u8>> {
@@ -5816,6 +7348,15 @@ fn build_media_success_response(
         .header("cache-control", "private, max-age=86400");
     if let Some(cr) = content_range {
         builder = builder.header("content-range", cr);
+    }
+    if let Some(cd) = content_disposition {
+        let trimmed = cd.trim();
+        if !trimmed.is_empty()
+            && !trimmed.chars().any(char::is_control)
+            && tauri::http::HeaderValue::from_str(trimmed).is_ok()
+        {
+            builder = builder.header("content-disposition", trimmed);
+        }
     }
     if let Some(origin) = cors_origin {
         builder = builder
@@ -5973,7 +7514,17 @@ fn handle_teza_media_protocol<R: tauri::Runtime>(
             }
         };
 
-        if is_forbidden_svg_mime(&obj.mime) {
+        let effective_mime: String = if zalo_core::media_vault::is_generic_mime(&obj.mime) {
+            vault
+                .sniff_cached_mime(&obj)
+                .await
+                .map(str::to_string)
+                .unwrap_or_else(|| obj.mime.clone())
+        } else {
+            obj.mime.clone()
+        };
+
+        if is_forbidden_svg_mime(&obj.mime) || is_forbidden_svg_mime(&effective_mime) {
             responder.respond(build_media_error_response(
                 415,
                 "SVG media is not supported",
@@ -5982,6 +7533,49 @@ fn handle_teza_media_protocol<R: tauri::Runtime>(
             ));
             return;
         }
+
+        let orig_name = {
+            let store = store_arc.lock().await;
+            let from_msg = msg_ref.and_then(|(t, m)| {
+                store
+                    .get_message_media_record(t, m, "primary")
+                    .ok()
+                    .flatten()
+                    .and_then(|rec| rec.original_name)
+                    .filter(|s| !s.trim().is_empty())
+            });
+            from_msg.or_else(|| {
+                let url_hash = MediaVault::sha256_url(&remote_url);
+                store
+                    .get_message_media_record("__url__", &url_hash, "primary")
+                    .ok()
+                    .flatten()
+                    .and_then(|rec| rec.original_name)
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| {
+                        store
+                            .find_media_original_name_by_hash(&url_hash)
+                            .ok()
+                            .flatten()
+                    })
+            })
+        };
+        let head_probe = if obj.size_bytes > 0
+            && file_dialog::extension_from_mime(&effective_mime).is_none()
+        {
+            read_vault_probe_bytes(&vault, &obj).await
+        } else {
+            Vec::new()
+        };
+        let (resolved_name, _resolved_ext) = file_dialog::resolve_download_filename_and_ext(
+            orig_name.as_deref().unwrap_or(&kind),
+            orig_name.as_deref(),
+            &remote_url,
+            &remote_url,
+            &effective_mime,
+            &head_probe,
+        );
+        let content_disposition = file_dialog::build_inline_content_disposition(&resolved_name);
 
         let total = obj.size_bytes;
         if total == 0 {
@@ -6001,9 +7595,10 @@ fn handle_teza_media_protocol<R: tauri::Runtime>(
             }
             responder.respond(build_media_success_response(
                 200,
-                &obj.mime,
+                &effective_mime,
                 0,
                 None,
+                Some(content_disposition.as_str()),
                 cors_origin.as_deref(),
                 Vec::new(),
             ));
@@ -6044,9 +7639,10 @@ fn handle_teza_media_protocol<R: tauri::Runtime>(
                     };
                     responder.respond(build_media_success_response(
                         206,
-                        &obj.mime,
+                        &effective_mime,
                         slice_len,
                         Some(format!("bytes {start}-{actual_end}/{total}")),
+                        Some(content_disposition.as_str()),
                         cors_origin.as_deref(),
                         body,
                     ));
@@ -6086,9 +7682,10 @@ fn handle_teza_media_protocol<R: tauri::Runtime>(
             let len = if is_head { total } else { body.len() as u64 };
             responder.respond(build_media_success_response(
                 200,
-                &obj.mime,
+                &effective_mime,
                 len,
                 None,
+                Some(content_disposition.as_str()),
                 cors_origin.as_deref(),
                 body,
             ));
@@ -6114,9 +7711,10 @@ fn handle_teza_media_protocol<R: tauri::Runtime>(
             };
             responder.respond(build_media_success_response(
                 206,
-                &obj.mime,
+                &effective_mime,
                 slice_len,
                 Some(format!("bytes 0-{actual_end}/{total}")),
+                Some(content_disposition.as_str()),
                 cors_origin.as_deref(),
                 body,
             ));
@@ -7193,7 +8791,6 @@ async fn lookup_cloud_candidate(
     } else {
         "primary"
     };
-    let url_hash = MediaVault::sha256_url(url);
     let guard = store.lock().await;
     if let Some((tid, mid)) = msg_ref {
         if let Ok(Some(obj)) = guard.lookup_media_by_msg(tid, mid, variant) {
@@ -7218,25 +8815,28 @@ async fn lookup_cloud_candidate(
             }
         }
     }
-    if let Ok(Some(obj)) = guard.lookup_media_by_url_hash(&url_hash) {
-        if obj
-            .cloud_file_id
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty())
-        {
-            let mm = guard
-                .get_message_media_record("__url__", &url_hash, variant)
-                .ok()
-                .flatten();
-            let original_name = mm.as_ref().and_then(|r| r.original_name.clone());
-            let cdn_expired = mm
-                .as_ref()
-                .is_some_and(|r| r.cdn_status == MEDIA_CDN_STATUS_EXPIRED);
-            return Some(CloudLookupResult {
-                obj,
-                original_name,
-                cdn_expired,
-            });
+    if !url.trim().is_empty() {
+        let url_hash = MediaVault::sha256_url(url);
+        if let Ok(Some(obj)) = guard.lookup_media_by_url_hash(&url_hash) {
+            if obj
+                .cloud_file_id
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            {
+                let mm = guard
+                    .get_message_media_record("__url__", &url_hash, variant)
+                    .ok()
+                    .flatten();
+                let original_name = mm.as_ref().and_then(|r| r.original_name.clone());
+                let cdn_expired = mm
+                    .as_ref()
+                    .is_some_and(|r| r.cdn_status == MEDIA_CDN_STATUS_EXPIRED);
+                return Some(CloudLookupResult {
+                    obj,
+                    original_name,
+                    cdn_expired,
+                });
+            }
         }
     }
     None
@@ -7446,7 +9046,7 @@ async fn rehydrate_cloud_object<R: tauri::Runtime>(
                             &sha,
                             eff_kind,
                             eff_mime,
-                            Some(url),
+                            (!url.trim().is_empty()).then_some(url),
                             msg_ref_variant,
                             candidate.original_name.as_deref(),
                         )
@@ -8259,6 +9859,536 @@ async fn gdrive_prune_cloud_older_than(
     execute_gdrive_prune_targets(&app, &state, targets).await
 }
 
+static AI_MSG_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn normalize_ai_session_id(session_id: Option<&str>) -> String {
+    match session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => s.to_string(),
+        None => "default".to_string(),
+    }
+}
+
+async fn translate_fallback_gemini_key(state: &AppState) -> Option<String> {
+    let cfg = state.translate_cfg.lock().await;
+    let trimmed = cfg.gemini_key.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[tauri::command]
+async fn ai_get_config(state: State<'_, AppState>) -> Result<AiConfigPublic, String> {
+    let fallback_key = translate_fallback_gemini_key(&state).await;
+    let cfg = state.ai_config.lock().await;
+    Ok(cfg.to_public(fallback_key.as_deref()))
+}
+
+#[tauri::command]
+async fn ai_update_config(
+    state: State<'_, AppState>,
+    update: AiConfigUpdate,
+) -> Result<AiConfigPublic, String> {
+    let staged = {
+        let cfg = state.ai_config.lock().await;
+        cfg.with_update(update).map_err(|e| e.to_string())?
+    };
+    let path = ai_config_file(&state.paths.root);
+    staged
+        .save_to_file(&path)
+        .map_err(|e| format!("Không lưu được cấu hình Trợ lý AI: {e}"))?;
+    {
+        let mut cfg = state.ai_config.lock().await;
+        *cfg = staged.clone();
+    }
+    let fallback_key = translate_fallback_gemini_key(&state).await;
+    Ok(staged.to_public(fallback_key.as_deref()))
+}
+
+#[tauri::command]
+async fn ai_probe_cli(
+    state: State<'_, AppState>,
+    cli_path: Option<String>,
+) -> Result<AiCliProbeDto, String> {
+    let target = match cli_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(p) => p.to_string(),
+        None => state.ai_config.lock().await.cli_path.clone(),
+    };
+    Ok(probe_gemini_cli(&target).await)
+}
+
+#[tauri::command]
+async fn ai_list_messages(
+    state: State<'_, AppState>,
+    session_id: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<AiStoredMessageDto>, String> {
+    let sid = normalize_ai_session_id(session_id.as_deref());
+    let capped = limit.unwrap_or(100).clamp(1, 500);
+    let store = state.store.lock().await;
+    store
+        .list_ai_messages(&sid, capped)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn ai_clear_messages(
+    state: State<'_, AppState>,
+    session_id: Option<String>,
+) -> Result<usize, String> {
+    let sid = normalize_ai_session_id(session_id.as_deref());
+    let store = state.store.lock().await;
+    store.clear_ai_messages(&sid).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn ai_chat_send(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    prompt: String,
+    session_id: Option<String>,
+) -> Result<AiStoredMessageDto, String> {
+    let prompt_clean = prompt.trim();
+    if prompt_clean.is_empty() {
+        return Err("Nội dung câu hỏi cho Trợ lý AI không được để trống".into());
+    }
+    let cfg = state.ai_config.lock().await.clone();
+    if !cfg.enabled {
+        return Err(
+            "Trợ lý AI đang tắt. Hãy bật Trợ lý AI trong Cài đặt trước khi sử dụng.".into(),
+        );
+    }
+
+    let sid = normalize_ai_session_id(session_id.as_deref());
+    let relay = state.relay_cfg.lock().await.clone();
+    let fallback_key = translate_fallback_gemini_key(&state).await;
+
+    let user_ts = chrono_now_ms();
+    let user_seq = AI_MSG_SEQ.fetch_add(1, Ordering::Relaxed);
+    let user_msg = AiStoredMessageDto {
+        id: format!("ai-u-{user_ts}-{user_seq}"),
+        session_id: sid.clone(),
+        role: "user".to_string(),
+        content: prompt_clean.to_string(),
+        model: String::new(),
+        backend: String::new(),
+        ts: user_ts,
+    };
+
+    let history: Vec<AiChatTurn> = {
+        let store = state.store.lock().await;
+        let prior = store
+            .list_ai_messages(&sid, MAX_CHAT_HISTORY_TURNS)
+            .map_err(|e| e.to_string())?;
+        store
+            .insert_ai_message(&user_msg)
+            .map_err(|e| e.to_string())?;
+        prior
+            .into_iter()
+            .map(|m| AiChatTurn {
+                role: m.role,
+                content: m.content,
+            })
+            .collect()
+    };
+
+    let sid_for_emit = sid.clone();
+    let reply = ai_chat_stream_with_relay(
+        &cfg,
+        &relay,
+        fallback_key.as_deref(),
+        &history,
+        prompt_clean,
+        |delta| {
+            let _ = app.emit(
+                "core://ai-stream-delta",
+                serde_json::json!({
+                    "session_id": sid_for_emit,
+                    "delta": delta,
+                }),
+            );
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let model_ts = chrono_now_ms().max(user_ts.saturating_add(1));
+    let model_seq = AI_MSG_SEQ.fetch_add(1, Ordering::Relaxed);
+    let model_msg = AiStoredMessageDto {
+        id: format!("ai-m-{model_ts}-{model_seq}"),
+        session_id: sid,
+        role: "model".to_string(),
+        content: reply.text,
+        model: reply.model,
+        backend: reply.backend.as_str().to_string(),
+        ts: model_ts,
+    };
+    {
+        let store = state.store.lock().await;
+        store
+            .insert_ai_message(&model_msg)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(model_msg)
+}
+
+#[tauri::command]
+async fn ai_summarize_unread(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> Result<AiSummaryDto, String> {
+    let tid = thread_id.trim().to_string();
+    if tid.is_empty() {
+        return Err("Mã cuộc trò chuyện không được để trống".into());
+    }
+    let cfg = state.ai_config.lock().await.clone();
+    if !cfg.enabled {
+        return Err(
+            "Trợ lý AI đang tắt. Hãy bật Trợ lý AI trong Cài đặt trước khi sử dụng.".into(),
+        );
+    }
+    let relay = state.relay_cfg.lock().await.clone();
+    let fallback_key = translate_fallback_gemini_key(&state).await;
+
+    let (thread_title, is_group, unread_msgs) = {
+        let store = state.store.lock().await;
+        let thread_opt = store
+            .list_threads(FolderFilter::All)
+            .ok()
+            .and_then(|list| list.into_iter().find(|t| t.id == tid));
+        let (title, is_grp) = match thread_opt {
+            Some(t) => (
+                if t.title.trim().is_empty() {
+                    tid.clone()
+                } else {
+                    t.title
+                },
+                t.kind == ThreadKind::Group,
+            ),
+            None => {
+                let is_grp = store
+                    .get_thread_kind(&tid)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|k| k == ThreadKind::Group);
+                (tid.clone(), is_grp)
+            }
+        };
+        let msgs = store
+            .list_unread_messages_for_summary(&tid, cfg.max_summary_messages)
+            .map_err(|e| e.to_string())?;
+        (title, is_grp, msgs)
+    };
+
+    let input_msgs: Vec<AiSummaryInputMsg> =
+        unread_msgs.iter().map(AiSummaryInputMsg::from).collect();
+    let tid_for_emit = tid.clone();
+    ai_summarize_unread_with_relay(
+        &cfg,
+        &relay,
+        fallback_key.as_deref(),
+        &thread_title,
+        is_group,
+        &input_msgs,
+        |delta| {
+            let _ = app.emit(
+                "core://ai-summary-delta",
+                serde_json::json!({
+                    "thread_id": tid_for_emit,
+                    "delta": delta,
+                }),
+            );
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn ai_translate_text(
+    state: State<'_, AppState>,
+    text: String,
+    target_lang: String,
+) -> Result<String, String> {
+    let cfg = state.ai_config.lock().await.clone();
+    if !cfg.enabled {
+        return Err(
+            "Trợ lý AI đang tắt. Hãy bật Trợ lý AI trong Cài đặt trước khi sử dụng.".into(),
+        );
+    }
+    let relay = state.relay_cfg.lock().await.clone();
+    let fallback_key = translate_fallback_gemini_key(&state).await;
+    ai_translate_text_with_relay(&cfg, &relay, fallback_key.as_deref(), &text, &target_lang)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn schedule_list(
+    state: State<'_, AppState>,
+    status_filter: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<ScheduledMessageDto>, String> {
+    let capped = limit.unwrap_or(200).clamp(1, 1000);
+    let store = state.store.lock().await;
+    store
+        .list_scheduled_messages(status_filter.as_deref(), capped)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn schedule_create(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    mut input: NewScheduledMessageInput,
+) -> Result<ScheduledMessageDto, String> {
+    if input.thread_id.trim().is_empty() {
+        return Err("Mã cuộc trò chuyện không được để trống".into());
+    }
+    if input.text.trim().is_empty() && input.attachment_path.trim().is_empty() {
+        return Err("Cần nhập nội dung tin nhắn hoặc chọn tệp đính kèm".into());
+    }
+    if !input.attachment_path.trim().is_empty() {
+        let canonical = {
+            let approved = state
+                .approved_attachment_paths
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            validate_approved_attachment_path(&approved, Path::new(input.attachment_path.trim()))?
+        };
+        input.attachment_path = canonical.to_string_lossy().into_owned();
+    }
+    let created = {
+        let store = state.store.lock().await;
+        store
+            .create_scheduled_message(&input)
+            .map_err(|e| e.to_string())?
+    };
+    state.scheduler.notify_changed();
+    let _ = app.emit("core://schedule-updated", &created);
+    Ok(created)
+}
+
+#[tauri::command]
+async fn schedule_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    mut input: UpdateScheduledMessageInput,
+) -> Result<Option<ScheduledMessageDto>, String> {
+    if let Some(ref att_raw) = input.attachment_path {
+        let trimmed = att_raw.trim();
+        if !trimmed.is_empty() {
+            let unchanged = {
+                let store = state.store.lock().await;
+                store
+                    .get_scheduled_message(&id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|cur| cur.attachment_path.trim() == trimmed)
+            };
+            if !unchanged {
+                let canonical = {
+                    let approved = state
+                        .approved_attachment_paths
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    validate_approved_attachment_path(&approved, Path::new(trimmed))?
+                };
+                input.attachment_path = Some(canonical.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let updated = {
+        let store = state.store.lock().await;
+        store
+            .update_scheduled_message(&id, &input)
+            .map_err(|e| e.to_string())?
+    };
+    if let Some(ref dto) = updated {
+        state.scheduler.notify_changed();
+        let _ = app.emit("core://schedule-updated", dto);
+    }
+    Ok(updated)
+}
+
+#[tauri::command]
+async fn schedule_cancel(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<bool, String> {
+    let (cancelled, updated) = {
+        let store = state.store.lock().await;
+        let ok = store
+            .cancel_scheduled_message(&id)
+            .map_err(|e| e.to_string())?;
+        let dto = if ok {
+            store.get_scheduled_message(&id).ok().flatten()
+        } else {
+            None
+        };
+        (ok, dto)
+    };
+    if cancelled {
+        state.scheduler.notify_changed();
+        if let Some(ref dto) = updated {
+            let _ = app.emit("core://schedule-updated", dto);
+        } else {
+            let _ = app.emit("core://schedule-updated", serde_json::Value::Null);
+        }
+    }
+    Ok(cancelled)
+}
+
+#[tauri::command]
+async fn schedule_delete(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<bool, String> {
+    let deleted = {
+        let store = state.store.lock().await;
+        store
+            .delete_scheduled_message(&id)
+            .map_err(|e| e.to_string())?
+    };
+    if deleted {
+        state.scheduler.notify_changed();
+        let _ = app.emit("core://schedule-updated", serde_json::Value::Null);
+    }
+    Ok(deleted)
+}
+
+#[tauri::command]
+async fn schedule_send_now(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<Option<ScheduledMessageDto>, String> {
+    let updated = {
+        let store = state.store.lock().await;
+        store
+            .reschedule_now(&id, chrono_now_ms())
+            .map_err(|e| e.to_string())?
+    };
+    if let Some(ref dto) = updated {
+        state.scheduler.notify_changed();
+        let _ = app.emit("core://schedule-updated", dto);
+    }
+    Ok(updated)
+}
+
+#[tauri::command]
+async fn local_api_get_config(
+    state: State<'_, AppState>,
+) -> Result<local_api::LocalApiConfig, String> {
+    Ok(state.local_api.config().await)
+}
+
+#[tauri::command]
+async fn local_api_get_status(
+    state: State<'_, AppState>,
+) -> Result<local_api::LocalApiStatusDto, String> {
+    Ok(state.local_api.status(&state.store).await)
+}
+
+#[tauri::command]
+async fn local_api_update_config(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    config: local_api::LocalApiConfig,
+) -> Result<local_api::LocalApiStatusDto, String> {
+    state
+        .local_api
+        .apply_config(
+            config,
+            app,
+            state.session.clone(),
+            state.store.clone(),
+            state.scheduler.clone(),
+        )
+        .await
+}
+
+#[tauri::command]
+async fn local_api_kill_switch(
+    state: State<'_, AppState>,
+) -> Result<local_api::LocalApiStatusDto, String> {
+    state.local_api.kill_switch(&state.store).await
+}
+
+#[tauri::command]
+async fn local_api_list_clients(state: State<'_, AppState>) -> Result<Vec<ApiClientDto>, String> {
+    let store = state.store.lock().await;
+    store.list_api_clients().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn local_api_create_client(
+    state: State<'_, AppState>,
+    name: String,
+    scopes: Vec<String>,
+    allowed_thread_ids: Vec<String>,
+    rate_limit_per_min: u32,
+) -> Result<CreatedApiClientDto, String> {
+    let store = state.store.lock().await;
+    store
+        .create_api_client(&name, &scopes, &allowed_thread_ids, rate_limit_per_min)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn local_api_update_client(
+    state: State<'_, AppState>,
+    id: String,
+    enabled: Option<bool>,
+    scopes: Option<Vec<String>>,
+    allowed_thread_ids: Option<Vec<String>>,
+    rate_limit_per_min: Option<u32>,
+) -> Result<Option<ApiClientDto>, String> {
+    let store = state.store.lock().await;
+    store
+        .update_api_client(
+            &id,
+            enabled,
+            scopes.as_deref(),
+            allowed_thread_ids.as_deref(),
+            rate_limit_per_min,
+        )
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn local_api_delete_client(state: State<'_, AppState>, id: String) -> Result<bool, String> {
+    let store = state.store.lock().await;
+    store.delete_api_client(&id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn local_api_list_audit_logs(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<ApiAuditLogDto>, String> {
+    let capped = limit.unwrap_or(100).clamp(1, 500);
+    let store = state.store.lock().await;
+    store
+        .list_api_audit_logs(capped)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn local_api_clear_audit_logs(state: State<'_, AppState>) -> Result<usize, String> {
+    let store = state.store.lock().await;
+    store.clear_api_audit_logs().map_err(|e| e.to_string())
+}
+
 fn chrono_now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -8374,6 +10504,9 @@ pub fn run() {
     ));
 
     let translate_cfg = TranslateConfig::load_from_file(&paths.translate_file());
+    let ai_cfg = AiConfig::load_from_file(&ai_config_file(&paths.root));
+    let scheduler = scheduler::SchedulerHandle::new();
+    let local_api = Arc::new(local_api::LocalApiManager::new(&paths));
     let sess_arc = Arc::new(Mutex::new(session));
     let store_arc = Arc::new(Mutex::new(store));
     let media_vault_arc = Arc::new(RwLock::new(Arc::new(media_vault)));
@@ -8390,6 +10523,10 @@ pub fn run() {
     let relay_for_setup = relay_cfg_arc.clone();
     let store_for_setup = store_arc.clone();
     let media_vault_for_setup = media_vault_arc.clone();
+    let session_for_setup = sess_arc.clone();
+    let store_for_automation = store_arc.clone();
+    let scheduler_for_setup = scheduler.clone();
+    let local_api_for_setup = local_api.clone();
     let state = AppState {
         paths,
         session: sess_arc,
@@ -8405,8 +10542,7 @@ pub fn run() {
         pending_update: Arc::new(Mutex::new(None)),
         close_to_tray: close_to_tray.clone(),
         allow_exit: allow_exit.clone(),
-        pending_notify: Arc::new(Mutex::new(None)),
-        notify_hide_gen: Arc::new(AtomicU64::new(0)),
+        notify_popup: notify_popup::NotifyPopupController::new(),
         webapp_op_lock: Arc::new(Mutex::new(())),
         webapp_epoch: Arc::new(AtomicU64::new(0)),
         webapp_base_urls: Arc::new(Mutex::new(HashMap::new())),
@@ -8414,7 +10550,11 @@ pub fn run() {
         webapp_accounts: Arc::new(Mutex::new(webapp_accounts)),
         recent_saved_files: Arc::new(Mutex::new(VecDeque::new())),
         approved_attachment_paths: Arc::new(std::sync::Mutex::new(VecDeque::new())),
+        staged_raw_uploads: Arc::new(std::sync::Mutex::new(HashMap::new())),
         call_mgr,
+        ai_config: Arc::new(Mutex::new(ai_cfg)),
+        scheduler,
+        local_api,
     };
 
     let builder = tauri::Builder::default();
@@ -8439,6 +10579,7 @@ pub fn run() {
             auth_logout,
             threads_sync,
             threads_list,
+            thread_ensure_direct,
             thread_set_active,
             thread_mark_read,
             thread_mark_unread,
@@ -8468,12 +10609,15 @@ pub fn run() {
             poll_create,
             poll_get_detail,
             poll_vote,
+            poll_add_options,
+            poll_lock,
             messages_load,
             messages_load_around,
             messages_list_pinned,
             message_get_by_id,
             message_send_text,
             message_send_quote,
+            message_forward,
             message_react,
             message_recall,
             message_delete_local,
@@ -8489,6 +10633,11 @@ pub fn run() {
             inspect_attachment_path,
             message_send_attachment_path,
             message_send_raw_attachment,
+            message_send_base64_attachment,
+            raw_attachment_stage_begin,
+            raw_attachment_stage_chunk,
+            raw_attachment_stage_send,
+            raw_attachment_stage_abort,
             search_global,
             translate_get_config,
             translate_save_config,
@@ -8520,6 +10669,7 @@ pub fn run() {
             app_set_close_to_tray,
             clipboard_copy_text,
             clipboard_copy_rgba_image,
+            clipboard_copy_rgba_image_b64,
             capture_screen,
             webapp_open,
             webapp_set_bounds,
@@ -8551,6 +10701,30 @@ pub fn run() {
             gdrive_delete_cloud_items,
             gdrive_delete_cloud_by_thread,
             gdrive_prune_cloud_older_than,
+            ai_get_config,
+            ai_update_config,
+            ai_probe_cli,
+            ai_list_messages,
+            ai_clear_messages,
+            ai_chat_send,
+            ai_summarize_unread,
+            ai_translate_text,
+            schedule_list,
+            schedule_create,
+            schedule_update,
+            schedule_cancel,
+            schedule_delete,
+            schedule_send_now,
+            local_api_get_config,
+            local_api_get_status,
+            local_api_update_config,
+            local_api_kill_switch,
+            local_api_list_clients,
+            local_api_create_client,
+            local_api_update_client,
+            local_api_delete_client,
+            local_api_list_audit_logs,
+            local_api_clear_audit_logs,
         ])
         .setup(move |app| {
             let _ = app.get_window("main");
@@ -8561,6 +10735,36 @@ pub fn run() {
                 store_for_setup,
                 media_vault_for_setup,
             );
+            {
+                let app_sched = app.handle().clone();
+                let sess_sched = session_for_setup.clone();
+                let store_sched = store_for_automation.clone();
+                let notify_sched = scheduler_for_setup.notify_arc();
+                tauri::async_runtime::spawn(async move {
+                    std::mem::drop(scheduler::spawn_scheduler(
+                        app_sched,
+                        sess_sched,
+                        store_sched,
+                        notify_sched,
+                    ));
+                });
+            }
+            {
+                let app_local_api = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(err) = local_api_for_setup
+                        .start_if_enabled(
+                            app_local_api,
+                            session_for_setup,
+                            store_for_automation,
+                            scheduler_for_setup,
+                        )
+                        .await
+                    {
+                        eprintln!("[teza][local-api] failed to start on boot: {err}");
+                    }
+                });
+            }
             let open_item = MenuItem::with_id(app, "open", "Mở Teza", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Thoát Teza", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open_item, &quit_item])?;
@@ -8581,6 +10785,9 @@ pub fn run() {
                         let quit_app = app_handle.clone();
                         tauri::async_runtime::spawn(async move {
                             if let Some(st) = quit_app.try_state::<AppState>() {
+                                notify_popup::force_hide_or_destroy(&quit_app, &st.notify_popup)
+                                    .await;
+                                let _ = st.local_api.stop().await;
                                 st.gdrive.shutdown().await;
                                 let vault = st.media_vault.read().await.clone();
                                 vault.flush_access_touches(&st.store).await;
@@ -8621,6 +10828,8 @@ pub fn run() {
                             api.prevent_close();
                             hide_all_webapp_children(window.app_handle());
                             let _ = window.hide();
+                        } else {
+                            notify_popup::force_destroy_sync(window.app_handle(), &st.notify_popup);
                         }
                     }
                     WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => {
@@ -9438,11 +11647,13 @@ mod tests {
         );
         assert_eq!(super::allowed_media_cors_origin(&hdrs), None);
 
+        let cd = super::file_dialog::build_inline_content_disposition("clip.mp4");
         let resp = super::build_media_success_response(
             206,
             "video/mp4",
             1024,
             Some("bytes 0-1023/4096".into()),
+            Some(cd.as_str()),
             Some("http://tauri.localhost"),
             vec![0u8; 1024],
         );
@@ -9451,6 +11662,10 @@ mod tests {
         assert_eq!(
             resp.headers().get("content-range").unwrap(),
             "bytes 0-1023/4096"
+        );
+        assert_eq!(
+            resp.headers().get("content-disposition").unwrap(),
+            cd.as_str()
         );
         assert_eq!(resp.headers().get("content-length").unwrap(), "1024");
         assert_eq!(resp.headers().get("content-type").unwrap(), "video/mp4");
@@ -9956,5 +12171,992 @@ mod tests {
         let long_vi = "Chào ".repeat(50); // 250 Unicode chars with diacritics
         let truncated = super::normalize_friend_request_message(Some(&long_vi)).unwrap();
         assert_eq!(truncated.chars().count(), 150);
+    }
+
+    #[test]
+    fn build_media_success_response_emits_and_sanitizes_content_disposition() {
+        let cd = super::file_dialog::build_inline_content_disposition("Báo cáo quý 1.png");
+        let resp = super::build_media_success_response(
+            200,
+            "image/png",
+            4,
+            None,
+            Some(cd.as_str()),
+            None,
+            vec![137, 80, 78, 71],
+        );
+        assert_eq!(resp.status().as_u16(), 200);
+        let hdr = resp
+            .headers()
+            .get("content-disposition")
+            .expect("content-disposition header should be emitted")
+            .to_str()
+            .unwrap();
+        assert!(hdr.starts_with("inline; filename=\""), "unexpected header: {hdr}");
+        assert!(hdr.contains(".png\""), "expected .png ASCII fallback in {hdr}");
+        assert!(hdr.contains("filename*=UTF-8''"), "expected RFC 5987 UTF-8 param in {hdr}");
+
+        // None omits content-disposition
+        let no_cd = super::build_media_success_response(
+            200,
+            "image/jpeg",
+            2,
+            None,
+            None,
+            None,
+            vec![0xFF, 0xD8],
+        );
+        assert!(no_cd.headers().get("content-disposition").is_none());
+
+        // Control characters (CRLF header injection attempt) must be suppressed cleanly
+        let injected = super::build_media_success_response(
+            200,
+            "image/png",
+            2,
+            None,
+            Some("inline; filename=\"a.png\"\r\nX-Evil: 1"),
+            None,
+            vec![1, 2],
+        );
+        assert_eq!(injected.status().as_u16(), 200);
+        assert!(injected.headers().get("content-disposition").is_none());
+        assert!(injected.headers().get("x-evil").is_none());
+    }
+
+    #[test]
+    fn unwrap_teza_media_url_extracts_remote_url_and_msg_ref_safely() {
+        // Direct HTTPS URL passes through untouched
+        let (u, tid, mid) =
+            super::unwrap_teza_media_url("https://photo.zdn.vn/original/pic.webp").unwrap();
+        assert_eq!(u, "https://photo.zdn.vn/original/pic.webp");
+        assert_eq!(tid, None);
+        assert_eq!(mid, None);
+
+        // Windows WebView2 loopback protocol URL unwraps inner URL + tid/mid
+        let (u2, tid2, mid2) = super::unwrap_teza_media_url(
+            "http://teza-media.localhost/resolve?url=https%3A%2F%2Fphoto.zdn.vn%2Fimg_123&kind=image&t=secret&tid=thread-9&mid=msg-42",
+        )
+        .unwrap();
+        assert_eq!(u2, "https://photo.zdn.vn/img_123");
+        assert_eq!(tid2.as_deref(), Some("thread-9"));
+        assert_eq!(mid2.as_deref(), Some("msg-42"));
+
+        // HTTPS teza-media.localhost and custom teza-media:// scheme also unwrap cleanly
+        let (u3, tid3, mid3) = super::unwrap_teza_media_url(
+            "https://teza-media.localhost/resolve?url=https%3A%2F%2Fcdn.zdn.vn%2Fvoice.aac&kind=audio&t=tok",
+        )
+        .unwrap();
+        assert_eq!(u3, "https://cdn.zdn.vn/voice.aac");
+        assert_eq!(tid3, None);
+        assert_eq!(mid3, None);
+
+        let (u4, tid4, mid4) = super::unwrap_teza_media_url(
+            "teza-media://localhost/resolve?url=https%3A%2F%2Fcdn.zdn.vn%2Fdoc.pdf&tid=t1&mid=m2&t=tok",
+        )
+        .unwrap();
+        assert_eq!(u4, "https://cdn.zdn.vn/doc.pdf");
+        assert_eq!(tid4.as_deref(), Some("t1"));
+        assert_eq!(mid4.as_deref(), Some("m2"));
+
+        // Unsafe inner targets or wrong paths must be rejected
+        for bad in [
+            "http://teza-media.localhost/resolve?url=file%3A%2F%2F%2FC%3A%2FWindows%2Fwin.ini&t=tok",
+            "http://teza-media.localhost/resolve?url=http%3A%2F%2Ftauri.localhost%2Findex.html&t=tok",
+            "teza-media://localhost/etc/passwd?url=https%3A%2F%2Fphoto.zdn.vn%2Fa.jpg&t=tok",
+            "http://teza-media.localhost/resolve?t=tok",
+        ] {
+            assert!(
+                super::unwrap_teza_media_url(bad).is_err(),
+                "expected unwrap_teza_media_url to reject: {bad}"
+            );
+        }
+
+        assert_eq!(super::normalize_ai_session_id(None), "default");
+        assert_eq!(super::normalize_ai_session_id(Some("   ")), "default");
+        assert_eq!(super::normalize_ai_session_id(Some(" work ")), "work");
+    }
+
+    #[test]
+    fn resolve_phone_country_code_defaults_to_vietnam_and_trims_override() {
+        assert_eq!(super::resolve_phone_country_code(None), "84");
+        assert_eq!(super::resolve_phone_country_code(Some("")), "84");
+        assert_eq!(super::resolve_phone_country_code(Some("   \t ")), "84");
+        assert_eq!(super::resolve_phone_country_code(Some("82")), "82");
+        assert_eq!(super::resolve_phone_country_code(Some(" +82 ")), "+82");
+    }
+
+    #[test]
+    fn upsert_incoming_message_dedupes_optimistic_poll_and_merges_sparse_payload() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use zalo_core::chat::{MessageDto, PollDto, PollOptionDto};
+        use zalo_core::data_dir::StoragePaths;
+        use zalo_core::store::MessageStore;
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("teza_tauri_poll_dedupe_{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = StoragePaths::from_dir(&dir).unwrap();
+        let mut store = MessageStore::open(&paths.history_db(Some("u-poll"))).unwrap();
+
+        let optimistic_poll = PollDto {
+            poll_id: 777,
+            question: "Trưa nay ăn gì?".into(),
+            options: vec![
+                PollOptionDto {
+                    id: 11,
+                    content: "Phở".into(),
+                    votes: 0,
+                    voted: false,
+                },
+                PollOptionDto {
+                    id: 12,
+                    content: "Bún chả".into(),
+                    votes: 0,
+                    voted: false,
+                },
+            ],
+            allow_multi: true,
+            allow_add_option: true,
+            is_anonymous: false,
+            expired_time: 1_900_000_000_000,
+            closed: false,
+        };
+        let optimistic_msg = MessageDto {
+            msg_id: "poll-777".into(),
+            cli_msg_id: None,
+            thread_id: "grp-100".into(),
+            sender_id: "me".into(),
+            sender_name: "Bạn".into(),
+            text: "Bình chọn: Trưa nay ăn gì?".into(),
+            msg_type: "chat.poll".into(),
+            ts: 1_700_000_000_000,
+            is_outgoing: true,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
+            reactions: Vec::new(),
+            attachment_url: None,
+            attachment_name: Some(format!(
+                "teza-poll:{}",
+                serde_json::to_string(&optimistic_poll).unwrap()
+            )),
+        };
+        assert_eq!(super::real_poll_id_for_dedupe(&optimistic_msg), None);
+        store.upsert_message(&optimistic_msg).unwrap();
+
+        // Real server message arrives with sparse poll payload (empty options + generic title)
+        let sparse_server_poll = PollDto {
+            poll_id: 777,
+            question: "Bình chọn".into(),
+            options: Vec::new(),
+            allow_multi: false,
+            allow_add_option: false,
+            is_anonymous: false,
+            expired_time: 0,
+            closed: false,
+        };
+        let mut real_msg = MessageDto {
+            msg_id: "90012345".into(),
+            cli_msg_id: Some("cli-1".into()),
+            thread_id: "grp-100".into(),
+            sender_id: "me".into(),
+            sender_name: "Bạn".into(),
+            text: "Bình chọn".into(),
+            msg_type: "chat.poll".into(),
+            ts: 1_700_000_001_000,
+            is_outgoing: true,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
+            reactions: Vec::new(),
+            attachment_url: None,
+            attachment_name: Some(format!(
+                "teza-poll:{}",
+                serde_json::to_string(&sparse_server_poll).unwrap()
+            )),
+        };
+        assert_eq!(super::real_poll_id_for_dedupe(&real_msg), Some(777));
+        super::upsert_incoming_message(&mut store, &mut real_msg).unwrap();
+
+        let stored = store.load_messages("grp-100", None, 20).unwrap();
+        assert_eq!(stored.len(), 1, "optimistic poll card must be deduplicated");
+        assert_eq!(stored[0].msg_id, "90012345");
+        assert_eq!(stored[0].text, "Bình chọn: Trưa nay ăn gì?");
+        let stored_poll = super::parse_message_poll_dto(&stored[0]).unwrap();
+        assert_eq!(stored_poll.question, "Trưa nay ăn gì?");
+        assert_eq!(stored_poll.options.len(), 2);
+        assert!(stored_poll.allow_multi);
+        assert!(stored_poll.allow_add_option);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_poll_update_to_store_finds_by_poll_id_merges_partial_and_locks() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use zalo_core::chat::{MessageDto, PollDto, PollOptionDto};
+        use zalo_core::data_dir::StoragePaths;
+        use zalo_core::store::MessageStore;
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("teza_tauri_poll_update_{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = StoragePaths::from_dir(&dir).unwrap();
+        let mut store = MessageStore::open(&paths.history_db(Some("u-poll-2"))).unwrap();
+
+        let initial_poll = PollDto {
+            poll_id: 888,
+            question: "Họp lúc mấy giờ?".into(),
+            options: vec![
+                PollOptionDto {
+                    id: 1,
+                    content: "9h".into(),
+                    votes: 1,
+                    voted: true,
+                },
+                PollOptionDto {
+                    id: 2,
+                    content: "14h".into(),
+                    votes: 0,
+                    voted: false,
+                },
+            ],
+            allow_multi: true,
+            allow_add_option: true,
+            is_anonymous: true,
+            expired_time: 1_950_000_000_000,
+            closed: false,
+        };
+        let msg = MessageDto {
+            msg_id: "srv-88801".into(),
+            cli_msg_id: None,
+            thread_id: "grp-200".into(),
+            sender_id: "u1".into(),
+            sender_name: "An".into(),
+            text: "Bình chọn: Họp lúc mấy giờ?".into(),
+            msg_type: "chat.poll".into(),
+            ts: 1_700_000_010_000,
+            is_outgoing: false,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
+            reactions: Vec::new(),
+            attachment_url: None,
+            attachment_name: Some(format!(
+                "teza-poll:{}",
+                serde_json::to_string(&initial_poll).unwrap()
+            )),
+        };
+        store.upsert_message(&msg).unwrap();
+
+        // Partial vote/add-option response without question/flags and without msg_id
+        let partial_update = PollDto {
+            poll_id: 888,
+            question: "Bình chọn".into(),
+            options: vec![
+                PollOptionDto {
+                    id: 1,
+                    content: "9h".into(),
+                    votes: 2,
+                    voted: true,
+                },
+                PollOptionDto {
+                    id: 2,
+                    content: "14h".into(),
+                    votes: 1,
+                    voted: false,
+                },
+                PollOptionDto {
+                    id: 3,
+                    content: "16h".into(),
+                    votes: 1,
+                    voted: true,
+                },
+            ],
+            allow_multi: false,
+            allow_add_option: false,
+            is_anonymous: false,
+            expired_time: 0,
+            closed: false,
+        };
+        let (updated_msg, merged) =
+            super::apply_poll_update_to_store(&mut store, Some("grp-200"), None, &partial_update)
+                .expect("should locate poll message by (thread_id, poll_id) without msg_id");
+        assert_eq!(updated_msg.msg_id, "srv-88801");
+        assert_eq!(merged.question, "Họp lúc mấy giờ?");
+        assert_eq!(merged.options.len(), 3);
+        assert!(merged.allow_multi);
+        assert!(merged.allow_add_option);
+        assert!(merged.is_anonymous);
+        assert!(!merged.closed);
+
+        // Lock update without msg_id marks closed = true while preserving metadata
+        let lock_update = PollDto {
+            closed: true,
+            ..partial_update
+        };
+        let (_, locked) =
+            super::apply_poll_update_to_store(&mut store, Some("grp-200"), None, &lock_update)
+                .expect("lock update should succeed");
+        assert!(locked.closed);
+        assert_eq!(locked.question, "Họp lúc mấy giờ?");
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn poll_create_reverse_order_race_merges_into_existing_real_ws_row_without_duplicate() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use zalo_core::chat::{MessageDto, PollDto, PollOptionDto};
+        use zalo_core::data_dir::StoragePaths;
+        use zalo_core::store::MessageStore;
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("teza_tauri_poll_reverse_race_{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = StoragePaths::from_dir(&dir).unwrap();
+        let mut store = MessageStore::open(&paths.history_db(Some("u-poll-race"))).unwrap();
+
+        // 1. Real WS poll message arrives and is persisted BEFORE `poll_create` finishes.
+        let sparse_ws_poll = PollDto {
+            poll_id: 901,
+            question: "Bình chọn".into(),
+            options: Vec::new(),
+            allow_multi: false,
+            allow_add_option: false,
+            is_anonymous: false,
+            expired_time: 0,
+            closed: false,
+        };
+        let mut ws_real_msg = MessageDto {
+            msg_id: "99001122".into(),
+            cli_msg_id: Some("cli-race-1".into()),
+            thread_id: "300400".into(),
+            sender_id: "me".into(),
+            sender_name: "Bạn".into(),
+            text: "Bình chọn".into(),
+            msg_type: "chat.poll".into(),
+            ts: 1_700_000_020_000,
+            is_outgoing: true,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
+            reactions: Vec::new(),
+            attachment_url: None,
+            attachment_name: Some(format!(
+                "teza-poll:{}",
+                serde_json::to_string(&sparse_ws_poll).unwrap()
+            )),
+        };
+        super::upsert_incoming_message(&mut store, &mut ws_real_msg).unwrap();
+
+        // 2. `poll_create` finishes later with synthetic `poll-901` carrying full metadata.
+        let created_poll = PollDto {
+            poll_id: 901,
+            question: "Cuối tuần đi đâu?".into(),
+            options: vec![
+                PollOptionDto {
+                    id: 51,
+                    content: "Đà Lạt".into(),
+                    votes: 0,
+                    voted: false,
+                },
+                PollOptionDto {
+                    id: 52,
+                    content: "Vũng Tàu".into(),
+                    votes: 0,
+                    voted: false,
+                },
+            ],
+            allow_multi: true,
+            allow_add_option: true,
+            is_anonymous: true,
+            expired_time: 1_960_000_000_000,
+            closed: false,
+        };
+        let synthetic_created_msg = MessageDto {
+            msg_id: "poll-901".into(),
+            cli_msg_id: None,
+            thread_id: "g300400".into(),
+            sender_id: "me".into(),
+            sender_name: "Bạn".into(),
+            text: "Bình chọn: Cuối tuần đi đâu?".into(),
+            msg_type: "chat.poll".into(),
+            ts: 1_700_000_020_500,
+            is_outgoing: true,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
+            reactions: Vec::new(),
+            attachment_url: None,
+            attachment_name: Some(format!(
+                "teza-poll:{}",
+                serde_json::to_string(&created_poll).unwrap()
+            )),
+        };
+
+        let result =
+            super::persist_created_poll_message_in_store(&mut store, synthetic_created_msg)
+                .unwrap();
+        let merged_msg = match result {
+            super::PollCreatePersistResult::MergedIntoReal { msg } => msg,
+            super::PollCreatePersistResult::InsertedNew { .. } => {
+                panic!("expected reverse-order poll_create to merge into existing real WS row")
+            }
+        };
+        assert_eq!(merged_msg.msg_id, "99001122");
+        assert_eq!(merged_msg.text, "Bình chọn: Cuối tuần đi đâu?");
+        let merged_poll = super::parse_message_poll_dto(&merged_msg).unwrap();
+        assert_eq!(merged_poll.question, "Cuối tuần đi đâu?");
+        assert_eq!(merged_poll.options.len(), 2);
+        assert!(merged_poll.allow_multi);
+        assert!(merged_poll.allow_add_option);
+        assert!(merged_poll.is_anonymous);
+
+        // Verify zero duplicate rows in SQLite and messages_fts.
+        assert!(store.get_message("300400", "poll-901").unwrap().is_none());
+        assert!(store.get_message("g300400", "poll-901").unwrap().is_none());
+        let thread_msgs = store.load_messages("300400", None, 20).unwrap();
+        assert_eq!(thread_msgs.len(), 1);
+        assert_eq!(thread_msgs[0].msg_id, "99001122");
+        let fts_hits = store.search_messages("Cuối tuần", 20).unwrap();
+        assert_eq!(fts_hits.len(), 1);
+        assert_eq!(fts_hits[0].msg_id, "99001122");
+
+        // 3. Normal order (no real WS row yet) inserts the synthetic row as expected.
+        let normal_poll = PollDto {
+            poll_id: 902,
+            question: "Uống trà sữa?".into(),
+            options: vec![
+                PollOptionDto {
+                    id: 61,
+                    content: "Có".into(),
+                    votes: 0,
+                    voted: false,
+                },
+                PollOptionDto {
+                    id: 62,
+                    content: "Không".into(),
+                    votes: 0,
+                    voted: false,
+                },
+            ],
+            allow_multi: false,
+            allow_add_option: false,
+            is_anonymous: false,
+            expired_time: 0,
+            closed: false,
+        };
+        let normal_msg = MessageDto {
+            msg_id: "poll-902".into(),
+            cli_msg_id: None,
+            thread_id: "300400".into(),
+            sender_id: "me".into(),
+            sender_name: "Bạn".into(),
+            text: "Bình chọn: Uống trà sữa?".into(),
+            msg_type: "chat.poll".into(),
+            ts: 1_700_000_021_000,
+            is_outgoing: true,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
+            reactions: Vec::new(),
+            attachment_url: None,
+            attachment_name: Some(format!(
+                "teza-poll:{}",
+                serde_json::to_string(&normal_poll).unwrap()
+            )),
+        };
+        match super::persist_created_poll_message_in_store(&mut store, normal_msg).unwrap() {
+            super::PollCreatePersistResult::InsertedNew { msg, .. } => {
+                assert_eq!(msg.msg_id, "poll-902");
+            }
+            super::PollCreatePersistResult::MergedIntoReal { .. } => {
+                panic!("expected normal-order poll_create to insert new synthetic row")
+            }
+        }
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_invoke_body_bytes_decodes_indexed_json_object_and_base64_string() {
+        use tauri::ipc::InvokeBody;
+
+        // Cross-realm Uint8Array JSON.stringify produces contiguous "0".."N-1" object
+        let indexed_obj = InvokeBody::Json(serde_json::json!({
+            "2": 78,
+            "0": 137,
+            "3": 71,
+            "1": 80
+        }));
+        assert_eq!(
+            super::extract_invoke_body_bytes(&indexed_obj, 16)
+                .unwrap()
+                .as_ref(),
+            &[137, 80, 78, 71]
+        );
+        assert!(super::extract_invoke_body_bytes(&indexed_obj, 3).is_err());
+
+        // Gaps, non-numeric keys, out-of-range bytes, and empty objects must be rejected
+        let gapped = InvokeBody::Json(serde_json::json!({ "0": 1, "2": 3 }));
+        assert!(super::extract_invoke_body_bytes(&gapped, 16).is_err());
+        let bad_val = InvokeBody::Json(serde_json::json!({ "0": 256 }));
+        assert!(super::extract_invoke_body_bytes(&bad_val, 16).is_err());
+        let empty_obj = InvokeBody::Json(serde_json::json!({}));
+        assert!(super::extract_invoke_body_bytes(&empty_obj, 16).is_err());
+
+        // Standard base64 JSON string decodes cleanly and enforces max_bytes
+        let b64 = InvokeBody::Json(serde_json::json!("iVBORw=="));
+        assert_eq!(
+            super::extract_invoke_body_bytes(&b64, 16).unwrap().as_ref(),
+            &[137, 80, 78, 71]
+        );
+        assert!(super::extract_invoke_body_bytes(&b64, 3).is_err());
+        let empty_str = InvokeBody::Json(serde_json::json!("   "));
+        assert!(super::extract_invoke_body_bytes(&empty_str, 16).is_err());
+        let invalid_b64 = InvokeBody::Json(serde_json::json!("not!valid!b64"));
+        assert!(super::extract_invoke_body_bytes(&invalid_b64, 16).is_err());
+    }
+
+    #[test]
+    fn should_dispatch_ws_event_accepts_e2ee_push_and_payload_bearing_unknown_cmds() {
+        let mk_ev = |cmd: u16, payload: serde_json::Value| zalo_core::socket::WsEvent {
+            cmd,
+            sub_cmd: 0,
+            version: 1,
+            payload,
+        };
+
+        assert!(super::should_dispatch_ws_event(&mk_ev(
+            zalo_core::socket::CMD_PULL_MSG_E2EE_1_1,
+            serde_json::json!({})
+        )));
+        assert!(super::should_dispatch_ws_event(&mk_ev(
+            zalo_core::socket::CMD_PULL_MSG_E2EE_GROUP,
+            serde_json::json!({})
+        )));
+        assert!(super::should_dispatch_ws_event(&mk_ev(
+            zalo_core::socket::CMD_PUSH_MSG_E2EE_1_1,
+            serde_json::json!({})
+        )));
+        assert!(super::should_dispatch_ws_event(&mk_ev(
+            zalo_core::socket::CMD_PUSH_MSG_E2EE_GROUP,
+            serde_json::json!({})
+        )));
+
+        // Unknown qCmds event carrying chat message payload must be dispatched
+        let unknown_stranger_push = mk_ev(
+            599,
+            serde_json::json!({
+                "data": {
+                    "strangerMsgs": [
+                        { "msgId": "7001", "uidFrom": "888777", "idTo": "111222", "content": "Hello" }
+                    ]
+                }
+            }),
+        );
+        assert!(super::should_dispatch_ws_event(&unknown_stranger_push));
+
+        // Unknown event with empty payload stays ignored
+        assert!(!super::should_dispatch_ws_event(&mk_ev(
+            599,
+            serde_json::json!({})
+        )));
+    }
+
+    #[test]
+    fn upsert_incoming_message_merges_real_vs_real_poll_votes_in_place() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use zalo_core::chat::{MessageDto, PollDto, PollOptionDto};
+        use zalo_core::data_dir::StoragePaths;
+        use zalo_core::store::MessageStore;
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("teza_tauri_poll_real_merge_{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = StoragePaths::from_dir(&dir).unwrap();
+        let mut store = MessageStore::open(&paths.history_db(Some("u-poll-real"))).unwrap();
+
+        let original_poll = PollDto {
+            poll_id: 5501,
+            question: "Đi ăn tối lúc mấy giờ?".into(),
+            options: vec![
+                PollOptionDto {
+                    id: 1,
+                    content: "19h".into(),
+                    votes: 1,
+                    voted: true,
+                },
+                PollOptionDto {
+                    id: 2,
+                    content: "20h".into(),
+                    votes: 0,
+                    voted: false,
+                },
+            ],
+            allow_multi: false,
+            allow_add_option: true,
+            is_anonymous: false,
+            expired_time: 1_999_000_000_000,
+            closed: false,
+        };
+        let mut first_real = MessageDto {
+            msg_id: "800001".into(),
+            cli_msg_id: Some("cli-5501".into()),
+            thread_id: "g9001".into(),
+            sender_id: "u-creator".into(),
+            sender_name: "Minh".into(),
+            text: "Bình chọn: Đi ăn tối lúc mấy giờ?".into(),
+            msg_type: "chat.poll".into(),
+            ts: 1_700_000_100_000,
+            is_outgoing: false,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
+            reactions: Vec::new(),
+            attachment_url: None,
+            attachment_name: Some(format!(
+                "teza-poll:{}",
+                serde_json::to_string(&original_poll).unwrap()
+            )),
+        };
+
+        let first_was_updated =
+            super::upsert_incoming_message(&mut store, &mut first_real).unwrap();
+        assert!(
+            !first_was_updated,
+            "first real poll insertion must report was_updated_existing == false"
+        );
+
+        // Second real server message arrives with a brand-new msg_id from someone voting
+        let vote_poll = PollDto {
+            poll_id: 5501,
+            question: "Bình chọn".into(),
+            options: vec![
+                PollOptionDto {
+                    id: 1,
+                    content: "19h".into(),
+                    votes: 1,
+                    voted: true,
+                },
+                PollOptionDto {
+                    id: 2,
+                    content: "20h".into(),
+                    votes: 2,
+                    voted: false,
+                },
+            ],
+            allow_multi: false,
+            allow_add_option: false,
+            is_anonymous: false,
+            expired_time: 0,
+            closed: false,
+        };
+        let mut vote_msg = MessageDto {
+            msg_id: "800099".into(),
+            cli_msg_id: Some("cli-5501-vote".into()),
+            thread_id: "g9001".into(),
+            sender_id: "u-voter".into(),
+            sender_name: "Lan".into(),
+            text: "Lan đã tham gia bình chọn".into(),
+            msg_type: "chat.poll".into(),
+            ts: 1_700_000_200_000,
+            is_outgoing: false,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
+            reactions: Vec::new(),
+            attachment_url: None,
+            attachment_name: Some(format!(
+                "teza-poll:{}",
+                serde_json::to_string(&vote_poll).unwrap()
+            )),
+        };
+
+        let second_was_updated =
+            super::upsert_incoming_message(&mut store, &mut vote_msg).unwrap();
+        assert!(
+            second_was_updated,
+            "real-vs-real poll vote must report was_updated_existing == true"
+        );
+        // Caller receives canonical original msg_id/ts/sender with merged poll state
+        assert_eq!(vote_msg.msg_id, "800001");
+        assert_eq!(vote_msg.ts, 1_700_000_100_000);
+        assert_eq!(vote_msg.sender_id, "u-creator");
+        assert_eq!(vote_msg.sender_name, "Minh");
+        assert_eq!(vote_msg.text, "Bình chọn: Đi ăn tối lúc mấy giờ?");
+        let merged_poll = super::parse_message_poll_dto(&vote_msg).unwrap();
+        assert_eq!(merged_poll.question, "Đi ăn tối lúc mấy giờ?");
+        assert_eq!(merged_poll.options.len(), 2);
+        assert_eq!(merged_poll.options[1].votes, 2);
+        assert!(merged_poll.allow_add_option);
+
+        // Only 1 row exists in SQLite — no duplicate created
+        let rows = store.load_messages("g9001", None, 20).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].msg_id, "800001");
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staged_raw_upload_helpers_sanitize_names_and_evict_stale_and_excess_entries() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        assert_eq!(
+            super::sanitize_staged_upload_filename("C:\\Users\\Alice\\Pictures\\shot.png"),
+            "shot.png"
+        );
+        assert_eq!(
+            super::sanitize_staged_upload_filename("../../etc/passwd"),
+            "passwd"
+        );
+        assert_eq!(super::sanitize_staged_upload_filename("   "), "clipboard.png");
+        assert_eq!(super::sanitize_staged_upload_filename(".."), "clipboard.png");
+
+        let mut map = HashMap::new();
+        let now_ms: i64 = 10_000_000;
+        // 1 expired entry (> 30 min)
+        map.insert(
+            "expired".to_string(),
+            super::StagedRawUpload {
+                path: PathBuf::from("expired.part"),
+                file_name: "old.png".into(),
+                bytes_written: 10,
+                created_ms: now_ms - super::STAGED_RAW_UPLOAD_TTL_MS - 1,
+            },
+        );
+        // 16 active entries (exceeds reserve_slot cap of 15)
+        for i in 0..super::MAX_STAGED_RAW_UPLOADS {
+            map.insert(
+                format!("up-{i}"),
+                super::StagedRawUpload {
+                    path: PathBuf::from(format!("up-{i}.part")),
+                    file_name: format!("f{i}.png"),
+                    bytes_written: 10,
+                    created_ms: now_ms - (super::MAX_STAGED_RAW_UPLOADS - i) as i64 * 1000,
+                },
+            );
+        }
+
+        let evicted = super::prune_staged_raw_uploads(&mut map, now_ms, true);
+        assert_eq!(evicted.len(), 2);
+        assert!(evicted.contains(&PathBuf::from("expired.part")));
+        assert!(evicted.contains(&PathBuf::from("up-0.part")));
+        assert_eq!(map.len(), super::MAX_STAGED_RAW_UPLOADS - 1);
+
+        // Direct peer thread ID helper
+        assert!(super::is_direct_peer_thread_id("88997766", "111", "222"));
+        assert!(!super::is_direct_peer_thread_id("g12345", "111", "222"));
+        assert!(!super::is_direct_peer_thread_id("cloud_123", "111", "222"));
+        assert!(!super::is_direct_peer_thread_id("cloud-me", "111", "222"));
+        assert!(!super::is_direct_peer_thread_id("111", "111", "222"));
+        assert!(!super::is_direct_peer_thread_id("222", "111", "222"));
+    }
+
+    #[test]
+    fn local_vault_only_forward_resolution_succeeds_without_attachment_url() {
+        use std::sync::Arc;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tokio::sync::Mutex;
+        use zalo_core::chat::messaging;
+        use zalo_core::data_dir::StoragePaths;
+        use zalo_core::media_vault::{MediaVault, MediaVaultConfig};
+        use zalo_core::store::MessageStore;
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("teza_tauri_fwd_local_vault_{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = StoragePaths::from_dir(&dir).unwrap();
+        let store = Arc::new(Mutex::new(
+            MessageStore::open(&paths.history_db(Some("u-fwd-local"))).unwrap(),
+        ));
+        let vault = Arc::new(
+            MediaVault::open(
+                &paths,
+                Some("u-fwd-local"),
+                MediaVaultConfig {
+                    encrypt_at_rest: true,
+                    ..MediaVaultConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+
+        let png_payload = b"\x89PNG\r\n\x1a\nlocal-only-forward-test-bytes".to_vec();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // Ingest a local-only media attachment (url_opt = None -> url_hash = "", no original_name)
+            let ingested = vault
+                .ingest_bytes(
+                    &store,
+                    &png_payload,
+                    "image",
+                    "image/png",
+                    None,
+                    Some(("peer-42", "msg-local-1")),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let mm_rec = {
+                let guard = store.lock().await;
+                guard
+                    .get_message_media_record("peer-42", "msg-local-1", "primary")
+                    .unwrap()
+                    .expect("message_media row must exist")
+            };
+            assert!(mm_rec.url_hash.is_empty());
+
+            // Even with attachment_url == None, attachment_name == None, original_name == None,
+            // effective_forward_attachment_name + is_forwardable_media_message must classify it as media
+            let eff_name = super::effective_forward_attachment_name(None, Some(&mm_rec));
+            assert_eq!(eff_name, Some("attachment.bin"));
+            assert!(messaging::is_forwardable_media_message(
+                "chat.photo",
+                None,
+                eff_name
+            ));
+
+            // Named message_media.original_name takes precedence over fallback "attachment.bin"
+            let mut mm_named = mm_rec.clone();
+            mm_named.original_name = Some("invoice.pdf".to_string());
+            assert_eq!(
+                super::effective_forward_attachment_name(None, Some(&mm_named)),
+                Some("invoice.pdf")
+            );
+            assert_eq!(
+                super::effective_forward_attachment_name(Some("explicit.png"), Some(&mm_named)),
+                Some("explicit.png")
+            );
+
+            // Local vault lookup resolves directly by (thread_id, msg_id) without any CDN URL
+            let resolved = super::resolve_local_vault_media_by_msg(
+                &vault,
+                &store,
+                Some(("peer-42", "msg-local-1")),
+            )
+            .await
+            .expect("local-vault-only media must resolve directly by msg_ref");
+            assert_eq!(resolved.sha256, ingested.sha256);
+            assert_eq!(resolved.size_bytes, png_payload.len() as u64);
+
+            let exported_path = dir.join("forwarded_local.png");
+            vault
+                .export_to_path(&resolved, &exported_path)
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(&exported_path).unwrap(), png_payload);
+
+            // Missing blob on disk must return None cleanly (so caller falls back to GDrive/error)
+            if let Some(rel) = resolved.local_rel_path.as_deref() {
+                let blob_path = vault.resolve_blob_path(rel).unwrap();
+                std::fs::remove_file(&blob_path).unwrap();
+            }
+            assert!(super::resolve_local_vault_media_by_msg(
+                &vault,
+                &store,
+                Some(("peer-42", "msg-local-1")),
+            )
+            .await
+            .is_none());
+        });
+
+        drop(vault);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ws_message_fallback_title_rejects_raw_and_suffixed_uids_while_preserving_real_names() {
+        let mk = |thread_id: &str, sender_id: &str, sender_name: &str, is_outgoing: bool| {
+            zalo_core::chat::MessageDto {
+                msg_id: "m1".into(),
+                cli_msg_id: None,
+                thread_id: thread_id.into(),
+                sender_id: sender_id.into(),
+                sender_name: sender_name.into(),
+                text: "hi".into(),
+                msg_type: "chat.text".into(),
+                ts: 1_700_000_000_000,
+                is_outgoing,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            }
+        };
+
+        // _0-suffixed and raw numeric UIDs must NEVER leak as thread fallback title
+        assert_eq!(
+            super::ws_message_fallback_title(&mk("777001", "777001_0", "777001_0", false)),
+            None
+        );
+        assert_eq!(
+            super::ws_message_fallback_title(&mk("777001", "999999", "777001_0", false)),
+            None
+        );
+        assert_eq!(
+            super::ws_message_fallback_title(&mk("777001", "777001", "777001", false)),
+            None
+        );
+        assert_eq!(
+            super::ws_message_fallback_title(&mk("peer-abc", "peer-abc", "peer-abc", false)),
+            None
+        );
+        assert_eq!(
+            super::ws_message_fallback_title(&mk("777001", "me", "Alice", true)),
+            None
+        );
+        assert_eq!(
+            super::ws_message_fallback_title(&mk("777001", "777001", "   ", false)),
+            None
+        );
+
+        // Real names (including underscores or mixed digits+letters) must pass through
+        assert_eq!(
+            super::ws_message_fallback_title(&mk("777001", "777001_0", "minh_anh", false)),
+            Some("minh_anh")
+        );
+        assert_eq!(
+            super::ws_message_fallback_title(&mk("777001", "777001_0", "user_123", false)),
+            Some("user_123")
+        );
+        assert_eq!(
+            super::ws_message_fallback_title(&mk("777001", "777001_0", "2025_team", false)),
+            Some("2025_team")
+        );
+        assert_eq!(
+            super::ws_message_fallback_title(&mk("777001", "777001_0", "Nguyễn Văn A", false)),
+            Some("Nguyễn Văn A")
+        );
     }
 }

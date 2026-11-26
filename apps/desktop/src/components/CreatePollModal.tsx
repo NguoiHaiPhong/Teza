@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { BarChart3, Loader2, Plus, Trash2, X } from "lucide-react";
 import { useI18n } from "../i18n";
+import { isImeComposingEvent } from "../utils/searchNormalize";
 
 interface Props {
   open: boolean;
@@ -41,6 +42,7 @@ export function CreatePollModal({ open, groupTitle, onClose, onSubmit }: Props) 
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (e: KeyboardEvent) => {
+      if (isImeComposingEvent(e)) return;
       if (e.key === "Escape") onClose();
     };
     window.addEventListener("keydown", onKeyDown);
@@ -54,11 +56,11 @@ export function CreatePollModal({ open, groupTitle, onClose, onSubmit }: Props) 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!question.trim()) {
-      setError("Vui lòng nhập câu hỏi bình chọn");
+      setError(t("pollErrorEmptyQuestion"));
       return;
     }
     if (cleanOptions.length < 2) {
-      setError("Vui lòng nhập ít nhất 2 phương án bình chọn");
+      setError(t("pollErrorMinOptions"));
       return;
     }
     setSaving(true);
@@ -75,7 +77,7 @@ export function CreatePollModal({ open, groupTitle, onClose, onSubmit }: Props) 
       });
       onClose();
     } catch (err) {
-      setError(String(err));
+      setError(String(err).replace(/^Error:\s*/i, ""));
     } finally {
       setSaving(false);
     }
@@ -88,6 +90,11 @@ export function CreatePollModal({ open, groupTitle, onClose, onSubmit }: Props) 
     >
       <form
         onSubmit={(e) => void handleSave(e)}
+        onKeyDown={(e) => {
+          if (isImeComposingEvent(e) && e.key === "Enter") {
+            e.preventDefault();
+          }
+        }}
         className="flex max-h-[88vh] w-full max-w-md flex-col overflow-hidden rounded-2xl shadow-2xl"
         style={{
           background: "var(--bg-sidebar)",

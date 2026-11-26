@@ -1,5 +1,5 @@
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { BarChart3, CalendarClock, CornerUpLeft, FileText, Image as ImageIcon, Loader2, Paperclip, Pencil, Scissors, Search, Send, Smile, Users, X, Zap } from "lucide-react";
+import { BarChart3, CalendarClock, Clock, CornerUpLeft, FileText, Image as ImageIcon, Loader2, Paperclip, Pencil, Scissors, Search, Send, Smile, Users, X, Zap } from "lucide-react";
 import { bridge, isTauri, MAX_ATTACHMENT_BYTES } from "../bridge";
 import { useI18n, type TranslationKey } from "../i18n";
 import type { MessageDto, PendingAttachment, StickerItem, ThreadMemberDto } from "../types";
@@ -80,6 +80,7 @@ interface Props {
   onBuzz?: () => Promise<void>;
   onOpenReminder?: () => void;
   onOpenPoll?: () => void;
+  onOpenSchedule?: () => void;
   onCaptureScreen?: () => void;
   capturingScreen?: boolean;
   onEditPendingImage?: () => void;
@@ -112,6 +113,7 @@ export function Composer({
   onBuzz,
   onOpenReminder,
   onOpenPoll,
+  onOpenSchedule,
   onCaptureScreen,
   capturingScreen = false,
   onEditPendingImage,
@@ -525,7 +527,13 @@ export function Composer({
       );
       return;
     }
-    const fileName = file.name || `clipboard-${Date.now()}.${extFromMime(file.type)}`;
+    const rawName = (file.name || "").trim();
+    const hasExt = /\.[A-Za-z0-9]{1,10}$/.test(rawName);
+    const fileName = !rawName
+      ? `clipboard-${Date.now()}.${extFromMime(file.type)}`
+      : !hasExt && file.type.startsWith("image/")
+        ? `${rawName}.${extFromMime(file.type)}`
+        : rawName;
     const isImage =
       file.type.startsWith("image/") || /\.(png|jpe?g|webp|gif|bmp)$/i.test(fileName);
     const previewUrl = isImage ? URL.createObjectURL(file) : null;
@@ -1370,6 +1378,21 @@ export function Composer({
           className="min-h-[40px] max-h-[140px] flex-1 resize-none overflow-y-auto rounded-xl px-3.5 py-2 text-[15px] leading-6 outline-none"
           style={{ background: "var(--bg-surface)", color: "var(--text-primary)" }}
         />
+
+        {onOpenSchedule && (
+          <button
+            type="button"
+            onClick={() => {
+              setEmojiOpen(false);
+              onOpenSchedule();
+            }}
+            title={t("composerScheduleTitle")}
+            className="hover-surface rounded-xl p-2.5 transition"
+            style={{ color: "var(--text-secondary)" }}
+          >
+            <Clock className="h-4 w-4" />
+          </button>
+        )}
 
         <button
           type="button"

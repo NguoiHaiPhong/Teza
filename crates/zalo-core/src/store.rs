@@ -3,17 +3,24 @@
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{anyhow, bail, Context, Result};
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64_URL},
+    Engine,
+};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Months, Utc};
 use md5::{Digest, Md5};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use sha2::Sha256;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::chat::parser::{canonicalize_reaction_emoji, clean_group_id, normalize_ts_ms};
 use crate::chat::{
-    strip_vi_accents, ChatFolderDto, FolderFilter, MessageDto, QuoteRef, ReactionSummary,
-    ThreadDto, ThreadKind,
+    contains_cjk_or_hangul, extract_korean_choseong, is_korean_choseong_query, strip_vi_accents,
+    ChatFolderDto, FolderFilter, MessageDto, PollDto, QuoteRef, ReactionSummary, ThreadDto,
+    ThreadKind,
 };
 use crate::translate::TranslationResult;
 use crate::{data_dir, dpapi};
@@ -182,6 +189,22 @@ fn message_media_aad(thread_id: &str, msg_id: &str, variant: &str) -> Vec<u8> {
     format!("msg_media:{thread_id}:{msg_id}:{variant}").into_bytes()
 }
 
+fn ai_msg_aad(id: &str) -> Vec<u8> {
+    format!("ai_msg:{id}").into_bytes()
+}
+
+fn sched_aad(id: &str) -> Vec<u8> {
+    format!("sched:{id}").into_bytes()
+}
+
+fn api_audit_aad(id: i64) -> Vec<u8> {
+    format!("api_audit:{id}").into_bytes()
+}
+
+fn api_idem_aad(client_id: &str, idem_key: &str) -> Vec<u8> {
+    format!("api_idem:{client_id}:{idem_key}").into_bytes()
+}
+
 pub const MEDIA_LOCAL_STATE_MISSING: i32 = 0;
 pub const MEDIA_LOCAL_STATE_LOCAL: i32 = 1;
 
@@ -340,10 +363,404 @@ impl HistoryDeltaBatch {
     }
 }
 
+const API_AUDIT_LOG_MAX_ROWS: i64 = 500;
+const API_IDEMPOTENCY_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
+const DAY_MS: i64 = 86_400_000;
+const WEEK_MS: i64 = 7 * DAY_MS;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiStoredMessageDto {
+    pub id: String,
+    pub session_id: String,
+    pub role: String,
+    pub content: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub backend: String,
+    pub ts: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledMessageDto {
+    pub id: String,
+    pub thread_id: String,
+    pub thread_title: String,
+    pub thread_kind: String,
+    pub text: String,
+    #[serde(default)]
+    pub attachment_path: String,
+    pub send_at_ts: i64,
+    pub recurrence: String,
+    pub misfire_policy: String,
+    pub misfire_grace_secs: i64,
+    pub status: String,
+    pub retry_count: u32,
+    #[serde(default)]
+    pub last_error: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub sent_at_ts: i64,
+}
+
+fn default_sched_thread_kind() -> String {
+    "direct".to_string()
+}
+
+fn default_sched_recurrence() -> String {
+    "once".to_string()
+}
+
+fn default_sched_misfire_policy() -> String {
+    "send_on_resume".to_string()
+}
+
+fn default_sched_misfire_grace_secs() -> i64 {
+    600
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewScheduledMessageInput {
+    pub thread_id: String,
+    #[serde(default)]
+    pub thread_title: String,
+    #[serde(default = "default_sched_thread_kind")]
+    pub thread_kind: String,
+    pub text: String,
+    #[serde(default)]
+    pub attachment_path: String,
+    pub send_at_ts: i64,
+    #[serde(default = "default_sched_recurrence")]
+    pub recurrence: String,
+    #[serde(default = "default_sched_misfire_policy")]
+    pub misfire_policy: String,
+    #[serde(default = "default_sched_misfire_grace_secs")]
+    pub misfire_grace_secs: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateScheduledMessageInput {
+    #[serde(default)]
+    pub thread_title: Option<String>,
+    #[serde(default)]
+    pub thread_kind: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub attachment_path: Option<String>,
+    #[serde(default)]
+    pub send_at_ts: Option<i64>,
+    #[serde(default)]
+    pub recurrence: Option<String>,
+    #[serde(default)]
+    pub misfire_policy: Option<String>,
+    #[serde(default)]
+    pub misfire_grace_secs: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiClientDto {
+    pub id: String,
+    pub name: String,
+    pub token_prefix: String,
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub allowed_thread_ids: Vec<String>,
+    pub rate_limit_per_min: u32,
+    pub enabled: bool,
+    pub created_at: i64,
+    pub last_used_at: i64,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatedApiClientDto {
+    pub client: ApiClientDto,
+    pub raw_token: String,
+}
+
+impl fmt::Debug for CreatedApiClientDto {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CreatedApiClientDto")
+            .field("client", &self.client)
+            .field("raw_token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiAuditLogDto {
+    pub id: i64,
+    pub client_id: String,
+    pub client_name: String,
+    pub method: String,
+    pub path: String,
+    pub target_thread_id: String,
+    pub status_code: u16,
+    pub outcome: String,
+    pub detail: String,
+    pub created_at: i64,
+}
+
+/// Computes the next occurrence timestamp (in Unix ms) strictly after `max(send_at_ts_ms, now_ms)`
+/// for recurring schedules (`"daily"`, `"weekly"`, `"monthly"`). Returns `None` for `"once"` or
+/// unrecognized recurrence values.
+pub fn compute_next_occurrence_ts(
+    send_at_ts_ms: i64,
+    recurrence: &str,
+    now_ms: i64,
+) -> Option<i64> {
+    let base_ms = normalize_ts_ms(send_at_ts_ms);
+    let target_min = normalize_ts_ms(now_ms).max(base_ms);
+    let base = DateTime::<Utc>::from_timestamp_millis(base_ms)?;
+    match recurrence.trim().to_ascii_lowercase().as_str() {
+        "daily" => {
+            let step_days = target_min.saturating_sub(base_ms) / DAY_MS + 1;
+            let mut next = base.checked_add_signed(ChronoDuration::days(step_days))?;
+            while next.timestamp_millis() <= target_min {
+                next = next.checked_add_signed(ChronoDuration::days(1))?;
+            }
+            Some(next.timestamp_millis())
+        }
+        "weekly" => {
+            let step_weeks = target_min.saturating_sub(base_ms) / WEEK_MS + 1;
+            let mut next = base.checked_add_signed(ChronoDuration::weeks(step_weeks))?;
+            while next.timestamp_millis() <= target_min {
+                next = next.checked_add_signed(ChronoDuration::weeks(1))?;
+            }
+            Some(next.timestamp_millis())
+        }
+        "monthly" => {
+            let target_dt = DateTime::<Utc>::from_timestamp_millis(target_min)?;
+            let approx_months = ((target_dt.year() - base.year()) * 12
+                + (target_dt.month() as i32 - base.month() as i32))
+                .max(1) as u32;
+            let mut months = approx_months.saturating_sub(1).max(1);
+            loop {
+                let candidate = base.checked_add_months(Months::new(months))?;
+                let cand_ms = candidate.timestamp_millis();
+                if cand_ms > target_min {
+                    return Some(cand_ms);
+                }
+                months = months.checked_add(1)?;
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Computes the SHA-256 lowercase hex digest of a raw Local Automation API token.
+pub fn hash_api_token(raw_token: &str) -> String {
+    let mut hasher = <Sha256 as sha2::Digest>::new();
+    sha2::Digest::update(&mut hasher, raw_token.as_bytes());
+    let digest = sha2::Digest::finalize(hasher);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Generates a cryptographically random Local Automation API token (`teza_` + 32 random bytes base64url).
+pub fn generate_api_token() -> Result<String> {
+    let mut raw = [0u8; 32];
+    getrandom::fill(&mut raw).context("Không tạo được token ngẫu nhiên CSPRNG")?;
+    Ok(format!("teza_{}", B64_URL.encode(raw)))
+}
+
+fn generate_prefixed_id(prefix: &str) -> Result<String> {
+    let mut raw = [0u8; 16];
+    getrandom::fill(&mut raw).context("Không tạo được định danh ngẫu nhiên CSPRNG")?;
+    let mut hex = String::with_capacity(prefix.len() + 1 + 32);
+    hex.push_str(prefix);
+    hex.push('_');
+    for b in raw {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    Ok(hex)
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn normalize_sched_thread_kind(raw: &str) -> Result<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "direct" => Ok("direct"),
+        "group" => Ok("group"),
+        "cloud" => Ok("cloud"),
+        other => bail!("Loại hội thoại không hợp lệ: {other}"),
+    }
+}
+
+fn normalize_sched_recurrence(raw: &str) -> Result<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "once" => Ok("once"),
+        "daily" => Ok("daily"),
+        "weekly" => Ok("weekly"),
+        "monthly" => Ok("monthly"),
+        other => bail!("Chu kỳ lặp không hợp lệ: {other}"),
+    }
+}
+
+fn normalize_sched_misfire_policy(raw: &str) -> Result<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "send_on_resume" => Ok("send_on_resume"),
+        "skip" => Ok("skip"),
+        "ask" => Ok("ask"),
+        other => bail!("Chính sách xử lý lỡ hẹn không hợp lệ: {other}"),
+    }
+}
+
+fn normalize_sched_status_token(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "pending" => Some("pending"),
+        "sending" => Some("sending"),
+        "sent" => Some("sent"),
+        "failed" => Some("failed"),
+        "cancelled" => Some("cancelled"),
+        "missed" => Some("missed"),
+        _ => None,
+    }
+}
+
+fn sanitize_api_scopes(scopes: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for raw in scopes {
+        let s = raw.trim().to_ascii_lowercase();
+        if s.is_empty() {
+            continue;
+        }
+        let canonical = match s.as_str() {
+            "send" => "send",
+            "schedule" => "schedule",
+            "read_threads" => "read_threads",
+            other => bail!("Quyền API không hợp lệ: {other}"),
+        };
+        if !out.iter().any(|x| x == canonical) {
+            out.push(canonical.to_string());
+        }
+    }
+    if out.is_empty() {
+        bail!("Cần chọn ít nhất một quyền (scope) cho ứng dụng API");
+    }
+    Ok(out)
+}
+
+fn sanitize_allowed_thread_ids(ids: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in ids {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() && !out.iter().any(|x| x == trimmed) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
+fn sanitize_rate_limit_per_min(raw: u32) -> u32 {
+    if raw == 0 {
+        20
+    } else {
+        raw.clamp(1, 600)
+    }
+}
+
 pub struct MessageStore {
     conn: Connection,
     fts_conn: Connection,
     cipher: DbCipher,
+}
+
+fn is_synthetic_poll_msg_id(msg_id: &str) -> bool {
+    msg_id.starts_with("poll-") || msg_id.starts_with("local-poll-")
+}
+
+fn parse_poll_dto_from_attachment_name(attachment_name: Option<&str>) -> Option<PollDto> {
+    attachment_name
+        .and_then(|s| s.strip_prefix("teza-poll:"))
+        .and_then(|json| serde_json::from_str::<PollDto>(json).ok())
+}
+
+fn extract_poll_id_from_message(msg: &MessageDto) -> Option<i64> {
+    if let Some(dto) = parse_poll_dto_from_attachment_name(msg.attachment_name.as_deref()) {
+        if dto.poll_id > 0 {
+            return Some(dto.poll_id);
+        }
+    }
+    msg.msg_id
+        .strip_prefix("poll-")
+        .or_else(|| msg.msg_id.strip_prefix("local-poll-"))
+        .and_then(|rest| rest.trim().parse::<i64>().ok())
+        .filter(|&id| id > 0)
+}
+
+fn poll_thread_id_candidates(thread_id: &str, extra_thread_id: Option<&str>) -> Vec<String> {
+    let mut tid_candidates: Vec<String> = Vec::with_capacity(4);
+    for candidate in [Some(thread_id), extra_thread_id].into_iter().flatten() {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !tid_candidates.iter().any(|t| t == trimmed) {
+            tid_candidates.push(trimmed.to_string());
+        }
+        let bare = clean_group_id(trimmed);
+        if !bare.is_empty() && !tid_candidates.iter().any(|t| t == bare) {
+            tid_candidates.push(bare.to_string());
+        }
+    }
+    tid_candidates
+}
+
+fn is_raw_numeric_uid_like(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    if let Some((lhs, rhs)) = t.split_once('_') {
+        return !lhs.is_empty()
+            && !rhs.is_empty()
+            && lhs.chars().all(|c| c.is_ascii_digit())
+            && rhs.chars().all(|c| c.is_ascii_digit());
+    }
+    false
+}
+
+fn is_placeholder_thread_title(title: &str, thread_id: &str) -> bool {
+    let trimmed = title.trim();
+    trimmed.is_empty() || trimmed == thread_id.trim() || is_raw_numeric_uid_like(trimmed)
+}
+
+fn fold_poll_dto(acc: Option<PollDto>, next: Option<PollDto>) -> Option<PollDto> {
+    match (acc, next) {
+        (Some(existing), Some(incoming)) => {
+            Some(crate::chat::threads::merge_poll_dto(&existing, &incoming))
+        }
+        (Some(existing), None) => Some(existing),
+        (None, Some(incoming)) => Some(incoming),
+        (None, None) => None,
+    }
+}
+
+fn format_merged_poll_text(question: &str) -> Option<String> {
+    let q = question.trim();
+    if !q.is_empty() && q != "Bình chọn" {
+        Some(format!("Bình chọn: {q}"))
+    } else {
+        None
+    }
 }
 
 fn normalize_reaction_summaries(reactions: &mut Vec<ReactionSummary>) -> bool {
@@ -520,6 +937,78 @@ impl MessageStore {
                 delta_file_id TEXT PRIMARY KEY,
                 applied_ts INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS ai_messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                model TEXT NOT NULL DEFAULT '',
+                backend TEXT NOT NULL DEFAULT '',
+                ts INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ai_messages_session_ts
+                ON ai_messages(session_id, ts);
+
+            CREATE TABLE IF NOT EXISTS scheduled_messages (
+                id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                thread_title TEXT NOT NULL,
+                thread_kind TEXT NOT NULL DEFAULT 'direct',
+                text TEXT NOT NULL,
+                attachment_path TEXT NOT NULL DEFAULT '',
+                send_at_ts INTEGER NOT NULL,
+                recurrence TEXT NOT NULL DEFAULT 'once',
+                misfire_policy TEXT NOT NULL DEFAULT 'send_on_resume',
+                misfire_grace_secs INTEGER NOT NULL DEFAULT 600,
+                status TEXT NOT NULL DEFAULT 'pending',
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                sent_at_ts INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_scheduled_messages_status_send_at
+                ON scheduled_messages(status, send_at_ts);
+
+            CREATE TABLE IF NOT EXISTS api_clients (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                token_prefix TEXT NOT NULL,
+                scopes TEXT NOT NULL,
+                allowed_thread_ids_json TEXT NOT NULL DEFAULT '[]',
+                rate_limit_per_min INTEGER NOT NULL DEFAULT 20,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                last_used_at INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS api_audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id TEXT NOT NULL,
+                client_name TEXT NOT NULL,
+                method TEXT NOT NULL,
+                path TEXT NOT NULL,
+                target_thread_id TEXT NOT NULL DEFAULT '',
+                status_code INTEGER NOT NULL,
+                outcome TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_api_audit_logs_created_at
+                ON api_audit_logs(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS api_idempotency (
+                client_id TEXT NOT NULL,
+                idem_key TEXT NOT NULL,
+                status_code INTEGER NOT NULL,
+                response_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (client_id, idem_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_api_idempotency_created_at
+                ON api_idempotency(created_at);
             "#,
         )?;
         self.ensure_column("messages", "quote_json", "TEXT")?;
@@ -966,7 +1455,12 @@ impl MessageStore {
         Ok(out)
     }
 
-    pub fn upsert_message(&mut self, m: &MessageDto) -> Result<()> {
+    fn upsert_message_row_in_tx(
+        cipher: &DbCipher,
+        tx: &rusqlite::Transaction<'_>,
+        m: &MessageDto,
+    ) -> Result<(i64, String, String)> {
+        let sender_norm = strip_vi_accents(&m.sender_name);
         let text_norm = strip_vi_accents(&m.text);
         let quote_json = m
             .quote
@@ -977,13 +1471,13 @@ impl MessageStore {
         let reactions_empty = m.reactions.is_empty() as i64;
 
         let aad = msg_aad(&m.thread_id, &m.msg_id);
-        let enc_sender_id = self.cipher.encrypt_str(&aad, &m.sender_id)?;
-        let enc_sender_name = self.cipher.encrypt_str(&aad, &m.sender_name)?;
-        let enc_text = self.cipher.encrypt_str(&aad, &m.text)?;
-        let enc_quote = self.cipher.encrypt_opt(&aad, quote_json.as_deref())?;
-        let enc_reactions = self.cipher.encrypt_str(&aad, &reactions_json)?;
-        let enc_att_url = self.cipher.encrypt_opt(&aad, m.attachment_url.as_deref())?;
-        let enc_att_name = self.cipher.encrypt_opt(&aad, m.attachment_name.as_deref())?;
+        let enc_sender_id = cipher.encrypt_str(&aad, &m.sender_id)?;
+        let enc_sender_name = cipher.encrypt_str(&aad, &m.sender_name)?;
+        let enc_text = cipher.encrypt_str(&aad, &m.text)?;
+        let enc_quote = cipher.encrypt_opt(&aad, quote_json.as_deref())?;
+        let enc_reactions = cipher.encrypt_str(&aad, &reactions_json)?;
+        let enc_att_url = cipher.encrypt_opt(&aad, m.attachment_url.as_deref())?;
+        let enc_att_name = cipher.encrypt_opt(&aad, m.attachment_name.as_deref())?;
         let ts = normalize_ts_ms(m.ts);
         let cli_msg_id = m
             .cli_msg_id
@@ -992,7 +1486,6 @@ impl MessageStore {
             .filter(|s| !s.is_empty() && *s != "0")
             .unwrap_or("");
 
-        let tx = self.conn.transaction()?;
         tx.execute(
             r#"
             INSERT INTO messages (msg_id, thread_id, sender_id, sender_name, text, text_norm, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id)
@@ -1052,6 +1545,12 @@ impl MessageStore {
                 params![m.thread_id, m.msg_id],
             )?;
         }
+        Ok((ts, sender_norm, text_norm))
+    }
+
+    pub fn upsert_message(&mut self, m: &MessageDto) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let (ts, sender_norm, text_norm) = Self::upsert_message_row_in_tx(&self.cipher, &tx, m)?;
         tx.commit()?;
 
         let fts_tx = self.fts_conn.transaction()?;
@@ -1061,15 +1560,378 @@ impl MessageStore {
         )?;
         fts_tx.execute(
             "INSERT INTO messages_fts (msg_id, thread_id, ts, sender_name, text_norm) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                m.msg_id,
-                m.thread_id,
-                ts,
-                strip_vi_accents(&m.sender_name),
-                text_norm
-            ],
+            params![m.msg_id, m.thread_id, ts, sender_norm, text_norm],
         )?;
         fts_tx.commit()?;
+        Ok(())
+    }
+
+    fn query_poll_candidates_in_tx(
+        &self,
+        tx: &Transaction<'_>,
+        tid_candidates: &[String],
+    ) -> Result<Vec<MessageDto>> {
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        let mut out: Vec<MessageDto> = Vec::new();
+        let mut stmt = tx.prepare(
+            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing,
+                    is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id
+             FROM messages
+             WHERE thread_id = ?1
+               AND (
+                   LOWER(msg_type) LIKE '%poll%'
+                   OR msg_id LIKE 'poll-%'
+                   OR msg_id LIKE 'local-poll-%'
+                   OR (attachment_name IS NOT NULL AND attachment_url IS NULL)
+               )
+             ORDER BY ts ASC, msg_id ASC",
+        )?;
+        for tid in tid_candidates {
+            let mut rows = stmt.query(params![tid])?;
+            while let Some(row) = rows.next()? {
+                let dto = self.decrypt_raw_message_tuple(row)?;
+                if seen.insert((dto.thread_id.clone(), dto.msg_id.clone())) {
+                    out.push(dto);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn delete_message_row_in_tx(tx: &Transaction<'_>, thread_id: &str, msg_id: &str) -> Result<()> {
+        tx.execute(
+            "DELETE FROM messages WHERE thread_id = ?1 AND msg_id = ?2",
+            params![thread_id, msg_id],
+        )?;
+        tx.execute(
+            "DELETE FROM message_translations WHERE msg_id = ?1",
+            params![msg_id],
+        )?;
+        tx.execute(
+            "DELETE FROM message_media WHERE thread_id = ?1 AND msg_id = ?2",
+            params![thread_id, msg_id],
+        )?;
+        Ok(())
+    }
+
+    /// Atomically upserts or merges a poll message in `thread_id` keyed by `(thread_id, poll_id)`
+    /// so vote/update pushes referencing an existing real server poll NEVER create duplicate rows.
+    ///
+    /// Returns `(saved_message, was_updated_existing)`:
+    /// - `true` when an existing real server poll row was found and updated in place (preserving
+    ///   its original `msg_id`, `ts`, `sender_id`, `sender_name`, `is_outgoing`).
+    /// - `false` when no real server poll row existed yet (brand-new poll or replacing only
+    ///   synthetic optimistic `poll-*`/`local-poll-*` rows).
+    pub fn upsert_or_merge_poll_message(
+        &self,
+        thread_id: &str,
+        poll_id: i64,
+        incoming: &MessageDto,
+    ) -> Result<(MessageDto, bool)> {
+        let incoming_poll = parse_poll_dto_from_attachment_name(incoming.attachment_name.as_deref());
+        let effective_poll_id = if poll_id > 0 {
+            poll_id
+        } else {
+            incoming_poll
+                .as_ref()
+                .map(|p| p.poll_id)
+                .filter(|&id| id > 0)
+                .unwrap_or(0)
+        };
+
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if effective_poll_id <= 0 {
+            let existed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE thread_id = ?1 AND msg_id = ?2)",
+                params![&incoming.thread_id, &incoming.msg_id],
+                |r| r.get::<_, i64>(0),
+            )? != 0;
+            let (ts, sender_norm, text_norm) =
+                Self::upsert_message_row_in_tx(&self.cipher, &tx, incoming)?;
+            tx.commit()?;
+
+            let fts_tx = self.fts_conn.unchecked_transaction()?;
+            fts_tx.execute(
+                "DELETE FROM messages_fts WHERE thread_id = ?1 AND msg_id = ?2",
+                params![&incoming.thread_id, &incoming.msg_id],
+            )?;
+            fts_tx.execute(
+                "INSERT INTO messages_fts (msg_id, thread_id, ts, sender_name, text_norm) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![&incoming.msg_id, &incoming.thread_id, ts, sender_norm, text_norm],
+            )?;
+            fts_tx.commit()?;
+
+            let mut saved = incoming.clone();
+            saved.ts = ts;
+            return Ok((saved, existed));
+        }
+
+        let tid_candidates = poll_thread_id_candidates(thread_id, Some(&incoming.thread_id));
+        let exact_poll_id = format!("poll-{effective_poll_id}");
+        let exact_local_poll_id = format!("local-poll-{effective_poll_id}");
+
+        let candidates = self.query_poll_candidates_in_tx(&tx, &tid_candidates)?;
+        let mut real_rows: Vec<MessageDto> = Vec::new();
+        let mut synthetic_rows: Vec<MessageDto> = Vec::new();
+        for row in candidates {
+            let matches = row.msg_id == exact_poll_id
+                || row.msg_id == exact_local_poll_id
+                || parse_poll_dto_from_attachment_name(row.attachment_name.as_deref())
+                    .is_some_and(|dto| dto.poll_id == effective_poll_id);
+            if !matches {
+                continue;
+            }
+            if is_synthetic_poll_msg_id(&row.msg_id) {
+                synthetic_rows.push(row);
+            } else {
+                real_rows.push(row);
+            }
+        }
+        real_rows.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.msg_id.cmp(&b.msg_id)));
+        synthetic_rows.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.msg_id.cmp(&b.msg_id)));
+
+        let mut to_delete: Vec<(String, String)> = Vec::new();
+        let (mut saved, was_updated_existing) = if !real_rows.is_empty() {
+            // Case 1: At least one real server poll row exists; keep earliest real row as canonical.
+            let mut canonical = real_rows.remove(0);
+            let mut merged_poll: Option<PollDto> = None;
+
+            for syn in &synthetic_rows {
+                merged_poll = fold_poll_dto(
+                    merged_poll,
+                    parse_poll_dto_from_attachment_name(syn.attachment_name.as_deref()),
+                );
+                to_delete.push((syn.thread_id.clone(), syn.msg_id.clone()));
+            }
+            merged_poll = fold_poll_dto(
+                merged_poll,
+                parse_poll_dto_from_attachment_name(canonical.attachment_name.as_deref()),
+            );
+            for dup in &real_rows {
+                merged_poll = fold_poll_dto(
+                    merged_poll,
+                    parse_poll_dto_from_attachment_name(dup.attachment_name.as_deref()),
+                );
+                to_delete.push((dup.thread_id.clone(), dup.msg_id.clone()));
+            }
+            merged_poll = fold_poll_dto(merged_poll, incoming_poll);
+
+            canonical.msg_type = "chat.poll".to_string();
+            canonical.attachment_url = None;
+            if incoming.msg_id == canonical.msg_id {
+                canonical.is_pinned |= incoming.is_pinned;
+                canonical.is_recalled |= incoming.is_recalled;
+                if canonical.cli_msg_id.is_none() {
+                    canonical.cli_msg_id = incoming.cli_msg_id.clone();
+                }
+            }
+            if let Some(merged) = merged_poll {
+                let poll_json = serde_json::to_string(&merged)?;
+                canonical.attachment_name = Some(format!("teza-poll:{poll_json}"));
+                if let Some(formatted) = format_merged_poll_text(&merged.question) {
+                    canonical.text = formatted;
+                } else if canonical.text.trim().is_empty() {
+                    canonical.text = "Bình chọn".to_string();
+                }
+            }
+            (canonical, true)
+        } else {
+            // Case 2: No existing real server poll row; merge any synthetic row metadata & remove synthetics.
+            let mut target = incoming.clone();
+            let mut syn_poll: Option<PollDto> = None;
+            for syn in &synthetic_rows {
+                syn_poll = fold_poll_dto(
+                    syn_poll,
+                    parse_poll_dto_from_attachment_name(syn.attachment_name.as_deref()),
+                );
+                if !(syn.thread_id == target.thread_id && syn.msg_id == target.msg_id) {
+                    to_delete.push((syn.thread_id.clone(), syn.msg_id.clone()));
+                }
+            }
+            if syn_poll.is_some() {
+                if let Some(merged) = fold_poll_dto(syn_poll, incoming_poll) {
+                    let poll_json = serde_json::to_string(&merged)?;
+                    target.attachment_name = Some(format!("teza-poll:{poll_json}"));
+                    target.attachment_url = None;
+                    let trimmed_text = target.text.trim();
+                    if trimmed_text.is_empty()
+                        || trimmed_text == "Bình chọn"
+                        || trimmed_text == "[Bình chọn]"
+                    {
+                        if let Some(formatted) = format_merged_poll_text(&merged.question) {
+                            target.text = formatted;
+                        }
+                    }
+                }
+            }
+            (target, false)
+        };
+
+        for (del_tid, del_mid) in &to_delete {
+            Self::delete_message_row_in_tx(&tx, del_tid, del_mid)?;
+        }
+
+        let (ts, sender_norm, text_norm) =
+            Self::upsert_message_row_in_tx(&self.cipher, &tx, &saved)?;
+        saved.ts = ts;
+        tx.commit()?;
+
+        let fts_tx = self.fts_conn.unchecked_transaction()?;
+        for (del_tid, del_mid) in &to_delete {
+            fts_tx.execute(
+                "DELETE FROM messages_fts WHERE thread_id = ?1 AND msg_id = ?2",
+                params![del_tid, del_mid],
+            )?;
+        }
+        fts_tx.execute(
+            "DELETE FROM messages_fts WHERE thread_id = ?1 AND msg_id = ?2",
+            params![&saved.thread_id, &saved.msg_id],
+        )?;
+        fts_tx.execute(
+            "INSERT INTO messages_fts (msg_id, thread_id, ts, sender_name, text_norm) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![&saved.msg_id, &saved.thread_id, ts, sender_norm, text_norm],
+        )?;
+        fts_tx.commit()?;
+
+        Ok((saved, was_updated_existing))
+    }
+
+    /// Cleans up pre-existing duplicate poll rows in SQLite for the same `(thread_id, poll_id)`,
+    /// keeping the earliest real row, merging newer `PollDto` state into it, and removing extra
+    /// duplicate rows from `messages`, `message_translations`, `message_media`, and `messages_fts`.
+    /// Returns the number of duplicate rows removed.
+    pub fn dedupe_duplicate_poll_messages_in_thread(&self, thread_id: &str) -> Result<usize> {
+        let tid_candidates = poll_thread_id_candidates(thread_id, None);
+        if tid_candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let candidates = self.query_poll_candidates_in_tx(&tx, &tid_candidates)?;
+
+        let mut grouped: BTreeMap<i64, Vec<MessageDto>> = BTreeMap::new();
+        for msg in candidates {
+            if let Some(pid) = extract_poll_id_from_message(&msg) {
+                grouped.entry(pid).or_default().push(msg);
+            }
+        }
+
+        let mut to_delete: Vec<(String, String)> = Vec::new();
+        let mut fts_updates: Vec<(String, String, i64, String, String)> = Vec::new();
+
+        for (_pid, rows) in grouped {
+            if rows.len() <= 1 {
+                continue;
+            }
+            let (mut synthetic_rows, mut real_rows): (Vec<MessageDto>, Vec<MessageDto>) = rows
+                .into_iter()
+                .partition(|m| is_synthetic_poll_msg_id(&m.msg_id));
+            real_rows.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.msg_id.cmp(&b.msg_id)));
+            synthetic_rows.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.msg_id.cmp(&b.msg_id)));
+
+            let mut merged_poll: Option<PollDto> = None;
+            let mut canonical = if !real_rows.is_empty() {
+                let first_real = real_rows.remove(0);
+                for syn in &synthetic_rows {
+                    merged_poll = fold_poll_dto(
+                        merged_poll,
+                        parse_poll_dto_from_attachment_name(syn.attachment_name.as_deref()),
+                    );
+                    to_delete.push((syn.thread_id.clone(), syn.msg_id.clone()));
+                }
+                merged_poll = fold_poll_dto(
+                    merged_poll,
+                    parse_poll_dto_from_attachment_name(first_real.attachment_name.as_deref()),
+                );
+                for dup in &real_rows {
+                    merged_poll = fold_poll_dto(
+                        merged_poll,
+                        parse_poll_dto_from_attachment_name(dup.attachment_name.as_deref()),
+                    );
+                    to_delete.push((dup.thread_id.clone(), dup.msg_id.clone()));
+                }
+                first_real
+            } else {
+                let first_syn = synthetic_rows.remove(0);
+                merged_poll = fold_poll_dto(
+                    merged_poll,
+                    parse_poll_dto_from_attachment_name(first_syn.attachment_name.as_deref()),
+                );
+                for dup in &synthetic_rows {
+                    merged_poll = fold_poll_dto(
+                        merged_poll,
+                        parse_poll_dto_from_attachment_name(dup.attachment_name.as_deref()),
+                    );
+                    to_delete.push((dup.thread_id.clone(), dup.msg_id.clone()));
+                }
+                first_syn
+            };
+
+            canonical.msg_type = "chat.poll".to_string();
+            canonical.attachment_url = None;
+            if let Some(merged) = merged_poll {
+                let poll_json = serde_json::to_string(&merged)?;
+                canonical.attachment_name = Some(format!("teza-poll:{poll_json}"));
+                if let Some(formatted) = format_merged_poll_text(&merged.question) {
+                    canonical.text = formatted;
+                } else if canonical.text.trim().is_empty() {
+                    canonical.text = "Bình chọn".to_string();
+                }
+            }
+
+            let (ts, sender_norm, text_norm) =
+                Self::upsert_message_row_in_tx(&self.cipher, &tx, &canonical)?;
+            fts_updates.push((
+                canonical.thread_id,
+                canonical.msg_id,
+                ts,
+                sender_norm,
+                text_norm,
+            ));
+        }
+
+        if to_delete.is_empty() {
+            return Ok(0);
+        }
+
+        for (del_tid, del_mid) in &to_delete {
+            Self::delete_message_row_in_tx(&tx, del_tid, del_mid)?;
+        }
+        tx.commit()?;
+
+        let fts_tx = self.fts_conn.unchecked_transaction()?;
+        for (del_tid, del_mid) in &to_delete {
+            fts_tx.execute(
+                "DELETE FROM messages_fts WHERE thread_id = ?1 AND msg_id = ?2",
+                params![del_tid, del_mid],
+            )?;
+        }
+        for (tid, mid, ts, sender_norm, text_norm) in fts_updates {
+            fts_tx.execute(
+                "DELETE FROM messages_fts WHERE thread_id = ?1 AND msg_id = ?2",
+                params![&tid, &mid],
+            )?;
+            fts_tx.execute(
+                "INSERT INTO messages_fts (msg_id, thread_id, ts, sender_name, text_norm) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![&mid, &tid, ts, sender_norm, text_norm],
+            )?;
+        }
+        fts_tx.commit()?;
+
+        Ok(to_delete.len())
+    }
+
+    /// Deduplicates an optimistic local poll message (`poll-{poll_id}`, `local-poll-{poll_id}`,
+    /// or a `local-poll-*` row whose `teza-poll:` payload carries `poll_id`) against the real
+    /// server message `real_msg`, removing the synthetic row from `messages` + `messages_fts`
+    /// and upserting `real_msg` atomically.
+    pub fn replace_optimistic_poll_message(
+        &self,
+        thread_id: &str,
+        poll_id: i64,
+        real_msg: &MessageDto,
+    ) -> Result<()> {
+        let _ = self.upsert_or_merge_poll_message(thread_id, poll_id, real_msg)?;
         Ok(())
     }
 
@@ -1858,18 +2720,121 @@ impl MessageStore {
         Ok(())
     }
 
+    fn get_thread_row(&self, thread_id: &str) -> Result<Option<ThreadDto>> {
+        struct RawThreadRow {
+            id: String,
+            enc_title: String,
+            enc_avatar: String,
+            kind_str: String,
+            enc_preview: String,
+            last_ts: i64,
+            unread: i64,
+            pinned: i64,
+            muted: i64,
+            last_read_in_ts: i64,
+            peer_read_ts: i64,
+            raw_muted_until_ts: i64,
+            archived: i64,
+        }
+        let row: Option<RawThreadRow> = self
+            .conn
+            .query_row(
+                "SELECT id, title, avatar, kind, last_preview, last_ts, unread_count, is_pinned, is_muted, last_read_in_ts, peer_read_ts, muted_until_ts, is_archived
+                 FROM threads WHERE id = ?1 LIMIT 1",
+                params![thread_id],
+                |row| {
+                    Ok(RawThreadRow {
+                        id: row.get(0)?,
+                        enc_title: row.get(1)?,
+                        enc_avatar: row.get(2)?,
+                        kind_str: row.get(3)?,
+                        enc_preview: row.get(4)?,
+                        last_ts: row.get(5)?,
+                        unread: row.get(6)?,
+                        pinned: row.get(7)?,
+                        muted: row.get(8)?,
+                        last_read_in_ts: row.get(9)?,
+                        peer_read_ts: row.get(10)?,
+                        raw_muted_until_ts: row.get(11)?,
+                        archived: row.get(12)?,
+                    })
+                },
+            )
+            .optional()?;
+        let Some(RawThreadRow {
+            id,
+            enc_title,
+            enc_avatar,
+            kind_str,
+            enc_preview,
+            last_ts,
+            unread,
+            pinned,
+            muted,
+            last_read_in_ts,
+            peer_read_ts,
+            raw_muted_until_ts,
+            archived,
+        }) = row
+        else {
+            return Ok(None);
+        };
+        let aad = thread_aad(&id);
+        let title = self.cipher.decrypt_str(&aad, &enc_title)?;
+        let avatar = self.cipher.decrypt_str(&aad, &enc_avatar)?;
+        let last_preview = self.cipher.decrypt_str(&aad, &enc_preview)?;
+        let kind = match kind_str.as_str() {
+            "group" => ThreadKind::Group,
+            "cloud" => ThreadKind::Cloud,
+            _ => ThreadKind::Direct,
+        };
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mute_expired = muted != 0 && raw_muted_until_ts > 0 && raw_muted_until_ts <= now_ms;
+        let is_muted = muted != 0 && !mute_expired;
+        let muted_until_ts = if is_muted { raw_muted_until_ts } else { 0 };
+        Ok(Some(ThreadDto {
+            id,
+            title,
+            avatar,
+            kind,
+            last_preview,
+            last_ts,
+            unread_count: unread.max(0) as u32,
+            is_pinned: pinned != 0,
+            is_muted,
+            last_read_in_ts,
+            peer_read_ts,
+            muted_until_ts,
+            is_archived: archived != 0,
+        }))
+    }
+
     /// Updates thread preview & unread counters, returning `true` when a brand-new thread row
     /// was inserted locally because `thread_id` did not exist in SQLite yet.
-    pub fn update_thread_preview_returning_created(
+    ///
+    /// When inserting a new stub thread, prefers `fallback_title` (if non-empty and not raw
+    /// numeric) over raw `thread_id`, and `fallback_avatar` if non-empty. When the thread row
+    /// already exists with a placeholder title (`title == id`, empty, or raw numeric), upgrades
+    /// `title` (and `avatar` if currently empty) without clobbering real names or avatars.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_thread_preview_with_fallback_meta(
         &self,
         thread_id: &str,
         preview: &str,
         ts: i64,
         inc_unread: bool,
         clear_unread: bool,
+        fallback_title: Option<&str>,
+        fallback_avatar: Option<&str>,
     ) -> Result<bool> {
         let ts = normalize_ts_ms(ts);
-        let enc_preview = self.cipher.encrypt_str(&thread_aad(thread_id), preview)?;
+        let aad = thread_aad(thread_id);
+        let enc_preview = self.cipher.encrypt_str(&aad, preview)?;
+        let clean_fallback_title = fallback_title
+            .map(str::trim)
+            .filter(|t| !t.is_empty() && !is_raw_numeric_uid_like(t));
+        let clean_fallback_avatar = fallback_avatar.map(str::trim).filter(|a| !a.is_empty());
+
         let updated = self.conn.execute(
             "UPDATE threads
              SET last_preview = ?2,
@@ -1894,8 +2859,8 @@ impl MessageStore {
         if updated == 0 {
             self.upsert_thread(&ThreadDto {
                 id: thread_id.to_string(),
-                title: thread_id.to_string(),
-                avatar: String::new(),
+                title: clean_fallback_title.unwrap_or(thread_id).to_string(),
+                avatar: clean_fallback_avatar.unwrap_or("").to_string(),
                 kind: ThreadKind::Direct,
                 last_preview: preview.to_string(),
                 last_ts: ts,
@@ -1909,7 +2874,218 @@ impl MessageStore {
             })?;
             return Ok(true);
         }
+
+        if clean_fallback_title.is_some() || clean_fallback_avatar.is_some() {
+            let existing: Option<(String, String)> = self
+                .conn
+                .query_row(
+                    "SELECT title, avatar FROM threads WHERE id = ?1 LIMIT 1",
+                    params![thread_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((enc_title, enc_avatar)) = existing {
+                let curr_title = self.cipher.decrypt_str(&aad, &enc_title)?;
+                let curr_avatar = self.cipher.decrypt_str(&aad, &enc_avatar)?;
+                let upgrade_title = clean_fallback_title
+                    .filter(|_| is_placeholder_thread_title(&curr_title, thread_id));
+                let upgrade_avatar = clean_fallback_avatar.filter(|_| curr_avatar.trim().is_empty());
+                if upgrade_title.is_some() || upgrade_avatar.is_some() {
+                    let next_enc_title = match upgrade_title {
+                        Some(t) => self.cipher.encrypt_str(&aad, t)?,
+                        None => enc_title,
+                    };
+                    let next_enc_avatar = match upgrade_avatar {
+                        Some(a) => self.cipher.encrypt_str(&aad, a)?,
+                        None => enc_avatar,
+                    };
+                    self.conn.execute(
+                        "UPDATE threads SET title = ?2, avatar = ?3, title_norm = '' WHERE id = ?1",
+                        params![thread_id, next_enc_title, next_enc_avatar],
+                    )?;
+                }
+            }
+        }
         Ok(false)
+    }
+
+    /// Updates thread preview & unread counters, returning `true` when a brand-new thread row
+    /// was inserted locally because `thread_id` did not exist in SQLite yet.
+    pub fn update_thread_preview_returning_created(
+        &self,
+        thread_id: &str,
+        preview: &str,
+        ts: i64,
+        inc_unread: bool,
+        clear_unread: bool,
+    ) -> Result<bool> {
+        self.update_thread_preview_with_fallback_meta(
+            thread_id,
+            preview,
+            ts,
+            inc_unread,
+            clear_unread,
+            None,
+            None,
+        )
+    }
+
+    /// Updates `title` and/or `avatar` on an existing thread row without clobbering `last_preview`,
+    /// `last_ts`, `unread_count`, `is_pinned`, `is_muted`, `is_archived`, or `kind`.
+    /// Returns `true` if the existing row was modified.
+    pub fn upsert_thread_profile_meta(
+        &self,
+        thread_id: &str,
+        title: &str,
+        avatar: &str,
+    ) -> Result<bool> {
+        let tid = thread_id.trim();
+        if tid.is_empty() {
+            return Ok(false);
+        }
+        let existing: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT title, avatar FROM threads WHERE id = ?1 LIMIT 1",
+                params![tid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((enc_title, enc_avatar)) = existing else {
+            return Ok(false);
+        };
+
+        let aad = thread_aad(tid);
+        let curr_title = self.cipher.decrypt_str(&aad, &enc_title)?;
+        let curr_avatar = self.cipher.decrypt_str(&aad, &enc_avatar)?;
+
+        let clean_title = title.trim();
+        let clean_avatar = avatar.trim();
+        let incoming_title_is_real =
+            !clean_title.is_empty() && !is_raw_numeric_uid_like(clean_title);
+        let curr_title_is_placeholder = is_placeholder_thread_title(&curr_title, tid);
+
+        let next_title = if incoming_title_is_real
+            || (!clean_title.is_empty() && curr_title_is_placeholder)
+        {
+            clean_title
+        } else {
+            curr_title.as_str()
+        };
+        let next_avatar = if !clean_avatar.is_empty() {
+            clean_avatar
+        } else {
+            curr_avatar.as_str()
+        };
+
+        if next_title == curr_title && next_avatar == curr_avatar {
+            return Ok(false);
+        }
+
+        let next_enc_title = if next_title != curr_title {
+            self.cipher.encrypt_str(&aad, next_title)?
+        } else {
+            enc_title
+        };
+        let next_enc_avatar = if next_avatar != curr_avatar {
+            self.cipher.encrypt_str(&aad, next_avatar)?
+        } else {
+            enc_avatar
+        };
+        let affected = self.conn.execute(
+            "UPDATE threads SET title = ?2, avatar = ?3, title_norm = '' WHERE id = ?1",
+            params![tid, next_enc_title, next_enc_avatar],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Ensures a `ThreadKind::Direct` row exists for `thread_id`: inserts a new row (with
+    /// `last_ts = 0`, `unread_count = 0`) if missing, or updates `title`/`avatar` via
+    /// `upsert_thread_profile_meta` if already present, returning the resulting `ThreadDto`.
+    pub fn ensure_direct_thread(
+        &self,
+        thread_id: &str,
+        title: &str,
+        avatar: &str,
+    ) -> Result<ThreadDto> {
+        let tid = thread_id.trim();
+        if tid.is_empty() {
+            bail!("Mã hội thoại không hợp lệ");
+        }
+        if self.get_thread_row(tid)?.is_some() {
+            let _ = self.upsert_thread_profile_meta(tid, title, avatar)?;
+            return self
+                .get_thread_row(tid)?
+                .ok_or_else(|| anyhow!("Không tìm thấy hội thoại sau khi cập nhật"));
+        }
+        let clean_title = title.trim();
+        let effective_title = if clean_title.is_empty() {
+            tid.to_string()
+        } else {
+            clean_title.to_string()
+        };
+        let dto = ThreadDto {
+            id: tid.to_string(),
+            title: effective_title,
+            avatar: avatar.trim().to_string(),
+            kind: ThreadKind::Direct,
+            last_preview: String::new(),
+            last_ts: 0,
+            unread_count: 0,
+            is_pinned: false,
+            is_muted: false,
+            last_read_in_ts: 0,
+            peer_read_ts: 0,
+            muted_until_ts: 0,
+            is_archived: false,
+        };
+        self.upsert_thread(&dto)?;
+        Ok(dto)
+    }
+
+    /// Returns direct thread IDs (`kind = 'direct'`, excluding `cloud_*` / `g*`) whose `title`
+    /// is empty, equals `id`, or consists solely of ASCII digits, OR whose `avatar` is empty,
+    /// ordered by `last_ts DESC` up to `limit`.
+    pub fn list_unresolved_direct_thread_ids(&self, limit: usize) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, avatar
+             FROM threads
+             WHERE kind = 'direct'
+               AND LOWER(id) NOT LIKE 'cloud\\_%' ESCAPE '\\'
+               AND LOWER(id) NOT LIKE 'g%'
+             ORDER BY last_ts DESC, id ASC",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let trimmed_id = id.trim();
+            if trimmed_id.is_empty() {
+                continue;
+            }
+            let lower_id = trimmed_id.to_ascii_lowercase();
+            if lower_id.starts_with("cloud_") || lower_id.starts_with('g') {
+                continue;
+            }
+            let enc_title: String = row.get(1)?;
+            let enc_avatar: String = row.get(2)?;
+            let aad = thread_aad(&id);
+            let title = self.cipher.decrypt_str(&aad, &enc_title).unwrap_or_default();
+            let avatar = self
+                .cipher
+                .decrypt_str(&aad, &enc_avatar)
+                .unwrap_or_default();
+            if is_placeholder_thread_title(&title, &id) || avatar.trim().is_empty() {
+                out.push(id);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub fn mark_thread_read(&self, thread_id: &str) -> Result<()> {
@@ -2468,40 +3644,159 @@ impl MessageStore {
         Ok(msgs)
     }
 
-    /// Accent-insensitive full-text search across decrypted in-memory index (`Ctrl+K`).
+    /// Accent-insensitive full-text search across decrypted in-memory index (`Ctrl+K`),
+    /// combining FTS5 prefix search with Hangul/CJK substring and Korean Choseong matching.
     pub fn search_messages(&self, query: &str, limit: usize) -> Result<Vec<MessageDto>> {
-        let safe_limit = limit.clamp(1, 200) as i64;
+        let safe_limit = limit.clamp(1, 200);
+        let safe_limit_i64 = safe_limit as i64;
         let clean = strip_vi_accents(query);
-        let tokens: Vec<String> = clean
-            .split(|c: char| c.is_whitespace() || c == '"' || c.is_control())
-            .filter_map(|w| {
-                let trimmed = w.trim_matches(|c: char| !c.is_alphanumeric());
-                if trimmed.is_empty() || !trimmed.chars().any(char::is_alphanumeric) {
-                    None
-                } else {
-                    Some(format!("\"{trimmed}\"*"))
+        let mut raw_tokens: Vec<String> = Vec::new();
+        for w in clean.split(|c: char| c.is_whitespace() || c == '"' || c.is_control()) {
+            let trimmed = w.trim_matches(|c: char| !c.is_alphanumeric());
+            if trimmed.is_empty() || !trimmed.chars().any(char::is_alphanumeric) {
+                continue;
+            }
+            if !raw_tokens.iter().any(|existing| existing == trimmed) {
+                raw_tokens.push(trimmed.to_string());
+                if raw_tokens.len() >= 32 {
+                    break;
                 }
-            })
-            .take(32)
-            .collect();
-        if tokens.is_empty() {
+            }
+        }
+        if raw_tokens.is_empty() {
             return Ok(Vec::new());
         }
-        let fts_query = tokens.join(" ");
-        let mut stmt = self.fts_conn.prepare(
-            "SELECT thread_id, msg_id
-             FROM messages_fts
-             WHERE messages_fts MATCH ?1
-             ORDER BY CAST(ts AS INTEGER) DESC LIMIT ?2",
-        )?;
-        let pairs = stmt
-            .query_map(params![fts_query, safe_limit], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        let mut results = Vec::with_capacity(pairs.len());
-        for (tid, mid) in pairs {
+        let is_cjk_or_hangul = contains_cjk_or_hangul(&clean);
+        let has_choseong_token = raw_tokens.iter().any(|t| is_korean_choseong_query(t));
+
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        let mut ranked: Vec<(i64, String, String)> = Vec::new();
+
+        // 1. Fast FTS5 prefix query for Latin/Vietnamese and word-initial hits.
+        let fts_tokens: Vec<String> = raw_tokens.iter().map(|t| format!("\"{t}\"*")).collect();
+        let fts_query = fts_tokens.join(" ");
+        {
+            let mut stmt = self.fts_conn.prepare(
+                "SELECT thread_id, msg_id, CAST(ts AS INTEGER)
+                 FROM messages_fts
+                 WHERE messages_fts MATCH ?1
+                 ORDER BY CAST(ts AS INTEGER) DESC LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(params![fts_query, safe_limit_i64], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for (tid, mid, ts) in rows {
+                if seen.insert((tid.clone(), mid.clone())) {
+                    ranked.push((ts, tid, mid));
+                }
+            }
+        }
+
+        // 2. Substring + Korean Choseong scan across in-memory `messages_fts` when query
+        //    contains Hangul/CJK, contains Korean Choseong tokens, or FTS5 returned < limit.
+        if is_cjk_or_hangul || has_choseong_token || ranked.len() < safe_limit {
+            if !has_choseong_token {
+                let mut clauses = Vec::with_capacity(raw_tokens.len());
+                for idx in 1..=raw_tokens.len() {
+                    clauses.push(format!(
+                        "(INSTR(text_norm, ?{idx}) > 0 OR INSTR(sender_name, ?{idx}) > 0)"
+                    ));
+                }
+                let limit_param = raw_tokens.len() + 1;
+                let sql = format!(
+                    "SELECT thread_id, msg_id, CAST(ts AS INTEGER)
+                     FROM messages_fts
+                     WHERE {}
+                     ORDER BY CAST(ts AS INTEGER) DESC LIMIT ?{limit_param}",
+                    clauses.join(" AND ")
+                );
+                let mut stmt = self.fts_conn.prepare(&sql)?;
+                let mut sql_params: Vec<rusqlite::types::Value> = raw_tokens
+                    .iter()
+                    .map(|t| rusqlite::types::Value::Text(t.clone()))
+                    .collect();
+                sql_params.push(rusqlite::types::Value::Integer(safe_limit_i64));
+                let rows = stmt
+                    .query_map(rusqlite::params_from_iter(sql_params), |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i64>(2)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (tid, mid, ts) in rows {
+                    if seen.insert((tid.clone(), mid.clone())) {
+                        ranked.push((ts, tid, mid));
+                    }
+                }
+            } else {
+                let (choseong_tokens, plain_tokens): (Vec<&String>, Vec<&String>) = raw_tokens
+                    .iter()
+                    .partition(|t| is_korean_choseong_query(t));
+                let mut sql_params: Vec<rusqlite::types::Value> =
+                    Vec::with_capacity(plain_tokens.len());
+                let where_clause = if plain_tokens.is_empty() {
+                    String::new()
+                } else {
+                    let mut clauses = Vec::with_capacity(plain_tokens.len());
+                    for (i, tok) in plain_tokens.iter().enumerate() {
+                        let idx = i + 1;
+                        clauses.push(format!(
+                            "(INSTR(text_norm, ?{idx}) > 0 OR INSTR(sender_name, ?{idx}) > 0)"
+                        ));
+                        sql_params.push(rusqlite::types::Value::Text((*tok).clone()));
+                    }
+                    format!("WHERE {}", clauses.join(" AND "))
+                };
+                let sql = format!(
+                    "SELECT thread_id, msg_id, CAST(ts AS INTEGER), sender_name, text_norm
+                     FROM messages_fts
+                     {where_clause}
+                     ORDER BY CAST(ts AS INTEGER) DESC"
+                );
+                let mut stmt = self.fts_conn.prepare(&sql)?;
+                let mut rows = stmt.query(rusqlite::params_from_iter(sql_params))?;
+                let mut matched_scan = 0usize;
+                while let Some(r) = rows.next()? {
+                    let tid: String = r.get(0)?;
+                    let mid: String = r.get(1)?;
+                    let ts: i64 = r.get(2)?;
+                    let sender_norm: String = r.get(3)?;
+                    let text_norm: String = r.get(4)?;
+                    let sender_cho = extract_korean_choseong(&sender_norm);
+                    let text_cho = extract_korean_choseong(&text_norm);
+                    let all_match = choseong_tokens.iter().all(|tok| {
+                        text_norm.contains(tok.as_str())
+                            || sender_norm.contains(tok.as_str())
+                            || text_cho.contains(tok.as_str())
+                            || sender_cho.contains(tok.as_str())
+                    });
+                    if all_match {
+                        if seen.insert((tid.clone(), mid.clone())) {
+                            ranked.push((ts, tid, mid));
+                        }
+                        matched_scan += 1;
+                        if matched_scan >= safe_limit {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.2.cmp(&a.2)));
+        ranked.truncate(safe_limit);
+
+        let mut results = Vec::with_capacity(ranked.len());
+        for (_ts, tid, mid) in ranked {
             if let Some(msg) = self.get_message(&tid, &mid)? {
                 results.push(msg);
             }
@@ -2758,6 +4053,42 @@ impl MessageStore {
             )
             .optional()?;
         Ok(obj)
+    }
+
+    /// Looks up any non-empty decrypted `original_name` in `message_media` matching `url_hash`,
+    /// preferring `'primary'` rows and most recently updated records.
+    pub fn find_media_original_name_by_hash(&self, url_hash: &str) -> Result<Option<String>> {
+        let trimmed_hash = url_hash.trim();
+        if trimmed_hash.is_empty() {
+            return Ok(None);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT thread_id, msg_id, variant, original_name
+             FROM message_media
+             WHERE url_hash = ?1
+               AND original_name IS NOT NULL
+               AND original_name != ''
+             ORDER BY CASE WHEN variant = 'primary' THEN 0 ELSE 1 END ASC, updated_ts DESC",
+        )?;
+        let rows = stmt.query_map(params![trimmed_hash], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (thread_id, msg_id, variant, enc_name) = row?;
+            let aad = message_media_aad(&thread_id, &msg_id, &variant);
+            if let Ok(plain) = self.cipher.decrypt_or_legacy(&aad, &enc_name) {
+                let name = plain.trim();
+                if !name.is_empty() {
+                    return Ok(Some(name.to_string()));
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub fn lookup_media_by_msg(
@@ -4304,6 +5635,1296 @@ impl MessageStore {
         }
 
         Ok(applied_count)
+    }
+
+    // -------------------------------------------------------------------------
+    // Item 1: Local AI Chat History & Unread Summary Query
+    // -------------------------------------------------------------------------
+
+    pub fn insert_ai_message(&self, msg: &AiStoredMessageDto) -> Result<()> {
+        let id = msg.id.trim();
+        let session_id = msg.session_id.trim();
+        if id.is_empty() {
+            bail!("ID tin nhắn AI không được để trống");
+        }
+        if session_id.is_empty() {
+            bail!("session_id tin nhắn AI không được để trống");
+        }
+        let role = match msg.role.trim().to_ascii_lowercase().as_str() {
+            "user" => "user",
+            "model" | "assistant" => "model",
+            other => bail!("Vai trò tin nhắn AI không hợp lệ: {other}"),
+        };
+        let ts = normalize_ts_ms(msg.ts);
+        let enc_content = self.cipher.encrypt_str(&ai_msg_aad(id), &msg.content)?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO ai_messages (id, session_id, role, content, model, backend, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, session_id, role, enc_content, msg.model, msg.backend, ts],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_ai_messages(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<AiStoredMessageDto>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let safe_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, role, content, model, backend, ts
+             FROM ai_messages
+             WHERE session_id = ?1
+             ORDER BY ts DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![session_id, safe_limit], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, i64>(6)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, sid, role, enc_content, model, backend, ts) = row?;
+            let content = self.cipher.decrypt_str(&ai_msg_aad(&id), &enc_content)?;
+            out.push(AiStoredMessageDto {
+                id,
+                session_id: sid,
+                role,
+                content,
+                model,
+                backend,
+                ts,
+            });
+        }
+        out.reverse();
+        Ok(out)
+    }
+
+    pub fn clear_ai_messages(&self, session_id: &str) -> Result<usize> {
+        let affected = self.conn.execute(
+            "DELETE FROM ai_messages WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(affected)
+    }
+
+    /// Fetches unread incoming (and interleaved context) messages in `thread_id` with
+    /// `ts > threads.last_read_in_ts` (when `last_read_in_ts > 0`), capped to the latest
+    /// `max_count` in chronological order. When `last_read_in_ts == 0`, or when
+    /// `unread_count > 0` yields no incoming messages after `last_read_in_ts`, falls back to
+    /// the latest `min(max(unread_count, 10), max_count)` incoming messages in chronological order.
+    pub fn list_unread_messages_for_summary(
+        &self,
+        thread_id: &str,
+        max_count: usize,
+    ) -> Result<Vec<MessageDto>> {
+        if max_count == 0 {
+            return Ok(Vec::new());
+        }
+        let thread_meta: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT last_read_in_ts, unread_count FROM threads WHERE id = ?1 LIMIT 1",
+                params![thread_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (last_read_in_ts, unread_count) = thread_meta
+            .map(|(lr, uc)| (lr, uc.max(0) as usize))
+            .unwrap_or((0, 0));
+
+        if last_read_in_ts > 0 {
+            let mut msgs = self.query_messages(
+                "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id
+                 FROM messages
+                 WHERE thread_id = ?1 AND is_recalled = 0 AND ts > ?2
+                 ORDER BY ts DESC, msg_id DESC
+                 LIMIT ?3",
+                params![thread_id, last_read_in_ts, max_count as i64],
+            )?;
+            if msgs.iter().any(|m| !m.is_outgoing) || unread_count == 0 {
+                msgs.reverse();
+                return Ok(msgs);
+            }
+        }
+
+        let fallback_limit = unread_count.max(10).min(max_count) as i64;
+        let mut incoming = self.query_messages(
+            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id
+             FROM messages
+             WHERE thread_id = ?1 AND is_recalled = 0 AND is_outgoing = 0
+             ORDER BY ts DESC, msg_id DESC
+             LIMIT ?2",
+            params![thread_id, fallback_limit],
+        )?;
+        incoming.reverse();
+        Ok(incoming)
+    }
+
+    // -------------------------------------------------------------------------
+    // Item 2: Scheduled Messages
+    // -------------------------------------------------------------------------
+
+    fn lookup_thread_title_and_kind(&self, thread_id: &str) -> Result<Option<(String, String)>> {
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT title, kind FROM threads WHERE id = ?1 LIMIT 1",
+                params![thread_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((enc_title, kind)) = row else {
+            return Ok(None);
+        };
+        let title = self
+            .cipher
+            .decrypt_or_legacy(&thread_aad(thread_id), &enc_title)
+            .unwrap_or_else(|_| thread_id.to_string());
+        Ok(Some((title, kind)))
+    }
+
+    fn decode_scheduled_message_row(
+        &self,
+        row: &rusqlite::Row<'_>,
+    ) -> Result<ScheduledMessageDto> {
+        let id: String = row.get(0)?;
+        let thread_id: String = row.get(1)?;
+        let enc_thread_title: String = row.get(2)?;
+        let thread_kind: String = row.get(3)?;
+        let enc_text: String = row.get(4)?;
+        let enc_attachment_path: String = row.get(5)?;
+        let send_at_ts: i64 = row.get(6)?;
+        let recurrence: String = row.get(7)?;
+        let misfire_policy: String = row.get(8)?;
+        let misfire_grace_secs: i64 = row.get(9)?;
+        let status: String = row.get(10)?;
+        let retry_count: i64 = row.get(11)?;
+        let enc_last_error: String = row.get(12)?;
+        let created_at: i64 = row.get(13)?;
+        let updated_at: i64 = row.get(14)?;
+        let sent_at_ts: i64 = row.get(15)?;
+
+        let aad = sched_aad(&id);
+        let thread_title = self.cipher.decrypt_str(&aad, &enc_thread_title)?;
+        let text = self.cipher.decrypt_str(&aad, &enc_text)?;
+        let attachment_path = self.cipher.decrypt_str(&aad, &enc_attachment_path)?;
+        let last_error = self.cipher.decrypt_str(&aad, &enc_last_error)?;
+
+        Ok(ScheduledMessageDto {
+            id,
+            thread_id,
+            thread_title,
+            thread_kind,
+            text,
+            attachment_path,
+            send_at_ts,
+            recurrence,
+            misfire_policy,
+            misfire_grace_secs,
+            status,
+            retry_count: retry_count.max(0) as u32,
+            last_error,
+            created_at,
+            updated_at,
+            sent_at_ts,
+        })
+    }
+
+    pub fn create_scheduled_message(
+        &self,
+        input: &NewScheduledMessageInput,
+    ) -> Result<ScheduledMessageDto> {
+        let thread_id = input.thread_id.trim();
+        if thread_id.is_empty() {
+            bail!("thread_id không được để trống");
+        }
+        if input.text.trim().is_empty() && input.attachment_path.trim().is_empty() {
+            bail!("Cần nhập nội dung tin nhắn hoặc tệp đính kèm");
+        }
+        let send_at_ts = normalize_ts_ms(input.send_at_ts);
+        if send_at_ts <= 0 {
+            bail!("Thời gian gửi hẹn giờ không hợp lệ");
+        }
+
+        let thread_meta = self.lookup_thread_title_and_kind(thread_id)?;
+        let thread_title = if !input.thread_title.trim().is_empty() {
+            input.thread_title.trim().to_string()
+        } else if let Some((ref t, _)) = thread_meta {
+            if t.trim().is_empty() {
+                thread_id.to_string()
+            } else {
+                t.clone()
+            }
+        } else {
+            thread_id.to_string()
+        };
+        let thread_kind = if input.thread_kind.trim().is_empty() {
+            match thread_meta.as_ref().map(|(_, k)| k.as_str()) {
+                Some("group") => "group",
+                Some("cloud") => "cloud",
+                _ => "direct",
+            }
+        } else {
+            normalize_sched_thread_kind(&input.thread_kind)?
+        };
+        let recurrence = normalize_sched_recurrence(&input.recurrence)?;
+        let misfire_policy = normalize_sched_misfire_policy(&input.misfire_policy)?;
+        let misfire_grace_secs = input.misfire_grace_secs.max(0);
+
+        let id = generate_prefixed_id("sched")?;
+        let now_ms = Utc::now().timestamp_millis();
+        let attachment_path = input.attachment_path.trim().to_string();
+        let aad = sched_aad(&id);
+        let enc_title = self.cipher.encrypt_str(&aad, &thread_title)?;
+        let enc_text = self.cipher.encrypt_str(&aad, &input.text)?;
+        let enc_att = self.cipher.encrypt_str(&aad, &attachment_path)?;
+        let enc_err = self.cipher.encrypt_str(&aad, "")?;
+
+        self.conn.execute(
+            "INSERT INTO scheduled_messages (
+                id, thread_id, thread_title, thread_kind, text, attachment_path,
+                send_at_ts, recurrence, misfire_policy, misfire_grace_secs,
+                status, retry_count, last_error, created_at, updated_at, sent_at_ts
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', 0, ?11, ?12, ?12, 0)",
+            params![
+                id,
+                thread_id,
+                enc_title,
+                thread_kind,
+                enc_text,
+                enc_att,
+                send_at_ts,
+                recurrence,
+                misfire_policy,
+                misfire_grace_secs,
+                enc_err,
+                now_ms,
+            ],
+        )?;
+
+        Ok(ScheduledMessageDto {
+            id,
+            thread_id: thread_id.to_string(),
+            thread_title,
+            thread_kind: thread_kind.to_string(),
+            text: input.text.clone(),
+            attachment_path,
+            send_at_ts,
+            recurrence: recurrence.to_string(),
+            misfire_policy: misfire_policy.to_string(),
+            misfire_grace_secs,
+            status: "pending".to_string(),
+            retry_count: 0,
+            last_error: String::new(),
+            created_at: now_ms,
+            updated_at: now_ms,
+            sent_at_ts: 0,
+        })
+    }
+
+    pub fn update_scheduled_message(
+        &self,
+        id: &str,
+        input: &UpdateScheduledMessageInput,
+    ) -> Result<Option<ScheduledMessageDto>> {
+        let Some(mut cur) = self.get_scheduled_message(id)? else {
+            return Ok(None);
+        };
+        if cur.status == "sending" {
+            bail!("Không thể sửa tin nhắn hẹn giờ đang trong quá trình gửi");
+        }
+        if cur.status == "sent" {
+            bail!("Không thể sửa tin nhắn hẹn giờ đã gửi");
+        }
+
+        if let Some(ref title) = input.thread_title {
+            let trimmed = title.trim();
+            if !trimmed.is_empty() {
+                cur.thread_title = trimmed.to_string();
+            }
+        }
+        if let Some(ref kind) = input.thread_kind {
+            cur.thread_kind = normalize_sched_thread_kind(kind)?.to_string();
+        }
+        if let Some(ref text) = input.text {
+            cur.text = text.clone();
+        }
+        if let Some(ref att) = input.attachment_path {
+            cur.attachment_path = att.trim().to_string();
+        }
+        if cur.text.trim().is_empty() && cur.attachment_path.trim().is_empty() {
+            bail!("Cần nhập nội dung tin nhắn hoặc tệp đính kèm");
+        }
+        if let Some(raw_ts) = input.send_at_ts {
+            let send_at_ts = normalize_ts_ms(raw_ts);
+            if send_at_ts <= 0 {
+                bail!("Thời gian gửi hẹn giờ không hợp lệ");
+            }
+            cur.send_at_ts = send_at_ts;
+            if cur.status != "pending" {
+                cur.status = "pending".to_string();
+                cur.retry_count = 0;
+                cur.last_error.clear();
+            }
+        }
+        if let Some(ref rec) = input.recurrence {
+            cur.recurrence = normalize_sched_recurrence(rec)?.to_string();
+        }
+        if let Some(ref policy) = input.misfire_policy {
+            cur.misfire_policy = normalize_sched_misfire_policy(policy)?.to_string();
+        }
+        if let Some(grace) = input.misfire_grace_secs {
+            cur.misfire_grace_secs = grace.max(0);
+        }
+
+        cur.updated_at = Utc::now().timestamp_millis();
+        let aad = sched_aad(&cur.id);
+        let enc_title = self.cipher.encrypt_str(&aad, &cur.thread_title)?;
+        let enc_text = self.cipher.encrypt_str(&aad, &cur.text)?;
+        let enc_att = self.cipher.encrypt_str(&aad, &cur.attachment_path)?;
+        let enc_err = self.cipher.encrypt_str(&aad, &cur.last_error)?;
+
+        let affected = self.conn.execute(
+            "UPDATE scheduled_messages
+             SET thread_title = ?2,
+                 thread_kind = ?3,
+                 text = ?4,
+                 attachment_path = ?5,
+                 send_at_ts = ?6,
+                 recurrence = ?7,
+                 misfire_policy = ?8,
+                 misfire_grace_secs = ?9,
+                 status = ?10,
+                 retry_count = ?11,
+                 last_error = ?12,
+                 updated_at = ?13
+             WHERE id = ?1 AND status NOT IN ('sending', 'sent')",
+            params![
+                cur.id,
+                enc_title,
+                cur.thread_kind,
+                enc_text,
+                enc_att,
+                cur.send_at_ts,
+                cur.recurrence,
+                cur.misfire_policy,
+                cur.misfire_grace_secs,
+                cur.status,
+                i64::from(cur.retry_count),
+                enc_err,
+                cur.updated_at,
+            ],
+        )?;
+        if affected == 0 {
+            return Ok(None);
+        }
+        Ok(Some(cur))
+    }
+
+    pub fn list_scheduled_messages(
+        &self,
+        status_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ScheduledMessageDto>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let safe_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let statuses: Vec<&'static str> = match status_filter.map(str::trim) {
+            None | Some("") | Some("all") => Vec::new(),
+            Some(raw) => {
+                let mut parsed = Vec::new();
+                for part in raw.split(',') {
+                    if let Some(st) = normalize_sched_status_token(part) {
+                        if !parsed.contains(&st) {
+                            parsed.push(st);
+                        }
+                    }
+                }
+                if parsed.is_empty() {
+                    return Ok(Vec::new());
+                }
+                parsed
+            }
+        };
+
+        let mut sql = String::from(
+            "SELECT id, thread_id, thread_title, thread_kind, text, attachment_path,
+                    send_at_ts, recurrence, misfire_policy, misfire_grace_secs,
+                    status, retry_count, last_error, created_at, updated_at, sent_at_ts
+             FROM scheduled_messages",
+        );
+        let mut bound: Vec<rusqlite::types::Value> = Vec::with_capacity(statuses.len() + 1);
+        if !statuses.is_empty() {
+            sql.push_str(" WHERE status IN (");
+            for (idx, st) in statuses.iter().enumerate() {
+                if idx > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push('?');
+                bound.push(rusqlite::types::Value::Text((*st).to_string()));
+            }
+            sql.push(')');
+        }
+        let only_active = !statuses.is_empty()
+            && statuses.iter().all(|s| matches!(*s, "pending" | "sending"));
+        let only_history = !statuses.is_empty()
+            && statuses
+                .iter()
+                .all(|s| !matches!(*s, "pending" | "sending"));
+        if only_active {
+            sql.push_str(" ORDER BY send_at_ts ASC, created_at ASC, id ASC LIMIT ?");
+        } else if only_history {
+            sql.push_str(" ORDER BY updated_at DESC, send_at_ts DESC, id DESC LIMIT ?");
+        } else {
+            sql.push_str(
+                " ORDER BY CASE WHEN status IN ('pending', 'sending') THEN 0 ELSE 1 END ASC,
+                           CASE WHEN status IN ('pending', 'sending') THEN send_at_ts ELSE -updated_at END ASC,
+                           id ASC
+                  LIMIT ?",
+            );
+        }
+        bound.push(rusqlite::types::Value::Integer(safe_limit));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(bound))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(self.decode_scheduled_message_row(row)?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_scheduled_message(&self, id: &str) -> Result<Option<ScheduledMessageDto>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, thread_id, thread_title, thread_kind, text, attachment_path,
+                    send_at_ts, recurrence, misfire_policy, misfire_grace_secs,
+                    status, retry_count, last_error, created_at, updated_at, sent_at_ts
+             FROM scheduled_messages
+             WHERE id = ?1
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(self.decode_scheduled_message_row(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn cancel_scheduled_message(&self, id: &str) -> Result<bool> {
+        let now_ms = Utc::now().timestamp_millis();
+        let affected = self.conn.execute(
+            "UPDATE scheduled_messages
+             SET status = 'cancelled', updated_at = ?2
+             WHERE id = ?1 AND status IN ('pending', 'missed', 'failed')",
+            params![id, now_ms],
+        )?;
+        Ok(affected > 0)
+    }
+
+    pub fn delete_scheduled_message(&self, id: &str) -> Result<bool> {
+        let affected = self.conn.execute(
+            "DELETE FROM scheduled_messages WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    pub fn next_pending_schedule_ts(&self) -> Result<Option<i64>> {
+        let next_ts: Option<i64> = self.conn.query_row(
+            "SELECT MIN(send_at_ts) FROM scheduled_messages WHERE status = 'pending'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(next_ts)
+    }
+
+    /// Recovers crash-interrupted `'sending'` rows on startup: rows with `retry_count >= 2`
+    /// transition to `'failed'`, while earlier attempts reset to `'pending'` with incremented
+    /// `retry_count`.
+    pub fn recover_stuck_sending_schedules(&self, now_ms: i64) -> Result<usize> {
+        let now_ms = normalize_ts_ms(now_ms);
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let res = (|| -> Result<usize> {
+            let stuck: Vec<(String, i64)> = {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, retry_count FROM scheduled_messages WHERE status = 'sending'",
+                )?;
+                let out = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                out
+            };
+            let mut recovered = 0usize;
+            for (id, retry_count) in stuck {
+                let aad = sched_aad(&id);
+                let next_retry = retry_count.max(0).saturating_add(1);
+                if retry_count >= 2 {
+                    let enc_err = self.cipher.encrypt_str(
+                        &aad,
+                        "Gián đoạn khi đang gửi (ứng dụng bị đóng đột ngột)",
+                    )?;
+                    recovered += self.conn.execute(
+                        "UPDATE scheduled_messages
+                         SET status = 'failed', retry_count = ?2, last_error = ?3, updated_at = ?4
+                         WHERE id = ?1 AND status = 'sending'",
+                        params![id, next_retry, enc_err, now_ms],
+                    )?;
+                } else {
+                    let enc_err = self.cipher.encrypt_str(
+                        &aad,
+                        "Khôi phục sau khi ứng dụng bị gián đoạn",
+                    )?;
+                    recovered += self.conn.execute(
+                        "UPDATE scheduled_messages
+                         SET status = 'pending', retry_count = ?2, last_error = ?3, updated_at = ?4
+                         WHERE id = ?1 AND status = 'sending'",
+                        params![id, next_retry, enc_err, now_ms],
+                    )?;
+                }
+            }
+            Ok(recovered)
+        })();
+        match res {
+            Ok(count) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(count)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
+    }
+
+    /// Atomically claims up to `max_batch` due `'pending'` rows (`send_at_ts <= now_ms`)
+    /// by marking them `'sending'` inside an `IMMEDIATE` transaction so double-send is impossible.
+    pub fn claim_due_scheduled_messages(
+        &self,
+        now_ms: i64,
+        max_batch: usize,
+    ) -> Result<Vec<ScheduledMessageDto>> {
+        if max_batch == 0 {
+            return Ok(Vec::new());
+        }
+        let now_ms = normalize_ts_ms(now_ms);
+        let safe_limit = i64::try_from(max_batch).unwrap_or(i64::MAX);
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let res = (|| -> Result<Vec<ScheduledMessageDto>> {
+            let candidates = {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, thread_id, thread_title, thread_kind, text, attachment_path,
+                            send_at_ts, recurrence, misfire_policy, misfire_grace_secs,
+                            status, retry_count, last_error, created_at, updated_at, sent_at_ts
+                     FROM scheduled_messages
+                     WHERE status = 'pending' AND send_at_ts <= ?1
+                     ORDER BY send_at_ts ASC, id ASC
+                     LIMIT ?2",
+                )?;
+                let mut rows = stmt.query(params![now_ms, safe_limit])?;
+                let mut items = Vec::new();
+                while let Some(row) = rows.next()? {
+                    items.push(self.decode_scheduled_message_row(row)?);
+                }
+                items
+            };
+
+            let mut claimed = Vec::with_capacity(candidates.len());
+            for mut item in candidates {
+                let affected = self.conn.execute(
+                    "UPDATE scheduled_messages
+                     SET status = 'sending', updated_at = ?2
+                     WHERE id = ?1 AND status = 'pending'",
+                    params![item.id, now_ms],
+                )?;
+                if affected == 1 {
+                    item.status = "sending".to_string();
+                    item.updated_at = now_ms;
+                    claimed.push(item);
+                }
+            }
+            Ok(claimed)
+        })();
+        match res {
+            Ok(claimed) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(claimed)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
+    }
+
+    /// Marks a scheduled message as completed. For recurring schedules (`"daily"`, `"weekly"`,
+    /// `"monthly"`), advances `send_at_ts` via `compute_next_occurrence_ts` and resets
+    /// `status = 'pending'`, `retry_count = 0`, `last_error = ''`, `sent_at_ts = now_ms`.
+    /// For `"once"`, transitions to `status = 'sent'`.
+    pub fn complete_scheduled_message(
+        &self,
+        id: &str,
+        now_ms: i64,
+    ) -> Result<Option<ScheduledMessageDto>> {
+        let now_ms = normalize_ts_ms(now_ms);
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let res = (|| -> Result<Option<ScheduledMessageDto>> {
+            let Some(mut cur) = self.get_scheduled_message(id)? else {
+                return Ok(None);
+            };
+            let enc_empty_err = self.cipher.encrypt_str(&sched_aad(&cur.id), "")?;
+            cur.last_error.clear();
+            cur.updated_at = now_ms;
+            cur.sent_at_ts = now_ms;
+
+            if let Some(next_ts) =
+                compute_next_occurrence_ts(cur.send_at_ts, &cur.recurrence, now_ms)
+            {
+                cur.send_at_ts = next_ts;
+                cur.status = "pending".to_string();
+                cur.retry_count = 0;
+                self.conn.execute(
+                    "UPDATE scheduled_messages
+                     SET status = 'pending',
+                         send_at_ts = ?2,
+                         retry_count = 0,
+                         last_error = ?3,
+                         updated_at = ?4,
+                         sent_at_ts = ?4
+                     WHERE id = ?1",
+                    params![cur.id, cur.send_at_ts, enc_empty_err, now_ms],
+                )?;
+            } else {
+                cur.status = "sent".to_string();
+                self.conn.execute(
+                    "UPDATE scheduled_messages
+                     SET status = 'sent',
+                         last_error = ?2,
+                         updated_at = ?3,
+                         sent_at_ts = ?3
+                     WHERE id = ?1",
+                    params![cur.id, enc_empty_err, now_ms],
+                )?;
+            }
+            Ok(Some(cur))
+        })();
+        match res {
+            Ok(out) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(out)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
+    }
+
+    pub fn fail_or_retry_scheduled_message(
+        &self,
+        id: &str,
+        error: &str,
+        next_retry_ts: Option<i64>,
+        now_ms: i64,
+    ) -> Result<Option<ScheduledMessageDto>> {
+        let now_ms = normalize_ts_ms(now_ms);
+        let Some(mut cur) = self.get_scheduled_message(id)? else {
+            return Ok(None);
+        };
+        let enc_err = self.cipher.encrypt_str(&sched_aad(&cur.id), error)?;
+        cur.retry_count = cur.retry_count.saturating_add(1);
+        cur.last_error = error.to_string();
+        cur.updated_at = now_ms;
+
+        if let Some(retry_ts) = next_retry_ts {
+            cur.send_at_ts = normalize_ts_ms(retry_ts);
+            cur.status = "pending".to_string();
+            self.conn.execute(
+                "UPDATE scheduled_messages
+                 SET status = 'pending',
+                     send_at_ts = ?2,
+                     retry_count = ?3,
+                     last_error = ?4,
+                     updated_at = ?5
+                 WHERE id = ?1",
+                params![
+                    cur.id,
+                    cur.send_at_ts,
+                    i64::from(cur.retry_count),
+                    enc_err,
+                    now_ms
+                ],
+            )?;
+        } else {
+            cur.status = "failed".to_string();
+            self.conn.execute(
+                "UPDATE scheduled_messages
+                 SET status = 'failed',
+                     retry_count = ?2,
+                     last_error = ?3,
+                     updated_at = ?4
+                 WHERE id = ?1",
+                params![cur.id, i64::from(cur.retry_count), enc_err, now_ms],
+            )?;
+        }
+        Ok(Some(cur))
+    }
+
+    /// Marks a misfired schedule as `'missed'`. For recurring schedules configured with
+    /// `misfire_policy == "skip"`, skips the missed occurrence and advances `send_at_ts`
+    /// to the next future occurrence with `status = 'pending'`.
+    pub fn mark_scheduled_message_missed(
+        &self,
+        id: &str,
+        reason: &str,
+        now_ms: i64,
+    ) -> Result<Option<ScheduledMessageDto>> {
+        let now_ms = normalize_ts_ms(now_ms);
+        let Some(mut cur) = self.get_scheduled_message(id)? else {
+            return Ok(None);
+        };
+        let enc_reason = self.cipher.encrypt_str(&sched_aad(&cur.id), reason)?;
+        cur.last_error = reason.to_string();
+        cur.updated_at = now_ms;
+
+        if cur.misfire_policy == "skip" {
+            if let Some(next_ts) =
+                compute_next_occurrence_ts(cur.send_at_ts, &cur.recurrence, now_ms)
+            {
+                cur.send_at_ts = next_ts;
+                cur.status = "pending".to_string();
+                cur.retry_count = 0;
+                self.conn.execute(
+                    "UPDATE scheduled_messages
+                     SET status = 'pending',
+                         send_at_ts = ?2,
+                         retry_count = 0,
+                         last_error = ?3,
+                         updated_at = ?4
+                     WHERE id = ?1",
+                    params![cur.id, cur.send_at_ts, enc_reason, now_ms],
+                )?;
+                return Ok(Some(cur));
+            }
+        }
+
+        cur.status = "missed".to_string();
+        self.conn.execute(
+            "UPDATE scheduled_messages
+             SET status = 'missed', last_error = ?2, updated_at = ?3
+             WHERE id = ?1",
+            params![cur.id, enc_reason, now_ms],
+        )?;
+        Ok(Some(cur))
+    }
+
+    /// Re-queues a missed/failed/cancelled schedule for immediate sending (`send_at_ts = now_ms`).
+    pub fn reschedule_now(&self, id: &str, now_ms: i64) -> Result<Option<ScheduledMessageDto>> {
+        let now_ms = normalize_ts_ms(now_ms);
+        let Some(mut cur) = self.get_scheduled_message(id)? else {
+            return Ok(None);
+        };
+        if cur.status == "sending" {
+            bail!("Tin nhắn hẹn giờ này đang được gửi");
+        }
+        if cur.status == "sent" {
+            bail!("Tin nhắn hẹn giờ này đã được gửi trước đó");
+        }
+        let enc_empty_err = self.cipher.encrypt_str(&sched_aad(&cur.id), "")?;
+        cur.status = "pending".to_string();
+        cur.send_at_ts = now_ms;
+        cur.retry_count = 0;
+        cur.last_error.clear();
+        cur.updated_at = now_ms;
+
+        self.conn.execute(
+            "UPDATE scheduled_messages
+             SET status = 'pending',
+                 send_at_ts = ?2,
+                 retry_count = 0,
+                 last_error = ?3,
+                 updated_at = ?2
+             WHERE id = ?1",
+            params![cur.id, now_ms, enc_empty_err],
+        )?;
+        Ok(Some(cur))
+    }
+
+    // -------------------------------------------------------------------------
+    // Item 3: Local Automation API Clients, Audit Logs & Idempotency
+    // -------------------------------------------------------------------------
+
+    fn decode_api_client_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ApiClientDto> {
+        let id: String = row.get(0)?;
+        let name: String = row.get(1)?;
+        let token_prefix: String = row.get(2)?;
+        let scopes_csv: String = row.get(3)?;
+        let allowed_json: String = row.get(4)?;
+        let rate_limit_per_min: i64 = row.get(5)?;
+        let enabled: i64 = row.get(6)?;
+        let created_at: i64 = row.get(7)?;
+        let last_used_at: i64 = row.get(8)?;
+
+        let scopes = scopes_csv
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        let allowed_thread_ids: Vec<String> =
+            serde_json::from_str(&allowed_json).unwrap_or_default();
+
+        Ok(ApiClientDto {
+            id,
+            name,
+            token_prefix,
+            scopes,
+            allowed_thread_ids,
+            rate_limit_per_min: rate_limit_per_min.max(1) as u32,
+            enabled: enabled != 0,
+            created_at,
+            last_used_at,
+        })
+    }
+
+    fn get_api_client_by_id(&self, id: &str) -> Result<Option<ApiClientDto>> {
+        let client = self
+            .conn
+            .query_row(
+                "SELECT id, name, token_prefix, scopes, allowed_thread_ids_json,
+                        rate_limit_per_min, enabled, created_at, last_used_at
+                 FROM api_clients
+                 WHERE id = ?1
+                 LIMIT 1",
+                params![id],
+                Self::decode_api_client_row,
+            )
+            .optional()?;
+        Ok(client)
+    }
+
+    pub fn create_api_client(
+        &self,
+        name: &str,
+        scopes: &[String],
+        allowed_thread_ids: &[String],
+        rate_limit_per_min: u32,
+    ) -> Result<CreatedApiClientDto> {
+        let clean_name = name.trim();
+        if clean_name.is_empty() {
+            bail!("Tên ứng dụng API không được để trống");
+        }
+        if clean_name.chars().count() > 100 {
+            bail!("Tên ứng dụng API tối đa 100 ký tự");
+        }
+        let clean_scopes = sanitize_api_scopes(scopes)?;
+        let clean_allowed = sanitize_allowed_thread_ids(allowed_thread_ids);
+        let rate_limit = sanitize_rate_limit_per_min(rate_limit_per_min);
+
+        let id = generate_prefixed_id("client")?;
+        let raw_token = generate_api_token()?;
+        let token_hash = hash_api_token(&raw_token);
+        let token_prefix: String = raw_token.chars().take(12).collect();
+        let scopes_csv = clean_scopes.join(",");
+        let allowed_json = serde_json::to_string(&clean_allowed)?;
+        let now_ms = Utc::now().timestamp_millis();
+
+        self.conn.execute(
+            "INSERT INTO api_clients (
+                id, name, token_hash, token_prefix, scopes, allowed_thread_ids_json,
+                rate_limit_per_min, enabled, created_at, last_used_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, 0)",
+            params![
+                id,
+                clean_name,
+                token_hash,
+                token_prefix,
+                scopes_csv,
+                allowed_json,
+                i64::from(rate_limit),
+                now_ms,
+            ],
+        )?;
+
+        Ok(CreatedApiClientDto {
+            client: ApiClientDto {
+                id,
+                name: clean_name.to_string(),
+                token_prefix,
+                scopes: clean_scopes,
+                allowed_thread_ids: clean_allowed,
+                rate_limit_per_min: rate_limit,
+                enabled: true,
+                created_at: now_ms,
+                last_used_at: 0,
+            },
+            raw_token,
+        })
+    }
+
+    pub fn list_api_clients(&self) -> Result<Vec<ApiClientDto>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, token_prefix, scopes, allowed_thread_ids_json,
+                    rate_limit_per_min, enabled, created_at, last_used_at
+             FROM api_clients
+             ORDER BY created_at DESC, id DESC",
+        )?;
+        let out = stmt
+            .query_map([], Self::decode_api_client_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(out)
+    }
+
+    pub fn update_api_client(
+        &self,
+        id: &str,
+        enabled: Option<bool>,
+        scopes: Option<&[String]>,
+        allowed_thread_ids: Option<&[String]>,
+        rate_limit_per_min: Option<u32>,
+    ) -> Result<Option<ApiClientDto>> {
+        let Some(mut cur) = self.get_api_client_by_id(id)? else {
+            return Ok(None);
+        };
+        if let Some(v) = enabled {
+            cur.enabled = v;
+        }
+        if let Some(sc) = scopes {
+            cur.scopes = sanitize_api_scopes(sc)?;
+        }
+        if let Some(ids) = allowed_thread_ids {
+            cur.allowed_thread_ids = sanitize_allowed_thread_ids(ids);
+        }
+        if let Some(rl) = rate_limit_per_min {
+            cur.rate_limit_per_min = sanitize_rate_limit_per_min(rl);
+        }
+
+        let scopes_csv = cur.scopes.join(",");
+        let allowed_json = serde_json::to_string(&cur.allowed_thread_ids)?;
+        let affected = self.conn.execute(
+            "UPDATE api_clients
+             SET enabled = ?2,
+                 scopes = ?3,
+                 allowed_thread_ids_json = ?4,
+                 rate_limit_per_min = ?5
+             WHERE id = ?1",
+            params![
+                cur.id,
+                cur.enabled as i64,
+                scopes_csv,
+                allowed_json,
+                i64::from(cur.rate_limit_per_min),
+            ],
+        )?;
+        if affected == 0 {
+            return Ok(None);
+        }
+        Ok(Some(cur))
+    }
+
+    pub fn delete_api_client(&self, id: &str) -> Result<bool> {
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let res = (|| -> Result<bool> {
+            self.conn.execute(
+                "DELETE FROM api_idempotency WHERE client_id = ?1",
+                params![id],
+            )?;
+            let affected = self
+                .conn
+                .execute("DELETE FROM api_clients WHERE id = ?1", params![id])?;
+            Ok(affected > 0)
+        })();
+        match res {
+            Ok(deleted) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(deleted)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
+    }
+
+    /// Verifies a raw Bearer token via SHA-256 hash lookup + constant-time hash comparison,
+    /// ensures `enabled == 1`, and updates `last_used_at`.
+    pub fn verify_api_token(&self, raw_token: &str, now_ms: i64) -> Result<Option<ApiClientDto>> {
+        if raw_token.is_empty() || raw_token != raw_token.trim() {
+            return Ok(None);
+        }
+        let candidate_hash = hash_api_token(raw_token);
+        let row: Option<(String, ApiClientDto)> = self
+            .conn
+            .query_row(
+                "SELECT id, name, token_prefix, scopes, allowed_thread_ids_json,
+                        rate_limit_per_min, enabled, created_at, last_used_at, token_hash
+                 FROM api_clients
+                 WHERE token_hash = ?1
+                 LIMIT 1",
+                params![&candidate_hash],
+                |r| {
+                    let stored_hash: String = r.get(9)?;
+                    let dto = Self::decode_api_client_row(r)?;
+                    Ok((stored_hash, dto))
+                },
+            )
+            .optional()?;
+        let Some((stored_hash, mut client)) = row else {
+            return Ok(None);
+        };
+        if !constant_time_eq(stored_hash.as_bytes(), candidate_hash.as_bytes()) || !client.enabled {
+            return Ok(None);
+        }
+        let now_ms = normalize_ts_ms(now_ms);
+        let next_last_used = client.last_used_at.max(now_ms);
+        self.conn.execute(
+            "UPDATE api_clients SET last_used_at = MAX(last_used_at, ?2) WHERE id = ?1",
+            params![&client.id, next_last_used],
+        )?;
+        client.last_used_at = next_last_used;
+        Ok(Some(client))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_api_audit_log(
+        &self,
+        client_id: &str,
+        client_name: &str,
+        method: &str,
+        path: &str,
+        target_thread_id: &str,
+        status_code: u16,
+        outcome: &str,
+        detail: &str,
+        now_ms: i64,
+    ) -> Result<ApiAuditLogDto> {
+        let now_ms = normalize_ts_ms(now_ms);
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let res = (|| -> Result<ApiAuditLogDto> {
+            self.conn.execute(
+                "INSERT INTO api_audit_logs (
+                    client_id, client_name, method, path, target_thread_id,
+                    status_code, outcome, detail, created_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '', ?8)",
+                params![
+                    client_id,
+                    client_name,
+                    method,
+                    path,
+                    target_thread_id,
+                    i64::from(status_code),
+                    outcome,
+                    now_ms,
+                ],
+            )?;
+            let id = self.conn.last_insert_rowid();
+            let enc_detail = self.cipher.encrypt_str(&api_audit_aad(id), detail)?;
+            self.conn.execute(
+                "UPDATE api_audit_logs SET detail = ?2 WHERE id = ?1",
+                params![id, enc_detail],
+            )?;
+            self.conn.execute(
+                "DELETE FROM api_audit_logs
+                 WHERE id NOT IN (
+                     SELECT id FROM api_audit_logs
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT ?1
+                 )",
+                params![API_AUDIT_LOG_MAX_ROWS],
+            )?;
+            Ok(ApiAuditLogDto {
+                id,
+                client_id: client_id.to_string(),
+                client_name: client_name.to_string(),
+                method: method.to_string(),
+                path: path.to_string(),
+                target_thread_id: target_thread_id.to_string(),
+                status_code,
+                outcome: outcome.to_string(),
+                detail: detail.to_string(),
+                created_at: now_ms,
+            })
+        })();
+        match res {
+            Ok(dto) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(dto)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
+    }
+
+    pub fn list_api_audit_logs(&self, limit: usize) -> Result<Vec<ApiAuditLogDto>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let safe_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, client_id, client_name, method, path, target_thread_id,
+                    status_code, outcome, detail, created_at
+             FROM api_audit_logs
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![safe_limit], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, String>(8)?,
+                r.get::<_, i64>(9)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (
+                id,
+                client_id,
+                client_name,
+                method,
+                path,
+                target_thread_id,
+                status_code,
+                outcome,
+                enc_detail,
+                created_at,
+            ) = row?;
+            let detail = self
+                .cipher
+                .decrypt_or_legacy(&api_audit_aad(id), &enc_detail)?;
+            out.push(ApiAuditLogDto {
+                id,
+                client_id,
+                client_name,
+                method,
+                path,
+                target_thread_id,
+                status_code: u16::try_from(status_code).unwrap_or(0),
+                outcome,
+                detail,
+                created_at,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn clear_api_audit_logs(&self) -> Result<usize> {
+        let affected = self.conn.execute("DELETE FROM api_audit_logs", [])?;
+        Ok(affected)
+    }
+
+    pub fn get_api_idempotency(
+        &self,
+        client_id: &str,
+        idem_key: &str,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> Result<Option<(u16, String)>> {
+        if client_id.trim().is_empty() || idem_key.trim().is_empty() {
+            return Ok(None);
+        }
+        let now_ms = normalize_ts_ms(now_ms);
+        let row: Option<(i64, String, i64)> = self
+            .conn
+            .query_row(
+                "SELECT status_code, response_json, created_at
+                 FROM api_idempotency
+                 WHERE client_id = ?1 AND idem_key = ?2
+                 LIMIT 1",
+                params![client_id, idem_key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((status_code, enc_response, created_at)) = row else {
+            return Ok(None);
+        };
+        if ttl_ms <= 0 || now_ms.saturating_sub(created_at) > ttl_ms {
+            let _ = self.conn.execute(
+                "DELETE FROM api_idempotency WHERE client_id = ?1 AND idem_key = ?2",
+                params![client_id, idem_key],
+            );
+            return Ok(None);
+        }
+        let response_json = self
+            .cipher
+            .decrypt_str(&api_idem_aad(client_id, idem_key), &enc_response)?;
+        Ok(Some((u16::try_from(status_code).unwrap_or(200), response_json)))
+    }
+
+    pub fn put_api_idempotency(
+        &self,
+        client_id: &str,
+        idem_key: &str,
+        status_code: u16,
+        response_json: &str,
+        now_ms: i64,
+    ) -> Result<()> {
+        if client_id.trim().is_empty() || idem_key.trim().is_empty() {
+            bail!("client_id và idem_key không được để trống");
+        }
+        if idem_key.len() > 128 {
+            bail!("idem_key tối đa 128 ký tự");
+        }
+        let now_ms = normalize_ts_ms(now_ms);
+        let enc_response = self
+            .cipher
+            .encrypt_str(&api_idem_aad(client_id, idem_key), response_json)?;
+        let prune_cutoff = now_ms.saturating_sub(API_IDEMPOTENCY_RETENTION_MS);
+
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let res = (|| -> Result<()> {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO api_idempotency (
+                    client_id, idem_key, status_code, response_json, created_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    client_id,
+                    idem_key,
+                    i64::from(status_code),
+                    enc_response,
+                    now_ms,
+                ],
+            )?;
+            self.conn.execute(
+                "DELETE FROM api_idempotency WHERE created_at < ?1",
+                params![prune_cutoff],
+            )?;
+            Ok(())
+        })();
+        match res {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT;")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
     }
 }
 
@@ -7599,6 +10220,1849 @@ mod tests {
         assert!(toggled.reactions.is_empty());
         let reloaded = store.get_message("t-legacy", "m-legacy-2").unwrap().unwrap();
         assert!(reloaded.reactions.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ai_messages_encrypted_on_disk_chronological_and_clearable() {
+        let dir = std::env::temp_dir().join(format!("teza-store-ai-msg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("ai.db");
+        let store = MessageStore::open(&db_path).unwrap();
+
+        let entries = [
+            AiStoredMessageDto {
+                id: "ai-1".into(),
+                session_id: "default".into(),
+                role: "user".into(),
+                content: "Bí mật dự án Alpha 2026".into(),
+                model: "gemini-2.5-flash".into(),
+                backend: "gemini_api".into(),
+                ts: 1_700_000_001_000,
+            },
+            AiStoredMessageDto {
+                id: "ai-2".into(),
+                session_id: "default".into(),
+                role: "assistant".into(),
+                content: "Đã tóm tắt kế hoạch Alpha".into(),
+                model: "gemini-2.5-flash".into(),
+                backend: "gemini_api".into(),
+                ts: 1_700_000_002_000,
+            },
+            AiStoredMessageDto {
+                id: "ai-3".into(),
+                session_id: "default".into(),
+                role: "user".into(),
+                content: "Dịch sang tiếng Anh".into(),
+                model: "gemini-2.5-flash".into(),
+                backend: "gemini_api".into(),
+                ts: 1_700_000_003_000,
+            },
+            AiStoredMessageDto {
+                id: "ai-other".into(),
+                session_id: "session-2".into(),
+                role: "user".into(),
+                content: "Phiên khác".into(),
+                model: String::new(),
+                backend: "gemini_cli".into(),
+                ts: 1_700_000_004_000,
+            },
+        ];
+        for e in &entries {
+            store.insert_ai_message(e).unwrap();
+        }
+
+        // Invalid role is rejected.
+        assert!(store
+            .insert_ai_message(&AiStoredMessageDto {
+                id: "ai-bad".into(),
+                session_id: "default".into(),
+                role: "system".into(),
+                content: "nope".into(),
+                model: String::new(),
+                backend: String::new(),
+                ts: 1_700_000_005_000,
+            })
+            .is_err());
+
+        // Latest 2 messages returned in chronological oldest->newest order, with role normalized.
+        let latest2 = store.list_ai_messages("default", 2).unwrap();
+        assert_eq!(latest2.len(), 2);
+        assert_eq!(latest2[0].id, "ai-2");
+        assert_eq!(latest2[0].role, "model");
+        assert_eq!(latest2[0].content, "Đã tóm tắt kế hoạch Alpha");
+        assert_eq!(latest2[1].id, "ai-3");
+        assert_eq!(latest2[1].role, "user");
+        assert!(store.list_ai_messages("default", 0).unwrap().is_empty());
+
+        // Raw SQLite row must store encrypted content with zero plaintext leakage.
+        let raw = Connection::open(&db_path).unwrap();
+        let raw_content: String = raw
+            .query_row("SELECT content FROM ai_messages WHERE id = 'ai-1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(raw_content.starts_with(ENC_PREFIX));
+        assert!(!raw_content.contains("Alpha"));
+        drop(raw);
+
+        // Clearing one session leaves other sessions untouched.
+        assert_eq!(store.clear_ai_messages("default").unwrap(), 3);
+        assert!(store.list_ai_messages("default", 10).unwrap().is_empty());
+        assert_eq!(store.list_ai_messages("session-2", 10).unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_unread_messages_for_summary_respects_watermark_and_fallback() {
+        let dir =
+            std::env::temp_dir().join(format!("teza-store-unread-sum-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("unread_sum.db");
+        let mut store = MessageStore::open(&db_path).unwrap();
+
+        let make_msg = |tid: &str, id: &str, ts: i64, outgoing: bool, recalled: bool| MessageDto {
+            msg_id: id.into(),
+            cli_msg_id: None,
+            thread_id: tid.into(),
+            sender_id: if outgoing { "me".into() } else { "peer".into() },
+            sender_name: if outgoing { "Bạn".into() } else { "An".into() },
+            text: format!("Nội dung {id}"),
+            msg_type: "chat.text".into(),
+            ts,
+            is_outgoing: outgoing,
+            is_recalled: recalled,
+            is_pinned: false,
+            quote: None,
+            reactions: Vec::new(),
+            attachment_url: None,
+            attachment_name: None,
+        };
+
+        // Thread A: last_read_in_ts > 0 -> returns non-recalled messages strictly after watermark,
+        // chronological oldest->newest, capped to latest max_count.
+        store
+            .upsert_thread(&ThreadDto {
+                id: "t-wm".into(),
+                title: "Nhóm A".into(),
+                avatar: String::new(),
+                kind: ThreadKind::Group,
+                last_preview: "hi".into(),
+                last_ts: 1_700_000_050_000,
+                unread_count: 3,
+                is_pinned: false,
+                is_muted: false,
+                last_read_in_ts: 1_700_000_020_000,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
+            })
+            .unwrap();
+        for (id, ts, out, rec) in [
+            ("m1", 1_700_000_010_000, false, false),
+            ("m2", 1_700_000_020_000, false, false),
+            ("m3", 1_700_000_030_000, false, false),
+            ("m4", 1_700_000_035_000, true, false),
+            ("m5", 1_700_000_040_000, false, true),
+            ("m6", 1_700_000_050_000, false, false),
+        ] {
+            store
+                .upsert_message(&make_msg("t-wm", id, ts, out, rec))
+                .unwrap();
+        }
+
+        let unread = store.list_unread_messages_for_summary("t-wm", 20).unwrap();
+        let ids: Vec<&str> = unread.iter().map(|m| m.msg_id.as_str()).collect();
+        assert_eq!(ids, vec!["m3", "m4", "m6"]);
+
+        let capped = store.list_unread_messages_for_summary("t-wm", 2).unwrap();
+        let capped_ids: Vec<&str> = capped.iter().map(|m| m.msg_id.as_str()).collect();
+        assert_eq!(capped_ids, vec!["m4", "m6"]);
+
+        // Thread B: last_read_in_ts == 0 -> returns min(max(unread_count, 10), max_count) incoming.
+        store
+            .upsert_thread(&ThreadDto {
+                id: "t-zero".into(),
+                title: "Nhóm B".into(),
+                avatar: String::new(),
+                kind: ThreadKind::Group,
+                last_preview: "hi".into(),
+                last_ts: 1_700_000_200_000,
+                unread_count: 3,
+                is_pinned: false,
+                is_muted: false,
+                last_read_in_ts: 0,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
+            })
+            .unwrap();
+        for i in 1..=15_i64 {
+            store
+                .upsert_message(&make_msg(
+                    "t-zero",
+                    &format!("in-{i:02}"),
+                    1_700_000_000_000 + i * 1_000,
+                    false,
+                    false,
+                ))
+                .unwrap();
+        }
+        store
+            .upsert_message(&make_msg("t-zero", "out-1", 1_700_000_099_000, true, false))
+            .unwrap();
+
+        let fallback10 = store.list_unread_messages_for_summary("t-zero", 40).unwrap();
+        assert_eq!(fallback10.len(), 10);
+        assert_eq!(fallback10[0].msg_id, "in-06");
+        assert_eq!(fallback10[9].msg_id, "in-15");
+        assert!(fallback10.iter().all(|m| !m.is_outgoing));
+
+        // Capped below 10 when max_count < 10
+        let fallback5 = store.list_unread_messages_for_summary("t-zero", 5).unwrap();
+        assert_eq!(fallback5.len(), 5);
+        assert_eq!(fallback5[0].msg_id, "in-11");
+        assert_eq!(fallback5[4].msg_id, "in-15");
+
+        // Thread C: watermark caught up & unread_count == 0 -> empty; if unread_count > 0 -> fallback.
+        store.mark_thread_read("t-wm").unwrap();
+        assert!(store
+            .list_unread_messages_for_summary("t-wm", 20)
+            .unwrap()
+            .is_empty());
+        store
+            .conn
+            .execute(
+                "UPDATE threads SET unread_count = 2 WHERE id = 't-wm'",
+                [],
+            )
+            .unwrap();
+        let marked_unread = store.list_unread_messages_for_summary("t-wm", 20).unwrap();
+        assert!(!marked_unread.is_empty());
+        assert!(marked_unread.iter().all(|m| !m.is_outgoing));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compute_next_occurrence_ts_handles_once_daily_weekly_and_monthly_rollover() {
+        let jan31_2026 = DateTime::parse_from_rfc3339("2026-01-31T09:30:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let feb28_2026 = DateTime::parse_from_rfc3339("2026-02-28T09:30:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let mar31_2026 = DateTime::parse_from_rfc3339("2026-03-31T09:30:00Z")
+            .unwrap()
+            .timestamp_millis();
+
+        assert_eq!(compute_next_occurrence_ts(jan31_2026, "once", jan31_2026), None);
+        assert_eq!(
+            compute_next_occurrence_ts(jan31_2026, "daily", jan31_2026),
+            Some(jan31_2026 + DAY_MS)
+        );
+        // Catch-up past 3.5 days jumps straight to day +4 at same wall time.
+        assert_eq!(
+            compute_next_occurrence_ts(jan31_2026, "daily", jan31_2026 + 3 * DAY_MS + 10_000),
+            Some(jan31_2026 + 4 * DAY_MS)
+        );
+        assert_eq!(
+            compute_next_occurrence_ts(jan31_2026, "weekly", jan31_2026),
+            Some(jan31_2026 + WEEK_MS)
+        );
+        // Monthly rollover clamps Jan 31 -> Feb 28 (non-leap 2026).
+        assert_eq!(
+            compute_next_occurrence_ts(jan31_2026, "monthly", jan31_2026 + 1_000),
+            Some(feb28_2026)
+        );
+        // Catch-up past Feb 28 preserves anchor day 31 -> Mar 31!
+        assert_eq!(
+            compute_next_occurrence_ts(jan31_2026, "monthly", feb28_2026 + 60_000),
+            Some(mar31_2026)
+        );
+        // Leap year 2028: Jan 31 -> Feb 29.
+        let jan31_2028 = DateTime::parse_from_rfc3339("2028-01-31T08:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let feb29_2028 = DateTime::parse_from_rfc3339("2028-02-29T08:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            compute_next_occurrence_ts(jan31_2028, "monthly", jan31_2028),
+            Some(feb29_2028)
+        );
+    }
+
+    #[test]
+    fn scheduled_messages_encrypted_atomic_claim_recovery_recurrence_and_misfire() {
+        let dir = std::env::temp_dir().join(format!("teza-store-sched-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("sched.db");
+        let store = MessageStore::open(&db_path).unwrap();
+
+        // Seed a thread to test auto-resolution of thread_title & thread_kind.
+        store
+            .upsert_thread(&ThreadDto {
+                id: "grp-ops".into(),
+                title: "Nhóm Vận Hành Mật".into(),
+                avatar: String::new(),
+                kind: ThreadKind::Group,
+                last_preview: String::new(),
+                last_ts: 1_700_000_000_000,
+                unread_count: 0,
+                is_pinned: false,
+                is_muted: false,
+                last_read_in_ts: 0,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
+            })
+            .unwrap();
+
+        let base_ts = 1_750_000_000_000_i64;
+        let s1 = store
+            .create_scheduled_message(&NewScheduledMessageInput {
+                thread_id: "grp-ops".into(),
+                thread_title: String::new(),
+                thread_kind: String::new(),
+                text: "Báo cáo doanh thu mật 999".into(),
+                attachment_path: r"J:\secret\report.pdf".into(),
+                send_at_ts: base_ts,
+                recurrence: "once".into(),
+                misfire_policy: "ask".into(),
+                misfire_grace_secs: 600,
+            })
+            .unwrap();
+        assert_eq!(s1.thread_title, "Nhóm Vận Hành Mật");
+        assert_eq!(s1.thread_kind, "group");
+        assert_eq!(s1.status, "pending");
+
+        let s2 = store
+            .create_scheduled_message(&NewScheduledMessageInput {
+                thread_id: "u-bob".into(),
+                thread_title: "Bob".into(),
+                thread_kind: "direct".into(),
+                text: "Chào buổi sáng".into(),
+                attachment_path: String::new(),
+                send_at_ts: base_ts + 5_000,
+                recurrence: "daily".into(),
+                misfire_policy: "skip".into(),
+                misfire_grace_secs: 300,
+            })
+            .unwrap();
+
+        let s3 = store
+            .create_scheduled_message(&NewScheduledMessageInput {
+                thread_id: "u-future".into(),
+                thread_title: "Future".into(),
+                thread_kind: "direct".into(),
+                text: "Tương lai".into(),
+                attachment_path: String::new(),
+                send_at_ts: base_ts + 60_000,
+                recurrence: "once".into(),
+                misfire_policy: "send_on_resume".into(),
+                misfire_grace_secs: 600,
+            })
+            .unwrap();
+
+        // Raw SQLite verification: all sensitive fields MUST be encrypted on disk.
+        {
+            let raw = Connection::open(&db_path).unwrap();
+            let (rt, rtxt, ratt, rerr): (String, String, String, String) = raw
+                .query_row(
+                    "SELECT thread_title, text, attachment_path, last_error FROM scheduled_messages WHERE id = ?1",
+                    params![&s1.id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            assert!(rt.starts_with(ENC_PREFIX) && !rt.contains("Vận Hành"));
+            assert!(rtxt.starts_with(ENC_PREFIX) && !rtxt.contains("999"));
+            assert!(ratt.starts_with(ENC_PREFIX) && !ratt.contains("report.pdf"));
+            assert!(rerr.starts_with(ENC_PREFIX));
+        }
+
+        // Update s1 text before sending.
+        let updated = store
+            .update_scheduled_message(
+                &s1.id,
+                &UpdateScheduledMessageInput {
+                    text: Some("Báo cáo đã cập nhật".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.text, "Báo cáo đã cập nhật");
+        assert_eq!(store.next_pending_schedule_ts().unwrap(), Some(base_ts));
+
+        // Atomic claim: claims s1 & s2, leaves s3 pending; second call returns empty!
+        let claimed = store
+            .claim_due_scheduled_messages(base_ts + 10_000, 10)
+            .unwrap();
+        let claimed_ids: Vec<&str> = claimed.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(claimed_ids, vec![s1.id.as_str(), s2.id.as_str()]);
+        assert!(claimed.iter().all(|c| c.status == "sending"));
+        assert!(store
+            .claim_due_scheduled_messages(base_ts + 10_000, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.next_pending_schedule_ts().unwrap(),
+            Some(base_ts + 60_000)
+        );
+
+        // Crash recovery: s1 (retry 0) -> pending (retry 1); force s2 retry_count=2 -> failed!
+        store
+            .conn
+            .execute(
+                "UPDATE scheduled_messages SET retry_count = 2 WHERE id = ?1",
+                params![&s2.id],
+            )
+            .unwrap();
+        let recovered = store
+            .recover_stuck_sending_schedules(base_ts + 15_000)
+            .unwrap();
+        assert_eq!(recovered, 2);
+        let s1_rec = store.get_scheduled_message(&s1.id).unwrap().unwrap();
+        assert_eq!(s1_rec.status, "pending");
+        assert_eq!(s1_rec.retry_count, 1);
+        let s2_rec = store.get_scheduled_message(&s2.id).unwrap().unwrap();
+        assert_eq!(s2_rec.status, "failed");
+        assert_eq!(s2_rec.retry_count, 3);
+
+        // 1-click reschedule_now on failed s2 brings it back to pending at now_ms.
+        let s2_now = store
+            .reschedule_now(&s2.id, base_ts + 20_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s2_now.status, "pending");
+        assert_eq!(s2_now.send_at_ts, base_ts + 20_000);
+        assert_eq!(s2_now.retry_count, 0);
+        assert!(s2_now.last_error.is_empty());
+
+        // Complete recurring s2 -> advances +1 day & stays pending!
+        let s2_done = store
+            .complete_scheduled_message(&s2.id, base_ts + 20_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s2_done.status, "pending");
+        assert_eq!(s2_done.send_at_ts, base_ts + 20_000 + DAY_MS);
+        assert_eq!(s2_done.sent_at_ts, base_ts + 20_000);
+
+        // Misfire "skip" on recurring s2 -> advances another day & stays pending!
+        let s2_skipped = store
+            .mark_scheduled_message_missed(&s2.id, "Bỏ qua do tắt máy", base_ts + 20_000 + DAY_MS + 700_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s2_skipped.status, "pending");
+        assert_eq!(s2_skipped.send_at_ts, base_ts + 20_000 + 2 * DAY_MS);
+
+        // Retry then fail on s1; then mark missed ("ask"), then reschedule_now, then complete ("once" -> sent).
+        let s1_retry = store
+            .fail_or_retry_scheduled_message(
+                &s1.id,
+                "Lỗi mạng tạm thời",
+                Some(base_ts + 50_000),
+                base_ts + 20_000,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(s1_retry.status, "pending");
+        assert_eq!(s1_retry.send_at_ts, base_ts + 50_000);
+        assert_eq!(s1_retry.retry_count, 2);
+
+        let s1_missed = store
+            .mark_scheduled_message_missed(&s1.id, "Quá hạn chờ xác nhận", base_ts + 2_000_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s1_missed.status, "missed");
+
+        let err_list = store
+            .list_scheduled_messages(Some("failed,missed"), 50)
+            .unwrap();
+        assert_eq!(err_list.len(), 1);
+        assert_eq!(err_list[0].id, s1.id);
+
+        let _ = store.reschedule_now(&s1.id, base_ts + 2_001_000).unwrap();
+        let s1_sent = store
+            .complete_scheduled_message(&s1.id, base_ts + 2_002_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(s1_sent.status, "sent");
+        assert_eq!(s1_sent.sent_at_ts, base_ts + 2_002_000);
+
+        // Cancel & delete s3
+        assert!(store.cancel_scheduled_message(&s3.id).unwrap());
+        assert_eq!(
+            store.get_scheduled_message(&s3.id).unwrap().unwrap().status,
+            "cancelled"
+        );
+        assert!(store.delete_scheduled_message(&s3.id).unwrap());
+        assert!(store.get_scheduled_message(&s3.id).unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn api_clients_hash_only_verification_audit_cap_and_idempotency_ttl() {
+        let dir = std::env::temp_dir().join(format!("teza-store-localapi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("localapi.db");
+        let store = MessageStore::open(&db_path).unwrap();
+
+        // Token generation & hashing
+        let t1 = generate_api_token().unwrap();
+        let t2 = generate_api_token().unwrap();
+        assert!(t1.starts_with("teza_"));
+        assert_eq!(t1.len(), 48);
+        assert_ne!(t1, t2);
+        let h1 = hash_api_token(&t1);
+        assert_eq!(h1.len(), 64);
+        assert!(h1.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+
+        // Create client
+        let created = store
+            .create_api_client(
+                "n8n Workflow",
+                &["send".into(), "read_threads".into()],
+                &["t-1".into(), "t-2".into(), "t-1".into()],
+                30,
+            )
+            .unwrap();
+        assert!(created.raw_token.starts_with("teza_"));
+        assert_eq!(created.client.allowed_thread_ids, vec!["t-1", "t-2"]);
+        assert_eq!(created.client.rate_limit_per_min, 30);
+        // Debug redacts raw_token!
+        assert!(!format!("{created:?}").contains(&created.raw_token));
+
+        // Raw SQLite stores ONLY SHA-256 hash, never raw_token!
+        {
+            let raw = Connection::open(&db_path).unwrap();
+            let (stored_hash, stored_prefix): (String, String) = raw
+                .query_row(
+                    "SELECT token_hash, token_prefix FROM api_clients WHERE id = ?1",
+                    params![&created.client.id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(stored_hash, hash_api_token(&created.raw_token));
+            assert_ne!(stored_hash, created.raw_token);
+            assert!(stored_prefix.len() <= 12);
+            assert_ne!(stored_prefix, created.raw_token);
+        }
+
+        // Verify token updates last_used_at; invalid/disabled tokens return None.
+        let verified = store
+            .verify_api_token(&created.raw_token, 1_750_000_010_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(verified.id, created.client.id);
+        assert_eq!(verified.last_used_at, 1_750_000_010_000);
+        assert!(store
+            .verify_api_token("teza_wrong_token", 1_750_000_020_000)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .verify_api_token(&format!(" {} ", created.raw_token), 1_750_000_020_000)
+            .unwrap()
+            .is_none());
+
+        // Disable client -> token immediately rejected.
+        let disabled = store
+            .update_api_client(&created.client.id, Some(false), None, None, None)
+            .unwrap()
+            .unwrap();
+        assert!(!disabled.enabled);
+        assert!(store
+            .verify_api_token(&created.raw_token, 1_750_000_030_000)
+            .unwrap()
+            .is_none());
+
+        // Re-enable & update scopes/rate_limit
+        let reenabled = store
+            .update_api_client(
+                &created.client.id,
+                Some(true),
+                Some(&["schedule".into()]),
+                Some(&[]),
+                Some(45),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(reenabled.enabled);
+        assert_eq!(reenabled.scopes, vec!["schedule"]);
+        assert!(reenabled.allowed_thread_ids.is_empty());
+        assert_eq!(reenabled.rate_limit_per_min, 45);
+        assert_eq!(store.list_api_clients().unwrap().len(), 1);
+
+        // Idempotency: encrypted on disk, TTL check, and >24h auto-prune.
+        let t0 = 1_750_000_000_000_i64;
+        store
+            .put_api_idempotency(
+                &created.client.id,
+                "idem-old",
+                200,
+                r#"{"ok":true,"secret":"payload-old"}"#,
+                t0,
+            )
+            .unwrap();
+        {
+            let raw = Connection::open(&db_path).unwrap();
+            let enc_resp: String = raw
+                .query_row(
+                    "SELECT response_json FROM api_idempotency WHERE idem_key = 'idem-old'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(enc_resp.starts_with(ENC_PREFIX));
+            assert!(!enc_resp.contains("payload-old"));
+        }
+        assert_eq!(
+            store
+                .get_api_idempotency(&created.client.id, "idem-old", 60_000, t0 + 30_000)
+                .unwrap(),
+            Some((200, r#"{"ok":true,"secret":"payload-old"}"#.to_string()))
+        );
+        // Expired TTL -> returns None
+        assert_eq!(
+            store
+                .get_api_idempotency(&created.client.id, "idem-old", 60_000, t0 + 60_001)
+                .unwrap(),
+            None
+        );
+
+        // Re-insert old key and confirm put > 24h later prunes it while keeping fresh key.
+        store
+            .put_api_idempotency(&created.client.id, "idem-stale", 200, r#"{"old":1}"#, t0)
+            .unwrap();
+        store
+            .put_api_idempotency(
+                &created.client.id,
+                "idem-fresh",
+                201,
+                r#"{"fresh":1}"#,
+                t0 + DAY_MS + 10_000,
+            )
+            .unwrap();
+        assert!(store
+            .get_api_idempotency(
+                &created.client.id,
+                "idem-stale",
+                2 * DAY_MS,
+                t0 + DAY_MS + 10_000
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .get_api_idempotency(
+                    &created.client.id,
+                    "idem-fresh",
+                    DAY_MS,
+                    t0 + DAY_MS + 20_000
+                )
+                .unwrap(),
+            Some((201, r#"{"fresh":1}"#.to_string()))
+        );
+
+        // Audit logs: encrypted detail + 500-row cap + clear.
+        for i in 1..=510_i64 {
+            store
+                .append_api_audit_log(
+                    &created.client.id,
+                    "n8n Workflow",
+                    "POST",
+                    "/v1/messages/send",
+                    "t-1",
+                    200,
+                    "ok",
+                    &format!("Chi tiết bí mật #{i}"),
+                    t0 + i * 1_000,
+                )
+                .unwrap();
+        }
+        let logs = store.list_api_audit_logs(600).unwrap();
+        assert_eq!(logs.len(), 500);
+        assert_eq!(logs[0].detail, "Chi tiết bí mật #510");
+        assert_eq!(logs[499].detail, "Chi tiết bí mật #11");
+        {
+            let raw = Connection::open(&db_path).unwrap();
+            let raw_detail: String = raw
+                .query_row(
+                    "SELECT detail FROM api_audit_logs ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(raw_detail.starts_with(ENC_PREFIX));
+            assert!(!raw_detail.contains("bí mật"));
+        }
+        assert_eq!(store.clear_api_audit_logs().unwrap(), 500);
+        assert!(store.list_api_audit_logs(10).unwrap().is_empty());
+
+        // Delete client cleans up client & idempotency rows.
+        assert!(store.delete_api_client(&created.client.id).unwrap());
+        assert!(store
+            .verify_api_token(&created.raw_token, t0 + DAY_MS + 30_000)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .get_api_idempotency(&created.client.id, "idem-fresh", DAY_MS, t0 + DAY_MS + 30_000)
+            .unwrap()
+            .is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_media_original_name_by_hash_prefers_primary_and_skips_empty_names() {
+        let dir = std::env::temp_dir().join(format!(
+            "teza-store-media-name-hash-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("media_name_hash.db");
+        let store = MessageStore::open(&db_path).unwrap();
+
+        // Empty / unknown hash returns None.
+        assert_eq!(store.find_media_original_name_by_hash("").unwrap(), None);
+        assert_eq!(
+            store.find_media_original_name_by_hash("missing-hash").unwrap(),
+            None
+        );
+
+        // Non-primary variant with name + newer primary row with blank name -> skips blank primary,
+        // returns non-empty name; once a real primary name exists, prefers primary over newer thumb.
+        let hash = "uh-photo-abc123";
+        store
+            .link_message_media(&MessageMediaRecord {
+                thread_id: "t-1".into(),
+                msg_id: "m-1".into(),
+                variant: "thumb".into(),
+                url_hash: hash.into(),
+                sha256: None,
+                original_name: Some("fallback_thumb.webp".into()),
+                saved_user_path: None,
+                cdn_status: MEDIA_CDN_STATUS_OK,
+                updated_ts: 5_000,
+            })
+            .unwrap();
+        store
+            .link_message_media(&MessageMediaRecord {
+                thread_id: "t-1".into(),
+                msg_id: "m-2".into(),
+                variant: "primary".into(),
+                url_hash: hash.into(),
+                sha256: None,
+                original_name: Some("   ".into()),
+                saved_user_path: None,
+                cdn_status: MEDIA_CDN_STATUS_OK,
+                updated_ts: 6_000,
+            })
+            .unwrap();
+        assert_eq!(
+            store.find_media_original_name_by_hash(hash).unwrap(),
+            Some("fallback_thumb.webp".to_string())
+        );
+
+        // Add primary row with actual original filename -> preferred even if thumb has newer ts.
+        store
+            .link_message_media(&MessageMediaRecord {
+                thread_id: "t-2".into(),
+                msg_id: "m-3".into(),
+                variant: "primary".into(),
+                url_hash: hash.into(),
+                sha256: None,
+                original_name: Some("bao_cao_2026.11.26.png".into()),
+                saved_user_path: None,
+                cdn_status: MEDIA_CDN_STATUS_OK,
+                updated_ts: 4_000,
+            })
+            .unwrap();
+        assert_eq!(
+            store.find_media_original_name_by_hash(hash).unwrap(),
+            Some("bao_cao_2026.11.26.png".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_messages_supports_korean_substrings_nfd_nfc_choseong_and_vietnamese() {
+        let dir = std::env::temp_dir().join(format!(
+            "litechat-store-ko-search-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("ko_search.db");
+
+        {
+            let mut store = MessageStore::open(&db_path).unwrap();
+            let msgs = [
+                MessageDto {
+                    msg_id: "ko-1".into(),
+                    cli_msg_id: None,
+                    thread_id: "t-ko".into(),
+                    sender_id: "u-kim".into(),
+                    sender_name: "김민수".into(),
+                    text: "김부장님께 보고서 보냈습니다".into(),
+                    msg_type: "chat.text".into(),
+                    ts: 1_700_000_100_000,
+                    is_outgoing: false,
+                    is_recalled: false,
+                    is_pinned: false,
+                    quote: None,
+                    reactions: Vec::new(),
+                    attachment_url: None,
+                    attachment_name: None,
+                },
+                MessageDto {
+                    msg_id: "ko-2".into(),
+                    cli_msg_id: None,
+                    thread_id: "t-ko".into(),
+                    sender_id: "u-park".into(),
+                    sender_name: "박지영".into(),
+                    text: "회의실에서 만나요".into(),
+                    msg_type: "chat.text".into(),
+                    ts: 1_700_000_200_000,
+                    is_outgoing: false,
+                    is_recalled: false,
+                    is_pinned: false,
+                    quote: None,
+                    reactions: Vec::new(),
+                    attachment_url: None,
+                    attachment_name: None,
+                },
+                MessageDto {
+                    msg_id: "ko-3".into(),
+                    cli_msg_id: None,
+                    thread_id: "t-ko".into(),
+                    sender_id: "u-kim".into(),
+                    // Stored as NFD Hangul Jamo for "김민수" + "오늘보고서"
+                    sender_name: "\u{1100}\u{1175}\u{11B7}\u{1106}\u{1175}\u{11AB}\u{1109}\u{116E}"
+                        .into(),
+                    text: "\u{110B}\u{1169}\u{1102}\u{1173}\u{11AF}\u{1107}\u{1169}\u{1100}\u{1169}\u{1109}\u{1165} 확인 부탁드립니다"
+                        .into(),
+                    msg_type: "chat.text".into(),
+                    ts: 1_700_000_300_000,
+                    is_outgoing: false,
+                    is_recalled: false,
+                    is_pinned: false,
+                    quote: None,
+                    reactions: Vec::new(),
+                    attachment_url: None,
+                    attachment_name: None,
+                },
+                MessageDto {
+                    msg_id: "vi-1".into(),
+                    cli_msg_id: None,
+                    thread_id: "t-vi".into(),
+                    sender_id: "u-minh".into(),
+                    // Stored with NFD Vietnamese diacritics
+                    sender_name: "Nguy\u{0065}\u{0302}\u{0303}n V\u{0061}\u{0306}n Minh".into(),
+                    text: "Đà Nẵng báo cáo tiến độ dự án".into(),
+                    msg_type: "chat.text".into(),
+                    ts: 1_700_000_400_000,
+                    is_outgoing: false,
+                    is_recalled: false,
+                    is_pinned: false,
+                    quote: None,
+                    reactions: Vec::new(),
+                    attachment_url: None,
+                    attachment_name: None,
+                },
+            ];
+            for m in &msgs {
+                store.upsert_message(m).unwrap();
+            }
+
+            // 1. Korean agglutinative compound substring search
+            let bujang = store.search_messages("부장", 20).unwrap();
+            assert_eq!(
+                bujang.iter().map(|m| m.msg_id.as_str()).collect::<Vec<_>>(),
+                vec!["ko-1"]
+            );
+
+            let sil = store.search_messages("실", 20).unwrap();
+            assert_eq!(
+                sil.iter().map(|m| m.msg_id.as_str()).collect::<Vec<_>>(),
+                vec!["ko-2"]
+            );
+
+            // "보고서" matches both "오늘보고서" (ko-3, newer) and "보고서" (ko-1, older) without duplicates
+            let bogoseo = store.search_messages("보고서", 20).unwrap();
+            assert_eq!(
+                bogoseo.iter().map(|m| m.msg_id.as_str()).collect::<Vec<_>>(),
+                vec!["ko-3", "ko-1"]
+            );
+
+            // 2. NFD Hangul query ("부장" in NFD) matches NFC stored message
+            let nfd_bujang = "\u{1107}\u{116E}\u{110C}\u{1161}\u{11BC}";
+            let nfd_hits = store.search_messages(nfd_bujang, 20).unwrap();
+            assert_eq!(
+                nfd_hits.iter().map(|m| m.msg_id.as_str()).collect::<Vec<_>>(),
+                vec!["ko-1"]
+            );
+
+            // NFC query ("오늘보고서") matches NFD stored message (ko-3)
+            let nfc_hits = store.search_messages("오늘보고서", 20).unwrap();
+            assert_eq!(
+                nfc_hits.iter().map(|m| m.msg_id.as_str()).collect::<Vec<_>>(),
+                vec!["ko-3"]
+            );
+
+            // 3. Korean Choseong search:
+            //    - "ㅎㅇ" matches both "확인" (ko-3, newer) and "회의실" (ko-2, older)
+            //    - "ㅎㅇㅅ" uniquely matches "회의실" (ko-2)
+            //    - "ㄱㅁㅅ" matches sender "김민수" (ko-3, ko-1)
+            let cho_hy = store.search_messages("ㅎㅇ", 20).unwrap();
+            assert_eq!(
+                cho_hy
+                    .iter()
+                    .map(|m| m.msg_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["ko-3", "ko-2"]
+            );
+
+            let cho_meeting = store.search_messages("ㅎㅇㅅ", 20).unwrap();
+            assert_eq!(
+                cho_meeting
+                    .iter()
+                    .map(|m| m.msg_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["ko-2"]
+            );
+
+            let cho_sender = store.search_messages("ㄱㅁㅅ", 20).unwrap();
+            assert_eq!(
+                cho_sender
+                    .iter()
+                    .map(|m| m.msg_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["ko-3", "ko-1"]
+            );
+
+            // Mixed Choseong + Hangul multi-token AND
+            let cho_mixed = store.search_messages("ㄱㅁㅅ 오늘", 20).unwrap();
+            assert_eq!(
+                cho_mixed
+                    .iter()
+                    .map(|m| m.msg_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["ko-3"]
+            );
+
+            // 4. Vietnamese NFC + NFD accent-insensitive search
+            let vi_ascii = store.search_messages("nguyen minh da nang", 20).unwrap();
+            assert_eq!(
+                vi_ascii.iter().map(|m| m.msg_id.as_str()).collect::<Vec<_>>(),
+                vec!["vi-1"]
+            );
+            let vi_nfd = store
+                .search_messages("Ba\u{0301}o ca\u{0301}o ti\u{0065}\u{0302}\u{0301}n", 20)
+                .unwrap();
+            assert_eq!(
+                vi_nfd.iter().map(|m| m.msg_id.as_str()).collect::<Vec<_>>(),
+                vec!["vi-1"]
+            );
+        }
+
+        // Re-open DB to verify `rebuild_in_memory_fts` preserves NFD->NFC Hangul & Choseong search
+        {
+            let store = MessageStore::open(&db_path).unwrap();
+            assert_eq!(
+                store
+                    .search_messages("보고서", 20)
+                    .unwrap()
+                    .iter()
+                    .map(|m| m.msg_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["ko-3", "ko-1"]
+            );
+            assert_eq!(
+                store
+                    .search_messages("ㅎㅇㅅ", 20)
+                    .unwrap()
+                    .iter()
+                    .map(|m| m.msg_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["ko-2"]
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replace_optimistic_poll_message_removes_synthetic_rows_and_prevents_duplicates() {
+        let dir = std::env::temp_dir().join(format!(
+            "litechat-store-poll-dedupe-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("poll_dedupe.db");
+        let mut store = MessageStore::open(&db_path).unwrap();
+
+        let make_poll_msg = |msg_id: &str, poll_id: i64, text: &str, ts: i64| MessageDto {
+            msg_id: msg_id.to_string(),
+            cli_msg_id: None,
+            thread_id: "grp-1".into(),
+            sender_id: "me".into(),
+            sender_name: "Bạn".into(),
+            text: text.to_string(),
+            msg_type: "chat.poll".into(),
+            ts,
+            is_outgoing: true,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
+            reactions: Vec::new(),
+            attachment_url: None,
+            attachment_name: Some(format!(
+                "teza-poll:{{\"poll_id\":{poll_id},\"question\":\"Lunch?\",\"options\":[]}}"
+            )),
+        };
+
+        // Insert synthetic poll-99, local-poll-99, timestamp local-poll-1700000001234 (same poll_id 99),
+        // plus an unrelated poll-100 that must NOT be touched.
+        store
+            .upsert_message(&make_poll_msg("poll-99", 99, "Bình chọn tạm 99", 1_700_000_100_000))
+            .unwrap();
+        store
+            .upsert_message(&make_poll_msg(
+                "local-poll-99",
+                99,
+                "Bình chọn cục bộ 99",
+                1_700_000_100_500,
+            ))
+            .unwrap();
+        store
+            .upsert_message(&make_poll_msg(
+                "local-poll-1700000001234",
+                99,
+                "Bình chọn lạc quan 99",
+                1_700_000_101_000,
+            ))
+            .unwrap();
+        store
+            .upsert_message(&make_poll_msg(
+                "poll-100",
+                100,
+                "Bình chọn khác 100",
+                1_700_000_102_000,
+            ))
+            .unwrap();
+
+        let real_msg = make_poll_msg(
+            "srv-msg-9901",
+            99,
+            "Bình chọn thật 99",
+            1_700_000_105_000,
+        );
+        store
+            .replace_optimistic_poll_message("grp-1", 99, &real_msg)
+            .unwrap();
+
+        // Synthetic rows for poll 99 are gone from both `messages` and `messages_fts`.
+        assert!(store.get_message("grp-1", "poll-99").unwrap().is_none());
+        assert!(store.get_message("grp-1", "local-poll-99").unwrap().is_none());
+        assert!(store
+            .get_message("grp-1", "local-poll-1700000001234")
+            .unwrap()
+            .is_none());
+        assert!(store.search_messages("binh chon tam 99", 10).unwrap().is_empty());
+        assert!(store
+            .search_messages("binh chon cuc bo 99", 10)
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .search_messages("binh chon lac quan 99", 10)
+            .unwrap()
+            .is_empty());
+
+        // Real server message is persisted & searchable; unrelated poll-100 is untouched.
+        assert_eq!(
+            store
+                .get_message("grp-1", "srv-msg-9901")
+                .unwrap()
+                .unwrap()
+                .text,
+            "Bình chọn thật 99"
+        );
+        assert_eq!(
+            store
+                .search_messages("binh chon that 99", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store.get_message("grp-1", "poll-100").unwrap().is_some());
+
+        // In-place update when real_msg.msg_id == "poll-100" keeps the row intact without self-deleting.
+        let updated_100 = make_poll_msg(
+            "poll-100",
+            100,
+            "Bình chọn cập nhật 100",
+            1_700_000_106_000,
+        );
+        store
+            .replace_optimistic_poll_message("grp-1", 100, &updated_100)
+            .unwrap();
+        assert_eq!(
+            store.get_message("grp-1", "poll-100").unwrap().unwrap().text,
+            "Bình chọn cập nhật 100"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upsert_or_merge_poll_message_merges_real_votes_in_place_and_preserves_flags() {
+        let dir = std::env::temp_dir().join(format!(
+            "litechat-store-poll-upsert-merge-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("poll_upsert_merge.db");
+        let mut store = MessageStore::open(&db_path).unwrap();
+
+        let make_poll = |msg_id: &str,
+                         sender_id: &str,
+                         sender_name: &str,
+                         is_outgoing: bool,
+                         ts: i64,
+                         text: &str,
+                         poll: &PollDto| {
+            let poll_json = serde_json::to_string(poll).unwrap();
+            MessageDto {
+                msg_id: msg_id.to_string(),
+                cli_msg_id: None,
+                thread_id: "grp-poll".into(),
+                sender_id: sender_id.to_string(),
+                sender_name: sender_name.to_string(),
+                text: text.to_string(),
+                msg_type: "chat.poll".into(),
+                ts,
+                is_outgoing,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: Some(format!("teza-poll:{poll_json}")),
+            }
+        };
+
+        // 1. Insert optimistic synthetic card with full flags & options.
+        let syn_poll = PollDto {
+            poll_id: 55,
+            question: "Trưa ăn gì?".into(),
+            options: vec![
+                crate::chat::PollOptionDto {
+                    id: 1,
+                    content: "Phở".into(),
+                    votes: 0,
+                    voted: false,
+                },
+                crate::chat::PollOptionDto {
+                    id: 2,
+                    content: "Bún chả".into(),
+                    votes: 0,
+                    voted: false,
+                },
+            ],
+            allow_multi: true,
+            allow_add_option: true,
+            is_anonymous: true,
+            expired_time: 1_800_000_000_000,
+            closed: false,
+        };
+        let syn_msg = make_poll(
+            "local-poll-55",
+            "u-alice",
+            "Alice",
+            true,
+            1_700_000_100_000,
+            "Bình chọn: Trưa ăn gì?",
+            &syn_poll,
+        );
+        store.upsert_message(&syn_msg).unwrap();
+
+        // 2. Case 2: Sparse real server creation message M1 arrives -> replaces synthetic,
+        //    preserves synthetic flags/options, returns was_updated_existing = false.
+        let sparse_m1_poll = PollDto {
+            poll_id: 55,
+            question: "Trưa ăn gì?".into(),
+            options: Vec::new(),
+            allow_multi: false,
+            allow_add_option: false,
+            is_anonymous: false,
+            expired_time: 0,
+            closed: false,
+        };
+        let m1 = make_poll(
+            "M1",
+            "u-alice",
+            "Alice",
+            true,
+            1_700_000_101_000,
+            "Bình chọn",
+            &sparse_m1_poll,
+        );
+        let (saved_m1, updated_existing) = store
+            .upsert_or_merge_poll_message("grp-poll", 55, &m1)
+            .unwrap();
+        assert!(!updated_existing);
+        assert_eq!(saved_m1.msg_id, "M1");
+        assert_eq!(saved_m1.text, "Bình chọn: Trưa ăn gì?");
+        assert!(store.get_message("grp-poll", "local-poll-55").unwrap().is_none());
+        let dto_after_m1 =
+            parse_poll_dto_from_attachment_name(saved_m1.attachment_name.as_deref()).unwrap();
+        assert!(dto_after_m1.allow_multi);
+        assert!(dto_after_m1.allow_add_option);
+        assert!(dto_after_m1.is_anonymous);
+        assert_eq!(dto_after_m1.options.len(), 2);
+
+        // 3. Case 1 (different server msgId M2 on poll vote): merges INTO canonical M1 in place!
+        let vote_m2_poll = PollDto {
+            poll_id: 55,
+            question: "Bình chọn".into(),
+            options: vec![
+                crate::chat::PollOptionDto {
+                    id: 1,
+                    content: "Phở".into(),
+                    votes: 2,
+                    voted: true,
+                },
+                crate::chat::PollOptionDto {
+                    id: 2,
+                    content: "Bún chả".into(),
+                    votes: 1,
+                    voted: false,
+                },
+            ],
+            allow_multi: false,
+            allow_add_option: false,
+            is_anonymous: false,
+            expired_time: 0,
+            closed: false,
+        };
+        let m2 = make_poll(
+            "M2",
+            "u-bob",
+            "Bob",
+            false,
+            1_700_000_200_000,
+            "Bob đã bình chọn",
+            &vote_m2_poll,
+        );
+        let (saved_after_m2, updated_existing) = store
+            .upsert_or_merge_poll_message("grp-poll", 55, &m2)
+            .unwrap();
+        assert!(updated_existing);
+        assert_eq!(saved_after_m2.msg_id, "M1");
+        assert_eq!(saved_after_m2.ts, 1_700_000_101_000);
+        assert_eq!(saved_after_m2.sender_id, "u-alice");
+        assert_eq!(saved_after_m2.sender_name, "Alice");
+        assert!(saved_after_m2.is_outgoing);
+        assert_eq!(saved_after_m2.text, "Bình chọn: Trưa ăn gì?");
+        assert!(store.get_message("grp-poll", "M2").unwrap().is_none());
+        let dto_after_m2 =
+            parse_poll_dto_from_attachment_name(saved_after_m2.attachment_name.as_deref()).unwrap();
+        assert_eq!(dto_after_m2.question, "Trưa ăn gì?");
+        assert_eq!(dto_after_m2.options[0].votes, 2);
+        assert!(dto_after_m2.options[0].voted);
+        assert!(dto_after_m2.allow_multi);
+        assert!(dto_after_m2.allow_add_option);
+        assert!(dto_after_m2.is_anonymous);
+
+        // 4. Case 1 (same msgId M1 updated with closed=true): updates in place, returns true.
+        let mut closed_poll = dto_after_m2.clone();
+        closed_poll.closed = true;
+        let m1_closed = make_poll(
+            "M1",
+            "u-alice",
+            "Alice",
+            true,
+            1_700_000_300_000,
+            "Bình chọn: Trưa ăn gì?",
+            &closed_poll,
+        );
+        let (saved_closed, updated_existing) = store
+            .upsert_or_merge_poll_message("grp-poll", 55, &m1_closed)
+            .unwrap();
+        assert!(updated_existing);
+        assert_eq!(saved_closed.msg_id, "M1");
+        assert_eq!(saved_closed.ts, 1_700_000_101_000);
+        assert!(
+            parse_poll_dto_from_attachment_name(saved_closed.attachment_name.as_deref())
+                .unwrap()
+                .closed
+        );
+
+        // 5. Case 1 (synthetic row arrives after real M1 exists): never inserts synthetic, merges into M1.
+        let late_syn = make_poll(
+            "poll-55",
+            "u-alice",
+            "Alice",
+            true,
+            1_700_000_400_000,
+            "Bình chọn: Trưa ăn gì?",
+            &syn_poll,
+        );
+        let (saved_after_syn, updated_existing) = store
+            .upsert_or_merge_poll_message("grp-poll", 55, &late_syn)
+            .unwrap();
+        assert!(updated_existing);
+        assert_eq!(saved_after_syn.msg_id, "M1");
+        assert!(store.get_message("grp-poll", "poll-55").unwrap().is_none());
+        assert!(
+            parse_poll_dto_from_attachment_name(saved_after_syn.attachment_name.as_deref())
+                .unwrap()
+                .closed
+        );
+
+        // Exactly 1 message exists in the entire thread.
+        let all_msgs = store.load_messages("grp-poll", None, 50).unwrap();
+        assert_eq!(all_msgs.len(), 1);
+        assert_eq!(all_msgs[0].msg_id, "M1");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dedupe_duplicate_poll_messages_in_thread_collapses_preexisting_duplicates() {
+        let dir = std::env::temp_dir().join(format!(
+            "litechat-store-poll-dedupe-thread-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("poll_dedupe_thread.db");
+        let mut store = MessageStore::open(&db_path).unwrap();
+
+        let make_poll_row = |msg_id: &str, sender: &str, ts: i64, text: &str, poll: &PollDto| {
+            MessageDto {
+                msg_id: msg_id.to_string(),
+                cli_msg_id: None,
+                thread_id: "grp-dup".into(),
+                sender_id: format!("u-{sender}"),
+                sender_name: sender.to_string(),
+                text: text.to_string(),
+                msg_type: "chat.poll".into(),
+                ts,
+                is_outgoing: sender == "Alice",
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: Some(format!(
+                    "teza-poll:{}",
+                    serde_json::to_string(poll).unwrap()
+                )),
+            }
+        };
+
+        let p88_v1 = PollDto {
+            poll_id: 88,
+            question: "Đi chơi cuối tuần?".into(),
+            options: vec![crate::chat::PollOptionDto {
+                id: 1,
+                content: "Đà Lạt".into(),
+                votes: 1,
+                voted: true,
+            }],
+            allow_multi: true,
+            allow_add_option: false,
+            is_anonymous: false,
+            expired_time: 0,
+            closed: false,
+        };
+        let p88_v2 = PollDto {
+            poll_id: 88,
+            question: "Bình chọn".into(),
+            options: vec![crate::chat::PollOptionDto {
+                id: 1,
+                content: "Đà Lạt".into(),
+                votes: 3,
+                voted: true,
+            }],
+            allow_multi: false,
+            allow_add_option: false,
+            is_anonymous: false,
+            expired_time: 0,
+            closed: false,
+        };
+        let p88_v3 = PollDto {
+            poll_id: 88,
+            question: "Bình chọn".into(),
+            options: vec![crate::chat::PollOptionDto {
+                id: 1,
+                content: "Đà Lạt".into(),
+                votes: 4,
+                voted: true,
+            }],
+            allow_multi: false,
+            allow_add_option: false,
+            is_anonymous: false,
+            expired_time: 0,
+            closed: true,
+        };
+        let p89 = PollDto {
+            poll_id: 89,
+            question: "Họp thứ mấy?".into(),
+            options: Vec::new(),
+            allow_multi: false,
+            allow_add_option: false,
+            is_anonymous: false,
+            expired_time: 0,
+            closed: false,
+        };
+
+        // Pre-populate duplicate rows for poll 88 (synthetic + 3 real server rows),
+        // plus an unrelated poll 89 and a regular text message.
+        store
+            .upsert_message(&make_poll_row(
+                "poll-88",
+                "Alice",
+                1_700_000_099_000,
+                "Bình chọn tạm 88",
+                &p88_v1,
+            ))
+            .unwrap();
+        store
+            .upsert_message(&make_poll_row(
+                "M1",
+                "Alice",
+                1_700_000_100_000,
+                "Bình chọn: Đi chơi cuối tuần?",
+                &p88_v1,
+            ))
+            .unwrap();
+        store
+            .upsert_message(&make_poll_row(
+                "M2",
+                "Bob",
+                1_700_000_200_000,
+                "Bình chọn dup M2",
+                &p88_v2,
+            ))
+            .unwrap();
+        store
+            .upsert_message(&make_poll_row(
+                "M3",
+                "Carol",
+                1_700_000_300_000,
+                "Bình chọn dup M3",
+                &p88_v3,
+            ))
+            .unwrap();
+        store
+            .upsert_message(&make_poll_row(
+                "M89",
+                "Alice",
+                1_700_000_400_000,
+                "Bình chọn: Họp thứ mấy?",
+                &p89,
+            ))
+            .unwrap();
+        store
+            .upsert_message(&MessageDto {
+                msg_id: "TXT1".into(),
+                cli_msg_id: None,
+                thread_id: "grp-dup".into(),
+                sender_id: "u-bob".into(),
+                sender_name: "Bob".into(),
+                text: "Chốt lịch nhé".into(),
+                msg_type: "chat.text".into(),
+                ts: 1_700_000_500_000,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+
+        let removed = store
+            .dedupe_duplicate_poll_messages_in_thread("grp-dup")
+            .unwrap();
+        assert_eq!(removed, 3);
+
+        // Second run is a clean no-op.
+        assert_eq!(
+            store
+                .dedupe_duplicate_poll_messages_in_thread("grp-dup")
+                .unwrap(),
+            0
+        );
+
+        let msgs = store.load_messages("grp-dup", None, 50).unwrap();
+        let ids: Vec<&str> = msgs.iter().map(|m| m.msg_id.as_str()).collect();
+        assert_eq!(ids, vec!["M1", "M89", "TXT1"]);
+
+        // Canonical M1 kept earliest identity & merged newest votes/closed/flags.
+        assert_eq!(msgs[0].sender_name, "Alice");
+        assert_eq!(msgs[0].ts, 1_700_000_100_000);
+        assert_eq!(msgs[0].text, "Bình chọn: Đi chơi cuối tuần?");
+        let merged_88 =
+            parse_poll_dto_from_attachment_name(msgs[0].attachment_name.as_deref()).unwrap();
+        assert_eq!(merged_88.options[0].votes, 4);
+        assert!(merged_88.allow_multi);
+        assert!(merged_88.closed);
+
+        // Duplicate FTS entries were cleaned too.
+        assert!(store.search_messages("dup M2", 10).unwrap().is_empty());
+        assert!(store.search_messages("dup M3", 10).unwrap().is_empty());
+        assert!(store.search_messages("binh chon tam 88", 10).unwrap().is_empty());
+        assert_eq!(
+            store.search_messages("di choi cuoi tuan", 10).unwrap().len(),
+            1
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stranger_thread_fallback_meta_profile_upsert_ensure_and_unresolved_listing() {
+        let dir = std::env::temp_dir().join(format!(
+            "litechat-store-stranger-threads-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("stranger_threads.db");
+        let store = MessageStore::open(&db_path).unwrap();
+
+        // 1. Brand-new stub uses real fallback_title + fallback_avatar instead of raw ID.
+        let created = store
+            .update_thread_preview_with_fallback_meta(
+                "900001",
+                "Xin chào shop",
+                1_700_000_100_000,
+                true,
+                false,
+                Some("Anh Minh"),
+                Some("https://avt.zdn.vn/minh.jpg"),
+            )
+            .unwrap();
+        assert!(created);
+        let t1 = store.get_thread_row("900001").unwrap().unwrap();
+        assert_eq!(t1.title, "Anh Minh");
+        assert_eq!(t1.avatar, "https://avt.zdn.vn/minh.jpg");
+        assert_eq!(t1.last_preview, "Xin chào shop");
+        assert_eq!(t1.unread_count, 1);
+
+        // 2. Numeric fallback_title falls back to thread_id; later real fallback upgrades it.
+        let created2 = store
+            .update_thread_preview_with_fallback_meta(
+                "900002",
+                "Alo",
+                1_700_000_200_000,
+                true,
+                false,
+                Some("900002"),
+                Some(""),
+            )
+            .unwrap();
+        assert!(created2);
+        let t2_stub = store.get_thread_row("900002").unwrap().unwrap();
+        assert_eq!(t2_stub.title, "900002");
+        assert!(t2_stub.avatar.is_empty());
+
+        let created2_again = store
+            .update_thread_preview_with_fallback_meta(
+                "900002",
+                "Còn hàng không?",
+                1_700_000_205_000,
+                true,
+                false,
+                Some("Chị Lan"),
+                Some("https://avt.zdn.vn/lan.jpg"),
+            )
+            .unwrap();
+        assert!(!created2_again);
+        let t2_upgraded = store.get_thread_row("900002").unwrap().unwrap();
+        assert_eq!(t2_upgraded.title, "Chị Lan");
+        assert_eq!(t2_upgraded.avatar, "https://avt.zdn.vn/lan.jpg");
+        assert_eq!(t2_upgraded.unread_count, 2);
+
+        // Existing real title/avatar are NOT overwritten by fallback meta on subsequent previews.
+        let _ = store
+            .update_thread_preview_with_fallback_meta(
+                "900002",
+                "Cảm ơn nhé",
+                1_700_000_210_000,
+                true,
+                false,
+                Some("Tên Khác"),
+                Some("https://avt.zdn.vn/other.jpg"),
+            )
+            .unwrap();
+        let t2_kept = store.get_thread_row("900002").unwrap().unwrap();
+        assert_eq!(t2_kept.title, "Chị Lan");
+        assert_eq!(t2_kept.avatar, "https://avt.zdn.vn/lan.jpg");
+
+        // 3. upsert_thread_profile_meta updates title/avatar without clobbering thread state.
+        store.set_thread_pinned("900001", true).unwrap();
+        store.set_thread_muted("900001", true).unwrap();
+        store.set_thread_archived("900001", true).unwrap();
+        assert!(!store
+            .upsert_thread_profile_meta("nonexistent", "Nobody", "https://avt.zdn.vn/x.jpg")
+            .unwrap());
+        // Raw numeric title + empty avatar must NOT downgrade real profile.
+        assert!(!store
+            .upsert_thread_profile_meta("900001", "900001", "")
+            .unwrap());
+        assert!(store
+            .upsert_thread_profile_meta(
+                "900001",
+                "Anh Minh (VIP)",
+                "https://avt.zdn.vn/minh_new.jpg"
+            )
+            .unwrap());
+        let t1_after = store.get_thread_row("900001").unwrap().unwrap();
+        assert_eq!(t1_after.title, "Anh Minh (VIP)");
+        assert_eq!(t1_after.avatar, "https://avt.zdn.vn/minh_new.jpg");
+        assert_eq!(t1_after.last_preview, "Xin chào shop");
+        assert_eq!(t1_after.last_ts, 1_700_000_100_000);
+        assert_eq!(t1_after.unread_count, 1);
+        assert!(t1_after.is_pinned);
+        assert!(t1_after.is_muted);
+        assert!(t1_after.is_archived);
+        assert_eq!(t1_after.kind, ThreadKind::Direct);
+
+        // 4. ensure_direct_thread creates missing thread (last_ts=0, unread=0) and updates existing safely.
+        let ensured_new = store
+            .ensure_direct_thread("900003", "Khách Mới", "https://avt.zdn.vn/new.jpg")
+            .unwrap();
+        assert_eq!(ensured_new.id, "900003");
+        assert_eq!(ensured_new.title, "Khách Mới");
+        assert_eq!(ensured_new.avatar, "https://avt.zdn.vn/new.jpg");
+        assert_eq!(ensured_new.kind, ThreadKind::Direct);
+        assert_eq!(ensured_new.last_ts, 0);
+        assert_eq!(ensured_new.unread_count, 0);
+
+        let ensured_existing = store
+            .ensure_direct_thread("900001", "Anh Minh (VIP 2)", "")
+            .unwrap();
+        assert_eq!(ensured_existing.title, "Anh Minh (VIP 2)");
+        assert_eq!(ensured_existing.avatar, "https://avt.zdn.vn/minh_new.jpg");
+        assert_eq!(ensured_existing.last_preview, "Xin chào shop");
+        assert_eq!(ensured_existing.last_ts, 1_700_000_100_000);
+        assert_eq!(ensured_existing.unread_count, 1);
+        assert!(ensured_existing.is_pinned);
+
+        // 5. list_unresolved_direct_thread_ids filters cloud_*/g*/group/resolved & orders by last_ts DESC.
+        let make_thread = |id: &str, title: &str, avatar: &str, kind: ThreadKind, last_ts: i64| {
+            ThreadDto {
+                id: id.into(),
+                title: title.into(),
+                avatar: avatar.into(),
+                kind,
+                last_preview: "hi".into(),
+                last_ts,
+                unread_count: 0,
+                is_pinned: false,
+                is_muted: false,
+                last_read_in_ts: 0,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
+            }
+        };
+        store
+            .upsert_thread(&make_thread(
+                "cloud_me",
+                "",
+                "",
+                ThreadKind::Direct,
+                1_700_000_999_000,
+            ))
+            .unwrap();
+        store
+            .upsert_thread(&make_thread(
+                "g123456",
+                "",
+                "",
+                ThreadKind::Direct,
+                1_700_000_998_000,
+            ))
+            .unwrap();
+        store
+            .upsert_thread(&make_thread(
+                "777000",
+                "",
+                "",
+                ThreadKind::Group,
+                1_700_000_997_000,
+            ))
+            .unwrap();
+        store
+            .upsert_thread(&make_thread(
+                "800001",
+                "800001",
+                "https://avt.zdn.vn/1.jpg",
+                ThreadKind::Direct,
+                1_700_000_900_000,
+            ))
+            .unwrap();
+        store
+            .upsert_thread(&make_thread(
+                "800002",
+                "Người Không Avatar",
+                "",
+                ThreadKind::Direct,
+                1_700_000_800_000,
+            ))
+            .unwrap();
+        store
+            .upsert_thread(&make_thread(
+                "800003",
+                "",
+                "https://avt.zdn.vn/3.jpg",
+                ThreadKind::Direct,
+                1_700_000_700_000,
+            ))
+            .unwrap();
+        store
+            .upsert_thread(&make_thread(
+                "800004",
+                "999888777",
+                "https://avt.zdn.vn/4.jpg",
+                ThreadKind::Direct,
+                1_700_000_600_000,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            store.list_unresolved_direct_thread_ids(2).unwrap(),
+            vec!["800001".to_string(), "800002".to_string()]
+        );
+        assert_eq!(
+            store.list_unresolved_direct_thread_ids(20).unwrap(),
+            vec![
+                "800001".to_string(),
+                "800002".to_string(),
+                "800003".to_string(),
+                "800004".to_string(),
+            ]
+        );
+        assert!(store
+            .list_unresolved_direct_thread_ids(0)
+            .unwrap()
+            .is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn suffixed_numeric_uid_title_is_treated_as_placeholder_rejected_as_fallback_and_rehydrated() {
+        let dir = std::env::temp_dir().join(format!(
+            "litechat-store-suffixed-uid-placeholder-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("suffixed_uid_placeholder.db");
+        let store = MessageStore::open(&db_path).unwrap();
+
+        // Pure helper checks: numeric and `<digits>_<digits>` match; real names with `_` do not.
+        assert!(is_raw_numeric_uid_like("777001"));
+        assert!(is_raw_numeric_uid_like("777001_0"));
+        assert!(is_raw_numeric_uid_like(" 777001_12 "));
+        assert!(!is_raw_numeric_uid_like(""));
+        assert!(!is_raw_numeric_uid_like("   "));
+        assert!(!is_raw_numeric_uid_like("minh_anh"));
+        assert!(!is_raw_numeric_uid_like("user_123"));
+        assert!(!is_raw_numeric_uid_like("123_abc"));
+        assert!(!is_raw_numeric_uid_like("777001_"));
+        assert!(!is_raw_numeric_uid_like("_0"));
+        assert!(is_placeholder_thread_title("777001_0", "777001"));
+        assert!(!is_placeholder_thread_title("minh_anh", "777001"));
+
+        // 1. `"777001_0"` is rejected as `fallback_title` when inserting a stub (falls back to thread_id).
+        let created = store
+            .update_thread_preview_with_fallback_meta(
+                "777001",
+                "Xin chào",
+                1_700_000_100_000,
+                true,
+                false,
+                Some("777001_0"),
+                Some("https://avt.zdn.vn/777001.jpg"),
+            )
+            .unwrap();
+        assert!(created);
+        let stub = store.get_thread_row("777001").unwrap().unwrap();
+        assert_eq!(stub.title, "777001");
+        assert_eq!(stub.avatar, "https://avt.zdn.vn/777001.jpg");
+
+        // 2. A thread whose stored title is `"777001_0"` (even with an avatar) is treated as
+        //    unresolved by `list_unresolved_direct_thread_ids`.
+        store
+            .upsert_thread(&ThreadDto {
+                id: "777002".into(),
+                title: "777001_0".into(),
+                avatar: "https://avt.zdn.vn/777002.jpg".into(),
+                kind: ThreadKind::Direct,
+                last_preview: "Alo".into(),
+                last_ts: 1_700_000_200_000,
+                unread_count: 1,
+                is_pinned: false,
+                is_muted: false,
+                last_read_in_ts: 0,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
+            })
+            .unwrap();
+        assert_eq!(
+            store.list_unresolved_direct_thread_ids(10).unwrap(),
+            vec!["777002".to_string(), "777001".to_string()]
+        );
+
+        // 3. When a real name arrives via `update_thread_preview_with_fallback_meta`, `"777001_0"`
+        //    is upgraded cleanly and leaves `list_unresolved_direct_thread_ids`.
+        let created_again = store
+            .update_thread_preview_with_fallback_meta(
+                "777002",
+                "Gửi anh báo giá",
+                1_700_000_205_000,
+                true,
+                false,
+                Some("minh_anh"),
+                None,
+            )
+            .unwrap();
+        assert!(!created_again);
+        let upgraded = store.get_thread_row("777002").unwrap().unwrap();
+        assert_eq!(upgraded.title, "minh_anh");
+        assert_eq!(upgraded.avatar, "https://avt.zdn.vn/777002.jpg");
+
+        // 4. `upsert_thread_profile_meta` rejects downgrading a real name to `"777001_0"`,
+        //    and upgrades `"777001"` to a real name so zero unresolved threads remain.
+        assert!(!store
+            .upsert_thread_profile_meta("777002", "777001_0", "")
+            .unwrap());
+        assert_eq!(
+            store.get_thread_row("777002").unwrap().unwrap().title,
+            "minh_anh"
+        );
+        assert!(store
+            .upsert_thread_profile_meta("777001", "Trần Quốc Bảo", "")
+            .unwrap());
+        assert_eq!(
+            store.get_thread_row("777001").unwrap().unwrap().title,
+            "Trần Quốc Bảo"
+        );
+        assert!(store
+            .list_unresolved_direct_thread_ids(10)
+            .unwrap()
+            .is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

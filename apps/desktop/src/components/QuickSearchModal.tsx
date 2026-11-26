@@ -3,13 +3,16 @@ import { Search, UserPlus, X } from "lucide-react";
 import { bridge } from "../bridge";
 import { useI18n } from "../i18n";
 import type { MessageDto, ThreadDto } from "../types";
+import { isImeComposingEvent, matchesSearchQuery } from "../utils/searchNormalize";
 import { looksLikePhoneQuery } from "../utils/threadState";
+import { ThreadAvatar } from "./ThreadAvatar";
 
 interface Props {
   open: boolean;
   threads: ThreadDto[];
   onClose: () => void;
   onSelectMessage: (msg: MessageDto) => void;
+  onSelectThread?: (threadId: string) => void;
   onFindPhone?: (phone: string) => void;
 }
 
@@ -24,7 +27,14 @@ function formatResultTime(ts: number, locale: string): string {
   });
 }
 
-export function QuickSearchModal({ open, threads, onClose, onSelectMessage, onFindPhone }: Props) {
+export function QuickSearchModal({
+  open,
+  threads,
+  onClose,
+  onSelectMessage,
+  onSelectThread,
+  onFindPhone,
+}: Props) {
   const { locale, t } = useI18n();
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<MessageDto[]>([]);
@@ -32,11 +42,22 @@ export function QuickSearchModal({ open, threads, onClose, onSelectMessage, onFi
 
   const threadTitleMap = useMemo(() => {
     const map = new Map<string, string>();
-    for (const t of threads) {
-      map.set(t.id, t.title);
+    for (const th of threads) {
+      map.set(th.id, th.title);
     }
     return map;
   }, [threads]);
+
+  const matchedThreads = useMemo(() => {
+    const trimmed = query.trim();
+    if (!trimmed || !onSelectThread) return [];
+    return threads
+      .filter((th) => matchesSearchQuery(`${th.title}\n${th.last_preview}\n${th.id}`, trimmed))
+      .slice(0, 6);
+  }, [threads, query, onSelectThread]);
+
+  const totalItems = matchedThreads.length + results.length;
+  const safeActiveIndex = totalItems > 0 ? Math.min(activeIndex, totalItems - 1) : 0;
 
   const resetState = useCallback(() => {
     setQuery("");
@@ -58,6 +79,16 @@ export function QuickSearchModal({ open, threads, onClose, onSelectMessage, onFi
     [onClose, onSelectMessage, resetState],
   );
 
+  const handleSelectMatchedThread = useCallback(
+    (threadId: string) => {
+      if (!onSelectThread) return;
+      resetState();
+      onSelectThread(threadId);
+      onClose();
+    },
+    [onClose, onSelectThread, resetState],
+  );
+
   useEffect(() => {
     if (!open) {
       resetState();
@@ -65,9 +96,9 @@ export function QuickSearchModal({ open, threads, onClose, onSelectMessage, onFi
     }
     let cancelled = false;
     const trimmed = query.trim();
+    setActiveIndex(0);
     if (!trimmed) {
       setResults([]);
-      setActiveIndex(0);
       return;
     }
     const timer = window.setTimeout(() => {
@@ -92,6 +123,7 @@ export function QuickSearchModal({ open, threads, onClose, onSelectMessage, onFi
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (e: KeyboardEvent) => {
+      if (isImeComposingEvent(e)) return;
       if (e.key === "Escape") handleClose();
     };
     window.addEventListener("keydown", onKeyDown);
@@ -120,18 +152,25 @@ export function QuickSearchModal({ open, threads, onClose, onSelectMessage, onFi
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => {
+              if (isImeComposingEvent(e)) return;
               if (e.key === "Escape") {
                 e.preventDefault();
                 handleClose();
-              } else if (e.key === "ArrowDown" && results.length > 0) {
+              } else if (e.key === "ArrowDown" && totalItems > 0) {
                 e.preventDefault();
-                setActiveIndex((i) => (i + 1) % results.length);
-              } else if (e.key === "ArrowUp" && results.length > 0) {
+                setActiveIndex((i) => (i + 1) % totalItems);
+              } else if (e.key === "ArrowUp" && totalItems > 0) {
                 e.preventDefault();
-                setActiveIndex((i) => (i - 1 + results.length) % results.length);
-              } else if (e.key === "Enter" && results[activeIndex]) {
+                setActiveIndex((i) => (i - 1 + totalItems) % totalItems);
+              } else if (e.key === "Enter" && totalItems > 0) {
                 e.preventDefault();
-                handleSelectHit(results[activeIndex]);
+                if (safeActiveIndex < matchedThreads.length) {
+                  const chosenThread = matchedThreads[safeActiveIndex];
+                  if (chosenThread) handleSelectMatchedThread(chosenThread.id);
+                } else {
+                  const chosenMsg = results[safeActiveIndex - matchedThreads.length];
+                  if (chosenMsg) handleSelectHit(chosenMsg);
+                }
               }
             }}
             placeholder={t("quickSearchPlaceholder")}
@@ -167,44 +206,93 @@ export function QuickSearchModal({ open, threads, onClose, onSelectMessage, onFi
               <span>{t("findFriendByPhonePrompt", { query: query.trim() })}</span>
             </button>
           )}
-          {results.length === 0 ? (
+          {matchedThreads.length > 0 && (
+            <div className="mb-1.5">
+              <div
+                className="px-3 py-1 text-[11px] font-semibold uppercase tracking-wider"
+                style={{ color: "var(--text-secondary)" }}
+              >
+                {t("quickSearchThreadsSection")}
+              </div>
+              {matchedThreads.map((th, idx) => {
+                const selected = idx === safeActiveIndex;
+                return (
+                  <button
+                    key={th.id}
+                    type="button"
+                    onMouseEnter={() => setActiveIndex(idx)}
+                    onClick={() => handleSelectMatchedThread(th.id)}
+                    className="hover-menu flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left transition"
+                    style={{
+                      background: selected ? "var(--bg-hover)" : "transparent",
+                    }}
+                  >
+                    <ThreadAvatar avatar={th.avatar} title={th.title} kind={th.kind} size="sm" />
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-[14px] font-semibold">{th.title}</div>
+                      {th.last_preview && (
+                        <div
+                          className="truncate text-[12px]"
+                          style={{ color: "var(--text-secondary)" }}
+                        >
+                          {th.last_preview}
+                        </div>
+                      )}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+          {matchedThreads.length === 0 && results.length === 0 ? (
             <p className="py-8 text-center text-[13px]" style={{ color: "var(--text-secondary)" }}>
               {query.trim()
                 ? t("quickSearchNoResults")
                 : t("quickSearchHint")}
             </p>
-          ) : (
-            results.map((m, idx) => {
-              const threadTitle = threadTitleMap.get(m.thread_id) || m.thread_id;
-              const selected = idx === activeIndex;
-              return (
-                <button
-                  key={`${m.thread_id}-${m.msg_id}`}
-                  type="button"
-                  onMouseEnter={() => setActiveIndex(idx)}
-                  onClick={() => handleSelectHit(m)}
-                  className="hover-menu flex w-full flex-col gap-0.5 rounded-xl px-3 py-2 text-left transition"
-                  style={{
-                    background: selected ? "var(--bg-hover)" : "transparent",
-                  }}
+          ) : results.length > 0 ? (
+            <div>
+              {matchedThreads.length > 0 && (
+                <div
+                  className="px-3 py-1 text-[11px] font-semibold uppercase tracking-wider"
+                  style={{ color: "var(--text-secondary)" }}
                 >
-                  <div className="flex items-center justify-between gap-2 text-[13px]">
-                    <span className="truncate font-semibold" style={{ color: "var(--accent)" }}>
-                      {threadTitle}
-                      <span className="font-normal" style={{ color: "var(--text-secondary)" }}>
-                        {" · "}
-                        {m.sender_name}
+                  {t("quickSearchMessagesSection")}
+                </div>
+              )}
+              {results.map((m, idx) => {
+                const combinedIdx = matchedThreads.length + idx;
+                const threadTitle = threadTitleMap.get(m.thread_id) || m.thread_id;
+                const selected = combinedIdx === safeActiveIndex;
+                return (
+                  <button
+                    key={`${m.thread_id}-${m.msg_id}`}
+                    type="button"
+                    onMouseEnter={() => setActiveIndex(combinedIdx)}
+                    onClick={() => handleSelectHit(m)}
+                    className="hover-menu flex w-full flex-col gap-0.5 rounded-xl px-3 py-2 text-left transition"
+                    style={{
+                      background: selected ? "var(--bg-hover)" : "transparent",
+                    }}
+                  >
+                    <div className="flex items-center justify-between gap-2 text-[13px]">
+                      <span className="truncate font-semibold" style={{ color: "var(--accent)" }}>
+                        {threadTitle}
+                        <span className="font-normal" style={{ color: "var(--text-secondary)" }}>
+                          {" · "}
+                          {m.sender_name}
+                        </span>
                       </span>
-                    </span>
-                    <span className="shrink-0 text-xs" style={{ color: "var(--text-secondary)" }}>
-                      {formatResultTime(m.ts, locale)}
-                    </span>
-                  </div>
-                  <span className="truncate text-[15px]">{m.text}</span>
-                </button>
-              );
-            })
-          )}
+                      <span className="shrink-0 text-xs" style={{ color: "var(--text-secondary)" }}>
+                        {formatResultTime(m.ts, locale)}
+                      </span>
+                    </div>
+                    <span className="truncate text-[15px]">{m.text}</span>
+                  </button>
+                );
+              })}
+            </div>
+          ) : null}
         </div>
       </div>
     </div>

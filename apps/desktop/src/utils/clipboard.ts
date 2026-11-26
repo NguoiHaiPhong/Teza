@@ -2,6 +2,18 @@ import { invoke } from "@tauri-apps/api/core";
 import { bridge, isTauri } from "../bridge";
 import { isBlobUrl, isDataUrl, normalizeMediaRequestUrl } from "./mediaCache";
 
+const BASE64_CHUNK_SIZE = 0x8000;
+
+export function uint8ArrayToBase64(bytes: Uint8Array): string {
+  if (bytes.byteLength === 0) return "";
+  const chunks: string[] = [];
+  for (let offset = 0; offset < bytes.byteLength; offset += BASE64_CHUNK_SIZE) {
+    const slice = bytes.subarray(offset, Math.min(offset + BASE64_CHUNK_SIZE, bytes.byteLength));
+    chunks.push(String.fromCharCode(...slice));
+  }
+  return btoa(chunks.join(""));
+}
+
 function execCommandCopyText(text: string): boolean {
   const ta = document.createElement("textarea");
   ta.value = text;
@@ -109,11 +121,10 @@ export async function copyImageReliable(url: string): Promise<void> {
         imageData.data.byteOffset,
         imageData.data.byteLength,
       );
-      await invoke("clipboard_copy_rgba_image", rgba, {
-        headers: {
-          "x-width": String(canvas.width),
-          "x-height": String(canvas.height),
-        },
+      await invoke("clipboard_copy_rgba_image_b64", {
+        width: canvas.width,
+        height: canvas.height,
+        rgbaBase64: uint8ArrayToBase64(rgba),
       });
       return;
     } catch (nativeErr) {

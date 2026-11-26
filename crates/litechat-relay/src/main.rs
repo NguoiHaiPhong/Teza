@@ -27,6 +27,8 @@ const UDP_DNS_TIMEOUT: Duration = Duration::from_secs(3);
 const DNS_CACHE_MAX_ENTRIES: usize = 1024;
 const DNS_TTL_MIN_SECS: u32 = 30;
 const DNS_TTL_MAX_SECS: u32 = 300;
+const MAX_DNS_CNAME_HOPS: usize = 4;
+const TUNNEL_COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 const DEFAULT_ALLOWED_SUFFIXES: &[&str] = &[
     // Official Zalo / VNG domains (kept synchronized with zalo-core::session::ALLOWED_MEDIA_HOST_SUFFIXES)
@@ -45,7 +47,10 @@ const DEFAULT_ALLOWED_SUFFIXES: &[&str] = &[
     "dlfl.vn",
     "dlfl.me",
     "flchat.vn",
+    "flchat.me",
+    "dlmd.vn",
     "dlmd.me",
+    "mdchat.vn",
     "mdchat.me",
     // Translation & updater endpoints
     "api-free.deepl.com",
@@ -419,12 +424,19 @@ fn generate_dns_txid() -> u16 {
     ((h ^ (h >> 16) ^ (h >> 32) ^ (h >> 48)) & 0xFFFF) as u16
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedDnsResponse {
+    ips: Vec<IpAddr>,
+    cnames: Vec<String>,
+    min_ttl: u32,
+}
+
 fn parse_dns_response(
     pkt: &[u8],
     expected_txid: u16,
     expected_host: &str,
     expected_qtype: u16,
-) -> Result<(Vec<IpAddr>, u32)> {
+) -> Result<ParsedDnsResponse> {
     if pkt.len() < 12 {
         bail!("Gói tin phản hồi DNS quá ngắn");
     }
@@ -469,6 +481,7 @@ fn parse_dns_response(
     }
 
     let mut ips = Vec::new();
+    let mut cnames = Vec::new();
     let mut min_ttl: Option<u32> = None;
 
     for _ in 0..ancount {
@@ -495,18 +508,31 @@ fn parse_dns_response(
                 ips.push(IpAddr::V6(Ipv6Addr::from(octets)));
                 min_ttl = Some(min_ttl.map_or(ttl, |cur| cur.min(ttl)));
             }
+        } else if rclass == 1 && rtype == 5 && rdlen > 0 {
+            let (target, end) = read_dns_name(pkt, pos)?;
+            if end > pos + rdlen {
+                bail!("Bản ghi CNAME DNS vượt quá kích thước RDATA");
+            }
+            if !target.is_empty() {
+                cnames.push(target);
+                min_ttl = Some(min_ttl.map_or(ttl, |cur| cur.min(ttl)));
+            }
         }
         pos += rdlen;
     }
 
-    Ok((ips, min_ttl.unwrap_or(60)))
+    Ok(ParsedDnsResponse {
+        ips,
+        cnames,
+        min_ttl: min_ttl.unwrap_or(60),
+    })
 }
 
 async fn query_udp_dns_once(
     server: SocketAddr,
     host: &str,
     qtype: u16,
-) -> Result<(Vec<IpAddr>, u32)> {
+) -> Result<ParsedDnsResponse> {
     let txid = generate_dns_txid();
     let query = build_dns_query(host, qtype, txid)?;
     let bind_addr = if server.is_ipv4() {
@@ -535,14 +561,43 @@ async fn resolve_via_udp_dns(host: &str, servers: &[String]) -> Result<(Vec<IpAd
 
     let mut last_err = None;
     for qtype in [1u16, 28u16] {
-        for &server in &addrs {
-            match query_udp_dns_once(server, host, qtype).await {
-                Ok((ips, ttl)) if !ips.is_empty() => {
-                    let clamped = ttl.clamp(DNS_TTL_MIN_SECS, DNS_TTL_MAX_SECS);
-                    return Ok((ips, Duration::from_secs(clamped as u64)));
+        let mut current_host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        let mut visited = vec![current_host.clone()];
+        let mut min_chain_ttl: Option<u32> = None;
+
+        for _hop in 0..=MAX_DNS_CNAME_HOPS {
+            let mut next_cname: Option<String> = None;
+            for &server in &addrs {
+                match query_udp_dns_once(server, &current_host, qtype).await {
+                    Ok(parsed) if !parsed.ips.is_empty() => {
+                        let effective_ttl = min_chain_ttl
+                            .map_or(parsed.min_ttl, |prev| prev.min(parsed.min_ttl));
+                        let clamped = effective_ttl.clamp(DNS_TTL_MIN_SECS, DNS_TTL_MAX_SECS);
+                        return Ok((parsed.ips, Duration::from_secs(clamped as u64)));
+                    }
+                    Ok(parsed) => {
+                        if let Some(target) = parsed
+                            .cnames
+                            .into_iter()
+                            .rev()
+                            .find(|c| !c.is_empty() && !visited.contains(c))
+                        {
+                            min_chain_ttl = Some(
+                                min_chain_ttl
+                                    .map_or(parsed.min_ttl, |prev| prev.min(parsed.min_ttl)),
+                            );
+                            next_cname = Some(target);
+                            break;
+                        }
+                    }
+                    Err(e) => last_err = Some(e),
                 }
-                Ok(_) => {}
-                Err(e) => last_err = Some(e),
+            }
+            if let Some(cname) = next_cname {
+                visited.push(cname.clone());
+                current_host = cname;
+            } else {
+                break;
             }
         }
     }
@@ -620,12 +675,36 @@ async fn resolve_target_ips(
     Ok((ips, Some(cache_key)))
 }
 
-async fn connect_outbound(host: &str, port: u16, cfg: &RelayServerConfig) -> Result<TcpStream> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OutboundError {
+    PolicyDenied(String),
+    UpstreamFailed(String),
+}
+
+impl std::fmt::Display for OutboundError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PolicyDenied(reason) | Self::UpstreamFailed(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for OutboundError {}
+
+async fn connect_outbound(
+    host: &str,
+    port: u16,
+    cfg: &RelayServerConfig,
+) -> std::result::Result<TcpStream, OutboundError> {
     if !is_allowed_target(host, port, cfg) {
-        bail!("Target {host}:{port} bị từ chối bởi chính sách relay");
+        return Err(OutboundError::PolicyDenied(format!(
+            "Target {host}:{port} bị từ chối bởi chính sách relay"
+        )));
     }
 
-    let (ips, cache_key) = resolve_target_ips(host, port, cfg).await?;
+    let (ips, cache_key) = resolve_target_ips(host, port, cfg)
+        .await
+        .map_err(|e| OutboundError::UpstreamFailed(e.to_string()))?;
 
     let mut usable: Vec<SocketAddr> = ips
         .into_iter()
@@ -634,26 +713,30 @@ async fn connect_outbound(host: &str, port: u16, cfg: &RelayServerConfig) -> Res
         .collect();
 
     if usable.is_empty() {
-        bail!("Địa chỉ IP đích {host}:{port} nằm trong dải nội bộ bị cấm");
+        return Err(OutboundError::PolicyDenied(format!(
+            "Địa chỉ IP đích {host}:{port} nằm trong dải nội bộ bị cấm"
+        )));
     }
 
     usable.sort_by_key(|a| if a.is_ipv4() { 0u8 } else { 1u8 });
 
-    let mut last_err = None;
+    let mut last_err: Option<String> = None;
     for addr in usable {
         match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
             Ok(Ok(stream)) => {
                 let _ = stream.set_nodelay(true);
                 return Ok(stream);
             }
-            Ok(Err(e)) => last_err = Some(anyhow::anyhow!(e)),
-            Err(_) => last_err = Some(anyhow::anyhow!("Hết thời gian kết nối tới {addr}")),
+            Ok(Err(e)) => last_err = Some(e.to_string()),
+            Err(_) => last_err = Some(format!("Hết thời gian kết nối tới {addr}")),
         }
     }
     if let Some(key) = cache_key {
         dns_cache().write().await.remove(&key);
     }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Không kết nối được tới {host}:{port}")))
+    Err(OutboundError::UpstreamFailed(
+        last_err.unwrap_or_else(|| format!("Không kết nối được tới {host}:{port}")),
+    ))
 }
 
 async fn handle_client(client: TcpStream, peer: SocketAddr, cfg: Arc<RelayServerConfig>) -> Result<()> {
@@ -770,9 +853,15 @@ async fn handle_socks5(
 
     let mut outbound = match connect_outbound(&host, port, &cfg).await {
         Ok(stream) => stream,
-        Err(e) => {
+        Err(OutboundError::PolicyDenied(reason)) => {
+            eprintln!("[RELAY-BLOCKED] {peer} -> {host}:{port}: {reason}");
             reply_and_close(&mut client, &[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
-            return Err(e);
+            bail!("{reason}");
+        }
+        Err(OutboundError::UpstreamFailed(reason)) => {
+            eprintln!("[RELAY-ERR] {peer} -> {host}:{port}: {reason}");
+            reply_and_close(&mut client, &[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+            bail!("{reason}");
         }
     };
 
@@ -783,7 +872,13 @@ async fn handle_socks5(
     client
         .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
         .await?;
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut outbound).await;
+    let _ = tokio::io::copy_bidirectional_with_sizes(
+        &mut client,
+        &mut outbound,
+        TUNNEL_COPY_BUFFER_BYTES,
+        TUNNEL_COPY_BUFFER_BYTES,
+    )
+    .await;
     Ok(())
 }
 
@@ -977,13 +1072,23 @@ async fn handle_http_connect(
 
     let mut outbound = match connect_outbound(&host, port, &cfg).await {
         Ok(stream) => stream,
-        Err(e) => {
+        Err(OutboundError::PolicyDenied(reason)) => {
+            eprintln!("[RELAY-BLOCKED] {peer} -> {host}:{port}: {reason}");
             reply_and_close(
                 reader.get_mut(),
                 b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n",
             )
             .await;
-            return Err(e);
+            bail!("{reason}");
+        }
+        Err(OutboundError::UpstreamFailed(reason)) => {
+            eprintln!("[RELAY-ERR] {peer} -> {host}:{port}: {reason}");
+            reply_and_close(
+                reader.get_mut(),
+                b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+            bail!("{reason}");
         }
     };
 
@@ -996,7 +1101,13 @@ async fn handle_http_connect(
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;
     // Keep BufReader around TcpStream so any pipelined bytes read during header parsing are preserved.
-    let _ = tokio::io::copy_bidirectional(&mut reader, &mut outbound).await;
+    let _ = tokio::io::copy_bidirectional_with_sizes(
+        &mut reader,
+        &mut outbound,
+        TUNNEL_COPY_BUFFER_BYTES,
+        TUNNEL_COPY_BUFFER_BYTES,
+    )
+    .await;
     Ok(())
 }
 
@@ -1497,10 +1608,11 @@ mod tests {
         resp.extend_from_slice(&4u16.to_be_bytes());
         resp.extend_from_slice(&[49, 213, 95, 137]);
 
-        let (ips, min_ttl) = parse_dns_response(&resp, 0x1234, "chat.zalo.me", 1).unwrap();
-        assert_eq!(min_ttl, 45);
+        let parsed = parse_dns_response(&resp, 0x1234, "chat.zalo.me", 1).unwrap();
+        assert_eq!(parsed.min_ttl, 45);
+        assert_eq!(parsed.cnames, vec!["alias.zalo.me".to_string()]);
         assert_eq!(
-            ips,
+            parsed.ips,
             vec![
                 "49.213.95.122".parse::<IpAddr>().unwrap(),
                 "49.213.95.137".parse::<IpAddr>().unwrap(),
@@ -1634,7 +1746,10 @@ mod tests {
             "file-stal-9.dlfl.vn",
             "file-stal-1.dlfl.me",
             "file-stal-9-te-vnso-pt-25.flchat.vn",
+            "file-stal-9-te-vnso-pt-25.flchat.me",
+            "video-stal-20.dlmd.vn",
             "video-stal-20.dlmd.me",
+            "video-stal-20-te-vnno-cm-1.mdchat.vn",
             "video-stal-20-te-vnno-cm-1.mdchat.me",
         ] {
             assert!(is_allowed_target(host, 443, &cfg), "expected 443 allowed: {host}");
@@ -1763,5 +1878,180 @@ mod tests {
             .unwrap();
         let resp = std::str::from_utf8(&buf[..n]).unwrap();
         assert!(resp.contains("431"), "expected 431, got: {resp}");
+    }
+
+    fn encode_dns_labels(host: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        for label in host.trim_end_matches('.').split('.') {
+            out.push(label.len() as u8);
+            out.extend_from_slice(label.as_bytes());
+        }
+        out.push(0);
+        out
+    }
+
+    #[tokio::test]
+    async fn parse_dns_response_extracts_cname_and_udp_dns_follows_cname_only_chain() {
+        // 1. Unit check: CNAME-only response (no glued A record) extracts target CNAME cleanly
+        let q = build_dns_query("file-stal-9-te-vnso-pt-25.flchat.vn", 1, 0x4242).unwrap();
+        let mut cname_only = q.clone();
+        cname_only[2] = 0x81;
+        cname_only[3] = 0x80;
+        cname_only[6..8].copy_from_slice(&1u16.to_be_bytes());
+        cname_only.extend_from_slice(&[0xC0, 0x0C]);
+        cname_only.extend_from_slice(&5u16.to_be_bytes()); // CNAME
+        cname_only.extend_from_slice(&1u16.to_be_bytes()); // IN
+        cname_only.extend_from_slice(&75u32.to_be_bytes());
+        let rdata = encode_dns_labels("edge-1.flchat.me");
+        cname_only.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        cname_only.extend_from_slice(&rdata);
+
+        let parsed = parse_dns_response(
+            &cname_only,
+            0x4242,
+            "file-stal-9-te-vnso-pt-25.flchat.vn",
+            1,
+        )
+        .unwrap();
+        assert!(parsed.ips.is_empty());
+        assert_eq!(parsed.cnames, vec!["edge-1.flchat.me".to_string()]);
+        assert_eq!(parsed.min_ttl, 75);
+
+        // 2. End-to-end mock UDP DNS returning 2 CNAME-only hops then final A record
+        let dns_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dns_addr = dns_sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            for _ in 0..3 {
+                if let Ok((n, peer)) = dns_sock.recv_from(&mut buf).await {
+                    if n < 12 {
+                        continue;
+                    }
+                    let (qname, _) = read_dns_name(&buf[..n], 12).unwrap();
+                    let mut reply = buf[..n].to_vec();
+                    reply[2] = 0x81;
+                    reply[3] = 0x80;
+                    reply[6..8].copy_from_slice(&1u16.to_be_bytes());
+                    reply.extend_from_slice(&[0xC0, 0x0C]);
+                    match qname.as_str() {
+                        "file-stal-9-te-vnso-pt-25.flchat.vn" => {
+                            reply.extend_from_slice(&5u16.to_be_bytes());
+                            reply.extend_from_slice(&1u16.to_be_bytes());
+                            reply.extend_from_slice(&90u32.to_be_bytes());
+                            let target = encode_dns_labels("hop1.flchat.me");
+                            reply.extend_from_slice(&(target.len() as u16).to_be_bytes());
+                            reply.extend_from_slice(&target);
+                        }
+                        "hop1.flchat.me" => {
+                            reply.extend_from_slice(&5u16.to_be_bytes());
+                            reply.extend_from_slice(&1u16.to_be_bytes());
+                            reply.extend_from_slice(&45u32.to_be_bytes());
+                            let target = encode_dns_labels("hop2.dlfl.vn");
+                            reply.extend_from_slice(&(target.len() as u16).to_be_bytes());
+                            reply.extend_from_slice(&target);
+                        }
+                        "hop2.dlfl.vn" => {
+                            reply.extend_from_slice(&1u16.to_be_bytes());
+                            reply.extend_from_slice(&1u16.to_be_bytes());
+                            reply.extend_from_slice(&120u32.to_be_bytes());
+                            reply.extend_from_slice(&4u16.to_be_bytes());
+                            reply.extend_from_slice(&[49, 213, 95, 200]);
+                        }
+                        _ => {}
+                    }
+                    let _ = dns_sock.send_to(&reply, peer).await;
+                }
+            }
+        });
+
+        let (ips, ttl) = resolve_via_udp_dns(
+            "file-stal-9-te-vnso-pt-25.flchat.vn",
+            &[dns_addr.to_string()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(ips, vec!["49.213.95.200".parse::<IpAddr>().unwrap()]);
+        assert_eq!(ttl, Duration::from_secs(45));
+    }
+
+    #[tokio::test]
+    async fn outbound_error_distinguishes_policy_denied_403_0x02_from_upstream_failed_502_0x04() {
+        // Reserve and immediately release a loopback TCP port so connections to it fail immediately (ECONNREFUSED).
+        let closed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_port = closed_listener.local_addr().unwrap().port();
+        drop(closed_listener);
+
+        // 1. Direct connect_outbound classification
+        let allowlist_cfg = RelayServerConfig::default();
+        let denied = connect_outbound("blocked.example", 443, &allowlist_cfg)
+            .await
+            .unwrap_err();
+        assert!(matches!(denied, OutboundError::PolicyDenied(_)));
+
+        let open_cfg = RelayServerConfig {
+            allow_all: true,
+            allow_private_targets: true,
+            ..Default::default()
+        };
+        let upstream = connect_outbound("127.0.0.1", closed_port, &open_cfg)
+            .await
+            .unwrap_err();
+        assert!(matches!(upstream, OutboundError::UpstreamFailed(_)));
+
+        // 2. End-to-end SOCKS5 & HTTP CONNECT replies for PolicyDenied (0x02 / 403)
+        let (_, policy_relay) = spawn_echo_and_relay(RelayServerConfig {
+            allow_all: false,
+            allow_private_targets: false,
+            ..Default::default()
+        })
+        .await;
+
+        // SOCKS5 PolicyDenied -> 0x02
+        let mut s_denied = TcpStream::connect(policy_relay).await.unwrap();
+        s_denied.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut rep = [0u8; 2];
+        s_denied.read_exact(&mut rep).await.unwrap();
+        assert_eq!(rep, [0x05, 0x00]);
+        let host = b"blocked.example";
+        let mut req = vec![0x05, 0x01, 0x00, 0x03, host.len() as u8];
+        req.extend_from_slice(host);
+        req.extend_from_slice(&443u16.to_be_bytes());
+        s_denied.write_all(&req).await.unwrap();
+        let mut conn_rep = [0u8; 10];
+        s_denied.read_exact(&mut conn_rep).await.unwrap();
+        assert_eq!(conn_rep[1], 0x02);
+
+        // HTTP CONNECT PolicyDenied -> 403
+        let mut h_denied = TcpStream::connect(policy_relay).await.unwrap();
+        h_denied
+            .write_all(b"CONNECT blocked.example:443 HTTP/1.1\r\nHost: blocked.example:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 256];
+        let n = h_denied.read(&mut buf).await.unwrap();
+        assert!(std::str::from_utf8(&buf[..n]).unwrap().contains("403 Forbidden"));
+
+        // 3. End-to-end SOCKS5 & HTTP CONNECT replies for UpstreamFailed (0x04 / 502)
+        let (_, upstream_relay) = spawn_echo_and_relay(open_cfg).await;
+
+        // SOCKS5 UpstreamFailed -> 0x04
+        let mut s_up = TcpStream::connect(upstream_relay).await.unwrap();
+        s_up.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        s_up.read_exact(&mut rep).await.unwrap();
+        assert_eq!(rep, [0x05, 0x00]);
+        let mut req_up = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
+        req_up.extend_from_slice(&closed_port.to_be_bytes());
+        s_up.write_all(&req_up).await.unwrap();
+        s_up.read_exact(&mut conn_rep).await.unwrap();
+        assert_eq!(conn_rep[1], 0x04);
+
+        // HTTP CONNECT UpstreamFailed -> 502
+        let mut h_up = TcpStream::connect(upstream_relay).await.unwrap();
+        let connect_closed = format!(
+            "CONNECT 127.0.0.1:{closed_port} HTTP/1.1\r\nHost: 127.0.0.1:{closed_port}\r\n\r\n"
+        );
+        h_up.write_all(connect_closed.as_bytes()).await.unwrap();
+        let n = h_up.read(&mut buf).await.unwrap();
+        assert!(std::str::from_utf8(&buf[..n]).unwrap().contains("502 Bad Gateway"));
     }
 }

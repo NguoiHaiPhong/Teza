@@ -1,9 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Ban, Check, Loader2, MessageSquare, Phone, Search, User, UserPlus, X } from "lucide-react";
 import { bridge } from "../bridge";
-import { useI18n } from "../i18n";
+import { useI18n, type UiLanguage } from "../i18n";
 import type { UserProfileDto } from "../types";
+import { isImeComposingEvent } from "../utils/searchNormalize";
 import { ThreadAvatar } from "./ThreadAvatar";
+
+const COUNTRY_CODE_OPTIONS = [
+  { code: "84", label: "+84 VN" },
+  { code: "82", label: "+82 KR" },
+] as const;
+
+function inferInitialCountryCode(raw: string, lang: UiLanguage): string {
+  const cleaned = raw.trim().replace(/[\s\-().\t]/g, "");
+  if (/^\+?82\d{7,}$/.test(cleaned)) return "82";
+  if (/^\+?84\d{7,}$/.test(cleaned)) return "84";
+  return lang === "ko" ? "82" : "84";
+}
 
 export interface FindUserModalProps {
   open: boolean;
@@ -22,8 +35,10 @@ export function FindUserModal({
   onStartChat,
   onRelationshipChanged,
 }: FindUserModalProps) {
-  const { t } = useI18n();
+  const { lang, t } = useI18n();
+  const defaultCountryCode = lang === "ko" ? "82" : "84";
   const [phone, setPhone] = useState("");
+  const [countryCode, setCountryCode] = useState<string>(defaultCountryCode);
   const [searching, setSearching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<UserProfileDto | null>(null);
@@ -33,10 +48,13 @@ export function FindUserModal({
   const [actionNotice, setActionNotice] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const searchSeqRef = useRef(0);
+  const tRef = useRef(t);
+  tRef.current = t;
 
   const resetState = useCallback(() => {
     searchSeqRef.current += 1;
     setPhone("");
+    setCountryCode(defaultCountryCode);
     setError(null);
     setResult(null);
     setSearching(false);
@@ -44,19 +62,19 @@ export function FindUserModal({
     setRequestSent(false);
     setActionError(null);
     setActionNotice(null);
-  }, []);
+  }, [defaultCountryCode]);
 
   const handleClose = useCallback(() => {
     resetState();
     onClose();
   }, [onClose, resetState]);
 
-  const runSearch = useCallback(async (raw: string) => {
+  const runSearch = useCallback(async (raw: string, selectedCode: string) => {
     const query = raw.trim();
     const seq = ++searchSeqRef.current;
     if (!query) {
       setSearching(false);
-      setError("Vui lòng nhập số điện thoại cần tìm");
+      setError(tRef.current("findUserEmptyPhoneError"));
       setResult(null);
       return;
     }
@@ -68,7 +86,8 @@ export function FindUserModal({
     setActionError(null);
     setActionNotice(null);
     try {
-      const found = await bridge.findUserByPhone(query);
+      const effectiveCountry = query.startsWith("+") ? undefined : selectedCode;
+      const found = await bridge.findUserByPhone(query, effectiveCountry);
       if (searchSeqRef.current !== seq) return;
       setResult(found);
     } catch (err) {
@@ -87,8 +106,10 @@ export function FindUserModal({
       return;
     }
     const init = initialPhone.trim();
+    const initCode = inferInitialCountryCode(init, lang);
     searchSeqRef.current += 1;
     setPhone(init);
+    setCountryCode(initCode);
     setError(null);
     setResult(null);
     setSearching(false);
@@ -98,17 +119,18 @@ export function FindUserModal({
     setActionNotice(null);
     const focusTimer = window.setTimeout(() => inputRef.current?.focus(), 20);
     if (init) {
-      void runSearch(init);
+      void runSearch(init, initCode);
     }
     return () => {
       window.clearTimeout(focusTimer);
       searchSeqRef.current += 1;
     };
-  }, [open, initialPhone, resetState, runSearch]);
+  }, [open, initialPhone, lang, resetState, runSearch]);
 
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (e: KeyboardEvent) => {
+      if (isImeComposingEvent(e)) return;
       if (e.key === "Escape") handleClose();
     };
     window.addEventListener("keydown", onKeyDown);
@@ -181,13 +203,33 @@ export function FindUserModal({
         <form
           onSubmit={(e) => {
             e.preventDefault();
-            void runSearch(phone);
+            void runSearch(phone, countryCode);
           }}
           className="space-y-3 p-4"
         >
           <div className="flex items-center gap-2">
+            <select
+              value={countryCode}
+              onChange={(e) => setCountryCode(e.target.value)}
+              aria-label={t("findUserCountryCodeLabel")}
+              title={t("findUserCountryOverrideHint")}
+              className={`shrink-0 rounded-xl px-2.5 py-2 text-[13px] font-medium outline-none transition ${
+                phone.trim().startsWith("+") ? "opacity-60" : ""
+              }`}
+              style={{
+                background: "var(--bg-surface)",
+                border: "1px solid var(--border-subtle)",
+                color: "var(--text-primary)",
+              }}
+            >
+              {COUNTRY_CODE_OPTIONS.map((opt) => (
+                <option key={opt.code} value={opt.code}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
             <div
-              className="flex flex-1 items-center gap-2 rounded-xl px-3 py-2"
+              className="flex min-w-0 flex-1 items-center gap-2 rounded-xl px-3 py-2"
               style={{ background: "var(--bg-surface)" }}
             >
               <Search className="h-4 w-4 shrink-0" style={{ color: "var(--text-secondary)" }} />
@@ -195,8 +237,14 @@ export function FindUserModal({
                 ref={inputRef}
                 value={phone}
                 onChange={(e) => setPhone(e.target.value)}
+                onKeyDown={(e) => {
+                  if (isImeComposingEvent(e)) {
+                    if (e.key === "Enter") e.preventDefault();
+                    return;
+                  }
+                }}
                 placeholder={t("findUserPhonePlaceholder")}
-                className="w-full bg-transparent text-[14.5px] outline-none"
+                className="w-full min-w-0 bg-transparent text-[14.5px] outline-none"
               />
             </div>
             <button

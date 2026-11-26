@@ -31,9 +31,11 @@ pub const CMD_SEEN_1_1: u16 = 503;
 pub const CMD_CLEAR_UNREAD_1_1: u16 = 504;
 pub const CMD_PULL_MSG_1_1: u16 = 510;
 pub const CMD_PULL_MSG_GROUP: u16 = 511;
+pub const CMD_PULL_MSG_E2EE_1_1: u16 = 512;
 pub const CMD_PULL_MSG_513: u16 = 513;
 pub const CMD_PULL_MSG_514: u16 = 514;
 pub const CMD_PULL_MSG_515: u16 = 515;
+pub const CMD_PULL_MSG_E2EE_GROUP: u16 = 516;
 pub const CMD_PULL_MSG_517: u16 = 517;
 pub const CMD_PULL_MSG_518: u16 = 518;
 pub const CMD_PULL_ACK_GROUP: u16 = 519;
@@ -43,6 +45,8 @@ pub const CMD_SEEN_GROUP: u16 = 523;
 pub const CMD_CLEAR_UNREAD_GROUP: u16 = 524;
 pub const CMD_HAS_MSG: u16 = 533;
 pub const CMD_PUSH_MISS_MSG: u16 = 534;
+pub const CMD_PUSH_MSG_E2EE_1_1: u16 = 551;
+pub const CMD_PUSH_MSG_E2EE_GROUP: u16 = 552;
 pub const CMD_E2EE_DELIVER_SEEN_1_1: u16 = 553;
 pub const CMD_E2EE_DELIVER_SEEN_GROUP: u16 = 554;
 pub const CMD_GET_MSG: u16 = 570;
@@ -74,6 +78,51 @@ pub struct WsEvent {
     pub payload: Value,
 }
 
+fn unwrap_json_str(v: &Value) -> std::borrow::Cow<'_, Value> {
+    if let Value::String(s) = v {
+        let trimmed = s.trim();
+        if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+            || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+        {
+            if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                return std::borrow::Cow::Owned(parsed);
+            }
+        }
+    }
+    std::borrow::Cow::Borrowed(v)
+}
+
+fn value_has_non_empty_chat_bucket(node: &Value, depth: u8) -> bool {
+    const CHAT_MESSAGE_BUCKETS: &[&str] = &[
+        "msgs",
+        "groupMsgs",
+        "strangerMsgs",
+        "strangers",
+        "otherMsgs",
+        "lastMsgs",
+    ];
+    let unwrapped = unwrap_json_str(node);
+    let Some(obj) = unwrapped.as_object() else {
+        return false;
+    };
+    for key in CHAT_MESSAGE_BUCKETS {
+        if let Some(raw) = obj.get(*key) {
+            let bucket = unwrap_json_str(raw);
+            if bucket.as_array().is_some_and(|arr| !arr.is_empty()) {
+                return true;
+            }
+        }
+    }
+    if depth > 0 {
+        if let Some(inner) = obj.get("data") {
+            if value_has_non_empty_chat_bucket(inner, depth - 1) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 impl WsEvent {
     pub fn is_chat_ish(&self) -> bool {
         matches!(
@@ -82,14 +131,22 @@ impl WsEvent {
                 | CMD_PUSH_MSG_GROUP
                 | CMD_PULL_MSG_1_1
                 | CMD_PULL_MSG_GROUP
+                | CMD_PULL_MSG_E2EE_1_1
                 | CMD_PULL_MSG_513
                 | CMD_PULL_MSG_514
                 | CMD_PULL_MSG_515
+                | CMD_PULL_MSG_E2EE_GROUP
                 | CMD_PULL_MSG_517
                 | CMD_PULL_MSG_518
                 | CMD_PUSH_MISS_MSG
+                | CMD_PUSH_MSG_E2EE_1_1
+                | CMD_PUSH_MSG_E2EE_GROUP
                 | CMD_GET_MSG
         )
+    }
+
+    pub fn has_chat_message_payload(&self) -> bool {
+        value_has_non_empty_chat_bucket(&self.payload, 3)
     }
 
     pub fn is_control_ish(&self) -> bool {
@@ -673,5 +730,84 @@ mod tests {
             }
         });
         assert_eq!(queues_from_auth(&auth), vec![(504, 1), (524, 1)]);
+    }
+
+    #[test]
+    fn e2ee_chat_cmds_are_chat_ish_and_payload_detector_finds_nested_stranger_buckets() {
+        for cmd in [
+            CMD_PULL_MSG_E2EE_1_1,
+            CMD_PULL_MSG_E2EE_GROUP,
+            CMD_PUSH_MSG_E2EE_1_1,
+            CMD_PUSH_MSG_E2EE_GROUP,
+        ] {
+            let ev = WsEvent {
+                cmd,
+                sub_cmd: 0,
+                version: 1,
+                payload: json!({}),
+            };
+            assert!(ev.is_chat_ish(), "cmd {cmd} should be chat-ish");
+        }
+
+        let stranger_ev = WsEvent {
+            cmd: 599,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "strangerMsgs": [{ "msgId": "s1", "uidFrom": "999", "content": "Hi" }]
+                }
+            }),
+        };
+        assert!(stranger_ev.has_chat_message_payload());
+
+        let nested_other_ev = WsEvent {
+            cmd: 599,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "data": {
+                        "otherMsgs": [{ "msgId": "s2", "uidFrom": "888", "content": "Hello" }]
+                    }
+                }
+            }),
+        };
+        assert!(nested_other_ev.has_chat_message_payload());
+
+        let stringified_ev = WsEvent {
+            cmd: 599,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": "{\"strangers\":\"[{\\\"msgId\\\":\\\"s3\\\"}]\"}"
+            }),
+        };
+        assert!(stringified_ev.has_chat_message_payload());
+
+        let last_msgs_ev = WsEvent {
+            cmd: 599,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": { "lastMsgs": [{ "msgId": "s4" }] }
+            }),
+        };
+        assert!(last_msgs_ev.has_chat_message_payload());
+
+        let empty_ev = WsEvent {
+            cmd: 599,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({
+                "data": {
+                    "msgs": [],
+                    "groupMsgs": [],
+                    "strangerMsgs": [],
+                    "seens": [{ "idTo": "999" }]
+                }
+            }),
+        };
+        assert!(!empty_ev.has_chat_message_payload());
     }
 }

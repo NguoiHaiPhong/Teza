@@ -1,21 +1,27 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import type { ChatFolderDto, MessageDto, ThreadDto } from "../src/types.ts";
+import type { ChatFolderDto, MessageDto, PollDto, ThreadDto } from "../src/types.ts";
+import { parsePollPayload } from "../src/utils/richMessage.ts";
 import {
   QUICK_REACTION_EMOJIS,
   applyOpenThreadSearchState,
   applyOptimisticReaction,
+  applyPollUpdateToMessages,
   applyThreadReadSync,
   bumpThreadList,
   compareThreads,
   computeLayoutMode,
   computeThreadRenderLimitForTarget,
   countFolderUnread,
+  dedupeOptimisticPollMessages,
+  dedupePollMessages,
   extractFirstUrl,
   filterThreadsByFolder,
   findFirstUnreadMsgId,
   getDisplayBodyText,
+  isPollVoteActivityQuestion,
   looksLikePhoneQuery,
+  mergePollDto,
   moveArrayItem,
   normalizeReactionEmoji,
   normalizeReactions,
@@ -251,8 +257,13 @@ test("computeLayoutMode and looksLikePhoneQuery enforce responsive breakpoints a
 
   assert.equal(looksLikePhoneQuery("0912 345 678"), true);
   assert.equal(looksLikePhoneQuery("+84912345678"), true);
+  assert.equal(looksLikePhoneQuery("010-1234-5678"), true);
+  assert.equal(looksLikePhoneQuery("+82 10-1234-5678"), true);
+  assert.equal(looksLikePhoneQuery("821012345678"), true);
+  assert.equal(looksLikePhoneQuery("+1 415 555 0100"), true);
   assert.equal(looksLikePhoneQuery("2025"), false);
   assert.equal(looksLikePhoneQuery("Minh Anh"), false);
+  assert.equal(looksLikePhoneQuery("김민수"), false);
 });
 
 test("filterThreadsByFolder, countFolderUnread, and extractFirstUrl support custom folders and links", () => {
@@ -779,4 +790,539 @@ test("applyOptimisticReaction and reconcileUpdatedMessage handle 2-way add, swit
     reactions: [{ emoji: "❤️", count: 1, me: false }],
   });
   assert.equal(reconcileUpdatedMessage(afterPhoneRemove, olderUnloaded), afterPhoneRemove);
+});
+
+test("poll deduplication and merge helpers prevent duplicate optimistic poll cards and preserve metadata", () => {
+  const fullPoll: PollDto = {
+    poll_id: 9001,
+    question: "Trưa nay ăn gì?",
+    options: [
+      { id: 1, content: "Phở", votes: 1, voted: true },
+      { id: 2, content: "Cơm tấm", votes: 0, voted: false },
+    ],
+    allow_multi: true,
+    allow_add_option: true,
+    is_anonymous: false,
+    expired_time: 0,
+    closed: false,
+  };
+  const sparsePoll: PollDto = {
+    poll_id: 9001,
+    question: "Bình chọn",
+    options: [],
+    allow_multi: false,
+    allow_add_option: false,
+    is_anonymous: false,
+    expired_time: 0,
+    closed: false,
+  };
+
+  // mergePollDto keeps full question/options/flags when incoming payload is sparse
+  const mergedSparse = mergePollDto(fullPoll, sparsePoll);
+  assert.equal(mergedSparse.question, "Trưa nay ăn gì?");
+  assert.equal(mergedSparse.options.length, 2);
+  assert.equal(mergedSparse.allow_multi, true);
+  assert.equal(mergedSparse.allow_add_option, true);
+
+  // Optimistic poll followed by real server poll replaces synthetic msg_id and preserves options
+  const optimisticMsg = makeMsg({
+    msg_id: "poll-9001",
+    thread_id: "grp-1",
+    msg_type: "chat.poll",
+    text: "Bình chọn: Trưa nay ăn gì?",
+    attachment_name: `teza-poll:${JSON.stringify(fullPoll)}`,
+    ts: 10_000,
+    is_outgoing: true,
+  });
+  const realSparseServerMsg = makeMsg({
+    msg_id: "srv-778899",
+    thread_id: "grp-1",
+    msg_type: "chat.poll",
+    text: "Bình chọn: Trưa nay ăn gì?",
+    attachment_name: `teza-poll:${JSON.stringify(sparsePoll)}`,
+    ts: 10_500,
+    is_outgoing: true,
+  });
+
+  const afterRealArrives = upsertMsg([optimisticMsg], realSparseServerMsg);
+  assert.equal(afterRealArrives.length, 1);
+  assert.equal(afterRealArrives[0].msg_id, "srv-778899");
+  assert.ok(afterRealArrives[0].attachment_name?.includes("Phở"));
+
+  // Reverse race: real server poll already present when local-poll-<id> arrives -> no duplicate
+  const localOptimistic = makeMsg({
+    ...optimisticMsg,
+    msg_id: "local-poll-9001",
+  });
+  const afterReverseRace = upsertMsg([realSparseServerMsg], localOptimistic);
+  assert.equal(afterReverseRace.length, 1);
+  assert.equal(afterReverseRace[0].msg_id, "srv-778899");
+  assert.ok(afterReverseRace[0].attachment_name?.includes("Cơm tấm"));
+
+  // dedupeOptimisticPollMessages strips synthetic duplicates from loaded history pages
+  const deduped = dedupeOptimisticPollMessages([optimisticMsg, localOptimistic, realSparseServerMsg]);
+  assert.equal(deduped.length, 1);
+  assert.equal(deduped[0].msg_id, "srv-778899");
+  assert.ok(deduped[0].attachment_name?.includes("Phở"));
+
+  // applyPollUpdateToMessages updates vote/lock state by poll_id even if msg_id changed
+  const lockedPoll: PollDto = {
+    ...fullPoll,
+    options: [
+      { id: 1, content: "Phở", votes: 2, voted: true },
+      { id: 2, content: "Cơm tấm", votes: 1, voted: false },
+      { id: 3, content: "Bún bò", votes: 1, voted: true },
+    ],
+    closed: true,
+  };
+  const updatedList = applyPollUpdateToMessages(deduped, 9001, lockedPoll, "poll-9001");
+  assert.equal(updatedList.length, 1);
+  assert.equal(updatedList[0].msg_id, "srv-778899");
+  assert.ok(updatedList[0].attachment_name?.includes("Bún bò"));
+  assert.ok(updatedList[0].attachment_name?.includes('"closed":true'));
+
+  // Sparse incoming with real question & empty options preserves all flags (allow_multi/allow_add_option/is_anonymous)
+  const anonFullPoll: PollDto = { ...fullPoll, is_anonymous: true };
+  const sparseWithRealQuestion: PollDto = {
+    poll_id: 9001,
+    question: "Trưa nay ăn gì?",
+    options: [],
+    allow_multi: false,
+    allow_add_option: false,
+    is_anonymous: false,
+    expired_time: 0,
+    closed: false,
+  };
+  const mergedRealQ = mergePollDto(anonFullPoll, sparseWithRealQuestion);
+  assert.equal(mergedRealQ.question, "Trưa nay ăn gì?");
+  assert.equal(mergedRealQ.options.length, 2);
+  assert.equal(mergedRealQ.allow_multi, true);
+  assert.equal(mergedRealQ.allow_add_option, true);
+  assert.equal(mergedRealQ.is_anonymous, true);
+
+  // Options-only partial payload (generic question + default false flags) preserves existing question & flags
+  const optionsOnlyPartial: PollDto = {
+    poll_id: 9001,
+    question: "Bình chọn",
+    options: [
+      { id: 1, content: "Phở", votes: 3, voted: true },
+      { id: 2, content: "Cơm tấm", votes: 1, voted: false },
+    ],
+    allow_multi: false,
+    allow_add_option: false,
+    is_anonymous: false,
+    expired_time: 0,
+    closed: false,
+  };
+  const mergedOptsOnly = mergePollDto(anonFullPoll, optionsOnlyPartial);
+  assert.equal(mergedOptsOnly.question, "Trưa nay ăn gì?");
+  assert.equal(mergedOptsOnly.options[0].votes, 3);
+  assert.equal(mergedOptsOnly.allow_multi, true);
+  assert.equal(mergedOptsOnly.allow_add_option, true);
+  assert.equal(mergedOptsOnly.is_anonymous, true);
+
+  // History re-sync of an old open creation message never re-opens an already locked poll
+  const resyncOpen = mergePollDto(lockedPoll, { ...fullPoll, closed: false });
+  assert.equal(resyncOpen.closed, true);
+});
+
+test("mergePollDto protects real question from vote-activity status strings", () => {
+  const basePoll: PollDto = {
+    poll_id: 9101,
+    question: "Trưa nay ăn gì?",
+    options: [
+      { id: 1, content: "Phở", votes: 1, voted: true },
+      { id: 2, content: "Bún bò", votes: 0, voted: false },
+    ],
+    allow_multi: true,
+    allow_add_option: true,
+    is_anonymous: true,
+    expired_time: 1_800_000_000_000,
+    closed: false,
+  };
+
+  const activityStrings = [
+    "đã tham gia bình chọn",
+    "An đã tham gia bình chọn",
+    "Minh đã bình chọn",
+    "đã bình chọn",
+    "Lan đã khóa bình chọn",
+    "Hùng đã thêm lựa chọn vào bình chọn",
+    "voted",
+    "Alice voted",
+    "Bob voted in the poll",
+  ];
+
+  for (const statusText of activityStrings) {
+    assert.equal(isPollVoteActivityQuestion(statusText), true, `Expected activity text: ${statusText}`);
+    const merged = mergePollDto(basePoll, {
+      poll_id: 9101,
+      question: statusText,
+      options: [
+        { id: 1, content: "Phở", votes: 2, voted: true },
+        { id: 2, content: "Bún bò", votes: 1, voted: false },
+      ],
+      allow_multi: false,
+      allow_add_option: false,
+      is_anonymous: false,
+      expired_time: 0,
+      closed: false,
+    });
+    assert.equal(merged.question, "Trưa nay ăn gì?", `Must not overwrite question with "${statusText}"`);
+    assert.equal(merged.options[0].votes, 2);
+    assert.equal(merged.options[1].votes, 1);
+    assert.equal(merged.allow_multi, true);
+    assert.equal(merged.allow_add_option, true);
+    assert.equal(merged.is_anonymous, true);
+    assert.equal(merged.expired_time, 1_800_000_000_000);
+  }
+
+  // Genuine user question mentioning voting with "?" is NOT classified as vote activity
+  assert.equal(isPollVoteActivityQuestion("Bạn đã bình chọn chưa?"), false);
+  assert.equal(isPollVoteActivityQuestion("Trưa nay ăn gì?"), false);
+
+  // Reverse direction: real question upgrades an existing vote-activity placeholder
+  const activityExisting: PollDto = {
+    ...basePoll,
+    question: "An đã tham gia bình chọn",
+  };
+  const upgraded = mergePollDto(activityExisting, {
+    ...basePoll,
+    question: "Tối nay đi đâu?",
+  });
+  assert.equal(upgraded.question, "Tối nay đi đâu?");
+});
+
+test("dedupeOptimisticPollMessages collapses multiple real server poll rows into one canonical card", () => {
+  const createPoll: PollDto = {
+    poll_id: 9202,
+    question: "Chọn địa điểm team building",
+    options: [
+      { id: 1, content: "Đà Lạt", votes: 0, voted: false },
+      { id: 2, content: "Phú Quốc", votes: 0, voted: false },
+    ],
+    allow_multi: true,
+    allow_add_option: true,
+    is_anonymous: true,
+    expired_time: 0,
+    closed: false,
+  };
+  const vote1Poll: PollDto = {
+    poll_id: 9202,
+    question: "Bình đã tham gia bình chọn",
+    options: [
+      { id: 1, content: "Đà Lạt", votes: 1, voted: false },
+      { id: 2, content: "Phú Quốc", votes: 0, voted: false },
+    ],
+    allow_multi: false,
+    allow_add_option: false,
+    is_anonymous: false,
+    expired_time: 0,
+    closed: false,
+  };
+  const vote2Poll: PollDto = {
+    poll_id: 9202,
+    question: "Chi đã bình chọn",
+    options: [
+      { id: 1, content: "Đà Lạt", votes: 1, voted: false },
+      { id: 2, content: "Phú Quốc", votes: 2, voted: true },
+    ],
+    allow_multi: false,
+    allow_add_option: false,
+    is_anonymous: false,
+    expired_time: 0,
+    closed: true,
+  };
+
+  const realCreate = makeMsg({
+    msg_id: "srv-create-100",
+    thread_id: "grp-team",
+    sender_id: "u-an",
+    sender_name: "An",
+    is_outgoing: true,
+    msg_type: "chat.poll",
+    text: "Bình chọn: Chọn địa điểm team building",
+    attachment_name: `teza-poll:${JSON.stringify(createPoll)}`,
+    ts: 10_000,
+  });
+  const chatBetween1 = makeMsg({ msg_id: "m-chat-1", thread_id: "grp-team", text: "Vote đi mn", ts: 11_000 });
+  const realVote1 = makeMsg({
+    msg_id: "srv-vote-200",
+    thread_id: "grp-team",
+    sender_id: "u-binh",
+    sender_name: "Bình",
+    is_outgoing: false,
+    msg_type: "chat.poll",
+    text: "Bình đã tham gia bình chọn",
+    attachment_name: `teza-poll:${JSON.stringify(vote1Poll)}`,
+    ts: 12_000,
+  });
+  const chatBetween2 = makeMsg({ msg_id: "m-chat-2", thread_id: "grp-team", text: "Ok nha", ts: 13_000 });
+  const realVote2 = makeMsg({
+    msg_id: "srv-vote-300",
+    thread_id: "grp-team",
+    sender_id: "u-chi",
+    sender_name: "Chi",
+    is_outgoing: false,
+    msg_type: "chat.poll",
+    text: "Chi đã bình chọn",
+    attachment_name: `teza-poll:${JSON.stringify(vote2Poll)}`,
+    ts: 15_000,
+  });
+
+  const deduped = dedupeOptimisticPollMessages([
+    realCreate,
+    chatBetween1,
+    realVote1,
+    chatBetween2,
+    realVote2,
+  ]);
+  assert.equal(deduped.length, 3);
+  assert.deepEqual(
+    deduped.map((m) => m.msg_id),
+    ["srv-create-100", "m-chat-1", "m-chat-2"],
+  );
+  // Preserves earliest real message's metadata and position (never jumps to bottom)
+  assert.equal(deduped[0].ts, 10_000);
+  assert.equal(deduped[0].sender_id, "u-an");
+  assert.equal(deduped[0].sender_name, "An");
+  assert.equal(deduped[0].is_outgoing, true);
+
+  const merged = parsePollPayload(deduped[0])!;
+  assert.equal(merged.poll_id, 9202);
+  assert.equal(merged.question, "Chọn địa điểm team building");
+  assert.equal(merged.options[0].votes, 1);
+  assert.equal(merged.options[1].votes, 2);
+  assert.equal(merged.allow_multi, true);
+  assert.equal(merged.allow_add_option, true);
+  assert.equal(merged.is_anonymous, true);
+  assert.equal(merged.closed, true);
+
+  // Out-of-order input still selects earliest real message by timestamp and folds newer votes on top
+  const outOfOrder = dedupePollMessages([realVote2, realCreate, realVote1]);
+  assert.equal(outOfOrder.length, 1);
+  assert.equal(outOfOrder[0].msg_id, "srv-create-100");
+  assert.equal(outOfOrder[0].ts, 10_000);
+  const outOfOrderPoll = parsePollPayload(outOfOrder[0])!;
+  assert.equal(outOfOrderPoll.question, "Chọn địa điểm team building");
+  assert.equal(outOfOrderPoll.options[1].votes, 2);
+  assert.equal(outOfOrderPoll.closed, true);
+
+  // Different threads sharing same poll_id are kept separate; no-op returns same reference
+  const otherThreadPoll = makeMsg({ ...realVote1, msg_id: "srv-other-thread", thread_id: "grp-other" });
+  const twoThreads = [realCreate, otherThreadPoll];
+  assert.equal(dedupeOptimisticPollMessages(twoThreads), twoThreads);
+});
+
+test("upsertMsg and reconcileUpdatedMessage merge real-vs-real poll vote messages in place without duplicating", () => {
+  const createPoll: PollDto = {
+    poll_id: 9303,
+    question: "Họp lúc mấy giờ?",
+    options: [
+      { id: 1, content: "9:00", votes: 1, voted: true },
+      { id: 2, content: "14:00", votes: 0, voted: false },
+    ],
+    allow_multi: false,
+    allow_add_option: true,
+    is_anonymous: false,
+    expired_time: 0,
+    closed: false,
+  };
+  const realCreate = makeMsg({
+    msg_id: "srv-poll-orig",
+    thread_id: "grp-1",
+    sender_id: "u1",
+    sender_name: "An",
+    is_outgoing: true,
+    msg_type: "chat.poll",
+    text: "Bình chọn: Họp lúc mấy giờ?",
+    attachment_name: `teza-poll:${JSON.stringify(createPoll)}`,
+    ts: 20_000,
+  });
+  const followUpChat = makeMsg({
+    msg_id: "m-after",
+    thread_id: "grp-1",
+    text: "Mọi người vote sớm nhé",
+    ts: 21_000,
+  });
+  const realVote = makeMsg({
+    msg_id: "srv-poll-vote-2",
+    thread_id: "grp-1",
+    sender_id: "u2",
+    sender_name: "Bình",
+    is_outgoing: false,
+    msg_type: "chat.poll",
+    text: "Bình đã tham gia bình chọn",
+    attachment_name: `teza-poll:${JSON.stringify({
+      poll_id: 9303,
+      question: "Bình đã tham gia bình chọn",
+      options: [
+        { id: 1, content: "9:00", votes: 1, voted: true },
+        { id: 2, content: "14:00", votes: 2, voted: false },
+      ],
+      allow_multi: false,
+      allow_add_option: false,
+      is_anonymous: false,
+      expired_time: 0,
+      closed: false,
+    } satisfies PollDto)}`,
+    ts: 25_000,
+  });
+
+  // Live vote with different msg_id merges into existing canonical card in place (no duplicate, no jump)
+  const afterVote = upsertMsg([realCreate, followUpChat], realVote);
+  assert.equal(afterVote.length, 2);
+  assert.deepEqual(
+    afterVote.map((m) => m.msg_id),
+    ["srv-poll-orig", "m-after"],
+  );
+  assert.equal(afterVote[0].ts, 20_000);
+  assert.equal(afterVote[0].sender_id, "u1");
+  assert.equal(afterVote[0].sender_name, "An");
+  assert.equal(afterVote[0].is_outgoing, true);
+  const pollAfterVote = parsePollPayload(afterVote[0])!;
+  assert.equal(pollAfterVote.question, "Họp lúc mấy giờ?");
+  assert.equal(pollAfterVote.options[1].votes, 2);
+  assert.equal(pollAfterVote.allow_add_option, true);
+
+  // reconcileUpdatedMessage with another real vote/lock msg_id also preserves original card in place
+  const realLock = makeMsg({
+    msg_id: "srv-poll-lock-3",
+    thread_id: "grp-1",
+    sender_id: "u1",
+    sender_name: "An",
+    is_outgoing: true,
+    msg_type: "chat.poll",
+    text: "An đã khóa bình chọn",
+    attachment_name: `teza-poll:${JSON.stringify({
+      poll_id: 9303,
+      question: "An đã khóa bình chọn",
+      options: [],
+      allow_multi: false,
+      allow_add_option: false,
+      is_anonymous: false,
+      expired_time: 0,
+      closed: true,
+    } satisfies PollDto)}`,
+    ts: 30_000,
+  });
+  const afterLock = reconcileUpdatedMessage(afterVote, realLock);
+  assert.equal(afterLock.length, 2);
+  assert.equal(afterLock[0].msg_id, "srv-poll-orig");
+  assert.equal(afterLock[0].ts, 20_000);
+  const pollAfterLock = parsePollPayload(afterLock[0])!;
+  assert.equal(pollAfterLock.question, "Họp lúc mấy giờ?");
+  assert.equal(pollAfterLock.options[1].votes, 2);
+  assert.equal(pollAfterLock.closed, true);
+
+  // Out-of-order upsert: older creation card arriving after newer vote keeps newer votes + recovers question
+  const outOfOrderUpsert = upsertMsg([realVote], realCreate);
+  assert.equal(outOfOrderUpsert.length, 1);
+  assert.equal(outOfOrderUpsert[0].msg_id, "srv-poll-vote-2");
+  const outOfOrderPoll = parsePollPayload(outOfOrderUpsert[0])!;
+  assert.equal(outOfOrderPoll.question, "Họp lúc mấy giờ?");
+  assert.equal(outOfOrderPoll.options[1].votes, 2);
+  assert.equal(outOfOrderPoll.allow_add_option, true);
+});
+
+test("applyPollUpdateToMessages updates all matching rows and dedupes stray duplicates for pollId", () => {
+  const createPoll: PollDto = {
+    poll_id: 9404,
+    question: "Thứ 6 đi ăn lẩu?",
+    options: [
+      { id: 1, content: "Đi", votes: 1, voted: true },
+      { id: 2, content: "Bận", votes: 0, voted: false },
+    ],
+    allow_multi: false,
+    allow_add_option: true,
+    is_anonymous: true,
+    expired_time: 0,
+    closed: false,
+  };
+  const optimisticRow = makeMsg({
+    msg_id: "poll-9404",
+    thread_id: "grp-1",
+    msg_type: "chat.poll",
+    attachment_name: `teza-poll:${JSON.stringify(createPoll)}`,
+    ts: 9_900,
+    is_outgoing: true,
+  });
+  const realCreate = makeMsg({
+    msg_id: "srv-9404-a",
+    thread_id: "grp-1",
+    sender_id: "u1",
+    sender_name: "An",
+    is_outgoing: true,
+    msg_type: "chat.poll",
+    attachment_name: `teza-poll:${JSON.stringify({ ...createPoll, options: [], allow_add_option: false, is_anonymous: false })}`,
+    ts: 10_000,
+  });
+  const otherMsg = makeMsg({ msg_id: "m-normal", thread_id: "grp-1", text: "ok", ts: 11_000 });
+  const strayVoteDup = makeMsg({
+    msg_id: "srv-9404-b",
+    thread_id: "grp-1",
+    sender_id: "u2",
+    sender_name: "Bình",
+    is_outgoing: false,
+    msg_type: "chat.poll",
+    attachment_name: `teza-poll:${JSON.stringify({
+      poll_id: 9404,
+      question: "Bình đã tham gia bình chọn",
+      options: [
+        { id: 1, content: "Đi", votes: 2, voted: true },
+        { id: 2, content: "Bận", votes: 0, voted: false },
+      ],
+      allow_multi: false,
+      allow_add_option: false,
+      is_anonymous: false,
+      expired_time: 0,
+      closed: false,
+    } satisfies PollDto)}`,
+    ts: 12_000,
+  });
+  const unrelatedPoll = makeMsg({
+    msg_id: "srv-9999",
+    thread_id: "grp-1",
+    msg_type: "chat.poll",
+    attachment_name: `teza-poll:${JSON.stringify({ ...createPoll, poll_id: 9999, question: "Khác" })}`,
+    ts: 13_000,
+  });
+
+  const serverUpdate: PollDto = {
+    poll_id: 9404,
+    question: "voted",
+    options: [
+      { id: 1, content: "Đi", votes: 3, voted: true },
+      { id: 2, content: "Bận", votes: 1, voted: false },
+    ],
+    allow_multi: false,
+    allow_add_option: false,
+    is_anonymous: false,
+    expired_time: 0,
+    closed: true,
+  };
+
+  const result = applyPollUpdateToMessages(
+    [optimisticRow, realCreate, otherMsg, strayVoteDup, unrelatedPoll],
+    9404,
+    serverUpdate,
+    "srv-9404-b",
+  );
+
+  assert.equal(result.length, 3);
+  assert.deepEqual(
+    result.map((m) => m.msg_id),
+    ["srv-9404-a", "m-normal", "srv-9999"],
+  );
+  assert.equal(result[0].ts, 10_000);
+  const updatedPoll = parsePollPayload(result[0])!;
+  assert.equal(updatedPoll.question, "Thứ 6 đi ăn lẩu?");
+  assert.equal(updatedPoll.options[0].votes, 3);
+  assert.equal(updatedPoll.options[1].votes, 1);
+  assert.equal(updatedPoll.allow_add_option, true);
+  assert.equal(updatedPoll.is_anonymous, true);
+  assert.equal(updatedPoll.closed, true);
+
+  // Unrelated poll untouched
+  assert.equal(parsePollPayload(result[2])!.question, "Khác");
 });

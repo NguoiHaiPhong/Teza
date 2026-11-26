@@ -31,8 +31,425 @@ const DEFAULT_QUOTA_MB: u64 = 1024;
 const DOWNLOAD_CONCURRENCY_LIMIT: usize = 4;
 const TOUCH_FLUSH_THRESHOLD: usize = 32;
 const IO_BUF_LEN: usize = 64 * 1024;
+const MIME_PROBE_WINDOW_BYTES: usize = 64 * 1024;
 
 static NEXT_VAULT_TMP_ID: AtomicU64 = AtomicU64::new(1);
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+fn bytes_contain_head_or_tail(bytes: &[u8], needle: &[u8]) -> bool {
+    let head_len = bytes.len().min(MIME_PROBE_WINDOW_BYTES);
+    if contains_bytes(&bytes[..head_len], needle) {
+        return true;
+    }
+    if bytes.len() > MIME_PROBE_WINDOW_BYTES {
+        let tail_start = bytes.len() - MIME_PROBE_WINDOW_BYTES;
+        return contains_bytes(&bytes[tail_start..], needle);
+    }
+    false
+}
+
+/// Returns `true` when `mime` is missing, generic octet-stream, or a generic ZIP container
+/// MIME that should be refined via magic-byte sniffing (e.g., to distinguish images/audio/video
+/// or OOXML/ODF documents from generic blobs).
+pub fn is_generic_mime(mime: &str) -> bool {
+    let base = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        base.as_str(),
+        ""
+            | "application/octet-stream"
+            | "binary/octet-stream"
+            | "application/binary"
+            | "application/zip"
+            | "application/x-zip-compressed"
+            | "application/x-zip"
+            | "multipart/x-zip"
+    )
+}
+
+fn is_zip_container_mime(mime: &str) -> bool {
+    let base = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        base.as_str(),
+        "application/zip"
+            | "application/x-zip-compressed"
+            | "application/x-zip"
+            | "multipart/x-zip"
+    )
+}
+
+fn is_valid_aac_adts_header(bytes: &[u8]) -> bool {
+    if bytes.len() < 7 || bytes[0] != 0xFF || (bytes[1] & 0xF6) != 0xF0 {
+        return false;
+    }
+    let sampling_freq_idx = (bytes[2] >> 2) & 0x0F;
+    if sampling_freq_idx >= 13 {
+        return false;
+    }
+    let frame_len = (((bytes[3] & 0x03) as usize) << 11)
+        | ((bytes[4] as usize) << 3)
+        | (((bytes[5] & 0xE0) as usize) >> 5);
+    frame_len >= 7
+}
+
+fn sniff_isobmff_mime(bytes: &[u8]) -> &'static str {
+    let major = &bytes[8..12];
+    match major {
+        b"M4A " | b"M4B " => "audio/mp4",
+        b"qt  " => "video/quicktime",
+        b"avif" | b"avis" => "image/avif",
+        b"heic" | b"heix" | b"hevc" | b"hevx" | b"heim" | b"heis" => "image/heic",
+        b"mif1" | b"msf1" => {
+            let box_len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+            let scan_end = if box_len >= 16 {
+                box_len.min(bytes.len()).min(64)
+            } else {
+                bytes.len().min(64)
+            };
+            let mut off = 16usize;
+            while off + 4 <= scan_end {
+                let brand = &bytes[off..off + 4];
+                if brand == b"avif" || brand == b"avis" {
+                    return "image/avif";
+                }
+                if matches!(
+                    brand,
+                    b"heic" | b"heix" | b"hevc" | b"hevx" | b"heim" | b"heis"
+                ) {
+                    return "image/heic";
+                }
+                off += 4;
+            }
+            "image/heic"
+        }
+        b"3gp4" | b"3gp5" | b"3gp6" | b"3gp7" | b"3g2a" | b"3g2b" => "video/3gpp",
+        _ => "video/mp4",
+    }
+}
+
+/// Sniffs a safe, concrete MIME type from file magic bytes (never returns `image/svg+xml`).
+pub fn sniff_mime_from_bytes(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" {
+        match &bytes[8..12] {
+            b"WEBP" => return Some("image/webp"),
+            b"WAVE" => return Some("audio/wav"),
+            b"AVI " => return Some("video/x-msvideo"),
+            _ => {}
+        }
+    }
+    if bytes.starts_with(b"BM") && bytes.len() >= 14 && bytes[6..10] == [0, 0, 0, 0] {
+        return Some("image/bmp");
+    }
+    if bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*") {
+        return Some("image/tiff");
+    }
+    if bytes.len() >= 6
+        && bytes[0..4] == [0x00, 0x00, 0x01, 0x00]
+        && u16::from_le_bytes([bytes[4], bytes[5]]) > 0
+    {
+        return Some("image/x-icon");
+    }
+    if bytes.starts_with(&[
+        0x00, 0x00, 0x00, 0x0C, 0x4A, 0x58, 0x4C, 0x20, 0x0D, 0x0A, 0x87, 0x0A,
+    ]) {
+        return Some("image/jxl");
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return Some("application/pdf");
+    }
+    if bytes.starts_with(b"Rar!\x1a\x07\x00") || bytes.starts_with(b"Rar!\x1a\x07\x01\x00") {
+        return Some("application/vnd.rar");
+    }
+    if bytes.starts_with(&[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C]) {
+        return Some("application/x-7z-compressed");
+    }
+    if bytes.starts_with(&[0x1F, 0x8B, 0x08]) {
+        return Some("application/gzip");
+    }
+    if bytes.len() >= 10
+        && bytes.starts_with(b"BZh")
+        && bytes[3].is_ascii_digit()
+        && &bytes[4..10] == b"\x31\x41\x59\x26\x53\x59"
+    {
+        return Some("application/x-bzip2");
+    }
+    if bytes.starts_with(&[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]) {
+        return Some("application/x-xz");
+    }
+    if bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        return Some("application/zstd");
+    }
+    if bytes.starts_with(b"{\\rtf") {
+        return Some("application/rtf");
+    }
+    if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        return Some(sniff_isobmff_mime(bytes));
+    }
+    if bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        let head = &bytes[..bytes.len().min(64)];
+        if head
+            .windows(4)
+            .any(|w| w.eq_ignore_ascii_case(b"webm"))
+        {
+            return Some("video/webm");
+        }
+        return Some("video/x-matroska");
+    }
+    if bytes.starts_with(b"OggS") {
+        return Some("audio/ogg");
+    }
+    if bytes.starts_with(b"fLaC") {
+        return Some("audio/flac");
+    }
+    if bytes.starts_with(b"#!AMR\n") || bytes.starts_with(b"#!AMR-WB\n") {
+        return Some("audio/amr");
+    }
+    if bytes.starts_with(b"ID3")
+        || (bytes.len() >= 2
+            && bytes[0] == 0xFF
+            && matches!(bytes[1], 0xFB | 0xFA | 0xF3 | 0xF2 | 0xE3 | 0xE2))
+    {
+        return Some("audio/mpeg");
+    }
+    if is_valid_aac_adts_header(bytes) {
+        return Some("audio/aac");
+    }
+    if bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06") {
+        if bytes_contain_head_or_tail(bytes, b"xl/workbook.bin") {
+            return Some("application/vnd.ms-excel.sheet.binary.macroenabled.12");
+        }
+        if bytes_contain_head_or_tail(bytes, b"xl/workbook.xml")
+            || bytes_contain_head_or_tail(bytes, b"xl/worksheets/")
+        {
+            if bytes_contain_head_or_tail(bytes, b"xl/vbaProject.bin") {
+                return Some("application/vnd.ms-excel.sheet.macroenabled.12");
+            }
+            return Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+        }
+        if bytes_contain_head_or_tail(bytes, b"word/document.xml") {
+            if bytes_contain_head_or_tail(bytes, b"word/vbaProject.bin") {
+                return Some("application/vnd.ms-word.document.macroenabled.12");
+            }
+            return Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+        }
+        if bytes_contain_head_or_tail(bytes, b"ppt/presentation.xml") {
+            if bytes_contain_head_or_tail(bytes, b"ppt/vbaProject.bin") {
+                return Some("application/vnd.ms-powerpoint.presentation.macroenabled.12");
+            }
+            return Some(
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            );
+        }
+        if bytes_contain_head_or_tail(bytes, b"mimetypeapplication/vnd.oasis.opendocument.text") {
+            return Some("application/vnd.oasis.opendocument.text");
+        }
+        if bytes_contain_head_or_tail(
+            bytes,
+            b"mimetypeapplication/vnd.oasis.opendocument.spreadsheet",
+        ) {
+            return Some("application/vnd.oasis.opendocument.spreadsheet");
+        }
+        if bytes_contain_head_or_tail(
+            bytes,
+            b"mimetypeapplication/vnd.oasis.opendocument.presentation",
+        ) {
+            return Some("application/vnd.oasis.opendocument.presentation");
+        }
+        if bytes_contain_head_or_tail(bytes, b"mimetypeapplication/epub+zip") {
+            return Some("application/epub+zip");
+        }
+        if bytes_contain_head_or_tail(bytes, b"AndroidManifest.xml") {
+            return Some("application/vnd.android.package-archive");
+        }
+        return Some("application/zip");
+    }
+    if bytes.starts_with(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]) {
+        if bytes_contain_head_or_tail(bytes, b"W\0o\0r\0d\0D\0o\0c\0u\0m\0e\0n\0t\0\0") {
+            return Some("application/msword");
+        }
+        if bytes_contain_head_or_tail(
+            bytes,
+            b"P\0o\0w\0e\0r\0P\0o\0i\0n\0t\0 \0D\0o\0c\0u\0m\0e\0n\0t\0\0",
+        ) {
+            return Some("application/vnd.ms-powerpoint");
+        }
+        if bytes_contain_head_or_tail(bytes, b"W\0o\0r\0k\0b\0o\0o\0k\0\0")
+            || bytes_contain_head_or_tail(bytes, b"B\0o\0o\0k\0\0")
+        {
+            return Some("application/vnd.ms-excel");
+        }
+    }
+    None
+}
+
+/// Maps a known file extension (without leading dot) to a safe MIME type (never SVG).
+pub fn mime_from_extension_safe(ext: &str) -> Option<&'static str> {
+    match ext.trim().trim_start_matches('.').to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" | "jfif" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "webp" => Some("image/webp"),
+        "gif" => Some("image/gif"),
+        "bmp" => Some("image/bmp"),
+        "tif" | "tiff" => Some("image/tiff"),
+        "ico" => Some("image/x-icon"),
+        "heic" => Some("image/heic"),
+        "heif" => Some("image/heif"),
+        "avif" => Some("image/avif"),
+        "jxl" => Some("image/jxl"),
+        "mp4" | "m4v" => Some("video/mp4"),
+        "mov" => Some("video/quicktime"),
+        "webm" => Some("video/webm"),
+        "mkv" => Some("video/x-matroska"),
+        "avi" => Some("video/x-msvideo"),
+        "wmv" => Some("video/x-ms-wmv"),
+        "flv" => Some("video/x-flv"),
+        "3gp" => Some("video/3gpp"),
+        "ogv" => Some("video/ogg"),
+        "mpg" | "mpeg" => Some("video/mpeg"),
+        "mp3" => Some("audio/mpeg"),
+        "m4a" => Some("audio/mp4"),
+        "aac" => Some("audio/aac"),
+        "ogg" => Some("audio/ogg"),
+        "opus" => Some("audio/opus"),
+        "wav" => Some("audio/wav"),
+        "flac" => Some("audio/flac"),
+        "amr" => Some("audio/amr"),
+        "pdf" => Some("application/pdf"),
+        "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "xlsm" => Some("application/vnd.ms-excel.sheet.macroenabled.12"),
+        "xlsb" => Some("application/vnd.ms-excel.sheet.binary.macroenabled.12"),
+        "xls" => Some("application/vnd.ms-excel"),
+        "docx" => Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        "docm" => Some("application/vnd.ms-word.document.macroenabled.12"),
+        "doc" => Some("application/msword"),
+        "pptx" => Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+        "pptm" => Some("application/vnd.ms-powerpoint.presentation.macroenabled.12"),
+        "ppt" => Some("application/vnd.ms-powerpoint"),
+        "odt" => Some("application/vnd.oasis.opendocument.text"),
+        "ods" => Some("application/vnd.oasis.opendocument.spreadsheet"),
+        "odp" => Some("application/vnd.oasis.opendocument.presentation"),
+        "epub" => Some("application/epub+zip"),
+        "apk" => Some("application/vnd.android.package-archive"),
+        "zip" => Some("application/zip"),
+        "rar" => Some("application/vnd.rar"),
+        "7z" => Some("application/x-7z-compressed"),
+        "gz" | "tgz" => Some("application/gzip"),
+        "tar" => Some("application/x-tar"),
+        "bz2" => Some("application/x-bzip2"),
+        "xz" => Some("application/x-xz"),
+        "zst" => Some("application/zstd"),
+        "txt" | "log" => Some("text/plain"),
+        "md" => Some("text/markdown"),
+        "csv" => Some("text/csv"),
+        "tsv" => Some("text/tab-separated-values"),
+        "json" => Some("application/json"),
+        "xml" => Some("application/xml"),
+        "rtf" => Some("application/rtf"),
+        "html" | "htm" => Some("text/html"),
+        _ => None,
+    }
+}
+
+fn extract_ext_hint(s: &str) -> Option<&str> {
+    let path = s.split(['?', '#']).next().unwrap_or("");
+    let seg = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let (stem, ext) = seg.rsplit_once('.')?;
+    if stem.trim_matches('.').is_empty() || ext.is_empty() || ext.len() > 10 {
+        return None;
+    }
+    Some(ext)
+}
+
+fn resolve_effective_mime_from_probe(
+    provided_mime: &str,
+    probe: &[u8],
+    original_name: Option<&str>,
+    url_opt: Option<&str>,
+) -> String {
+    let trimmed = provided_mime.trim();
+    if !is_generic_mime(trimmed) && !crate::session::is_forbidden_svg_mime(trimmed) {
+        return trimmed.to_string();
+    }
+    if let Some(sniffed) = sniff_mime_from_bytes(probe) {
+        return sniffed.to_string();
+    }
+    if is_zip_container_mime(trimmed) {
+        return "application/zip".to_string();
+    }
+    if let Some(ext) = original_name
+        .and_then(extract_ext_hint)
+        .or_else(|| url_opt.and_then(extract_ext_hint))
+    {
+        if let Some(m) = mime_from_extension_safe(ext) {
+            return m.to_string();
+        }
+    }
+    "application/octet-stream".to_string()
+}
+
+fn read_file_head_and_tail_probe(path: &Path) -> Vec<u8> {
+    let Ok(mut file) = File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(meta) = file.metadata() else {
+        return Vec::new();
+    };
+    let total = meta.len();
+    if total == 0 {
+        return Vec::new();
+    }
+    let window = MIME_PROBE_WINDOW_BYTES as u64;
+    if total <= window * 2 {
+        let mut buf = Vec::with_capacity(total as usize);
+        let _ = file.read_to_end(&mut buf);
+        return buf;
+    }
+    let mut head = vec![0u8; MIME_PROBE_WINDOW_BYTES];
+    if file.read_exact(&mut head).is_err() {
+        return Vec::new();
+    }
+    if file.seek(SeekFrom::Start(total - window)).is_ok() {
+        let mut tail = vec![0u8; MIME_PROBE_WINDOW_BYTES];
+        if file.read_exact(&mut tail).is_ok() {
+            head.extend_from_slice(&tail);
+        }
+    }
+    head
+}
+
+fn slice_head_and_tail_probe(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if bytes.len() <= MIME_PROBE_WINDOW_BYTES * 2 {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+    let mut out = Vec::with_capacity(MIME_PROBE_WINDOW_BYTES * 2);
+    out.extend_from_slice(&bytes[..MIME_PROBE_WINDOW_BYTES]);
+    out.extend_from_slice(&bytes[bytes.len() - MIME_PROBE_WINDOW_BYTES..]);
+    std::borrow::Cow::Owned(out)
+}
 
 fn default_quota_mb() -> u64 {
     DEFAULT_QUOTA_MB
@@ -1107,6 +1524,16 @@ impl MediaVault {
         msg_ref: Option<(&str, &str)>,
         original_name: Option<&str>,
     ) -> Result<MediaObjectRecord> {
+        let effective_mime = if is_generic_mime(mime) {
+            let src_probe = src_path.to_path_buf();
+            let probe = tokio::task::spawn_blocking(move || read_file_head_and_tail_probe(&src_probe))
+                .await
+                .unwrap_or_default();
+            resolve_effective_mime_from_probe(mime, &probe, original_name, url_opt)
+        } else {
+            mime.trim().to_string()
+        };
+
         let (rel_path, is_encrypted) = if let Some(hit) =
             self.check_existing_local_blob(store, &sha256_hex).await?
         {
@@ -1140,7 +1567,7 @@ impl MediaVault {
             store,
             &sha256_hex,
             kind,
-            mime,
+            &effective_mime,
             size_bytes,
             rel_path,
             is_encrypted,
@@ -1194,6 +1621,13 @@ impl MediaVault {
         msg_ref: Option<(&str, &str)>,
         original_name: Option<&str>,
     ) -> Result<MediaObjectRecord> {
+        let effective_mime = if is_generic_mime(mime) {
+            let probe = slice_head_and_tail_probe(bytes);
+            resolve_effective_mime_from_probe(mime, &probe, original_name, url_opt)
+        } else {
+            mime.trim().to_string()
+        };
+
         let digest = Sha256::digest(bytes);
         let mut sha256_bytes = [0u8; 32];
         sha256_bytes.copy_from_slice(&digest);
@@ -1238,7 +1672,7 @@ impl MediaVault {
             store,
             &sha256_hex,
             kind,
-            mime,
+            &effective_mime,
             size_bytes,
             rel_path,
             is_encrypted,
@@ -1247,6 +1681,26 @@ impl MediaVault {
             original_name,
         )
         .await
+    }
+
+    /// Sniffs the concrete MIME type of a cached local blob by inspecting its decrypted head & tail
+    /// windows (at most 128 KiB total). Returns `None` if unknown or unreadable.
+    pub async fn sniff_cached_mime(&self, obj: &MediaObjectRecord) -> Option<&'static str> {
+        let total = obj.size_bytes;
+        if total == 0 || obj.local_state != MEDIA_LOCAL_STATE_LOCAL {
+            return None;
+        }
+        let window = MIME_PROBE_WINDOW_BYTES as u64;
+        let probe = if total <= window * 2 {
+            self.read_range(obj, 0, total - 1).await.ok()?
+        } else {
+            let mut buf = self.read_range(obj, 0, window - 1).await.ok()?;
+            if let Ok(tail) = self.read_range(obj, total - window, total - 1).await {
+                buf.extend_from_slice(&tail);
+            }
+            buf
+        };
+        sniff_mime_from_bytes(&probe)
     }
 
     async fn try_hit_cache(
@@ -1260,7 +1714,7 @@ impl MediaVault {
             let guard = store.lock().await;
             guard.lookup_media_by_url_hash(url_hash)?
         };
-        let Some(obj) = maybe_obj else {
+        let Some(mut obj) = maybe_obj else {
             return Ok(None);
         };
         if obj.local_state != MEDIA_LOCAL_STATE_LOCAL {
@@ -1274,6 +1728,18 @@ impl MediaVault {
         };
         if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
             return Ok(None);
+        }
+
+        // Self-heal legacy blobs cached with generic MIME (e.g. `application/octet-stream`)
+        // so `teza-media://` and Save-As always receive accurate Content-Type & extensions.
+        if is_generic_mime(&obj.mime) && obj.size_bytes > 0 {
+            if let Some(sniffed) = self.sniff_cached_mime(&obj).await {
+                if !sniffed.eq_ignore_ascii_case(obj.mime.trim()) {
+                    obj.mime = sniffed.to_string();
+                    let guard = store.lock().await;
+                    let _ = guard.upsert_media_object(&obj);
+                }
+            }
         }
 
         let pending_count = self.record_access_touch(&obj.sha256);
@@ -2479,6 +2945,169 @@ mod tests {
             .filter_map(Result::ok)
             .collect();
         assert!(leftovers.is_empty(), "leftover tmp files: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sniff_mime_from_bytes_detects_images_video_audio_docs_and_never_svg() {
+        assert_eq!(
+            sniff_mime_from_bytes(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            sniff_mime_from_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"),
+            Some("image/png")
+        );
+        assert_eq!(
+            sniff_mime_from_bytes(b"RIFF\x24\x00\x00\x00WEBPVP8 "),
+            Some("image/webp")
+        );
+        assert_eq!(sniff_mime_from_bytes(b"GIF89a\x01\x00"), Some("image/gif"));
+        assert_eq!(
+            sniff_mime_from_bytes(b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00heic"),
+            Some("image/heic")
+        );
+        assert_eq!(
+            sniff_mime_from_bytes(b"\x00\x00\x00\x1cftypmif1\x00\x00\x00\x00mif1avif"),
+            Some("image/avif")
+        );
+        assert_eq!(
+            sniff_mime_from_bytes(b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00"),
+            Some("video/mp4")
+        );
+        assert_eq!(
+            sniff_mime_from_bytes(b"\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00"),
+            Some("audio/mp4")
+        );
+        assert_eq!(
+            sniff_mime_from_bytes(b"\x00\x00\x00\x14ftypqt  \x00\x00\x00\x00"),
+            Some("video/quicktime")
+        );
+        // Raw AAC ADTS frame (sync 0xFFF1, sampling_freq_idx=4 -> 44.1kHz, frame_len=20)
+        assert_eq!(
+            sniff_mime_from_bytes(&[0xFF, 0xF1, 0x50, 0x80, 0x02, 0x80, 0xFC]),
+            Some("audio/aac")
+        );
+        assert_eq!(sniff_mime_from_bytes(b"#!AMR\n\x3c\x00"), Some("audio/amr"));
+        assert_eq!(sniff_mime_from_bytes(b"%PDF-1.7\n"), Some("application/pdf"));
+
+        let mut xlsx = b"PK\x03\x04\x14\x00\x00\x00\x00\x00".to_vec();
+        xlsx.extend_from_slice(b"xl/workbook.xml");
+        assert_eq!(
+            sniff_mime_from_bytes(&xlsx),
+            Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        );
+
+        let mut xlsm = xlsx.clone();
+        xlsm.extend_from_slice(b"xl/vbaProject.bin");
+        assert_eq!(
+            sniff_mime_from_bytes(&xlsm),
+            Some("application/vnd.ms-excel.sheet.macroenabled.12")
+        );
+
+        // SVG must never be elevated as a safe vault MIME
+        assert_eq!(
+            sniff_mime_from_bytes(b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>"),
+            None
+        );
+        assert_eq!(mime_from_extension_safe("svg"), None);
+    }
+
+    #[tokio::test]
+    async fn media_vault_upgrades_generic_mime_on_ingest_and_heals_legacy_cache_hit() {
+        let dir = test_temp_dir("mime-heal");
+        let paths = StoragePaths::from_dir(&dir).unwrap();
+        let store = Arc::new(AsyncMutex::new(
+            MessageStore::open(&paths.history_db(Some("u_mime"))).unwrap(),
+        ));
+        let vault = MediaVault::open(&paths, Some("u_mime"), MediaVaultConfig::default()).unwrap();
+
+        // 1. Ingest extensionless JPEG bytes with generic application/octet-stream -> upgraded to image/jpeg
+        let mut jpeg_bytes = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0];
+        jpeg_bytes.extend_from_slice(&[0xAB; 512]);
+        let url_img = "https://photo-stal-6.zdn.vn/a/extensionless_blob";
+        let obj_img = vault
+            .ingest_bytes(
+                &store,
+                &jpeg_bytes,
+                "image",
+                "application/octet-stream",
+                Some(url_img),
+                Some(("t1", "m_img")),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(obj_img.mime, "image/jpeg");
+
+        // 2. Ingest local AAC ADTS file with empty MIME -> upgraded to audio/aac
+        let aac_path = dir.join("voice_raw");
+        let mut aac_bytes = vec![0xFF, 0xF1, 0x50, 0x80, 0x02, 0x80, 0xFC];
+        aac_bytes.extend_from_slice(&[0x11; 256]);
+        std::fs::write(&aac_path, &aac_bytes).unwrap();
+        let obj_aac = vault
+            .ingest_local_file(
+                &store,
+                &aac_path,
+                "audio",
+                "",
+                Some("https://voice-stal-1.dlmd.me/raw"),
+                Some(("t1", "m_aac")),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(obj_aac.mime, "audio/aac");
+
+        // 3. Simulate a legacy v0.6.0 cached WebP image persisted with `application/octet-stream`:
+        //    on cache hit (`try_hit_cache`), MediaVault must sniff and self-heal to `image/webp`.
+        let mut webp_bytes = b"RIFF\x24\x00\x00\x00WEBPVP8 ".to_vec();
+        webp_bytes.extend_from_slice(&[0x22; 256]);
+        let url_webp = "https://f10-zpc.zdn.vn/legacy_blob";
+        let obj_webp = vault
+            .ingest_bytes(
+                &store,
+                &webp_bytes,
+                "image",
+                "application/octet-stream",
+                Some(url_webp),
+                Some(("t1", "m_webp")),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(obj_webp.mime, "image/webp");
+
+        // Manually downgrade mime in SQLite back to application/octet-stream to simulate legacy cache row
+        {
+            let guard = store.lock().await;
+            let mut stale = obj_webp.clone();
+            stale.mime = "application/octet-stream".to_string();
+            // Direct reset via delete + re-insert with stale mime
+            let db_path = paths.history_db(Some("u_mime"));
+            drop(guard);
+            let raw_conn = rusqlite::Connection::open(&db_path).unwrap();
+            raw_conn
+                .execute(
+                    "UPDATE media_objects SET mime = 'application/octet-stream' WHERE sha256 = ?1",
+                    rusqlite::params![&obj_webp.sha256],
+                )
+                .unwrap();
+        }
+        let url_hash = MediaVault::sha256_url(url_webp);
+        let healed = vault
+            .try_hit_cache(&store, &url_hash, "image", Some(("t1", "m_webp")))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(healed.mime, "image/webp");
+
+        let persisted = {
+            let guard = store.lock().await;
+            guard.get_media_object(&obj_webp.sha256).unwrap().unwrap()
+        };
+        assert_eq!(persisted.mime, "image/webp");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

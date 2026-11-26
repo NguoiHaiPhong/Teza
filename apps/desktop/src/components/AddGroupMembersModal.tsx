@@ -3,6 +3,7 @@ import { Check, Loader2, Search, UserPlus, X } from "lucide-react";
 import { bridge } from "../bridge";
 import { useI18n } from "../i18n";
 import type { AddGroupMembersResultDto, ThreadDto } from "../types";
+import { isImeComposingEvent, matchesSearchQuery } from "../utils/searchNormalize";
 import { ThreadAvatar } from "./ThreadAvatar";
 
 interface Props {
@@ -24,7 +25,7 @@ export function AddGroupMembersModal({
   onClose,
   onAdded,
 }: Props) {
-  const { t } = useI18n();
+  const { lang, t } = useI18n();
   const [query, setQuery] = useState("");
   const [phoneQuery, setPhoneQuery] = useState("");
   const [pickedIds, setPickedIds] = useState<string[]>([]);
@@ -63,6 +64,7 @@ export function AddGroupMembersModal({
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (e: KeyboardEvent) => {
+      if (isImeComposingEvent(e)) return;
       if (e.key === "Escape") onClose();
     };
     window.addEventListener("keydown", onKeyDown);
@@ -90,10 +92,12 @@ export function AddGroupMembersModal({
         merged.set(t.id, { id: t.id, title: t.title, avatar: t.avatar });
       }
     }
-    const q = query.trim().toLowerCase();
+    const q = query.trim();
     const list = Array.from(merged.values());
-    return (q ? list.filter((u) => u.title.toLowerCase().includes(q) || u.id.includes(q)) : list)
-      .slice(0, 120);
+    return (q ? list.filter((u) => matchesSearchQuery(`${u.title}\n${u.id}`, q)) : list).slice(
+      0,
+      120,
+    );
   }, [threads, extraUsers, existingSet, query]);
 
   if (!open) return null;
@@ -110,7 +114,8 @@ export function AddGroupMembersModal({
     setSearchingPhone(true);
     setError(null);
     try {
-      const profile = await bridge.findUserByPhone(trimmed);
+      const countryCode = trimmed.startsWith("+") ? undefined : lang === "ko" ? "82" : "84";
+      const profile = await bridge.findUserByPhone(trimmed, countryCode);
       if (existingSet.has(profile.uid)) {
         setError(`${profile.display_name} đã ở trong nhóm này.`);
       } else {
@@ -209,6 +214,7 @@ export function AddGroupMembersModal({
               value={phoneQuery}
               onChange={(e) => setPhoneQuery(e.target.value)}
               onKeyDown={(e) => {
+                if (isImeComposingEvent(e)) return;
                 if (e.key === "Enter") {
                   e.preventDefault();
                   void handleFindPhone();

@@ -27,7 +27,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "rt-multi-thread", "macros", "time", "net", "io-util", "sync"] }
+tokio = { version = "1", features = ["fs", "rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 webpki-roots = "0.26"

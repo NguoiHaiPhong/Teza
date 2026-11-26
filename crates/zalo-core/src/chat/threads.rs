@@ -6,8 +6,9 @@ use anyhow::Result;
 use serde_json::{json, Map, Value};
 
 use crate::chat::parser::{
-    clean_group_id, collect_reactions_from_node, extract_content_text, extract_thread_id,
-    format_thread_preview, is_raw_numeric_id, normalize_avatar_url, normalize_media_url,
+    clean_group_id, collect_reactions_from_node, extract_content_text, extract_poll_activity_dto,
+    extract_poll_activity_update, extract_thread_id, format_thread_preview, is_group_flag,
+    is_poll_activity_text, is_raw_numeric_id, normalize_avatar_url, normalize_media_url,
     normalize_ts_ms, parse_chat_message, parse_friend_thread, parse_poll_value,
     parse_reaction_item, pick_str, WsParsedAction,
 };
@@ -447,12 +448,49 @@ fn parse_profiles_response(resp: &Value) -> Map<String, Value> {
     out
 }
 
-pub async fn get_mini_profiles(session: &Session, user_ids: &[String]) -> Result<Map<String, Value>> {
-    if !session.is_authenticated() || user_ids.is_empty() {
-        return Ok(Map::new());
+fn profile_entry_has_identity(v: &Value) -> bool {
+    pick_str(v, &["displayName", "zaloName", "name", "display_name"]).is_some()
+        || pick_str(v, &["avatar", "avt", "profile_avatar"])
+            .is_some_and(|a| !normalize_avatar_url(&a).is_empty())
+}
+
+fn compute_missing_profile_uids(requested: &[String], found: &Map<String, Value>) -> Vec<String> {
+    let mut missing = Vec::new();
+    for raw in requested {
+        let clean = clean_uid(raw);
+        if clean.is_empty() || clean == "0" || missing.iter().any(|x| x == &clean) {
+            continue;
+        }
+        let resolved = found
+            .get(&clean)
+            .is_some_and(profile_entry_has_identity);
+        if !resolved {
+            missing.push(clean);
+        }
     }
-    let versioned_ids: Vec<String> = user_ids
-        .iter()
+    missing
+}
+
+fn merge_mini_profile_maps(primary: &mut Map<String, Value>, fallback: Map<String, Value>) {
+    for (uid, val) in fallback {
+        let clean = clean_uid(&uid);
+        if clean.is_empty() || clean == "0" {
+            continue;
+        }
+        let should_replace = match primary.get(&clean) {
+            None => true,
+            Some(existing) => {
+                !profile_entry_has_identity(existing) && profile_entry_has_identity(&val)
+            }
+        };
+        if should_replace {
+            primary.insert(clean, val);
+        }
+    }
+}
+
+fn to_versioned_profile_ids(uids: &[String]) -> Vec<String> {
+    uids.iter()
         .map(|uid| {
             let clean = uid.trim();
             if clean.contains('_') {
@@ -461,15 +499,36 @@ pub async fn get_mini_profiles(session: &Session, user_ids: &[String]) -> Result
                 format!("{clean}_0")
             }
         })
-        .collect();
+        .collect()
+}
+
+pub async fn get_mini_profiles(session: &Session, user_ids: &[String]) -> Result<Map<String, Value>> {
+    if !session.is_authenticated() || user_ids.is_empty() {
+        return Ok(Map::new());
+    }
+    let mut requested_clean: Vec<String> = Vec::new();
+    for uid in user_ids {
+        let clean = clean_uid(uid);
+        if !clean.is_empty() && clean != "0" && !requested_clean.iter().any(|x| x == &clean) {
+            requested_clean.push(clean);
+        }
+    }
+    if requested_clean.is_empty() {
+        return Ok(Map::new());
+    }
+    let versioned_ids = to_versioned_profile_ids(&requested_clean);
 
     let mut profile_hosts = session.domains.candidates("profile");
-    for extra in ["https://profile-wpa.zaloapp.com", "https://tt-profile-wpa.chat.zalo.me"] {
+    for extra in [
+        "https://profile-wpa.zaloapp.com",
+        "https://tt-profile-wpa.chat.zalo.me",
+    ] {
         if !profile_hosts.iter().any(|h| h == extra) {
             profile_hosts.push(extra.to_string());
         }
     }
 
+    let mut merged = Map::new();
     let members_body = obj(&[("friend_pversion_map", json!(versioned_ids))]);
     let members_params = session.encoded_params(&members_body)?;
     for host in &profile_hosts {
@@ -478,15 +537,20 @@ pub async fn get_mini_profiles(session: &Session, user_ids: &[String]) -> Result
             host.trim_end_matches('/'),
             session.common_params()
         );
-        match session.post_form(&url, format!("params={members_params}")).await {
+        match session
+            .post_form(&url, format!("params={members_params}"))
+            .await
+        {
             Ok(raw) => {
-                let resp = unwrap_data_str(session.maybe_decrypt(raw, session.session_key_bytes()));
+                let resp =
+                    unwrap_data_str(session.maybe_decrypt(raw, session.session_key_bytes()));
                 ensure_not_expired(&resp)?;
                 let code = resp.get("error_code").and_then(Value::as_i64).unwrap_or(0);
                 if code == 0 {
                     let parsed = parse_profiles_response(&resp);
                     if !parsed.is_empty() {
-                        return Ok(parsed);
+                        merge_mini_profile_maps(&mut merged, parsed);
+                        break;
                     }
                 } else {
                     eprintln!("[litechat][profiles] group/members ({host}) error_code={code}");
@@ -499,40 +563,189 @@ pub async fn get_mini_profiles(session: &Session, user_ids: &[String]) -> Result
         }
     }
 
-    // Fallback: /api/social/friend/getprofiles/v2
-    let v2_body = obj(&[
-        ("friend_pversion_map", json!(versioned_ids)),
-        ("avatar_size", json!(120)),
-        ("language", json!("vi")),
-    ]);
-    let v2_params = session.encoded_params(&v2_body)?;
-    for host in &profile_hosts {
-        let url = format!(
-            "{}/api/social/friend/getprofiles/v2?{}",
-            host.trim_end_matches('/'),
-            session.common_params()
-        );
-        match session.post_form(&url, format!("params={v2_params}")).await {
-            Ok(raw) => {
-                let resp = unwrap_data_str(session.maybe_decrypt(raw, session.session_key_bytes()));
-                ensure_not_expired(&resp)?;
-                let code = resp.get("error_code").and_then(Value::as_i64).unwrap_or(0);
-                if code == 0 {
-                    let parsed = parse_profiles_response(&resp);
-                    if !parsed.is_empty() {
-                        return Ok(parsed);
+    // Always query `/api/social/friend/getprofiles/v2` for any UIDs still missing after
+    // `/api/social/group/members` (common for non-friend / stranger direct threads).
+    let still_missing = compute_missing_profile_uids(&requested_clean, &merged);
+    if !still_missing.is_empty() {
+        let missing_versioned = to_versioned_profile_ids(&still_missing);
+        let v2_body = obj(&[
+            ("friend_pversion_map", json!(missing_versioned)),
+            ("avatar_size", json!(120)),
+            ("language", json!("vi")),
+        ]);
+        let v2_params = session.encoded_params(&v2_body)?;
+        for host in &profile_hosts {
+            let url = format!(
+                "{}/api/social/friend/getprofiles/v2?{}",
+                host.trim_end_matches('/'),
+                session.common_params()
+            );
+            match session.post_form(&url, format!("params={v2_params}")).await {
+                Ok(raw) => {
+                    let resp =
+                        unwrap_data_str(session.maybe_decrypt(raw, session.session_key_bytes()));
+                    ensure_not_expired(&resp)?;
+                    let code = resp.get("error_code").and_then(Value::as_i64).unwrap_or(0);
+                    if code == 0 {
+                        let parsed = parse_profiles_response(&resp);
+                        if !parsed.is_empty() {
+                            merge_mini_profile_maps(&mut merged, parsed);
+                            break;
+                        }
+                    } else {
+                        eprintln!(
+                            "[litechat][profiles] friend/getprofiles/v2 ({host}) error_code={code}"
+                        );
                     }
                 }
+                Err(e) if is_expired_err(&e) => return Err(e),
+                Err(e) => {
+                    eprintln!("[litechat][profiles] friend/getprofiles/v2 ({host}) error: {e}");
+                }
             }
-            Err(e) if is_expired_err(&e) => return Err(e),
-            Err(_) => {}
         }
     }
 
-    Ok(Map::new())
+    Ok(merged)
+}
+
+/// Resolve display name & avatar for raw-UID / unresolved direct threads in 50-UID batches.
+/// Returns `uid -> (display_name, avatar_url)`.
+pub async fn hydrate_unresolved_direct_threads(
+    session: &Session,
+    uids: &[String],
+) -> HashMap<String, (String, String)> {
+    let mut out = HashMap::new();
+    if !session.is_authenticated() || uids.is_empty() {
+        return out;
+    }
+    let mut clean_uids: Vec<String> = Vec::new();
+    for raw in uids {
+        let clean = clean_uid(raw);
+        if clean.is_empty()
+            || clean == "0"
+            || (!session.profile.uid.is_empty() && clean == session.profile.uid)
+            || (!session.profile.send2me_id.is_empty() && clean == session.profile.send2me_id)
+            || clean_uids.iter().any(|x| x == &clean)
+        {
+            continue;
+        }
+        clean_uids.push(clean);
+    }
+    if clean_uids.is_empty() {
+        return out;
+    }
+    for chunk in clean_uids.chunks(50) {
+        match get_mini_profiles(session, chunk).await {
+            Ok(mp) => {
+                for (k, v) in mp {
+                    let uid = clean_uid(&k);
+                    if uid.is_empty() || uid == "0" {
+                        continue;
+                    }
+                    let name = pick_str(&v, &["displayName", "zaloName", "name", "display_name"])
+                        .unwrap_or_default();
+                    let avatar = pick_str(&v, &["avatar", "avt", "profile_avatar"])
+                        .map(|u| normalize_avatar_url(&u))
+                        .unwrap_or_default();
+                    if !name.is_empty() || !avatar.is_empty() {
+                        out.insert(uid, (name, avatar));
+                    }
+                }
+            }
+            Err(e) if is_expired_err(&e) => {
+                eprintln!("[litechat][profiles] hydrate_unresolved_direct_threads expired: {e}");
+                break;
+            }
+            Err(e) => {
+                eprintln!("[litechat][profiles] hydrate_unresolved_direct_threads error: {e}");
+            }
+        }
+    }
+    out
+}
+
+const LAST_MSG_BUCKETS: &[(&str, bool)] = &[
+    ("msgs", false),
+    ("groupMsgs", true),
+    ("lastMsgs", false),
+    ("strangerMsgs", false),
+    ("strangers", false),
+    ("otherMsgs", false),
+    ("conversations", false),
+    ("convs", false),
+];
+
+fn normalize_last_msg_item(item: Value) -> Value {
+    let Some(obj_map) = item.as_object() else {
+        return item;
+    };
+    if obj_map.contains_key("content") || obj_map.contains_key("msg") {
+        return item;
+    }
+    let nested = obj_map
+        .get("lastMsg")
+        .or_else(|| obj_map.get("last_msg"))
+        .and_then(unwrap_json_field);
+    let Some(Value::Object(inner_map)) = nested else {
+        return item;
+    };
+    let mut merged = obj_map.clone();
+    for (k, v) in inner_map {
+        merged.entry(k).or_insert(v);
+    }
+    Value::Object(merged)
+}
+
+fn collect_last_msg_entries_inner(node: &Value, depth: u8, out: &mut Vec<(bool, Value)>) {
+    let owned = unwrap_json_field(node);
+    let current = owned.as_ref().unwrap_or(node);
+    let Some(map) = current.as_object() else {
+        if let Value::Array(arr) = current {
+            for item in arr {
+                let item_owned = unwrap_json_field(item);
+                let effective = item_owned.as_ref().unwrap_or(item);
+                if effective.is_object() {
+                    out.push((false, normalize_last_msg_item(effective.clone())));
+                }
+            }
+        }
+        return;
+    };
+
+    for &(bucket, in_group) in LAST_MSG_BUCKETS {
+        if let Some(raw) = map.get(bucket) {
+            let bucket_owned = unwrap_json_field(raw);
+            let bucket_val = bucket_owned.as_ref().unwrap_or(raw);
+            if let Some(arr) = bucket_val.as_array() {
+                for item in arr {
+                    let item_owned = unwrap_json_field(item);
+                    let effective = item_owned.as_ref().unwrap_or(item);
+                    if effective.is_object() {
+                        out.push((in_group, normalize_last_msg_item(effective.clone())));
+                    }
+                }
+            }
+        }
+    }
+
+    if depth > 0 {
+        if let Some(inner) = map.get("data") {
+            collect_last_msg_entries_inner(inner, depth - 1, out);
+        }
+    }
+}
+
+fn collect_last_msg_entries(root: &Value) -> Vec<(bool, Value)> {
+    let mut out = Vec::new();
+    collect_last_msg_entries_inner(root, 3, &mut out);
+    out
 }
 
 pub async fn get_last_msgs(session: &Session) -> Result<Value> {
+    if !session.is_authenticated() {
+        anyhow::bail!("Chưa đăng nhập");
+    }
     let body = obj(&[
         ("threadIdLocalMsgId", json!("{}")),
         ("imei", json!(session.imei)),
@@ -541,60 +754,173 @@ pub async fn get_last_msgs(session: &Session) -> Result<Value> {
         .encoded_params(&body)
         .map(|p| format!("params={p}"))
         .unwrap_or_else(|_| Session::plain_params(&body));
-    let url = format!(
-        "{}/api/preloadconvers/get-last-msgs?{}&{params}",
-        session.domains.conversation.trim_end_matches('/'),
-        session.common_params()
-    );
-    let raw = session.get_json(&url).await?;
-    Ok(unwrap_data_str(
-        session.maybe_decrypt(raw, session.session_key_bytes()),
-    ))
+
+    let mut conv_hosts = session.domains.candidates("conversation");
+    if conv_hosts.is_empty() && !session.domains.conversation.is_empty() {
+        push_unique_host(&mut conv_hosts, &session.domains.conversation);
+    }
+    let mut fallback_hosts = conv_hosts.clone();
+    for h in session.domains.candidates("chat") {
+        push_unique_host(&mut fallback_hosts, &h);
+    }
+
+    let attempts: [(&str, &[String]); 2] = [
+        ("api/preloadconvers/get-last-msgs", &conv_hosts),
+        ("api/message/get-last-msgs", &fallback_hosts),
+    ];
+
+    let mut empty_ok_resp: Option<Value> = None;
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for (path, hosts) in attempts {
+        for host in hosts {
+            let url = format!(
+                "{}/{path}?{}&{params}",
+                host.trim_end_matches('/'),
+                session.common_params()
+            );
+            match session.get_json(&url).await {
+                Ok(raw) => {
+                    let resp =
+                        unwrap_data_str(session.maybe_decrypt(raw, session.session_key_bytes()));
+                    ensure_not_expired(&resp)?;
+                    let code = resp.get("error_code").and_then(value_as_i64).unwrap_or(0);
+                    if code != 0 {
+                        eprintln!("[litechat][threads] {path} ({host}) error_code={code}");
+                        last_err = Some(anyhow::anyhow!("{path} error_code={code}"));
+                        continue;
+                    }
+                    if !collect_last_msg_entries(&resp).is_empty() {
+                        return Ok(resp);
+                    }
+                    if empty_ok_resp.is_none() {
+                        empty_ok_resp = Some(resp);
+                    }
+                    // Try fallback endpoint/host if preloadconvers returned empty buckets.
+                    break;
+                }
+                Err(e) if is_expired_err(&e) => return Err(e),
+                Err(e) => {
+                    eprintln!("[litechat][threads] {path} ({host}) error: {e}");
+                    last_err = Some(e);
+                }
+            }
+        }
+    }
+
+    if let Some(resp) = empty_ok_resp {
+        return Ok(resp);
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Không thể tải danh sách tin nhắn gần nhất")))
 }
 
-async fn fetch_pinned_thread_ids(session: &Session) -> Result<HashSet<String>> {
-    if !session.is_authenticated() || session.domains.conversation.is_empty() {
-        return Ok(HashSet::new());
+fn is_numeric_direct_uid(uid: &str) -> bool {
+    !uid.is_empty() && uid != "0" && uid.chars().all(|c| c.is_ascii_digit())
+}
+
+fn parse_pinned_thread_ids_split(resp: &Value) -> (HashSet<String>, HashSet<String>) {
+    let mut all_pinned = HashSet::new();
+    let mut direct_pinned = HashSet::new();
+    let data_owned = resp.get("data").and_then(unwrap_json_field);
+    let data = data_owned.as_ref().unwrap_or(resp);
+    let inner_owned = data.get("data").and_then(unwrap_json_field);
+    let effective = inner_owned.as_ref().unwrap_or(data);
+
+    let mut raw_arrays: Vec<Vec<Value>> = Vec::new();
+    if let Some(arr) = effective.as_array() {
+        raw_arrays.push(arr.clone());
+    }
+    for key in ["conversations", "pinConvers", "list", "items"] {
+        if let Some(raw) = effective.get(key) {
+            let unwrapped = unwrap_json_field(raw);
+            let val = unwrapped.as_ref().unwrap_or(raw);
+            if let Some(arr) = val.as_array() {
+                raw_arrays.push(arr.clone());
+            }
+        }
+    }
+
+    for arr in raw_arrays {
+        for item in arr {
+            let (raw_id, explicit_group) = match &item {
+                Value::String(s) => (Some(s.trim().to_string()), false),
+                Value::Number(n) => (Some(n.to_string()), false),
+                Value::Object(_) => {
+                    let is_grp = is_group_flag(&item)
+                        || item.get("is_group").and_then(value_as_bool) == Some(true)
+                        || item.get("type").and_then(value_as_i64) == Some(1)
+                        || item.get("grid").is_some()
+                        || item.get("groupId").is_some();
+                    (
+                        pick_str(&item, &["id", "threadId", "conversId", "grid", "uid"]),
+                        is_grp,
+                    )
+                }
+                _ => (None, false),
+            };
+            if let Some(id) = raw_id {
+                let prefixed_group = id.starts_with("group_")
+                    || id.starts_with('g')
+                    || id.starts_with('G');
+                let is_grp = explicit_group || prefixed_group;
+                let clean = if is_grp {
+                    clean_group_id(&id).to_string()
+                } else {
+                    clean_uid(&id)
+                };
+                if !clean.is_empty() && clean != "0" {
+                    all_pinned.insert(clean.clone());
+                    if !is_grp && is_numeric_direct_uid(&clean) {
+                        direct_pinned.insert(clean);
+                    }
+                }
+            }
+        }
+    }
+    (all_pinned, direct_pinned)
+}
+
+async fn fetch_pinned_thread_ids_split(
+    session: &Session,
+) -> Result<(HashSet<String>, HashSet<String>)> {
+    if !session.is_authenticated() {
+        return Ok((HashSet::new(), HashSet::new()));
+    }
+    let hosts = session.domains.candidates("conversation");
+    if hosts.is_empty() {
+        return Ok((HashSet::new(), HashSet::new()));
     }
     let body = obj(&[("imei", json!(session.imei))]);
     let params = session
         .encoded_params(&body)
         .map(|p| format!("params={p}"))
         .unwrap_or_else(|_| Session::plain_params(&body));
-    let url = format!(
-        "{}/api/pinconvers/list?{}&{params}",
-        session.domains.conversation.trim_end_matches('/'),
-        session.common_params()
-    );
-    let raw = session.get_json(&url).await?;
-    let resp = unwrap_data_str(session.maybe_decrypt(raw, session.session_key_bytes()));
-    ensure_not_expired(&resp)?;
-
-    let mut pinned = HashSet::new();
-    let data = resp.get("data").unwrap_or(&resp);
-    let arrays = [
-        data.as_array(),
-        data.get("conversations").and_then(Value::as_array),
-        data.get("pinConvers").and_then(Value::as_array),
-        data.get("list").and_then(Value::as_array),
-    ];
-    for arr in arrays.into_iter().flatten() {
-        for item in arr {
-            let raw_id = match item {
-                Value::String(s) => Some(s.trim().to_string()),
-                Value::Number(n) => Some(n.to_string()),
-                Value::Object(_) => pick_str(item, &["id", "threadId", "conversId", "grid", "uid"]),
-                _ => None,
-            };
-            if let Some(id) = raw_id {
-                let clean = clean_group_id(&id);
-                if !clean.is_empty() && clean != "0" {
-                    pinned.insert(clean.to_string());
+    let mut last_err: Option<anyhow::Error> = None;
+    for host in &hosts {
+        let url = format!(
+            "{}/api/pinconvers/list?{}&{params}",
+            host.trim_end_matches('/'),
+            session.common_params()
+        );
+        match session.get_json(&url).await {
+            Ok(raw) => {
+                let resp =
+                    unwrap_data_str(session.maybe_decrypt(raw, session.session_key_bytes()));
+                ensure_not_expired(&resp)?;
+                let code = resp.get("error_code").and_then(value_as_i64).unwrap_or(0);
+                if code == 0 {
+                    return Ok(parse_pinned_thread_ids_split(&resp));
                 }
+                last_err = Some(anyhow::anyhow!("pinconvers/list error_code={code}"));
             }
+            Err(e) if is_expired_err(&e) => return Err(e),
+            Err(e) => last_err = Some(e),
         }
     }
-    Ok(pinned)
+    if let Some(err) = last_err {
+        return Err(err);
+    }
+    Ok((HashSet::new(), HashSet::new()))
 }
 
 fn unwrap_unread_mark_data_node(resp: &Value) -> Option<Value> {
@@ -676,57 +1002,94 @@ fn collect_unread_mark_ids(
     found
 }
 
-/// Parse `/api/convers/get-unread-mark` response into the set of unread thread IDs.
-/// Returns `None` on non-zero `error_code` or unrecognized response structure so callers
-/// safely fall back without clobbering local unread state.
-pub fn parse_unread_marks_response(resp: &Value) -> Option<HashSet<String>> {
+fn parse_unread_marks_split(resp: &Value) -> Option<(HashSet<String>, HashSet<String>)> {
     if let Some(code) = resp.get("error_code").and_then(value_as_i64) {
         if code != 0 {
             return None;
         }
     }
     let data_node = unwrap_unread_mark_data_node(resp)?;
-    let mut unread_ids = HashSet::new();
+    let mut user_ids = HashSet::new();
+    let mut group_ids = HashSet::new();
     let found_users =
-        collect_unread_mark_ids(&data_node, &["convsUser", "convs_user"], false, &mut unread_ids);
-    let found_groups =
-        collect_unread_mark_ids(&data_node, &["convsGroup", "convs_group"], true, &mut unread_ids);
+        collect_unread_mark_ids(&data_node, &["convsUser", "convs_user"], false, &mut user_ids);
+    let found_groups = collect_unread_mark_ids(
+        &data_node,
+        &["convsGroup", "convs_group"],
+        true,
+        &mut group_ids,
+    );
     if !found_users && !found_groups {
         return None;
     }
-    Some(unread_ids)
+    Some((user_ids, group_ids))
 }
 
-/// Best-effort fetch of `/api/conv/getUnreadMark` (with fallback to legacy
-/// `/api/convers/get-unread-mark`) on the `conversation` service host.
-/// Propagates `SessionError::Expired`; falls back to `Ok(None)` on network errors or unknown schema.
-pub async fn fetch_unread_marks(session: &Session) -> Result<Option<HashSet<String>>> {
-    if !session.is_authenticated() || session.domains.conversation.is_empty() {
+/// Parse `/api/convers/get-unread-mark` response into the set of unread thread IDs.
+/// Returns `None` on non-zero `error_code` or unrecognized response structure so callers
+/// safely fall back without clobbering local unread state.
+pub fn parse_unread_marks_response(resp: &Value) -> Option<HashSet<String>> {
+    let (mut users, groups) = parse_unread_marks_split(resp)?;
+    users.extend(groups);
+    Some(users)
+}
+
+async fn fetch_unread_marks_split(
+    session: &Session,
+) -> Result<Option<(HashSet<String>, HashSet<String>)>> {
+    if !session.is_authenticated() {
         return Ok(None);
     }
-    let base_host = session.domains.conversation.trim_end_matches('/');
+    let mut conv_hosts = session.domains.candidates("conversation");
+    if conv_hosts.is_empty() && !session.domains.conversation.is_empty() {
+        push_unique_host(&mut conv_hosts, &session.domains.conversation);
+    }
+    if conv_hosts.is_empty() {
+        return Ok(None);
+    }
     let attempts = [
         ("api/conv/getUnreadMark", json!({})),
-        ("api/convers/get-unread-mark", obj(&[("imei", json!(session.imei))])),
+        (
+            "api/convers/get-unread-mark",
+            obj(&[("imei", json!(session.imei))]),
+        ),
     ];
     for (path, body) in attempts {
         let params = session
             .encoded_params(&body)
             .map(|p| format!("params={p}"))
             .unwrap_or_else(|_| Session::plain_params(&body));
-        let url = format!("{base_host}/{path}?{}&{params}", session.common_params());
-        let raw = match session.get_json(&url).await {
-            Ok(v) => v,
-            Err(e) if is_expired_err(&e) => return Err(e),
-            Err(_) => continue,
-        };
-        let resp = unwrap_data_str(session.maybe_decrypt(raw, session.session_key_bytes()));
-        ensure_not_expired(&resp)?;
-        if let Some(parsed) = parse_unread_marks_response(&resp) {
-            return Ok(Some(parsed));
+        for base_host in &conv_hosts {
+            let url = format!(
+                "{}/{path}?{}&{params}",
+                base_host.trim_end_matches('/'),
+                session.common_params()
+            );
+            let raw = match session.get_json(&url).await {
+                Ok(v) => v,
+                Err(e) if is_expired_err(&e) => return Err(e),
+                Err(_) => continue,
+            };
+            let resp = unwrap_data_str(session.maybe_decrypt(raw, session.session_key_bytes()));
+            ensure_not_expired(&resp)?;
+            if let Some(parsed) = parse_unread_marks_split(&resp) {
+                return Ok(Some(parsed));
+            }
         }
     }
     Ok(None)
+}
+
+/// Best-effort fetch of `/api/conv/getUnreadMark` (with fallback to legacy
+/// `/api/convers/get-unread-mark`) on the `conversation` service host.
+/// Propagates `SessionError::Expired`; falls back to `Ok(None)` on network errors or unknown schema.
+pub async fn fetch_unread_marks(session: &Session) -> Result<Option<HashSet<String>>> {
+    Ok(fetch_unread_marks_split(session)
+        .await?
+        .map(|(mut users, groups)| {
+            users.extend(groups);
+            users
+        }))
 }
 
 fn apply_unread_marks_to_threads(
@@ -775,20 +1138,361 @@ async fn fetch_alias_map(session: &Session) -> Result<HashMap<String, String>> {
                 pick_str(item, &["userId", "uid", "friendId", "id"]),
                 pick_str(item, &["alias", "displayName", "name"]),
             ) {
-                aliases.insert(uid, alias);
+                let clean = clean_uid(&uid);
+                if !clean.is_empty() && clean != "0" {
+                    aliases.insert(clean, alias);
+                }
             }
         }
     }
     Ok(aliases)
 }
 
-/// Synchronize friends, groups, Cloud thread, pinned state, aliases, and latest conversation previews.
+fn parse_remote_label_direct_uids(resp: &Value) -> Vec<String> {
+    if resp
+        .get("error_code")
+        .and_then(value_as_i64)
+        .is_some_and(|c| c != 0)
+    {
+        return Vec::new();
+    }
+    let Some(data_node) = unwrap_history_data_node(resp) else {
+        return Vec::new();
+    };
+    let mut raw_labels: Vec<Value> = Vec::new();
+    if let Some(arr) = data_node.as_array() {
+        raw_labels.extend(arr.iter().cloned());
+    } else {
+        if let Some(ld) = data_node.get("labelData").and_then(unwrap_json_field) {
+            if let Some(arr) = ld.as_array() {
+                raw_labels.extend(arr.iter().cloned());
+            }
+        }
+        if raw_labels.is_empty() {
+            for key in ["labels", "items", "list"] {
+                if let Some(arr) = data_node.get(key).and_then(Value::as_array) {
+                    raw_labels.extend(arr.iter().cloned());
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for item in raw_labels {
+        for key in ["conversations", "conversationIds", "threadIds", "convs"] {
+            let Some(node) = item.get(key) else {
+                continue;
+            };
+            let unwrapped = unwrap_json_field(node);
+            let val = unwrapped.as_ref().unwrap_or(node);
+            let Some(arr) = val.as_array() else {
+                continue;
+            };
+            for entry in arr {
+                let raw_tid = match entry {
+                    Value::String(s) => Some(s.trim().to_string()),
+                    Value::Number(n) => Some(n.to_string()),
+                    Value::Object(_) => {
+                        let is_grp = is_group_flag(entry)
+                            || entry.get("is_group").and_then(value_as_bool) == Some(true)
+                            || entry.get("type").and_then(value_as_i64) == Some(1)
+                            || entry.get("grid").is_some()
+                            || entry.get("groupId").is_some();
+                        if is_grp {
+                            None
+                        } else {
+                            pick_str(entry, &["thread_id", "threadId", "id", "uid", "userId"])
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(raw) = raw_tid {
+                    if raw.starts_with("group_") || raw.starts_with('g') || raw.starts_with('G') {
+                        continue;
+                    }
+                    let clean = clean_uid(&raw);
+                    if is_numeric_direct_uid(&clean) && seen.insert(clean.clone()) {
+                        out.push(clean);
+                    }
+                }
+            }
+            break;
+        }
+    }
+    out
+}
+
+async fn fetch_remote_label_direct_uids(session: &Session) -> Result<Vec<String>> {
+    if !session.is_authenticated() {
+        return Ok(Vec::new());
+    }
+    let body = obj(&[("imei", json!(session.imei))]);
+    let params = session.encoded_params(&body)?;
+    let path_and_query = format!("/api/label/get?{}&params={params}", session.common_params());
+    let raw = session.get_endpoint("label", &path_and_query).await?;
+    let resp = unwrap_data_str(session.maybe_decrypt(raw, session.session_key_bytes()));
+    ensure_not_expired(&resp)?;
+    Ok(parse_remote_label_direct_uids(&resp))
+}
+
+fn parse_direct_thread_ids_from_conv_list(resp: &Value) -> Vec<String> {
+    if resp
+        .get("error_code")
+        .and_then(value_as_i64)
+        .is_some_and(|c| c != 0)
+    {
+        return Vec::new();
+    }
+    let data_owned = resp.get("data").and_then(unwrap_json_field);
+    let data = data_owned.as_ref().unwrap_or(resp);
+    let inner_owned = data.get("data").and_then(unwrap_json_field);
+    let effective = inner_owned.as_ref().unwrap_or(data);
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push_entry = |entry: &Value, force_direct: bool| {
+        let (raw_id, explicit_group) = match entry {
+            Value::String(s) => (Some(s.trim().to_string()), false),
+            Value::Number(n) => (Some(n.to_string()), false),
+            Value::Object(_) => {
+                let is_grp = !force_direct
+                    && (is_group_flag(entry)
+                        || entry.get("is_group").and_then(value_as_bool) == Some(true)
+                        || entry.get("type").and_then(value_as_i64) == Some(1)
+                        || entry.get("grid").is_some()
+                        || entry.get("groupId").is_some());
+                let id = pick_str(
+                    entry,
+                    &["thread_id", "threadId", "id", "uid", "userId", "conversId"],
+                );
+                (id, is_grp)
+            }
+            _ => (None, false),
+        };
+        let Some(raw) = raw_id else {
+            return;
+        };
+        if explicit_group
+            || (!force_direct
+                && (raw.starts_with("group_") || raw.starts_with('g') || raw.starts_with('G')))
+        {
+            return;
+        }
+        let clean = clean_uid(&raw);
+        if is_numeric_direct_uid(&clean) && seen.insert(clean.clone()) {
+            out.push(clean);
+        }
+    };
+
+    if let Some(arr) = effective.as_array() {
+        for entry in arr {
+            push_entry(entry, false);
+        }
+    }
+    for key in ["convsUser", "convs_user"] {
+        if let Some(raw) = effective.get(key) {
+            let unwrapped = unwrap_json_field(raw);
+            let val = unwrapped.as_ref().unwrap_or(raw);
+            if let Some(arr) = val.as_array() {
+                for entry in arr {
+                    push_entry(entry, true);
+                }
+            }
+        }
+    }
+    for key in [
+        "threads",
+        "items",
+        "conversations",
+        "convs",
+        "archivedChats",
+        "archived_chats",
+        "hiddenConvers",
+        "hidden_convers",
+        "list",
+    ] {
+        if let Some(raw) = effective.get(key) {
+            let unwrapped = unwrap_json_field(raw);
+            let val = unwrapped.as_ref().unwrap_or(raw);
+            if let Some(arr) = val.as_array() {
+                for entry in arr {
+                    push_entry(entry, false);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn conversation_and_chat_hosts(session: &Session) -> Vec<String> {
+    let mut hosts = session.domains.candidates("conversation");
+    if hosts.is_empty() && !session.domains.conversation.is_empty() {
+        push_unique_host(&mut hosts, &session.domains.conversation);
+    }
+    for h in session.domains.candidates("chat") {
+        push_unique_host(&mut hosts, &h);
+    }
+    hosts
+}
+
+async fn fetch_direct_uids_from_conv_endpoint(
+    session: &Session,
+    path: &str,
+    body: &Value,
+) -> Result<Vec<String>> {
+    if !session.is_authenticated() {
+        return Ok(Vec::new());
+    }
+    let hosts = conversation_and_chat_hosts(session);
+    if hosts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let params = session
+        .encoded_params(body)
+        .map(|p| format!("params={p}"))
+        .unwrap_or_else(|_| Session::plain_params(body));
+    let clean_path = path.trim_start_matches('/');
+    let mut last_err: Option<anyhow::Error> = None;
+    for host in &hosts {
+        let url = format!(
+            "{}/{clean_path}?{}&{params}",
+            host.trim_end_matches('/'),
+            session.common_params()
+        );
+        match session.get_json(&url).await {
+            Ok(raw) => {
+                let resp =
+                    unwrap_data_str(session.maybe_decrypt(raw, session.session_key_bytes()));
+                ensure_not_expired(&resp)?;
+                let code = resp.get("error_code").and_then(value_as_i64).unwrap_or(0);
+                if code == 0 {
+                    return Ok(parse_direct_thread_ids_from_conv_list(&resp));
+                }
+                last_err = Some(anyhow::anyhow!("{clean_path} error_code={code}"));
+            }
+            Err(e) if is_expired_err(&e) => return Err(e),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if let Some(err) = last_err {
+        return Err(err);
+    }
+    Ok(Vec::new())
+}
+
+async fn fetch_archived_direct_uids(session: &Session) -> Result<Vec<String>> {
+    let body = obj(&[("version", json!(0)), ("imei", json!(session.imei))]);
+    fetch_direct_uids_from_conv_endpoint(session, "api/archivedchat/list", &body).await
+}
+
+async fn fetch_hidden_direct_uids(session: &Session) -> Result<Vec<String>> {
+    let body = obj(&[("imei", json!(session.imei))]);
+    fetch_direct_uids_from_conv_endpoint(session, "api/hiddenconvers/get-all", &body).await
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_discovered_direct_threads(
+    threads: &mut Vec<ThreadDto>,
+    my_uid: &str,
+    send2me_id: &str,
+    unread_user_ids: &HashSet<String>,
+    pinned_direct_ids: &HashSet<String>,
+    alias_map: &HashMap<String, String>,
+    label_direct_ids: &[String],
+    archived_direct_ids: &[String],
+    hidden_direct_ids: &[String],
+) -> Vec<String> {
+    let mut seen: HashSet<String> = threads.iter().map(|t| t.id.clone()).collect();
+    let clean_my_uid = clean_uid(my_uid);
+    let mut created = Vec::new();
+
+    let mut candidate_uids: Vec<String> = Vec::new();
+    let mut push_candidate = |raw: &str| {
+        let uid = clean_uid(raw);
+        if is_numeric_direct_uid(&uid)
+            && (clean_my_uid.is_empty() || uid != clean_my_uid)
+            && (send2me_id.is_empty() || uid != send2me_id)
+            && !seen.contains(&uid)
+            && !candidate_uids.iter().any(|x| x == &uid)
+        {
+            candidate_uids.push(uid);
+        }
+    };
+
+    // Prioritize unread & pinned non-friend conversations first.
+    let mut unread_sorted: Vec<&String> = unread_user_ids.iter().collect();
+    unread_sorted.sort();
+    for uid in unread_sorted {
+        push_candidate(uid);
+    }
+    let mut pinned_sorted: Vec<&String> = pinned_direct_ids.iter().collect();
+    pinned_sorted.sort();
+    for uid in pinned_sorted {
+        push_candidate(uid);
+    }
+    for uid in archived_direct_ids {
+        push_candidate(uid);
+    }
+    for uid in hidden_direct_ids {
+        push_candidate(uid);
+    }
+    for uid in label_direct_ids {
+        push_candidate(uid);
+    }
+    let mut alias_uids: Vec<&String> = alias_map.keys().collect();
+    alias_uids.sort();
+    for uid in alias_uids {
+        push_candidate(uid);
+    }
+
+    for uid in candidate_uids {
+        if !seen.insert(uid.clone()) {
+            continue;
+        }
+        let title = alias_map
+            .get(&uid)
+            .cloned()
+            .unwrap_or_else(|| uid.clone());
+        let is_pinned = pinned_direct_ids.contains(&uid);
+        let unread_count = u32::from(unread_user_ids.contains(&uid));
+        threads.push(ThreadDto {
+            id: uid.clone(),
+            title,
+            avatar: String::new(),
+            kind: ThreadKind::Direct,
+            last_preview: String::new(),
+            last_ts: 0,
+            unread_count,
+            is_pinned,
+            is_muted: false,
+            last_read_in_ts: 0,
+            peer_read_ts: 0,
+            muted_until_ts: 0,
+            is_archived: false,
+        });
+        created.push(uid);
+    }
+    created
+}
+
+/// Synchronize friends, groups, Cloud thread, non-friend conversations, pinned state, aliases,
+/// and latest conversation previews.
 pub async fn sync_threads_full(session: &Session) -> Result<SyncedThreads> {
     let mut threads = match get_friends(session).await {
         Ok(list) => list,
         Err(e) if is_expired_err(&e) => return Err(e),
-        Err(_) => Vec::new(),
+        Err(e) => {
+            eprintln!("[litechat][threads] get_friends failed: {e}");
+            Vec::new()
+        }
     };
+    let friend_ids: HashSet<String> = threads
+        .iter()
+        .filter(|t| t.kind == ThreadKind::Direct)
+        .map(|t| t.id.clone())
+        .collect();
     let mut seen: HashSet<String> = threads.iter().map(|t| t.id.clone()).collect();
 
     match get_groups(session).await {
@@ -800,59 +1504,161 @@ pub async fn sync_threads_full(session: &Session) -> Result<SyncedThreads> {
             }
         }
         Err(e) if is_expired_err(&e) => return Err(e),
-        Err(_) => {}
+        Err(e) => {
+            eprintln!("[litechat][threads] get_groups failed: {e}");
+        }
     }
 
-    if let Ok(aliases) = fetch_alias_map(session).await {
-        for t in &mut threads {
-            if t.kind == ThreadKind::Direct {
-                if let Some(alias) = aliases.get(&t.id) {
-                    t.title = alias.clone();
+    let (last_msgs_res, aliases_res, unread_res, pinned_res, labels_res, archived_res, hidden_res) = tokio::join!(
+        get_last_msgs(session),
+        fetch_alias_map(session),
+        fetch_unread_marks_split(session),
+        fetch_pinned_thread_ids_split(session),
+        fetch_remote_label_direct_uids(session),
+        fetch_archived_direct_uids(session),
+        fetch_hidden_direct_uids(session),
+    );
+
+    let last_msgs_opt = match last_msgs_res {
+        Ok(v) => Some(v),
+        Err(e) if is_expired_err(&e) => return Err(e),
+        Err(e) => {
+            eprintln!("[litechat][threads] get_last_msgs failed: {e}");
+            None
+        }
+    };
+    let aliases = match aliases_res {
+        Ok(map) => map,
+        Err(e) if is_expired_err(&e) => return Err(e),
+        Err(e) => {
+            eprintln!("[litechat][threads] fetch_alias_map failed: {e}");
+            HashMap::new()
+        }
+    };
+    let (unread_user_ids, unread_all_ids) = match unread_res {
+        Ok(Some((users, groups))) => {
+            let mut all = users.clone();
+            all.extend(groups);
+            (users, Some(all))
+        }
+        Ok(None) => (HashSet::new(), None),
+        Err(e) if is_expired_err(&e) => return Err(e),
+        Err(e) => {
+            eprintln!("[litechat][threads] fetch_unread_marks failed: {e}");
+            (HashSet::new(), None)
+        }
+    };
+    let (pinned_synced, all_pinned_ids, direct_pinned_ids) = match pinned_res {
+        Ok((all_pinned, direct_pinned)) => (true, all_pinned, direct_pinned),
+        Err(e) if is_expired_err(&e) => return Err(e),
+        Err(e) => {
+            eprintln!("[litechat][threads] fetch_pinned_thread_ids failed: {e}");
+            (false, HashSet::new(), HashSet::new())
+        }
+    };
+    let label_direct_ids = match labels_res {
+        Ok(ids) => ids,
+        Err(e) if is_expired_err(&e) => return Err(e),
+        Err(e) => {
+            eprintln!("[litechat][threads] fetch_remote_label_direct_uids failed: {e}");
+            Vec::new()
+        }
+    };
+    let archived_direct_ids = match archived_res {
+        Ok(ids) => ids,
+        Err(e) if is_expired_err(&e) => return Err(e),
+        Err(e) => {
+            eprintln!("[litechat][threads] fetch_archived_direct_uids failed: {e}");
+            Vec::new()
+        }
+    };
+    let hidden_direct_ids = match hidden_res {
+        Ok(ids) => ids,
+        Err(e) if is_expired_err(&e) => return Err(e),
+        Err(e) => {
+            eprintln!("[litechat][threads] fetch_hidden_direct_uids failed: {e}");
+            Vec::new()
+        }
+    };
+
+    let newly_discovered_direct_ids = materialize_discovered_direct_threads(
+        &mut threads,
+        &session.profile.uid,
+        &session.profile.send2me_id,
+        &unread_user_ids,
+        &direct_pinned_ids,
+        &aliases,
+        &label_direct_ids,
+        &archived_direct_ids,
+        &hidden_direct_ids,
+    );
+
+    // Separate direct non-friend / unresolved thread UIDs from group sender UIDs so direct
+    // stranger profiles are ALWAYS resolved first and never truncated by group-sender caps.
+    let mut direct_thread_need_uids: Vec<String> = Vec::new();
+    let mut group_sender_need_uids: Vec<String> = Vec::new();
+    let known_ids: HashSet<String> = threads.iter().map(|t| t.id.clone()).collect();
+    let clean_my_uid = clean_uid(&session.profile.uid);
+
+    for t in &threads {
+        if t.kind == ThreadKind::Direct
+            && t.id != clean_my_uid
+            && t.id != session.profile.send2me_id
+        {
+            let is_non_friend = !friend_ids.contains(&t.id);
+            let needs_title =
+                t.title.trim().is_empty() || t.title == t.id || is_raw_numeric_id(&t.title);
+            if (needs_title || (is_non_friend && t.avatar.is_empty()))
+                && !direct_thread_need_uids.iter().any(|x| x == &t.id)
+            {
+                direct_thread_need_uids.push(t.id.clone());
+            }
+        }
+    }
+
+    if let Some(ref last_msgs) = last_msgs_opt {
+        let entries = collect_last_msg_entries(last_msgs);
+        for (in_group, item) in &entries {
+            if let Some((tid, is_grp)) = extract_thread_id(
+                item,
+                *in_group,
+                &session.profile.uid,
+                &session.profile.send2me_id,
+            ) {
+                if !is_grp
+                    && !tid.is_empty()
+                    && tid != "0"
+                    && tid != clean_my_uid
+                    && tid != session.profile.send2me_id
+                    && !friend_ids.contains(&tid)
+                    && !direct_thread_need_uids.iter().any(|x| x == &tid)
+                {
+                    direct_thread_need_uids.push(tid);
                 }
+            }
+            let uid_from =
+                pick_str(item, &["uidFrom", "fromUid", "fromId", "senderId"]).unwrap_or_default();
+            let clean_sender = clean_uid(&uid_from);
+            if !clean_sender.is_empty()
+                && clean_sender != "0"
+                && clean_sender != clean_my_uid
+                && clean_sender != session.profile.send2me_id
+                && !known_ids.contains(&clean_sender)
+                && !direct_thread_need_uids.iter().any(|x| x == &clean_sender)
+                && !group_sender_need_uids.iter().any(|x| x == &clean_sender)
+            {
+                group_sender_need_uids.push(clean_sender);
             }
         }
     }
 
     let mut extra_profiles: Map<String, Value> = Map::new();
     let mut name_map: HashMap<String, String> = HashMap::new();
-    let last_msgs_opt = get_last_msgs(session).await.ok();
 
-    if let Some(ref last_msgs) = last_msgs_opt {
-        let mut need_uids: Vec<String> = Vec::new();
-        let known_ids: HashSet<&str> = threads.iter().map(|t| t.id.as_str()).collect();
-        let data = last_msgs.get("data").unwrap_or(last_msgs);
-        for bucket in ["msgs", "groupMsgs", "lastMsgs"] {
-            if let Some(arr) = data.get(bucket).and_then(Value::as_array) {
-                let in_group = bucket == "groupMsgs";
-                for item in arr {
-                    let uid_from =
-                        pick_str(item, &["uidFrom", "fromUid", "fromId", "senderId"])
-                            .unwrap_or_default();
-                    let clean_sender = uid_from.split('_').next().unwrap_or(&uid_from);
-                    if !clean_sender.is_empty()
-                        && clean_sender != "0"
-                        && clean_sender != session.profile.uid
-                        && !known_ids.contains(clean_sender)
-                        && !need_uids.iter().any(|x| x == clean_sender)
-                    {
-                        need_uids.push(clean_sender.to_string());
-                    }
-                    if let Some((tid, is_grp)) =
-                        extract_thread_id(item, in_group, &session.profile.uid, &session.profile.send2me_id)
-                    {
-                        if !is_grp
-                            && tid != session.profile.send2me_id
-                            && !known_ids.contains(tid.as_str())
-                            && !need_uids.iter().any(|x| x == &tid)
-                        {
-                            need_uids.push(tid);
-                        }
-                    }
-                }
-            }
-        }
-        for chunk in need_uids.chunks(50).take(3) {
-            if let Ok(mp) = get_mini_profiles(session, chunk).await {
+    // 1. Resolve ALL direct stranger / unresolved threads first (no `.take(3)` truncation).
+    for chunk in direct_thread_need_uids.chunks(50) {
+        match get_mini_profiles(session, chunk).await {
+            Ok(mp) => {
                 for (k, v) in mp {
                     if let Some(name) =
                         pick_str(&v, &["displayName", "zaloName", "name", "display_name"])
@@ -861,6 +1667,34 @@ pub async fn sync_threads_full(session: &Session) -> Result<SyncedThreads> {
                     }
                     extra_profiles.insert(k, v);
                 }
+            }
+            Err(e) if is_expired_err(&e) => return Err(e),
+            Err(e) => {
+                eprintln!("[litechat][threads] direct get_mini_profiles failed: {e}");
+            }
+        }
+    }
+
+    // 2. Resolve group message sender names (bounded to avoid excessive startup calls).
+    let remaining_group_senders: Vec<String> = group_sender_need_uids
+        .into_iter()
+        .filter(|uid| !extra_profiles.contains_key(uid))
+        .collect();
+    for chunk in remaining_group_senders.chunks(50).take(3) {
+        match get_mini_profiles(session, chunk).await {
+            Ok(mp) => {
+                for (k, v) in mp {
+                    if let Some(name) =
+                        pick_str(&v, &["displayName", "zaloName", "name", "display_name"])
+                    {
+                        name_map.insert(k.clone(), name);
+                    }
+                    extra_profiles.insert(k, v);
+                }
+            }
+            Err(e) if is_expired_err(&e) => return Err(e),
+            Err(e) => {
+                eprintln!("[litechat][threads] group sender get_mini_profiles failed: {e}");
             }
         }
     }
@@ -876,19 +1710,22 @@ pub async fn sync_threads_full(session: &Session) -> Result<SyncedThreads> {
         );
     }
 
-    match fetch_unread_marks(session).await {
-        Ok(Some(unread_ids)) => {
-            apply_unread_marks_to_threads(&mut threads, &unread_ids, &mut remote_read_known);
+    if let Some(ref unread_ids) = unread_all_ids {
+        apply_unread_marks_to_threads(&mut threads, unread_ids, &mut remote_read_known);
+    }
+
+    if pinned_synced {
+        for t in &mut threads {
+            if all_pinned_ids.contains(clean_group_id(&t.id)) || all_pinned_ids.contains(&t.id) {
+                t.is_pinned = true;
+            }
         }
-        Ok(None) => {}
-        Err(e) if is_expired_err(&e) => return Err(e),
-        Err(_) => {}
     }
 
     for t in &mut threads {
         if t.kind == ThreadKind::Direct {
             if let Some(p) = extra_profiles.get(&t.id) {
-                if t.title == t.id {
+                if t.title.trim().is_empty() || t.title == t.id || is_raw_numeric_id(&t.title) {
                     if let Some(name) =
                         pick_str(p, &["displayName", "zaloName", "name", "display_name"])
                     {
@@ -904,18 +1741,76 @@ pub async fn sync_threads_full(session: &Session) -> Result<SyncedThreads> {
         }
     }
 
-    let mut pinned_synced = false;
-    match fetch_pinned_thread_ids(session).await {
-        Ok(pinned_ids) => {
-            pinned_synced = true;
-            for t in &mut threads {
-                if pinned_ids.contains(clean_group_id(&t.id)) || pinned_ids.contains(&t.id) {
-                    t.is_pinned = true;
+    // Apply user-defined aliases AFTER all threads (including strangers) are created & populated.
+    if !aliases.is_empty() {
+        for t in &mut threads {
+            if t.kind == ThreadKind::Direct {
+                if let Some(alias) = aliases.get(&t.id) {
+                    t.title = alias.clone();
                 }
             }
         }
-        Err(e) if is_expired_err(&e) => return Err(e),
-        Err(_) => {}
+    }
+
+    // Hydrate up to 12 newly discovered non-friend direct threads that still have `last_ts == 0`
+    // (e.g., from pinned/unread/archived/hidden/label lists) so they show real previews & times.
+    let newly_discovered_set: HashSet<&str> =
+        newly_discovered_direct_ids.iter().map(String::as_str).collect();
+    let mut hydrate_indices: Vec<usize> = threads
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| {
+            t.kind == ThreadKind::Direct
+                && t.last_ts == 0
+                && !friend_ids.contains(&t.id)
+                && (newly_discovered_set.contains(t.id.as_str())
+                    || t.is_pinned
+                    || t.unread_count > 0)
+        })
+        .map(|(idx, _)| idx)
+        .collect();
+    hydrate_indices.sort_by(|&a, &b| {
+        let ta = &threads[a];
+        let tb = &threads[b];
+        tb.is_pinned
+            .cmp(&ta.is_pinned)
+            .then_with(|| (tb.unread_count > 0).cmp(&(ta.unread_count > 0)))
+            .then_with(|| ta.id.cmp(&tb.id))
+    });
+    hydrate_indices.truncate(12);
+    for idx in hydrate_indices {
+        let tid = threads[idx].id.clone();
+        match fetch_thread_history_page(session, &tid, ThreadKind::Direct, 1).await {
+            Ok(page) => {
+                if let Some(last_msg) = page.messages.last() {
+                    if last_msg.ts > threads[idx].last_ts {
+                        threads[idx].last_ts = last_msg.ts;
+                    }
+                    let preview = format_thread_preview(
+                        &last_msg.text,
+                        last_msg.is_outgoing,
+                        &last_msg.sender_name,
+                        false,
+                    );
+                    if !preview.is_empty() {
+                        threads[idx].last_preview = preview;
+                    }
+                    if !last_msg.is_outgoing
+                        && (threads[idx].title.trim().is_empty()
+                            || threads[idx].title == threads[idx].id
+                            || is_raw_numeric_id(&threads[idx].title))
+                        && !last_msg.sender_name.trim().is_empty()
+                        && !is_raw_numeric_id(&last_msg.sender_name)
+                    {
+                        threads[idx].title = last_msg.sender_name.clone();
+                    }
+                }
+            }
+            Err(e) if is_expired_err(&e) => return Err(e),
+            Err(e) => {
+                eprintln!("[litechat][threads] hydrate history for stranger {tid} failed: {e}");
+            }
+        }
     }
 
     sort_threads_by_recent(&mut threads);
@@ -1054,31 +1949,93 @@ pub fn extract_history_has_more(resp: &Value, item_count: usize) -> bool {
     item_count > 0
 }
 
-pub fn normalize_vn_phone(raw: &str) -> Result<String> {
+fn strip_redundant_trunk_zero(digits: &str, country_code: &str) -> Option<String> {
+    const TRUNK_ZERO_CODES: &[&str] = &[
+        "886", "84", "82", "81", "44", "61", "66", "60", "62", "63", "49", "33",
+    ];
+    if !TRUNK_ZERO_CODES.contains(&country_code) {
+        return None;
+    }
+    let rest = digits.strip_prefix(country_code)?.strip_prefix('0')?;
+    if rest.is_empty() {
+        return None;
+    }
+    Some(format!("{country_code}{rest}"))
+}
+
+pub fn normalize_phone_number(raw: &str, default_country: &str) -> Result<String> {
     let cleaned: String = raw
         .trim()
         .chars()
-        .filter(|c| !matches!(c, ' ' | '-' | '.' | '(' | ')' | '\t'))
+        .filter(|c| !matches!(c, ' ' | '-' | '.' | '(' | ')' | '\t' | '\u{00A0}'))
         .collect();
-    let stripped = cleaned.strip_prefix('+').unwrap_or(&cleaned);
-    if stripped.is_empty() || !stripped.chars().all(|c| c.is_ascii_digit()) {
+    let (has_plus, digits) = match cleaned.strip_prefix('+') {
+        Some(rest) => (true, rest),
+        None => (false, cleaned.as_str()),
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
         return Err(anyhow::anyhow!("Số điện thoại không hợp lệ"));
     }
-    let normalized = if let Some(rest) = stripped.strip_prefix("840") {
-        format!("84{rest}")
-    } else if let Some(rest) = stripped.strip_prefix('0') {
-        format!("84{rest}")
-    } else if stripped.starts_with("84") {
-        stripped.to_string()
-    } else if stripped.len() == 9 {
-        format!("84{stripped}")
+
+    let cc_clean: String = default_country
+        .trim()
+        .trim_start_matches('+')
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+    let cc = if cc_clean.is_empty() {
+        "84"
     } else {
-        stripped.to_string()
+        cc_clean.as_str()
     };
-    if !(10..=15).contains(&normalized.len()) {
-        return Err(anyhow::anyhow!("Số điện thoại phải gồm 10-11 chữ số"));
+
+    let normalized = if has_plus {
+        const TRUNK_ZERO_CODES: &[&str] = &[
+            "886", "84", "82", "81", "44", "61", "66", "60", "62", "63", "49", "33",
+        ];
+        TRUNK_ZERO_CODES
+            .iter()
+            .find_map(|code| strip_redundant_trunk_zero(digits, code))
+            .unwrap_or_else(|| digits.to_string())
+    } else if let Some(fixed) = strip_redundant_trunk_zero(digits, cc) {
+        fixed
+    } else if cc == "84" {
+        if let Some(fixed_kr) = strip_redundant_trunk_zero(digits, "82")
+            .filter(|s| (11..=12).contains(&s.len()))
+        {
+            fixed_kr
+        } else if let Some(rest) = digits.strip_prefix('0') {
+            format!("84{rest}")
+        } else if (digits.starts_with("84") && digits.len() >= 10)
+            || (digits.starts_with("82") && (11..=12).contains(&digits.len()))
+        {
+            digits.to_string()
+        } else if digits.len() == 9 {
+            format!("84{digits}")
+        } else {
+            digits.to_string()
+        }
+    } else if let Some(rest) = digits.strip_prefix('0') {
+        format!("{cc}{rest}")
+    } else if digits.starts_with(cc) && digits.len() >= 10 {
+        digits.to_string()
+    } else if digits.len() <= 10 {
+        format!("{cc}{digits}")
+    } else {
+        digits.to_string()
+    };
+
+    let min_len = if has_plus { 8 } else { 10 };
+    if !(min_len..=15).contains(&normalized.len()) {
+        return Err(anyhow::anyhow!(
+            "Số điện thoại không hợp lệ (cần 10-15 chữ số kèm mã quốc gia)"
+        ));
     }
     Ok(normalized)
+}
+
+pub fn normalize_vn_phone(raw: &str) -> Result<String> {
+    normalize_phone_number(raw, "84")
 }
 
 pub fn parse_phone_profile_response(
@@ -1425,117 +2382,138 @@ pub fn apply_last_msgs_to_threads_with_read_state(
     }
 
     let mut previews: HashMap<String, PreviewInfo> = HashMap::new();
-    let data = last_msgs.get("data").unwrap_or(last_msgs);
-    for bucket in ["msgs", "groupMsgs", "lastMsgs"] {
-        if let Some(arr) = data.get(bucket).and_then(Value::as_array) {
-            let in_group = bucket == "groupMsgs";
-            for item in arr {
-                let parsed = parse_chat_message(item, None, my_uid, send2me_id, in_group);
-                let (tid, is_grp) = match extract_thread_id(item, in_group, my_uid, send2me_id) {
-                    Some(v) => v,
-                    None => match &parsed {
-                        Some(msg) => (msg.thread_id.clone(), in_group),
-                        None => continue,
-                    },
-                };
-                if tid.is_empty() || tid == "0" {
-                    continue;
+    let clean_my_uid = clean_uid(my_uid);
+    let entries = collect_last_msg_entries(last_msgs);
+    for (in_group, item) in &entries {
+        let parsed = parse_chat_message(item, None, my_uid, send2me_id, *in_group);
+        let (tid, is_grp) = match extract_thread_id(item, *in_group, my_uid, send2me_id) {
+            Some(v) => v,
+            None => match &parsed {
+                Some(msg) => (msg.thread_id.clone(), *in_group),
+                None => {
+                    let Some(raw_id) = pick_str(item, &["id", "uid"]) else {
+                        continue;
+                    };
+                    let grp = *in_group
+                        || is_group_flag(item)
+                        || raw_id.starts_with("group_")
+                        || raw_id.starts_with('g')
+                        || raw_id.starts_with('G');
+                    let clean = if grp {
+                        clean_group_id(&raw_id).to_string()
+                    } else if !send2me_id.is_empty() && raw_id == send2me_id {
+                        raw_id
+                    } else {
+                        clean_uid(&raw_id)
+                    };
+                    (clean, grp)
                 }
-                let raw_ts = item
-                    .get("ts")
-                    .or_else(|| item.get("cliMsgId"))
-                    .or_else(|| item.get("sendTime"))
-                    .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
-                    .map(normalize_ts_ms)
-                    .unwrap_or(0);
-                let ts = parsed.as_ref().map(|m| m.ts).filter(|&t| t > 0).unwrap_or(raw_ts);
-                let raw_text = item
-                    .get("content")
-                    .and_then(extract_content_text)
-                    .or_else(|| pick_str(item, &["msg", "message"]))
-                    .or_else(|| parsed.as_ref().map(|m| m.text.clone()))
-                    .unwrap_or_default();
-                let uid_from = pick_str(item, &["uidFrom", "fromUid", "fromId", "senderId"])
-                    .unwrap_or_default();
-                let clean_sender = uid_from.split('_').next().unwrap_or(&uid_from);
-                let is_self_flag = [item.get("isSelf"), item.get("is_self")]
-                    .into_iter()
-                    .flatten()
-                    .any(|v| {
-                        v.as_bool() == Some(true)
-                            || v.as_i64() == Some(1)
-                            || v.as_str() == Some("1")
-                    });
-                let is_outgoing = parsed.as_ref().map(|m| m.is_outgoing).unwrap_or_else(|| {
-                    is_self_flag
-                        || clean_sender == "0"
-                        || clean_sender.is_empty()
-                        || (!my_uid.is_empty() && clean_sender == my_uid)
-                        || (!send2me_id.is_empty() && clean_sender == send2me_id)
-                });
-                let mut sender_name = parsed
-                    .as_ref()
-                    .map(|m| m.sender_name.clone())
-                    .or_else(|| pick_str(item, &["dName", "displayName", "fromName", "senderName"]))
-                    .unwrap_or_default();
-                if !is_outgoing && (sender_name.is_empty() || sender_name == uid_from || is_raw_numeric_id(&sender_name)) {
-                    if let Some(resolved) = friend_names.get(clean_sender) {
-                        sender_name = resolved.clone();
-                    }
-                }
-                let preview = format_thread_preview(&raw_text, is_outgoing, &sender_name, is_grp);
-                let (unread, read_state_known) =
-                    extract_last_msg_read_state(item, is_outgoing, my_uid);
-                let fallback_title = if is_grp {
-                    pick_str(item, &["groupName", "name"])
-                } else if !is_outgoing {
-                    pick_str(item, &["dName", "displayName", "senderName", "name"])
-                        .or_else(|| friend_names.get(&tid).cloned())
-                } else {
-                    friend_names.get(&tid).cloned()
-                };
+            },
+        };
+        if tid.is_empty()
+            || tid == "0"
+            || (!is_grp
+                && !clean_my_uid.is_empty()
+                && tid == clean_my_uid
+                && tid != send2me_id)
+        {
+            continue;
+        }
+        let raw_ts = item
+            .get("ts")
+            .or_else(|| item.get("cliMsgId"))
+            .or_else(|| item.get("sendTime"))
+            .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
+            .map(normalize_ts_ms)
+            .unwrap_or(0);
+        let ts = parsed.as_ref().map(|m| m.ts).filter(|&t| t > 0).unwrap_or(raw_ts);
+        let raw_text = item
+            .get("content")
+            .and_then(extract_content_text)
+            .or_else(|| pick_str(item, &["msg", "message"]))
+            .or_else(|| parsed.as_ref().map(|m| m.text.clone()))
+            .unwrap_or_default();
+        let uid_from = pick_str(item, &["uidFrom", "fromUid", "fromId", "senderId"])
+            .unwrap_or_default();
+        let clean_sender = uid_from.split('_').next().unwrap_or(&uid_from);
+        let is_self_flag = [item.get("isSelf"), item.get("is_self")]
+            .into_iter()
+            .flatten()
+            .any(|v| {
+                v.as_bool() == Some(true)
+                    || v.as_i64() == Some(1)
+                    || v.as_str() == Some("1")
+            });
+        let is_outgoing = parsed.as_ref().map(|m| m.is_outgoing).unwrap_or_else(|| {
+            is_self_flag
+                || clean_sender == "0"
+                || clean_sender.is_empty()
+                || (!my_uid.is_empty() && (clean_sender == my_uid || clean_sender == clean_my_uid))
+                || (!send2me_id.is_empty() && clean_sender == send2me_id)
+        });
+        let mut sender_name = parsed
+            .as_ref()
+            .map(|m| m.sender_name.clone())
+            .or_else(|| pick_str(item, &["dName", "displayName", "fromName", "senderName"]))
+            .unwrap_or_default();
+        if !is_outgoing
+            && (sender_name.is_empty() || sender_name == uid_from || is_raw_numeric_id(&sender_name))
+        {
+            if let Some(resolved) = friend_names.get(clean_sender) {
+                sender_name = resolved.clone();
+            }
+        }
+        let preview = format_thread_preview(&raw_text, is_outgoing, &sender_name, is_grp);
+        let (unread, read_state_known) =
+            extract_last_msg_read_state(item, is_outgoing, my_uid);
+        let fallback_title = if is_grp {
+            pick_str(item, &["groupName", "name"])
+        } else if !is_outgoing {
+            pick_str(item, &["dName", "displayName", "senderName", "name"])
+                .or_else(|| friend_names.get(&tid).cloned())
+        } else {
+            friend_names.get(&tid).cloned()
+        };
 
-                match previews.get_mut(&tid) {
-                    Some(existing) => {
-                        if ts > existing.ts
-                            || (ts == existing.ts && existing.preview.is_empty() && !preview.is_empty())
-                        {
-                            existing.ts = ts;
-                            if !preview.is_empty() {
-                                existing.preview = preview;
-                            }
-                            existing.is_grp |= is_grp;
-                            existing.is_outgoing = is_outgoing;
-                            if is_outgoing {
-                                existing.unread = 0;
-                                existing.read_state_known = true;
-                            } else if read_state_known {
-                                existing.unread = unread;
-                                existing.read_state_known = true;
-                            } else {
-                                existing.unread = existing.unread.max(unread);
-                                existing.read_state_known = false;
-                            }
-                            if existing.fallback_title.is_none() {
-                                existing.fallback_title = fallback_title;
-                            }
-                        }
+        match previews.get_mut(&tid) {
+            Some(existing) => {
+                if ts > existing.ts
+                    || (ts == existing.ts && existing.preview.is_empty() && !preview.is_empty())
+                {
+                    existing.ts = ts;
+                    if !preview.is_empty() {
+                        existing.preview = preview;
                     }
-                    None => {
-                        previews.insert(
-                            tid,
-                            PreviewInfo {
-                                preview,
-                                ts,
-                                is_grp,
-                                is_outgoing,
-                                unread,
-                                read_state_known,
-                                fallback_title,
-                            },
-                        );
+                    existing.is_grp |= is_grp;
+                    existing.is_outgoing = is_outgoing;
+                    if is_outgoing {
+                        existing.unread = 0;
+                        existing.read_state_known = true;
+                    } else if read_state_known {
+                        existing.unread = unread;
+                        existing.read_state_known = true;
+                    } else {
+                        existing.unread = existing.unread.max(unread);
+                        existing.read_state_known = false;
+                    }
+                    if existing.fallback_title.is_none() {
+                        existing.fallback_title = fallback_title;
                     }
                 }
+            }
+            None => {
+                previews.insert(
+                    tid,
+                    PreviewInfo {
+                        preview,
+                        ts,
+                        is_grp,
+                        is_outgoing,
+                        unread,
+                        read_state_known,
+                        fallback_title,
+                    },
+                );
             }
         }
     }
@@ -1701,6 +2679,34 @@ fn fold_reaction_action_into_message(
     }
 }
 
+fn extract_message_poll_dto(msg: &MessageDto) -> Option<PollDto> {
+    let raw = msg.attachment_name.as_deref()?.strip_prefix("teza-poll:")?;
+    serde_json::from_str::<PollDto>(raw).ok()
+}
+
+fn apply_merged_poll_to_message(msg: &mut MessageDto, incoming_poll: &PollDto) {
+    let merged = match extract_message_poll_dto(msg) {
+        Some(existing) => merge_poll_dto(&existing, incoming_poll),
+        None => incoming_poll.clone(),
+    };
+    if let Ok(poll_json) = serde_json::to_string(&merged) {
+        msg.msg_type = "chat.poll".to_string();
+        msg.attachment_url = None;
+        msg.attachment_name = Some(format!("teza-poll:{poll_json}"));
+        let has_real_q = !merged.question.trim().is_empty()
+            && merged.question.trim() != "Bình chọn"
+            && !is_poll_activity_text(&merged.question);
+        if has_real_q
+            && (msg.text.trim().is_empty()
+                || msg.text.trim() == "[Bình chọn]"
+                || msg.text.trim() == "Bình chọn"
+                || is_poll_activity_text(&msg.text))
+        {
+            msg.text = format!("Bình chọn: {}", merged.question);
+        }
+    }
+}
+
 fn parse_remote_history_page(
     resp: &Value,
     thread_id: &str,
@@ -1717,12 +2723,28 @@ fn parse_remote_history_page(
     let raw_count = items.len();
     let has_more = extract_history_has_more(resp, raw_count);
     let mut reaction_actions: Vec<WsParsedAction> = Vec::new();
+    let mut poll_activity_updates: Vec<(i64, PollDto)> = Vec::new();
     let mut msgs: Vec<MessageDto> = Vec::new();
     for item in &items {
         if pick_str(item, &["msgType", "type"])
             .is_some_and(|t| t.eq_ignore_ascii_case("chat.reaction"))
         {
             parse_reaction_item(item, is_group, my_uid, send2me, &mut reaction_actions);
+            continue;
+        }
+        if let Some((_, activity_poll_id)) =
+            extract_poll_activity_update(item, is_group, my_uid, send2me)
+        {
+            if let Some(dto) = extract_poll_activity_dto(item, activity_poll_id) {
+                let ts = item
+                    .get("ts")
+                    .or_else(|| item.get("cliMsgId"))
+                    .or_else(|| item.get("sendTime"))
+                    .and_then(value_as_i64)
+                    .map(normalize_ts_ms)
+                    .unwrap_or(0);
+                poll_activity_updates.push((ts, dto));
+            }
             continue;
         }
         if let Some(msg) = parse_chat_message(item, Some(thread_id), my_uid, send2me, is_group) {
@@ -1770,8 +2792,41 @@ fn parse_remote_history_page(
         }
     }
     msgs.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.msg_id.cmp(&b.msg_id)));
+
+    // Fold any duplicate poll messages sharing `(thread_id, poll_id)` (where `poll_id > 0`) into
+    // a single canonical message keeping the earliest `msg_id`/`ts` and merging `PollDto` state.
+    let mut folded: Vec<MessageDto> = Vec::with_capacity(msgs.len());
+    let mut poll_idx_by_key: HashMap<(String, i64), usize> = HashMap::new();
+    for msg in msgs {
+        if let Some(incoming_poll) = extract_message_poll_dto(&msg) {
+            if incoming_poll.poll_id > 0 {
+                let key = (msg.thread_id.clone(), incoming_poll.poll_id);
+                if let Some(&idx) = poll_idx_by_key.get(&key) {
+                    apply_merged_poll_to_message(&mut folded[idx], &incoming_poll);
+                    folded[idx].is_pinned |= msg.is_pinned;
+                    continue;
+                }
+                poll_idx_by_key.insert(key, folded.len());
+            }
+        }
+        folded.push(msg);
+    }
+
+    // Apply any vote/update/end activity payloads in chronological order to matching poll cards.
+    if !poll_activity_updates.is_empty() && !poll_idx_by_key.is_empty() {
+        poll_activity_updates.sort_by_key(|(ts, _)| *ts);
+        for (_, dto) in poll_activity_updates {
+            if dto.poll_id > 0 {
+                let key = (thread_id.to_string(), dto.poll_id);
+                if let Some(&idx) = poll_idx_by_key.get(&key) {
+                    apply_merged_poll_to_message(&mut folded[idx], &dto);
+                }
+            }
+        }
+    }
+
     Ok(RemoteHistoryPage {
-        messages: msgs,
+        messages: folded,
         has_more,
         error_code,
     })
@@ -2272,10 +3327,18 @@ pub async fn fetch_mutual_groups(
 }
 
 pub async fn find_user_by_phone(session: &Session, raw_phone: &str) -> Result<UserProfileDto> {
+    find_user_by_phone_with_country(session, raw_phone, "84").await
+}
+
+pub async fn find_user_by_phone_with_country(
+    session: &Session,
+    raw_phone: &str,
+    default_country: &str,
+) -> Result<UserProfileDto> {
     if !session.is_authenticated() {
         anyhow::bail!("Chưa đăng nhập");
     }
-    let phone = normalize_vn_phone(raw_phone)?;
+    let phone = normalize_phone_number(raw_phone, default_country)?;
     let body = obj(&[
         ("phone", json!(phone)),
         ("avatar_size", json!(240)),
@@ -2872,7 +3935,8 @@ async fn post_form_across_hosts(
 ) -> Result<Value> {
     let params = session.encoded_params(body)?;
     let clean_path = path.trim_start_matches('/');
-    let mut last_err = anyhow::anyhow!("Không có máy chủ khả dụng cho {clean_path}");
+    let mut first_proto_err: Option<anyhow::Error> = None;
+    let mut last_err: Option<anyhow::Error> = None;
     for host in hosts {
         let url = format!(
             "{}/{}?{}",
@@ -2884,19 +3948,77 @@ async fn post_form_across_hosts(
             Ok(raw) => {
                 let dec = unwrap_data_str(session.maybe_decrypt(raw, session.session_key_bytes()));
                 ensure_not_expired(&dec)?;
-                let code = dec.get("error_code").and_then(value_as_i64).unwrap_or(0);
-                if code == 0 {
-                    return Ok(dec);
+                if dec.is_object() {
+                    let code = dec.get("error_code").and_then(value_as_i64).unwrap_or(0);
+                    if code == 0 {
+                        return Ok(dec);
+                    }
+                    let msg = pick_str(&dec, &["error_message", "message"])
+                        .unwrap_or_else(|| format!("Mã lỗi {code}"));
+                    if first_proto_err.is_none() {
+                        first_proto_err = Some(anyhow::anyhow!("{msg}"));
+                    }
+                    last_err = Some(anyhow::anyhow!("{msg}"));
+                } else {
+                    last_err = Some(anyhow::anyhow!(
+                        "Phản hồi không hợp lệ từ máy chủ cho {clean_path}"
+                    ));
                 }
-                let msg = pick_str(&dec, &["error_message", "message"])
-                    .unwrap_or_else(|| format!("Mã lỗi {code}"));
-                last_err = anyhow::anyhow!("{msg}");
             }
             Err(e) if is_expired_err(&e) => return Err(e),
-            Err(e) => last_err = e,
+            Err(e) => last_err = Some(e),
         }
     }
-    Err(last_err)
+    Err(first_proto_err
+        .or(last_err)
+        .unwrap_or_else(|| anyhow::anyhow!("Không có máy chủ khả dụng cho {clean_path}")))
+}
+
+async fn get_across_hosts(
+    session: &Session,
+    hosts: &[String],
+    path: &str,
+    body: &Value,
+) -> Result<Value> {
+    let params = session.encoded_params(body)?;
+    let clean_path = path.trim_start_matches('/');
+    let mut first_proto_err: Option<anyhow::Error> = None;
+    let mut last_err: Option<anyhow::Error> = None;
+    for host in hosts {
+        let url = format!(
+            "{}/{}?{}&params={params}",
+            host.trim_end_matches('/'),
+            clean_path,
+            session.common_params()
+        );
+        match session.get_json(&url).await {
+            Ok(raw) => {
+                let dec = unwrap_data_str(session.maybe_decrypt(raw, session.session_key_bytes()));
+                ensure_not_expired(&dec)?;
+                if dec.is_object() {
+                    let code = dec.get("error_code").and_then(value_as_i64).unwrap_or(0);
+                    if code == 0 {
+                        return Ok(dec);
+                    }
+                    let msg = pick_str(&dec, &["error_message", "message"])
+                        .unwrap_or_else(|| format!("Mã lỗi {code}"));
+                    if first_proto_err.is_none() {
+                        first_proto_err = Some(anyhow::anyhow!("{msg}"));
+                    }
+                    last_err = Some(anyhow::anyhow!("{msg}"));
+                } else {
+                    last_err = Some(anyhow::anyhow!(
+                        "Phản hồi không hợp lệ từ máy chủ cho {clean_path}"
+                    ));
+                }
+            }
+            Err(e) if is_expired_err(&e) => return Err(e),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(first_proto_err
+        .or(last_err)
+        .unwrap_or_else(|| anyhow::anyhow!("Không có máy chủ khả dụng cho {clean_path}")))
 }
 
 fn collect_id_list(v: Option<&Value>) -> Vec<String> {
@@ -3773,9 +4895,175 @@ pub async fn create_reminder(
     })
 }
 
+/// All 5 poll endpoints live on `zpwServiceMap.group[0]` (`tt-group-wpa.chat.zalo.me`),
+/// keeping `groupboard` / `board` only as secondary fallbacks.
+fn poll_service_hosts(session: &Session) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for h in session.domains.candidates("group") {
+        push_unique_host(&mut hosts, &h);
+    }
+    if let Some(svc) = crate::endpoints::service("group") {
+        push_unique_host(&mut hosts, svc);
+    }
+    for h in session.domains.candidates("groupboard") {
+        push_unique_host(&mut hosts, &h);
+    }
+    push_unique_host(&mut hosts, crate::endpoints::GROUP_BOARD);
+    push_unique_host(&mut hosts, crate::endpoints::BOARD);
+    hosts
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_create_poll_body(
+    clean_gid: &str,
+    clean_q: &str,
+    clean_opts: &[String],
+    expired_time_ms: i64,
+    allow_multi: bool,
+    allow_add_option: bool,
+    is_anonymous: bool,
+    imei: &str,
+) -> Value {
+    let normalized_expiry = if expired_time_ms > 0 {
+        normalize_ts_ms(expired_time_ms)
+    } else {
+        0
+    };
+    obj(&[
+        ("group_id", json!(clean_gid)),
+        ("question", json!(clean_q)),
+        ("options", json!(clean_opts)),
+        ("expired_time", json!(normalized_expiry)),
+        ("pinAct", json!(false)),
+        ("allow_multi_choices", json!(allow_multi)),
+        ("allow_add_new_option", json!(allow_add_option)),
+        ("is_hide_vote_preview", json!(false)),
+        ("is_anonymous", json!(is_anonymous)),
+        ("poll_type", json!(0)),
+        ("src", json!(1)),
+        ("imei", json!(imei)),
+    ])
+}
+
+fn build_poll_detail_body(poll_id: i64, imei: &str) -> Value {
+    obj(&[("poll_id", json!(poll_id)), ("imei", json!(imei))])
+}
+
+fn build_vote_poll_body(poll_id: i64, option_ids: &[i64], imei: &str) -> Value {
+    obj(&[
+        ("poll_id", json!(poll_id)),
+        ("option_ids", json!(option_ids)),
+        ("imei", json!(imei)),
+    ])
+}
+
+fn build_add_poll_options_body(
+    poll_id: i64,
+    new_options: &[String],
+    voted_option_ids: &[i64],
+) -> Result<Value> {
+    let clean_opts: Vec<String> = new_options
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if clean_opts.is_empty() {
+        anyhow::bail!("Vui lòng nhập ít nhất 1 lựa chọn mới");
+    }
+    let opts_json: Vec<Value> = clean_opts
+        .iter()
+        .map(|opt| json!({ "content": opt, "voted": true }))
+        .collect();
+    let encoded_opts = serde_json::to_string(&opts_json)?;
+    Ok(obj(&[
+        ("poll_id", json!(poll_id)),
+        ("new_options", json!(encoded_opts)),
+        ("voted_option_ids", json!(voted_option_ids)),
+    ]))
+}
+
+fn build_lock_poll_body(poll_id: i64, imei: &str) -> Value {
+    obj(&[("poll_id", json!(poll_id)), ("imei", json!(imei))])
+}
+
+/// Merge an incoming (possibly partial, e.g. `/api/poll/vote` options-only or sparse
+/// message payload with empty options) `PollDto` into an existing `PollDto` without
+/// wiping question/flags metadata or re-opening a locked poll.
+pub fn merge_poll_dto(existing: &PollDto, incoming: &PollDto) -> PollDto {
+    let incoming_has_real_question = !incoming.question.trim().is_empty()
+        && incoming.question.trim() != "Bình chọn"
+        && !is_poll_activity_text(&incoming.question);
+    let existing_has_real_question = !existing.question.trim().is_empty()
+        && existing.question.trim() != "Bình chọn"
+        && !is_poll_activity_text(&existing.question);
+    let is_partial = (!incoming_has_real_question && existing_has_real_question)
+        || (incoming.options.is_empty() && !existing.options.is_empty());
+
+    let poll_id = if incoming.poll_id > 0 {
+        incoming.poll_id
+    } else {
+        existing.poll_id
+    };
+    let question = if incoming_has_real_question {
+        incoming.question.clone()
+    } else if existing_has_real_question {
+        existing.question.clone()
+    } else if !incoming.question.trim().is_empty() && !is_poll_activity_text(&incoming.question) {
+        incoming.question.clone()
+    } else {
+        "Bình chọn".to_string()
+    };
+    let options = if !incoming.options.is_empty() {
+        incoming.options.clone()
+    } else {
+        existing.options.clone()
+    };
+    let expired_time = if incoming.expired_time > 0 {
+        incoming.expired_time
+    } else {
+        existing.expired_time
+    };
+    // Closing/locking a poll is irreversible on Zalo; history re-sync of an older creation
+    // payload with `closed: false` must never re-open an already locked poll.
+    let closed = existing.closed || incoming.closed;
+
+    if is_partial {
+        PollDto {
+            poll_id,
+            question,
+            options,
+            allow_multi: existing.allow_multi || incoming.allow_multi,
+            allow_add_option: existing.allow_add_option || incoming.allow_add_option,
+            is_anonymous: existing.is_anonymous || incoming.is_anonymous,
+            expired_time,
+            closed,
+        }
+    } else {
+        PollDto {
+            poll_id,
+            question,
+            options,
+            allow_multi: incoming.allow_multi,
+            allow_add_option: incoming.allow_add_option,
+            is_anonymous: incoming.is_anonymous,
+            expired_time,
+            closed,
+        }
+    }
+}
+
 pub fn parse_poll_dto(resp: &Value, fallback_poll_id: i64) -> Option<PollDto> {
-    let data = resp.get("data").unwrap_or(resp);
-    parse_poll_value(data, fallback_poll_id)
+    if let Some(data_owned) = resp.get("data").and_then(unwrap_json_field) {
+        if let Some(inner_data) = data_owned.get("data").and_then(unwrap_json_field) {
+            if let Some(dto) = parse_poll_value(&inner_data, fallback_poll_id) {
+                return Some(dto);
+            }
+        }
+        if let Some(dto) = parse_poll_value(&data_owned, fallback_poll_id) {
+            return Some(dto);
+        }
+    }
+    parse_poll_value(resp, fallback_poll_id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3793,6 +5081,9 @@ pub async fn create_poll(
         anyhow::bail!("Chưa đăng nhập");
     }
     let clean_gid = clean_group_id(group_id);
+    if clean_gid.is_empty() {
+        anyhow::bail!("Mã nhóm không hợp lệ");
+    }
     let clean_q = question.trim();
     if clean_q.is_empty() {
         anyhow::bail!("Câu hỏi bình chọn không được để trống");
@@ -3806,32 +5097,27 @@ pub async fn create_poll(
         anyhow::bail!("Cần ít nhất 2 lựa chọn để tạo bình chọn");
     }
 
-    let body = obj(&[
-        ("group_id", json!(clean_gid)),
-        ("question", json!(clean_q)),
-        ("options", json!(clean_opts)),
-        ("expired_time", json!(expired_time_ms.max(0))),
-        ("pinAct", json!(false)),
-        ("allow_multi_choices", json!(allow_multi)),
-        ("allow_add_new_option", json!(allow_add_option)),
-        ("is_hide_vote_preview", json!(false)),
-        ("is_anonymous", json!(is_anonymous)),
-        ("poll_type", json!(0)),
-        ("src", json!(1)),
-        ("imei", json!(session.imei)),
-    ]);
-    let mut hosts = session.domains.candidates("groupboard");
-    push_unique_host(&mut hosts, crate::endpoints::GROUP_BOARD);
-    push_unique_host(&mut hosts, crate::endpoints::BOARD);
-    for h in session.domains.candidates("group") {
-        push_unique_host(&mut hosts, &h);
-    }
+    let body = build_create_poll_body(
+        clean_gid,
+        clean_q,
+        &clean_opts,
+        expired_time_ms,
+        allow_multi,
+        allow_add_option,
+        is_anonymous,
+        &session.imei,
+    );
+    let hosts = poll_service_hosts(session);
 
     let resp = post_form_across_hosts(session, &hosts, "api/poll/create", &body).await?;
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let fallback_id = now_ms;
-    let poll = parse_poll_dto(&resp, fallback_id).unwrap_or_else(|| PollDto {
-        poll_id: fallback_id,
+    let normalized_expiry = if expired_time_ms > 0 {
+        normalize_ts_ms(expired_time_ms)
+    } else {
+        0
+    };
+    let build_local_fallback = |poll_id: i64| PollDto {
+        poll_id,
         question: clean_q.to_string(),
         options: clean_opts
             .iter()
@@ -3846,9 +5132,31 @@ pub async fn create_poll(
         allow_multi,
         allow_add_option,
         is_anonymous,
-        expired_time: expired_time_ms.max(0),
+        expired_time: normalized_expiry,
         closed: false,
-    });
+    };
+
+    let poll = match parse_poll_dto(&resp, 0) {
+        Some(mut parsed) if parsed.poll_id > 0 => {
+            if parsed.options.is_empty() {
+                match get_poll_detail(session, parsed.poll_id).await {
+                    Ok(detail) if !detail.options.is_empty() => detail,
+                    Err(e) if is_expired_err(&e) => return Err(e),
+                    _ => {
+                        let base = build_local_fallback(parsed.poll_id);
+                        merge_poll_dto(&base, &parsed)
+                    }
+                }
+            } else {
+                if parsed.question == "Bình chọn" && clean_q != "Bình chọn" {
+                    parsed.question = clean_q.to_string();
+                }
+                parsed
+            }
+        }
+        _ => build_local_fallback(now_ms),
+    };
+
     let poll_json = serde_json::to_string(&poll)?;
     Ok(MessageDto {
         msg_id: format!("poll-{}", poll.poll_id),
@@ -3873,13 +5181,11 @@ pub async fn get_poll_detail(session: &Session, poll_id: i64) -> Result<PollDto>
     if !session.is_authenticated() {
         anyhow::bail!("Chưa đăng nhập");
     }
-    let body = obj(&[("poll_id", json!(poll_id)), ("imei", json!(session.imei))]);
-    let mut hosts = session.domains.candidates("groupboard");
-    push_unique_host(&mut hosts, crate::endpoints::GROUP_BOARD);
-    push_unique_host(&mut hosts, crate::endpoints::BOARD);
-    for h in session.domains.candidates("group") {
-        push_unique_host(&mut hosts, &h);
+    if poll_id <= 0 {
+        anyhow::bail!("Mã bình chọn không hợp lệ");
     }
+    let body = build_poll_detail_body(poll_id, &session.imei);
+    let hosts = poll_service_hosts(session);
     let resp = post_form_across_hosts(session, &hosts, "api/poll/detail", &body).await?;
     parse_poll_dto(&resp, poll_id).ok_or_else(|| anyhow::anyhow!("Không đọc được dữ liệu bình chọn"))
 }
@@ -3892,22 +5198,107 @@ pub async fn vote_poll(
     if !session.is_authenticated() {
         anyhow::bail!("Chưa đăng nhập");
     }
-    let body = obj(&[
-        ("poll_id", json!(poll_id)),
-        ("option_id", json!(option_ids)),
-        ("imei", json!(session.imei)),
-    ]);
-    let mut hosts = session.domains.candidates("groupboard");
-    push_unique_host(&mut hosts, crate::endpoints::GROUP_BOARD);
-    push_unique_host(&mut hosts, crate::endpoints::BOARD);
-    for h in session.domains.candidates("group") {
-        push_unique_host(&mut hosts, &h);
+    if poll_id <= 0 {
+        anyhow::bail!("Mã bình chọn không hợp lệ");
     }
-    let resp = post_form_across_hosts(session, &hosts, "api/poll/vote", &body).await?;
-    if let Some(dto) = parse_poll_dto(&resp, poll_id).filter(|p| !p.options.is_empty()) {
-        return Ok(dto);
+    let body = build_vote_poll_body(poll_id, option_ids, &session.imei);
+    let hosts = poll_service_hosts(session);
+    let resp = match get_across_hosts(session, &hosts, "api/poll/vote", &body).await {
+        Ok(v) => v,
+        Err(e) if is_expired_err(&e) => return Err(e),
+        Err(get_err) => match post_form_across_hosts(session, &hosts, "api/poll/vote", &body).await
+        {
+            Ok(v) => v,
+            Err(e) if is_expired_err(&e) => return Err(e),
+            Err(_) => return Err(get_err),
+        },
+    };
+    let voted_partial = parse_poll_dto(&resp, poll_id);
+    // `/api/poll/vote` only returns `{ options: [...] }` without question/flags metadata.
+    // Always fetch fresh detail so metadata is never wiped.
+    match get_poll_detail(session, poll_id).await {
+        Ok(detail) => {
+            if detail.options.is_empty() {
+                if let Some(partial) = voted_partial.as_ref().filter(|p| !p.options.is_empty()) {
+                    return Ok(merge_poll_dto(&detail, partial));
+                }
+            }
+            Ok(detail)
+        }
+        Err(e) if is_expired_err(&e) => Err(e),
+        Err(detail_err) => voted_partial
+            .filter(|p| !p.options.is_empty())
+            .ok_or(detail_err),
     }
-    get_poll_detail(session, poll_id).await
+}
+
+pub async fn add_poll_options(
+    session: &Session,
+    poll_id: i64,
+    new_options: &[String],
+    voted_option_ids: &[i64],
+) -> Result<PollDto> {
+    if !session.is_authenticated() {
+        anyhow::bail!("Chưa đăng nhập");
+    }
+    if poll_id <= 0 {
+        anyhow::bail!("Mã bình chọn không hợp lệ");
+    }
+    let body = build_add_poll_options_body(poll_id, new_options, voted_option_ids)?;
+    let hosts = poll_service_hosts(session);
+    let resp = match get_across_hosts(session, &hosts, "api/poll/option/add", &body).await {
+        Ok(v) => v,
+        Err(e) if is_expired_err(&e) => return Err(e),
+        Err(get_err) => {
+            match post_form_across_hosts(session, &hosts, "api/poll/option/add", &body).await {
+                Ok(v) => v,
+                Err(e) if is_expired_err(&e) => return Err(e),
+                Err(_) => return Err(get_err),
+            }
+        }
+    };
+    let added_partial = parse_poll_dto(&resp, poll_id);
+    match get_poll_detail(session, poll_id).await {
+        Ok(detail) => {
+            if detail.options.is_empty() {
+                if let Some(partial) = added_partial.as_ref().filter(|p| !p.options.is_empty()) {
+                    return Ok(merge_poll_dto(&detail, partial));
+                }
+            }
+            Ok(detail)
+        }
+        Err(e) if is_expired_err(&e) => Err(e),
+        Err(detail_err) => added_partial
+            .filter(|p| !p.options.is_empty())
+            .ok_or(detail_err),
+    }
+}
+
+pub async fn lock_poll(session: &Session, poll_id: i64) -> Result<PollDto> {
+    if !session.is_authenticated() {
+        anyhow::bail!("Chưa đăng nhập");
+    }
+    if poll_id <= 0 {
+        anyhow::bail!("Mã bình chọn không hợp lệ");
+    }
+    let body = build_lock_poll_body(poll_id, &session.imei);
+    let hosts = poll_service_hosts(session);
+    let resp = post_form_across_hosts(session, &hosts, "api/poll/end", &body).await?;
+    match get_poll_detail(session, poll_id).await {
+        Ok(mut detail) => {
+            detail.closed = true;
+            Ok(detail)
+        }
+        Err(e) if is_expired_err(&e) => Err(e),
+        Err(detail_err) => {
+            if let Some(mut partial) = parse_poll_dto(&resp, poll_id) {
+                partial.closed = true;
+                Ok(partial)
+            } else {
+                Err(detail_err)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4875,5 +6266,586 @@ mod tests {
         assert_eq!(m2.reactions[0].emoji, "😮");
         assert_eq!(m2.reactions[0].count, 1);
         assert!(!m2.reactions[0].me);
+    }
+
+    #[test]
+    fn poll_service_hosts_prioritizes_group_before_groupboard_fallbacks() {
+        let mut session = Session::new().unwrap();
+        session.domains.group = "https://tt-group-wpa.chat.zalo.me".into();
+        session.domains.service_map_candidates.insert(
+            "groupboard".into(),
+            vec!["https://groupboard-wpa.chat.zalo.me".into()],
+        );
+        let hosts = poll_service_hosts(&session);
+        assert!(!hosts.is_empty());
+        assert_eq!(hosts[0], "https://tt-group-wpa.chat.zalo.me");
+        let grp_idx = hosts
+            .iter()
+            .position(|h| h == "https://tt-group-wpa.chat.zalo.me")
+            .unwrap();
+        let gb_idx = hosts
+            .iter()
+            .position(|h| h == crate::endpoints::GROUP_BOARD)
+            .unwrap();
+        let board_idx = hosts
+            .iter()
+            .position(|h| h == crate::endpoints::BOARD)
+            .unwrap();
+        assert!(grp_idx < gb_idx);
+        assert!(gb_idx < board_idx);
+    }
+
+    #[test]
+    fn poll_payload_builders_match_zalo_wire_protocol() {
+        let create_body = build_create_poll_body(
+            "888111",
+            "Trưa nay ăn gì?",
+            &["Phở".into(), "Bún".into()],
+            0,
+            true,
+            true,
+            false,
+            "imei-poll",
+        );
+        assert_eq!(create_body["group_id"], "888111");
+        assert_eq!(create_body["question"], "Trưa nay ăn gì?");
+        assert_eq!(create_body["options"], json!(["Phở", "Bún"]));
+        assert_eq!(create_body["allow_multi_choices"], true);
+        assert_eq!(create_body["allow_add_new_option"], true);
+        assert_eq!(create_body["is_anonymous"], false);
+        assert_eq!(create_body["pinAct"], false);
+        assert_eq!(create_body["is_hide_vote_preview"], false);
+        assert_eq!(create_body["poll_type"], 0);
+        assert_eq!(create_body["src"], 1);
+        assert_eq!(create_body["imei"], "imei-poll");
+
+        // vote_poll MUST send plural "option_ids" (never singular "option_id")
+        let vote_body = build_vote_poll_body(98765, &[101, 102], "imei-poll");
+        assert_eq!(vote_body["poll_id"], 98765);
+        assert_eq!(vote_body["option_ids"], json!([101, 102]));
+        assert!(vote_body.get("option_id").is_none());
+        assert_eq!(vote_body["imei"], "imei-poll");
+
+        // add_poll_options encodes new_options as JSON string of { content, voted: true }
+        let add_body = build_add_poll_options_body(
+            98765,
+            &["  Cơm tấm  ".into(), "".into(), "Bánh mì".into()],
+            &[101],
+        )
+        .unwrap();
+        assert_eq!(add_body["poll_id"], 98765);
+        assert_eq!(add_body["voted_option_ids"], json!([101]));
+        let parsed_new_opts: Value =
+            serde_json::from_str(add_body["new_options"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            parsed_new_opts,
+            json!([
+                { "content": "Cơm tấm", "voted": true },
+                { "content": "Bánh mì", "voted": true }
+            ])
+        );
+        assert!(build_add_poll_options_body(98765, &["   ".into()], &[]).is_err());
+
+        // lock_poll sends { poll_id, imei }
+        let lock_body = build_lock_poll_body(98765, "imei-poll");
+        assert_eq!(lock_body["poll_id"], 98765);
+        assert_eq!(lock_body["imei"], "imei-poll");
+    }
+
+    #[test]
+    fn parse_poll_dto_unwraps_nested_data_and_merge_preserves_metadata() {
+        let nested_resp = json!({
+            "error_code": 0,
+            "data": {
+                "data": {
+                    "poll_id": 774411_i64,
+                    "question": "Chốt lịch team building",
+                    "allow_multi_choices": true,
+                    "allow_add_new_option": true,
+                    "is_anonymous": false,
+                    "expired_time": 0,
+                    "options": [
+                        { "option_id": 501, "content": "Thứ 7", "votes": 3, "voted": true, "voters": ["u1", "u2", "u3"] },
+                        { "option_id": 502, "content": "Chủ nhật", "votes": 1, "voted": false, "voters": ["u4"] }
+                    ]
+                }
+            }
+        });
+        let full = parse_poll_dto(&nested_resp, 0).unwrap();
+        assert_eq!(full.poll_id, 774411);
+        assert_eq!(full.question, "Chốt lịch team building");
+        assert!(full.allow_multi);
+        assert!(full.allow_add_option);
+        assert_eq!(full.options[0].id, 501);
+        assert_eq!(full.options[0].votes, 3);
+
+        // Simulate partial `/api/poll/vote` response containing ONLY options (no question/flags)
+        let vote_only_resp = json!({
+            "error_code": 0,
+            "data": {
+                "options": [
+                    { "option_id": 501, "content": "Thứ 7", "votes": 4, "voted": true },
+                    { "option_id": 502, "content": "Chủ nhật", "votes": 1, "voted": false }
+                ]
+            }
+        });
+        let partial = parse_poll_dto(&vote_only_resp, 774411).unwrap();
+        assert_eq!(partial.question, "Bình chọn");
+        let merged = merge_poll_dto(&full, &partial);
+        assert_eq!(merged.poll_id, 774411);
+        assert_eq!(merged.question, "Chốt lịch team building");
+        assert!(merged.allow_multi);
+        assert!(merged.allow_add_option);
+        assert_eq!(merged.options[0].votes, 4);
+    }
+
+    #[test]
+    fn merge_poll_dto_preserves_flags_on_sparse_payload_and_never_reopens_locked_poll() {
+        let existing = PollDto {
+            poll_id: 99001,
+            question: "Chọn địa điểm họp".into(),
+            options: vec![
+                PollOptionDto {
+                    id: 10,
+                    content: "Phòng A".into(),
+                    votes: 3,
+                    voted: true,
+                },
+                PollOptionDto {
+                    id: 11,
+                    content: "Phòng B".into(),
+                    votes: 1,
+                    voted: false,
+                },
+            ],
+            allow_multi: true,
+            allow_add_option: true,
+            is_anonymous: true,
+            expired_time: 1_900_000_000_000,
+            closed: false,
+        };
+
+        // (a) Sparse incoming payload with real question + empty options must preserve flags & options
+        let sparse_incoming = PollDto {
+            poll_id: 99001,
+            question: "Chọn địa điểm họp".into(),
+            options: Vec::new(),
+            allow_multi: false,
+            allow_add_option: false,
+            is_anonymous: false,
+            expired_time: 0,
+            closed: false,
+        };
+        let merged_sparse = merge_poll_dto(&existing, &sparse_incoming);
+        assert_eq!(merged_sparse.poll_id, 99001);
+        assert_eq!(merged_sparse.question, "Chọn địa điểm họp");
+        assert_eq!(merged_sparse.options.len(), 2);
+        assert_eq!(merged_sparse.options[0].votes, 3);
+        assert!(merged_sparse.allow_multi);
+        assert!(merged_sparse.allow_add_option);
+        assert!(merged_sparse.is_anonymous);
+        assert_eq!(merged_sparse.expired_time, 1_900_000_000_000);
+        assert!(!merged_sparse.closed);
+
+        // (b) History re-sync of an old creation payload (`closed: false`, with options)
+        // must NEVER re-open an already locked poll (`closed: true`)
+        let mut locked_existing = existing.clone();
+        locked_existing.closed = true;
+        let stale_history_creation = PollDto {
+            poll_id: 99001,
+            question: "Chọn địa điểm họp".into(),
+            options: existing.options.clone(),
+            allow_multi: true,
+            allow_add_option: true,
+            is_anonymous: true,
+            expired_time: 1_900_000_000_000,
+            closed: false,
+        };
+        let merged_locked = merge_poll_dto(&locked_existing, &stale_history_creation);
+        assert!(merged_locked.closed);
+    }
+
+    #[test]
+    fn normalize_phone_number_supports_korean_international_and_vn_formats() {
+        // Explicit international prefixes preserve country code and strip redundant trunk 0
+        assert_eq!(
+            normalize_phone_number("+82 10-1234-5678", "84").unwrap(),
+            "821012345678"
+        );
+        assert_eq!(
+            normalize_phone_number("+82-010-1234-5678", "84").unwrap(),
+            "821012345678"
+        );
+        assert_eq!(
+            normalize_phone_number("+84 912 345 678", "82").unwrap(),
+            "84912345678"
+        );
+        assert_eq!(
+            normalize_phone_number("+84 0912 345 678", "84").unwrap(),
+            "84912345678"
+        );
+        assert_eq!(
+            normalize_phone_number("+1 (415) 555-2671", "84").unwrap(),
+            "14155552671"
+        );
+
+        // Korean local number with default_country == "82"
+        assert_eq!(
+            normalize_phone_number("010-1234-5678", "82").unwrap(),
+            "821012345678"
+        );
+        assert_eq!(
+            normalize_phone_number("010-1234-5678", "+82").unwrap(),
+            "821012345678"
+        );
+        assert_eq!(
+            normalize_phone_number("10-1234-5678", "82").unwrap(),
+            "821012345678"
+        );
+
+        // VN default ("84") preserves existing VN behavior and does not mangle 82... numbers
+        assert_eq!(
+            normalize_phone_number("0912 345 678", "84").unwrap(),
+            "84912345678"
+        );
+        assert_eq!(
+            normalize_phone_number("912345678", "84").unwrap(),
+            "84912345678"
+        );
+        assert_eq!(
+            normalize_phone_number("821012345678", "84").unwrap(),
+            "821012345678"
+        );
+        assert_eq!(
+            normalize_phone_number("8201012345678", "84").unwrap(),
+            "821012345678"
+        );
+
+        // Invalid inputs rejected
+        assert!(normalize_phone_number("abc123", "82").is_err());
+        assert!(normalize_phone_number("0123", "82").is_err());
+    }
+
+    #[test]
+    fn parse_remote_history_page_folds_duplicate_polls_and_vote_notices_preserving_question() {
+        // Remote history often arrives newest-first and mixes poll creation, duplicate poll frames,
+        // vote activity notices, and end-poll notices for the same `poll_id`.
+        let resp = json!({
+            "error_code": 0,
+            "data": {
+                "hasMore": 0,
+                "groupMsgs": [
+                    {
+                        "msgId": "m-poll-4",
+                        "uidFrom": "100",
+                        "grid": "888111",
+                        "msgType": "group.action",
+                        "ts": 1_760_000_004_000_i64,
+                        "content": {
+                            "action": "end_poll",
+                            "title": "Bình chọn đã kết thúc",
+                            "params": "{\"topic\":{\"id\":555001}}"
+                        }
+                    },
+                    {
+                        "msgId": "m-poll-3",
+                        "uidFrom": "200",
+                        "grid": "888111",
+                        "msgType": "group.action",
+                        "ts": 1_760_000_003_000_i64,
+                        "content": {
+                            "action": "vote_poll",
+                            "title": "Bình đã tham gia bình chọn",
+                            "params": "{\"poll_id\":555001,\"options\":[{\"option_id\":1,\"content\":\"Phở\",\"votes\":3,\"voted\":true},{\"option_id\":2,\"content\":\"Bún\",\"votes\":1,\"voted\":false}]}"
+                        }
+                    },
+                    {
+                        "msgId": "m-poll-2",
+                        "uidFrom": "300",
+                        "grid": "888111",
+                        "msgType": "group.poll",
+                        "ts": 1_760_000_002_000_i64,
+                        "content": {
+                            "poll_id": 555001_i64,
+                            "title": "An đã bình chọn",
+                            "options": [
+                                { "option_id": 1, "content": "Phở", "votes": 2, "voted": false },
+                                { "option_id": 2, "content": "Bún", "votes": 1, "voted": false }
+                            ]
+                        }
+                    },
+                    {
+                        "msgId": "m-poll-1",
+                        "uidFrom": "100",
+                        "grid": "888111",
+                        "msgType": "group.poll",
+                        "ts": 1_760_000_001_000_i64,
+                        "content": {
+                            "poll_id": 555001_i64,
+                            "question": "Trưa nay ăn gì?",
+                            "allow_multi_choices": true,
+                            "allow_add_new_option": true,
+                            "options": [
+                                { "option_id": 1, "content": "Phở", "votes": 0, "voted": false },
+                                { "option_id": 2, "content": "Bún", "votes": 0, "voted": false }
+                            ]
+                        }
+                    },
+                    {
+                        "msgId": "m-text-1",
+                        "uidFrom": "200",
+                        "grid": "888111",
+                        "msgType": "chat.text",
+                        "ts": 1_760_000_005_000_i64,
+                        "content": "OK chốt nhé"
+                    }
+                ]
+            }
+        });
+
+        let page = parse_remote_history_page(&resp, "888111", "100", "", true, None).unwrap();
+        assert_eq!(page.messages.len(), 2);
+        let poll_msg = &page.messages[0];
+        assert_eq!(poll_msg.msg_id, "m-poll-1");
+        assert_eq!(poll_msg.ts, 1_760_000_001_000);
+        assert_eq!(poll_msg.text, "Bình chọn: Trưa nay ăn gì?");
+        let dto = extract_message_poll_dto(poll_msg).unwrap();
+        assert_eq!(dto.poll_id, 555001);
+        assert_eq!(dto.question, "Trưa nay ăn gì?");
+        assert!(dto.allow_multi);
+        assert!(dto.allow_add_option);
+        assert_eq!(dto.options[0].votes, 3);
+        assert!(dto.options[0].voted);
+        assert!(dto.closed);
+
+        assert_eq!(page.messages[1].msg_id, "m-text-1");
+
+        // `merge_poll_dto` must never overwrite a real question with a vote-activity string
+        let bad_incoming = PollDto {
+            poll_id: 555001,
+            question: "An đã tham gia bình chọn".into(),
+            options: dto.options.clone(),
+            allow_multi: false,
+            allow_add_option: false,
+            is_anonymous: false,
+            expired_time: 0,
+            closed: false,
+        };
+        let merged = merge_poll_dto(&dto, &bad_incoming);
+        assert_eq!(merged.question, "Trưa nay ăn gì?");
+        assert!(merged.allow_multi);
+        assert!(merged.closed);
+    }
+
+    #[test]
+    fn last_msgs_unwraps_nested_data_and_stranger_buckets_and_normalizes_uid_suffixes() {
+        let mut threads: Vec<ThreadDto> = Vec::new();
+        let last_msgs = json!({
+            "error_code": 0,
+            "data": {
+                "data": {
+                    "strangerMsgs": "[{\"uidFrom\":\"777001_0\",\"idTo\":\"100_0\",\"dName\":\"Khách lạ A\",\"content\":\"Xin chào shop\",\"ts\":1760000010000}]",
+                    "otherMsgs": [
+                        {
+                            "uidFrom": "100_0",
+                            "idTo": "777002_0",
+                            "content": "Mình đã gửi báo giá",
+                            "ts": 1_760_000_020_000_i64
+                        }
+                    ],
+                    "conversations": [
+                        {
+                            "threadId": "777003_0",
+                            "unread": 2,
+                            "lastMsg": {
+                                "uidFrom": "777003_0",
+                                "idTo": "100_0",
+                                "dName": "Khách lạ C",
+                                "content": "Còn hàng không bạn?",
+                                "ts": 1_760_000_030_000_i64
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+
+        let mut names = HashMap::new();
+        names.insert("777002".to_string(), "Khách lạ B".to_string());
+        let read_known = apply_last_msgs_to_threads_with_read_state(
+            &mut threads,
+            &last_msgs,
+            "100",
+            "cloud_100",
+            &names,
+        );
+
+        let ids: Vec<&str> = threads.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["777003", "777002", "777001"]);
+        assert_eq!(threads[0].title, "Khách lạ C");
+        assert_eq!(threads[0].unread_count, 2);
+        assert!(read_known.contains("777003"));
+        assert_eq!(threads[1].title, "Khách lạ B");
+        assert_eq!(threads[1].last_preview, "Bạn: Mình đã gửi báo giá");
+        assert_eq!(threads[2].title, "Khách lạ A");
+        assert!(!threads.iter().any(|t| t.id == "100"));
+    }
+
+    #[test]
+    fn non_friend_discovery_materializes_unread_pinned_alias_label_archived_and_hidden_threads() {
+        let mut threads = vec![
+            ThreadDto {
+                id: "100001".into(),
+                title: "Bạn Thân".into(),
+                avatar: String::new(),
+                kind: ThreadKind::Direct,
+                last_preview: String::new(),
+                last_ts: 0,
+                unread_count: 0,
+                is_pinned: false,
+                is_muted: false,
+                last_read_in_ts: 0,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
+            },
+            ThreadDto {
+                id: "888001".into(),
+                title: "Nhóm A".into(),
+                avatar: String::new(),
+                kind: ThreadKind::Group,
+                last_preview: String::new(),
+                last_ts: 0,
+                unread_count: 0,
+                is_pinned: false,
+                is_muted: false,
+                last_read_in_ts: 0,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
+            },
+        ];
+
+        let unread_resp = json!({
+            "error_code": 0,
+            "data": { "convsUser": ["200001", "100001"], "convsGroup": ["g888999"] }
+        });
+        let (unread_users, unread_groups) = parse_unread_marks_split(&unread_resp).unwrap();
+        assert!(unread_users.contains("200001"));
+        assert!(unread_groups.contains("888999"));
+
+        let pinned_resp = json!({
+            "error_code": 0,
+            "data": { "conversations": ["200002", "g888001", { "id": "888002", "isGroup": 1 }] }
+        });
+        let (all_pinned, direct_pinned) = parse_pinned_thread_ids_split(&pinned_resp);
+        assert!(all_pinned.contains("888001"));
+        assert!(all_pinned.contains("888002"));
+        assert!(direct_pinned.contains("200002"));
+        assert!(!direct_pinned.contains("888001"));
+        assert!(!direct_pinned.contains("888002"));
+
+        let label_resp = json!({
+            "error_code": 0,
+            "data": {
+                "labelData": "[{\"id\":1,\"text\":\"VIP\",\"conversations\":[\"200003\",\"g888777\"]}]"
+            }
+        });
+        let label_direct = parse_remote_label_direct_uids(&label_resp);
+        assert_eq!(label_direct, vec!["200003"]);
+
+        let archived_resp = json!({
+            "error_code": 0,
+            "data": {
+                "items": [
+                    { "id": "200004_0", "type": 0 },
+                    { "id": "888333", "type": 1 }
+                ]
+            }
+        });
+        let archived_direct = parse_direct_thread_ids_from_conv_list(&archived_resp);
+        assert_eq!(archived_direct, vec!["200004"]);
+
+        let hidden_resp = json!({
+            "error_code": 0,
+            "data": {
+                "threads": [
+                    { "thread_id": "200005", "is_group": 0 },
+                    { "thread_id": "888444", "is_group": 1 }
+                ]
+            }
+        });
+        let hidden_direct = parse_direct_thread_ids_from_conv_list(&hidden_resp);
+        assert_eq!(hidden_direct, vec!["200005"]);
+
+        let mut aliases = HashMap::new();
+        aliases.insert("200006".to_string(), "Anh Shipper".to_string());
+        aliases.insert("200004".to_string(), "Khách Lưu Trữ".to_string());
+
+        let created = materialize_discovered_direct_threads(
+            &mut threads,
+            "999000",
+            "cloud_999000",
+            &unread_users,
+            &direct_pinned,
+            &aliases,
+            &label_direct,
+            &archived_direct,
+            &hidden_direct,
+        );
+
+        assert_eq!(
+            created,
+            vec!["200001", "200002", "200004", "200005", "200003", "200006"]
+        );
+        let t_unread = threads.iter().find(|t| t.id == "200001").unwrap();
+        assert_eq!(t_unread.unread_count, 1);
+        assert_eq!(t_unread.kind, ThreadKind::Direct);
+        let t_pinned = threads.iter().find(|t| t.id == "200002").unwrap();
+        assert!(t_pinned.is_pinned);
+        let t_archived = threads.iter().find(|t| t.id == "200004").unwrap();
+        assert_eq!(t_archived.title, "Khách Lưu Trữ");
+        assert!(!t_archived.is_archived);
+        let t_alias = threads.iter().find(|t| t.id == "200006").unwrap();
+        assert_eq!(t_alias.title, "Anh Shipper");
+        // No group IDs leaked as direct threads
+        assert!(!threads.iter().any(|t| t.id == "888999" || t.id == "888333" || t.id == "888444"));
+    }
+
+    #[test]
+    fn mini_profiles_partial_miss_computes_missing_and_merges_v2_fallback() {
+        let requested = vec![
+            "1001".to_string(),
+            "1002_0".to_string(),
+            "1003".to_string(),
+        ];
+        // Primary `/api/social/group/members` returned 1001, an empty stub for 1002, and missed 1003
+        let mut merged = Map::new();
+        merged.insert(
+            "1001".into(),
+            json!({ "displayName": "Member One", "avatar": "https://s160-ava-talk.zadn.vn/1.jpg" }),
+        );
+        merged.insert("1002".into(), json!({}));
+
+        let still_missing = compute_missing_profile_uids(&requested, &merged);
+        assert_eq!(still_missing, vec!["1002", "1003"]);
+
+        // Fallback `/api/social/friend/getprofiles/v2` resolves 1002 and 1003
+        let mut v2_result = Map::new();
+        v2_result.insert(
+            "1002_0".into(),
+            json!({ "displayName": "Stranger Two", "avatar": "https://s160-ava-talk.zadn.vn/2.jpg" }),
+        );
+        v2_result.insert(
+            "1003".into(),
+            json!({ "displayName": "Stranger Three", "avatar": "" }),
+        );
+        merge_mini_profile_maps(&mut merged, v2_result);
+
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged["1001"]["displayName"], "Member One");
+        assert_eq!(merged["1002"]["displayName"], "Stranger Two");
+        assert_eq!(merged["1003"]["displayName"], "Stranger Three");
+        assert!(compute_missing_profile_uids(&requested, &merged).is_empty());
     }
 }

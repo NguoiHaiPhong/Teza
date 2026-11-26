@@ -332,8 +332,10 @@ impl RelayConfig {
 
     pub fn apply_to_client_builder(&self, builder: ClientBuilder) -> Result<ClientBuilder> {
         if let Some(proxy_url) = self.proxy_url_string()? {
-            let proxy = Proxy::all(&proxy_url).context("Không áp dụng được cấu hình Relay HTTP")?;
-            Ok(builder.proxy(proxy))
+            let proxy = Proxy::all(&proxy_url)
+                .context("Không áp dụng được cấu hình Relay HTTP")?
+                .no_proxy(None);
+            Ok(builder.no_proxy().proxy(proxy))
         } else {
             Ok(builder)
         }
@@ -824,5 +826,82 @@ mod tests {
         assert!(err.to_string().contains("không hợp lệ"));
         drop(client);
         assert_eq!(srv.await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn apply_to_client_builder_builds_and_routes_socks5_and_http_modes() {
+        // Disabled mode builds cleanly without modifying proxy settings.
+        let disabled = RelayConfig::default();
+        assert!(disabled
+            .apply_to_client_builder(Client::builder())
+            .unwrap()
+            .build()
+            .is_ok());
+
+        // SOCKS5 mode (with auth): client builds cleanly and initiates a SOCKS5 handshake to the configured relay.
+        let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_addr = socks_listener.local_addr().unwrap();
+        let socks_srv = tokio::spawn(async move {
+            let (mut s, _) = socks_listener.accept().await.unwrap();
+            let mut hello = [0u8; 4];
+            let n = s.read(&mut hello).await.unwrap();
+            // Reply with auth-not-acceptable so reqwest fails fast after proving it hit our SOCKS5 relay.
+            let _ = s.write_all(&[0x05, 0xFF]).await;
+            (n, hello[0])
+        });
+
+        let socks_cfg = RelayConfig {
+            enabled: true,
+            mode: RelayMode::Socks5,
+            host: "127.0.0.1".into(),
+            port: socks_addr.port(),
+            username: "relay_u".into(),
+            password: "relay_p".into(),
+            route_webview_media: true,
+        };
+        let socks_client = socks_cfg
+            .apply_to_client_builder(Client::builder().timeout(Duration::from_secs(3)))
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(socks_client.get("https://file-stal-9.dlfl.vn/test").send().await.is_err());
+        let (socks_n, socks_ver) = socks_srv.await.unwrap();
+        assert!(socks_n >= 3);
+        assert_eq!(socks_ver, 0x05);
+
+        // HTTP mode (with auth): client builds cleanly and sends CONNECT to the configured relay.
+        let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_addr = http_listener.local_addr().unwrap();
+        let http_srv = tokio::spawn(async move {
+            let (mut s, _) = http_listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let n = s.read(&mut buf).await.unwrap();
+            let _ = s
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+                .await;
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        });
+
+        let http_cfg = RelayConfig {
+            enabled: true,
+            mode: RelayMode::Http,
+            host: "127.0.0.1".into(),
+            port: http_addr.port(),
+            username: "relay_u".into(),
+            password: "relay_p".into(),
+            route_webview_media: true,
+        };
+        let http_client = http_cfg
+            .apply_to_client_builder(Client::builder().timeout(Duration::from_secs(3)))
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(http_client.get("https://file-stal-9.dlfl.vn/test").send().await.is_err());
+        let req_head = http_srv.await.unwrap();
+        assert!(
+            req_head.starts_with("CONNECT file-stal-9.dlfl.vn:443 HTTP/1.1"),
+            "expected CONNECT via configured HTTP relay, got: {req_head}"
+        );
+        assert!(req_head.contains("Proxy-Authorization: Basic ") || req_head.contains("proxy-authorization: Basic "));
     }
 }

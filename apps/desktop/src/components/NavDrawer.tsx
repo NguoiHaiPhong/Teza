@@ -3,6 +3,8 @@ import {
   Archive,
   ArrowDownToLine,
   Bookmark,
+  Bot,
+  CalendarClock,
   FolderKanban,
   Languages,
   Lock,
@@ -16,6 +18,7 @@ import {
 } from "lucide-react";
 import { useI18n } from "../i18n";
 import type { AccountProfile, AppUpdateInfo, ConnectionStatus, ThemeMode } from "../types";
+import type { SettingsTab } from "./SettingsModal";
 import { ThreadAvatar } from "./ThreadAvatar";
 
 export interface NavDrawerProps {
@@ -29,25 +32,18 @@ export interface NavDrawerProps {
   archivedCount: number;
   hasPasscode: boolean;
   pendingFriendRequestsCount?: number;
+  aiEnabled?: boolean;
+  pendingSchedulesCount?: number;
   onOpenMyProfile: () => void;
   onOpenSavedMessages: () => void;
+  onOpenAiChat?: () => void;
+  onOpenScheduledMessages?: () => void;
   onOpenArchived: () => void;
   onOpenFindUser: () => void;
   onOpenFriendRequests?: () => void;
   onOpenFolders: () => void;
   onLockApp: () => void;
-  onOpenSettings: (
-    tab?:
-      | "account"
-      | "notifications"
-      | "appearance"
-      | "folders"
-      | "webapps"
-      | "calls"
-      | "translate"
-      | "network"
-      | "system",
-  ) => void;
+  onOpenSettings: (tab?: SettingsTab) => void;
   onCycleTheme: () => void;
   onOpenUpdateModal: () => void;
   onLogout: () => void;
@@ -64,8 +60,12 @@ export function NavDrawer({
   archivedCount,
   hasPasscode,
   pendingFriendRequestsCount = 0,
+  aiEnabled = false,
+  pendingSchedulesCount = 0,
   onOpenMyProfile,
   onOpenSavedMessages,
+  onOpenAiChat,
+  onOpenScheduledMessages,
   onOpenArchived,
   onOpenFindUser,
   onOpenFriendRequests,
@@ -188,6 +188,59 @@ export function NavDrawer({
             <Bookmark className="h-4 w-4 shrink-0" style={{ color: "var(--accent)" }} />
             <span>{t("savedMessages")}</span>
           </button>
+
+          {onOpenAiChat && (
+            <button
+              type="button"
+              onClick={() => {
+                onOpenAiChat();
+                onClose();
+              }}
+              className="hover-menu flex w-full items-center justify-between gap-2 rounded-xl px-3 py-2.5 text-left font-medium transition"
+            >
+              <span className="flex items-center gap-3">
+                <Bot className="h-4 w-4 shrink-0" style={{ color: "var(--accent)" }} />
+                <span>{t("navAiAssistantMenu")}</span>
+              </span>
+              {aiEnabled ? (
+                <span
+                  className="h-2 w-2 shrink-0 rounded-full bg-emerald-400"
+                  title="AI"
+                />
+              ) : (
+                <span
+                  className="rounded-lg px-2 py-0.5 text-[10.5px]"
+                  style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
+                >
+                  {t("navAiOptionalBadge")}
+                </span>
+              )}
+            </button>
+          )}
+
+          {onOpenScheduledMessages && (
+            <button
+              type="button"
+              onClick={() => {
+                onOpenScheduledMessages();
+                onClose();
+              }}
+              className="hover-menu flex w-full items-center justify-between gap-2 rounded-xl px-3 py-2.5 text-left font-medium transition"
+            >
+              <span className="flex items-center gap-3">
+                <CalendarClock className="h-4 w-4 shrink-0" style={{ color: "var(--accent)" }} />
+                <span>{t("navScheduledMessagesMenu")}</span>
+              </span>
+              {pendingSchedulesCount > 0 && (
+                <span
+                  className="rounded-full px-2 py-0.5 text-[11px] font-bold"
+                  style={{ background: "var(--accent)", color: "var(--text-on-accent)" }}
+                >
+                  {pendingSchedulesCount > 99 ? "99+" : pendingSchedulesCount}
+                </span>
+              )}
+            </button>
+          )}
 
           <button
             type="button"

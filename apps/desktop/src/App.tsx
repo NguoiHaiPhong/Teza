@@ -28,6 +28,7 @@ import {
   Languages,
   LayoutGrid,
   Link2,
+  Loader2,
   Lock,
   LogOut,
   Menu,
@@ -43,6 +44,7 @@ import {
   Search,
   Settings,
   Shield,
+  Sparkles,
   Star,
   Tag,
   Trash2,
@@ -84,6 +86,7 @@ import {
 import {
   applyOpenThreadSearchState,
   applyOptimisticReaction,
+  applyPollUpdateToMessages,
   applyThreadReadSync,
   bumpThreadList,
   compareThreads,
@@ -91,6 +94,7 @@ import {
   computeThreadRenderLimitForTarget,
   countFolderUnread,
   dayKey,
+  dedupeOptimisticPollMessages,
   extractFirstUrl,
   filterThreadsByFolder,
   findFirstUnreadMsgId,
@@ -104,6 +108,7 @@ import {
   shouldAutoMarkReadOnFocus,
   upsertMsg,
 } from "./utils/threadState";
+import { isImeComposingEvent, matchesSearchQuery } from "./utils/searchNormalize";
 import {
   playCallCueTone,
   startIncomingRingtone,
@@ -164,6 +169,9 @@ import {
 } from "./utils/webApps";
 import type {
   AccountProfile,
+  AiConfigDto,
+  AiStoredMessageDto,
+  AiSummaryDto,
   AppUpdateInfo,
   BuiltInRailFolderId,
   CallDevicesDto,
@@ -186,6 +194,7 @@ import type {
   RailDisplayMode,
   RelayConfigSummary,
   SavedFileResultDto,
+  ScheduledMessageDto,
   StickerItem,
   ThemeMode,
   ThreadDetailsDto,
@@ -198,6 +207,7 @@ import type {
 const AddGroupMembersModal = lazy(() =>
   import("./components/AddGroupMembersModal").then((m) => ({ default: m.AddGroupMembersModal })),
 );
+const AiChatPanel = lazy(() => import("./components/AiChatPanel"));
 const CreatePollModal = lazy(() =>
   import("./components/CreatePollModal").then((m) => ({ default: m.CreatePollModal })),
 );
@@ -220,6 +230,7 @@ const MediaLightbox = lazy(() =>
 const QuickSearchModal = lazy(() =>
   import("./components/QuickSearchModal").then((m) => ({ default: m.QuickSearchModal })),
 );
+const ScheduledMessagesModal = lazy(() => import("./components/ScheduledMessagesModal"));
 const ScreenshotEditorModal = lazy(() =>
   import("./components/ScreenshotEditorModal").then((m) => ({ default: m.ScreenshotEditorModal })),
 );
@@ -430,11 +441,35 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsInitialTab, setSettingsInitialTab] = useState<SettingsTab>("notifications");
   const [navDrawerOpen, setNavDrawerOpen] = useState(false);
+  const [aiConfig, setAiConfig] = useState<AiConfigDto | null>(null);
+  const [aiChatOpen, setAiChatOpen] = useState(false);
+  const [aiMessages, setAiMessages] = useState<AiStoredMessageDto[]>([]);
+  const [aiStreamingText, setAiStreamingText] = useState("");
+  const [aiIsStreaming, setAiIsStreaming] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
+  const [aiSummaryByThread, setAiSummaryByThread] = useState<
+    Record<
+      string,
+      {
+        loading: boolean;
+        streamingText: string;
+        result: AiSummaryDto | null;
+        error: string | null;
+      }
+    >
+  >({});
+  const [schedules, setSchedules] = useState<ScheduledMessageDto[]>([]);
+  const [schedulesLoading, setSchedulesLoading] = useState(false);
+  const [scheduledModalOpen, setScheduledModalOpen] = useState(false);
+  const [scheduledInitialThreadId, setScheduledInitialThreadId] = useState<string | null>(null);
+  const aiIsStreamingRef = useRef(false);
+  aiIsStreamingRef.current = aiIsStreaming;
   const [notifyPrefs, setNotifyPrefs] = useState<NotificationPrefs>(() => loadNotifyPrefs());
   const [sendOnEnter, setSendOnEnter] = useState<boolean>(
     () => localStorage.getItem("teza.sendOnEnter") !== "0",
   );
   const [webNotifyToast, setWebNotifyToast] = useState<NotifyToastPayload | null>(null);
+  const [webToastHovered, setWebToastHovered] = useState(false);
   const [drawerMuteOpen, setDrawerMuteOpen] = useState(false);
   const [hiddenBuiltInFolders, setHiddenBuiltInFolders] = useState<BuiltInRailFolderId[]>(() => {
     try {
@@ -485,6 +520,7 @@ export default function App() {
     streak: number;
     nonce: number;
   } | null>(null);
+  const [buzzToastHovered, setBuzzToastHovered] = useState(false);
   const [buzzCooldownUntil, setBuzzCooldownUntil] = useState<Record<string, number>>({});
   const [buzzNow, setBuzzNow] = useState(() => Date.now());
   const [appVersion, setAppVersion] = useState("0.6.1");
@@ -506,7 +542,9 @@ export default function App() {
     text: string;
     tone: "info" | "warn" | "error";
   } | null>(null);
-  const [videoOverlayMinimized, setVideoOverlayMinimized] = useState(false);
+  const [videoOverlayMode, setVideoOverlayMode] = useState<"expanded" | "floating" | "minimized">(
+    "expanded",
+  );
   const [localVideoStream, setLocalVideoStream] = useState<MediaStream | null>(null);
   const [localCameraStatus, setLocalCameraStatus] = useState<LocalCameraStatus>("idle");
   const [localCameraError, setLocalCameraError] = useState<string | null>(null);
@@ -525,6 +563,8 @@ export default function App() {
   });
 
   const selectedIdRef = useRef<string | null>(null);
+  const messagesRef = useRef<MessageDto[]>(messages);
+  const pollRefreshTimersRef = useRef<Map<number, number>>(new Map());
   const folderRef = useRef<string>(folder);
   const filterTextRef = useRef<string>(filterText);
   const threadsRef = useRef<ThreadDto[]>(threads);
@@ -606,6 +646,7 @@ export default function App() {
   });
 
   selectedIdRef.current = selectedId;
+  messagesRef.current = messages;
   folderRef.current = folder;
   filterTextRef.current = filterText;
   threadsRef.current = threads;
@@ -631,7 +672,9 @@ export default function App() {
   pendingAttachmentRef.current = pendingAttachment;
   webAppHubOpenRef.current = Boolean(webAppsCfg.enabled && webAppHubOpen);
   const showVideoOverlay = Boolean(
-    authed && !isLocked && shouldShowVideoOverlay(callState.active, videoOverlayMinimized),
+    authed &&
+      !isLocked &&
+      shouldShowVideoOverlay(callState.active, videoOverlayMode === "minimized"),
   );
   const hasBlockingOverlay = Boolean(
     isLocked ||
@@ -645,13 +688,14 @@ export default function App() {
       addMembersOpen ||
       createReminderOpen ||
       createPollOpen ||
+      scheduledModalOpen ||
       screenshotEditor ||
       profileUid ||
       lightboxState ||
       forwardMessages.length > 0 ||
       updateModalOpen ||
       translateModalOpen ||
-      showVideoOverlay ||
+      (showVideoOverlay && videoOverlayMode === "expanded") ||
       activeCallDevicesOpen ||
       callState.phase === "incoming_ringing",
   );
@@ -835,8 +879,10 @@ export default function App() {
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (isLockedRef.current) return;
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "l") {
+      if (isLockedRef.current || isImeComposingEvent(e)) return;
+      const keyLower = e.key.toLowerCase();
+      const isCodeOrKey = (code: string, key: string) => e.code === code || keyLower === key;
+      if ((e.ctrlKey || e.metaKey) && isCodeOrKey("KeyL", "l")) {
         if (passcodeEnabledRef.current) {
           e.preventDefault();
           setIsLocked(true);
@@ -847,7 +893,7 @@ export default function App() {
         (e.ctrlKey || e.metaKey) &&
         e.shiftKey &&
         !e.altKey &&
-        e.key.toLowerCase() === "s"
+        isCodeOrKey("KeyS", "s")
       ) {
         if (
           authedRef.current &&
@@ -862,10 +908,10 @@ export default function App() {
         }
         return;
       }
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+      if ((e.ctrlKey || e.metaKey) && isCodeOrKey("KeyK", "k")) {
         e.preventDefault();
         setQuickSearchOpen((v) => !v);
-      } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f") {
+      } else if ((e.ctrlKey || e.metaKey) && isCodeOrKey("KeyF", "f")) {
         if (
           selectedIdRef.current &&
           !activeThreadRootIdRef.current &&
@@ -997,6 +1043,14 @@ export default function App() {
     );
   }, [folder, filterText]);
 
+  const dismissToastError = useCallback(() => {
+    if (toastErrorTimerRef.current !== null) {
+      window.clearTimeout(toastErrorTimerRef.current);
+      toastErrorTimerRef.current = null;
+    }
+    setToastError(null);
+  }, []);
+
   const showError = useCallback((err: unknown) => {
     setToastError(String(err));
     if (toastErrorTimerRef.current !== null) {
@@ -1008,6 +1062,14 @@ export default function App() {
     }, 5000);
   }, []);
 
+  const dismissCallNotice = useCallback(() => {
+    if (callNoticeTimerRef.current !== null) {
+      window.clearTimeout(callNoticeTimerRef.current);
+      callNoticeTimerRef.current = null;
+    }
+    setCallNotice(null);
+  }, []);
+
   const showCallNotice = useCallback((text: string, tone: "info" | "warn" | "error" = "info") => {
     setCallNotice({ text, tone });
     if (callNoticeTimerRef.current !== null) {
@@ -1017,6 +1079,14 @@ export default function App() {
       callNoticeTimerRef.current = null;
       setCallNotice(null);
     }, 4500);
+  }, []);
+
+  const dismissSocialNotice = useCallback(() => {
+    if (socialNoticeTimerRef.current !== null) {
+      window.clearTimeout(socialNoticeTimerRef.current);
+      socialNoticeTimerRef.current = null;
+    }
+    setSocialNotice(null);
   }, []);
 
   const showSocialNotice = useCallback(
@@ -1032,6 +1102,24 @@ export default function App() {
     },
     [],
   );
+
+  const dismissBuzzToast = useCallback(() => {
+    if (buzzToastTimerRef.current !== null) {
+      window.clearTimeout(buzzToastTimerRef.current);
+      buzzToastTimerRef.current = null;
+    }
+    setBuzzToastHovered(false);
+    setBuzzToast(null);
+  }, []);
+
+  const dismissWebNotifyToast = useCallback(() => {
+    if (webToastTimerRef.current !== null) {
+      window.clearTimeout(webToastTimerRef.current);
+      webToastTimerRef.current = null;
+    }
+    setWebToastHovered(false);
+    setWebNotifyToast(null);
+  }, []);
 
   const refreshCallDevices = useCallback(() => {
     setCallDevicesLoading(true);
@@ -1337,7 +1425,7 @@ export default function App() {
       if (callActionBusy) return;
       setCallActionBusy(true);
       setCallNotice(null);
-      setVideoOverlayMinimized(false);
+      setVideoOverlayMode("expanded");
       try {
         const next = await bridge.callStartVideo(partnerId, partnerName);
         setCallState(next);
@@ -1354,7 +1442,7 @@ export default function App() {
     async (callId: number) => {
       if (callActionBusy) return;
       setCallActionBusy(true);
-      setVideoOverlayMinimized(false);
+      setVideoOverlayMode("expanded");
       try {
         const next = await bridge.callAnswer(callId);
         setCallState(next);
@@ -1477,6 +1565,10 @@ export default function App() {
       }
       recentlyLeftTimersRef.current.clear();
       recentlyLeftGroupIdsRef.current.clear();
+      for (const timerId of pollRefreshTimersRef.current.values()) {
+        window.clearTimeout(timerId);
+      }
+      pollRefreshTimersRef.current.clear();
       if (webToastTimerRef.current !== null) {
         window.clearTimeout(webToastTimerRef.current);
         webToastTimerRef.current = null;
@@ -1574,15 +1666,148 @@ export default function App() {
     remoteVideoRendererRef.current?.reset();
     lastVideoCallIdRef.current = null;
     lastPliRequestAtRef.current = 0;
-    setVideoOverlayMinimized(false);
+    setVideoOverlayMode("expanded");
+    for (const timerId of pollRefreshTimersRef.current.values()) {
+      window.clearTimeout(timerId);
+    }
+    pollRefreshTimersRef.current.clear();
     setLocalCameraStatus("idle");
     setLocalCameraError(null);
     setHasRemoteVideoFrame(false);
     setRemoteVideoDims(null);
     setIsLocked(false);
     setLastOpenedWebAppId(null);
+    setAiChatOpen(false);
+    setAiMessages([]);
+    setAiStreamingText("");
+    setAiIsStreaming(false);
+    setAiError(null);
+    setAiSummaryByThread({});
+    setSchedules([]);
+    setScheduledModalOpen(false);
+    setScheduledInitialThreadId(null);
     leaveWebApps();
   }, [stopLocalCameraEncoder, updatePendingAttachment, leaveWebApps]);
+
+  const pendingSchedulesCount = useMemo(
+    () => schedules.filter((s) => s.status === "pending" || s.status === "sending").length,
+    [schedules],
+  );
+
+  const refreshSchedules = useCallback(async () => {
+    setSchedulesLoading(true);
+    try {
+      const list = await bridge.scheduleList("all", 200);
+      setSchedules(list);
+    } catch {
+      // Ignore transient refresh failures
+    } finally {
+      setSchedulesLoading(false);
+    }
+  }, []);
+
+  const handleOpenAiChat = useCallback(() => {
+    leaveWebApps();
+    setActiveThreadRootId(null);
+    setDrawerOpen(false);
+    setAiChatOpen(true);
+    setMobilePane("chat");
+  }, [leaveWebApps]);
+
+  const handleAiSend = useCallback(async (rawPrompt: string) => {
+    const trimmed = rawPrompt.trim();
+    if (!trimmed || aiIsStreamingRef.current) return;
+    const tempUserId = `tmp-ai-user-${Date.now()}`;
+    const optimisticUser: AiStoredMessageDto = {
+      id: tempUserId,
+      session_id: "default",
+      role: "user",
+      content: trimmed,
+      model: aiConfig?.gemini_model || "",
+      backend: aiConfig?.backend || "gemini_api",
+      ts: Date.now(),
+    };
+    setAiError(null);
+    setAiStreamingText("");
+    setAiIsStreaming(true);
+    setAiMessages((prev) => [...prev, optimisticUser]);
+    try {
+      const reply = await bridge.aiChatSend(trimmed, "default");
+      try {
+        const synced = await bridge.aiListMessages("default", 100);
+        setAiMessages(synced);
+      } catch {
+        setAiMessages((prev) => [...prev, reply]);
+      }
+      setAiStreamingText("");
+    } catch (err) {
+      setAiError(err instanceof Error ? err.message : String(err));
+      setAiStreamingText("");
+      void bridge
+        .aiListMessages("default", 100)
+        .then(setAiMessages)
+        .catch(() => {
+          setAiMessages((prev) => prev.filter((m) => m.id !== tempUserId));
+        });
+    } finally {
+      setAiIsStreaming(false);
+    }
+  }, [aiConfig?.backend, aiConfig?.gemini_model]);
+
+  const handleAiClearHistory = useCallback(async () => {
+    try {
+      await bridge.aiClearMessages("default");
+      setAiMessages([]);
+      setAiStreamingText("");
+      setAiError(null);
+    } catch (err) {
+      setAiError(err instanceof Error ? err.message : String(err));
+    }
+  }, []);
+
+  const handleSummarizeUnread = useCallback(async (threadId: string) => {
+    if (!threadId) return;
+    setAiSummaryByThread((prev) => ({
+      ...prev,
+      [threadId]: {
+        loading: true,
+        streamingText: "",
+        result: null,
+        error: null,
+      },
+    }));
+    try {
+      const summary = await bridge.aiSummarizeUnread(threadId);
+      setAiSummaryByThread((prev) => ({
+        ...prev,
+        [threadId]: {
+          loading: false,
+          streamingText: "",
+          result: summary,
+          error: null,
+        },
+      }));
+    } catch (err) {
+      setAiSummaryByThread((prev) => ({
+        ...prev,
+        [threadId]: {
+          loading: false,
+          streamingText: "",
+          result: null,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      }));
+    }
+  }, []);
+
+  const handleDismissSummary = useCallback((threadId: string) => {
+    setAiSummaryByThread((prev) => {
+      if (!prev[threadId]) return prev;
+      const next = { ...prev };
+      delete next[threadId];
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     if (!authed) return;
@@ -1591,11 +1816,101 @@ export default function App() {
       .then(setTranslateCfg)
       .catch(() => undefined);
     void bridge
+      .aiGetConfig()
+      .then(setAiConfig)
+      .catch(() => undefined);
+    void refreshSchedules();
+    void bridge
       .callGetState()
       .then(setCallState)
       .catch(() => undefined);
     refreshCallDevices();
-  }, [authed, refreshCallDevices]);
+  }, [authed, refreshCallDevices, refreshSchedules]);
+
+  useEffect(() => {
+    if (!authed || !aiChatOpen) return;
+    let cancelled = false;
+    void bridge
+      .aiGetConfig()
+      .then((cfg) => {
+        if (!cancelled) setAiConfig(cfg);
+      })
+      .catch(() => undefined);
+    void bridge
+      .aiListMessages("default", 100)
+      .then((list) => {
+        if (!cancelled) setAiMessages(list);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [authed, aiChatOpen]);
+
+  useEffect(() => {
+    if (!authed) return;
+    let disposed = false;
+    const unsubs: (() => void)[] = [];
+
+    const register = (promise: Promise<() => void>) => {
+      void promise
+        .then((fn) => {
+          if (disposed) {
+            fn();
+          } else {
+            unsubs.push(fn);
+          }
+        })
+        .catch(() => undefined);
+    };
+
+    register(
+      bridge.onAiStreamDelta((ev) => {
+        if (disposed) return;
+        const sid = ev.session_id || "default";
+        if (sid !== "default" || !aiIsStreamingRef.current) return;
+        if (ev.delta) {
+          setAiStreamingText((prev) => prev + ev.delta);
+        }
+      }),
+    );
+
+    register(
+      bridge.onAiSummaryDelta((ev) => {
+        if (disposed || !ev.thread_id || !ev.delta) return;
+        setAiSummaryByThread((prev) => {
+          const cur = prev[ev.thread_id];
+          if (!cur || !cur.loading) return prev;
+          return {
+            ...prev,
+            [ev.thread_id]: {
+              ...cur,
+              streamingText: cur.streamingText + ev.delta,
+            },
+          };
+        });
+      }),
+    );
+
+    register(
+      bridge.onScheduleUpdated(() => {
+        if (!disposed) {
+          void refreshSchedules();
+        }
+      }),
+    );
+
+    return () => {
+      disposed = true;
+      for (const fn of unsubs) {
+        try {
+          fn();
+        } catch {
+          // Ignore cleanup errors
+        }
+      }
+    };
+  }, [authed, refreshSchedules]);
 
   useEffect(() => {
     if (!authed || isLocked || callState.phase !== "incoming_ringing") return;
@@ -1614,7 +1929,7 @@ export default function App() {
     remoteVideoRendererRef.current?.reset();
     setHasRemoteVideoFrame(false);
     setRemoteVideoDims(null);
-    setVideoOverlayMinimized(false);
+    setVideoOverlayMode("expanded");
     if (activeVideoCallId === null) {
       stopLocalCameraEncoder(true);
       setLocalCameraStatus("idle");
@@ -2211,6 +2526,7 @@ export default function App() {
       } else {
         pendingSidebarScrollIdRef.current = null;
       }
+      setAiChatOpen(false);
       setSelectedId(tid);
     },
     [],
@@ -2235,12 +2551,14 @@ export default function App() {
       }
       return;
     }
+    setWebToastHovered(false);
     setWebNotifyToast(payload);
     if (webToastTimerRef.current !== null) {
       window.clearTimeout(webToastTimerRef.current);
     }
     webToastTimerRef.current = window.setTimeout(() => {
       webToastTimerRef.current = null;
+      setWebToastHovered(false);
       setWebNotifyToast(null);
     }, Math.max(2500, Math.min(15000, payload.duration_ms)));
   }, []);
@@ -2419,6 +2737,7 @@ export default function App() {
                   });
                 }
                 if (!locked) {
+                  setBuzzToastHovered(false);
                   setBuzzToast({
                     threadId: msg.thread_id,
                     threadTitle: matchedThread?.title || msg.sender_name || msg.thread_id,
@@ -2431,6 +2750,7 @@ export default function App() {
                   }
                   buzzToastTimerRef.current = window.setTimeout(() => {
                     buzzToastTimerRef.current = null;
+                    setBuzzToastHovered(false);
                     setBuzzToast(null);
                   }, 5000);
                 }
@@ -2493,12 +2813,51 @@ export default function App() {
         }),
         listen<MessageDto>("core://message-updated", (ev) => {
           const msg = ev.payload;
+          const updatedPoll = parsePollPayload(msg);
+          if (updatedPoll && updatedPoll.poll_id > 0 && updatedPoll.options.length > 0) {
+            const pendingTimer = pollRefreshTimersRef.current.get(updatedPoll.poll_id);
+            if (pendingTimer !== undefined) {
+              window.clearTimeout(pendingTimer);
+              pollRefreshTimersRef.current.delete(updatedPoll.poll_id);
+            }
+          }
           if (msg.thread_id === selectedIdRef.current) {
             setMessages((prev) => reconcileUpdatedMessage(prev, msg));
             if (msg.is_pinned || pinnedMsgIdsRef.current.has(msg.msg_id)) {
               void refreshPinnedMessages(msg.thread_id);
             }
           }
+        }),
+        listen<{ thread_id?: string; poll_id?: number | null }>("core://poll-updated", (ev) => {
+          const pid = ev.payload?.poll_id;
+          const tid = ev.payload?.thread_id;
+          if (!pid || pid <= 0) return;
+          const curSelectedId = selectedIdRef.current;
+          if (!curSelectedId) return;
+          if (tid && tid !== curSelectedId) return;
+          const matched = messagesRef.current.find((m) => parsePollPayload(m)?.poll_id === pid);
+          const targetThreadId = matched?.thread_id || tid || curSelectedId;
+          if (targetThreadId !== curSelectedId) return;
+          if (!matched && !tid) return;
+          const existingTimer = pollRefreshTimersRef.current.get(pid);
+          if (existingTimer !== undefined) {
+            window.clearTimeout(existingTimer);
+          }
+          const timerId = window.setTimeout(() => {
+            pollRefreshTimersRef.current.delete(pid);
+            if (selectedIdRef.current !== targetThreadId) return;
+            const curMsg = messagesRef.current.find((m) => parsePollPayload(m)?.poll_id === pid);
+            void bridge
+              .getPollDetail(pid, targetThreadId, curMsg?.msg_id)
+              .then((updated) => {
+                if (selectedIdRef.current !== targetThreadId) return;
+                setMessages((prev) =>
+                  applyPollUpdateToMessages(prev, pid, updated, curMsg?.msg_id),
+                );
+              })
+              .catch(() => undefined);
+          }, 250);
+          pollRefreshTimersRef.current.set(pid, timerId);
         }),
         listen<{ thread_id: string; msg_id: string }>("core://message-deleted", (ev) => {
           if (ev.payload.thread_id === selectedIdRef.current) {
@@ -2958,7 +3317,7 @@ export default function App() {
         if (found && selectedIdRef.current === tid) {
           const around = await bridge.loadMessagesAround(tid, found.ts);
           if (selectedIdRef.current === tid) {
-            setMessages(around.messages);
+            setMessages(dedupeOptimisticPollMessages(around.messages));
             setHasMoreHistory(around.has_more);
             if (jumpRetryTimerRef.current !== null) {
               window.clearTimeout(jumpRetryTimerRef.current);
@@ -3102,10 +3461,10 @@ export default function App() {
           if (!page.messages.some((m) => m.msg_id === pending.msgId)) {
             const around = await bridge.loadMessagesAround(selectedId, pending.ts);
             if (cancelled) return;
-            setMessages(around.messages);
+            setMessages(dedupeOptimisticPollMessages(around.messages));
             setHasMoreHistory(around.has_more);
           } else {
-            setMessages(page.messages);
+            setMessages(dedupeOptimisticPollMessages(page.messages));
             setHasMoreHistory(page.has_more);
           }
           timers.push(
@@ -3116,9 +3475,10 @@ export default function App() {
             }, 60),
           );
         } else {
-          setMessages(page.messages);
+          const cleanMessages = dedupeOptimisticPollMessages(page.messages);
+          setMessages(cleanMessages);
           setHasMoreHistory(page.has_more);
-          const targetUnreadId = findFirstUnreadMsgId(page.messages, initWatermark, initUnread);
+          const targetUnreadId = findFirstUnreadMsgId(cleanMessages, initWatermark, initUnread);
           if (targetUnreadId) {
             stickToBottomRef.current = false;
             raf1 = window.requestAnimationFrame(() => {
@@ -3269,7 +3629,7 @@ export default function App() {
         setMessages((prev) => {
           const seen = new Set(prev.map((m) => m.msg_id));
           const fresh = page.messages.filter((m) => !seen.has(m.msg_id));
-          return fresh.length > 0 ? [...fresh, ...prev] : prev;
+          return fresh.length > 0 ? dedupeOptimisticPollMessages([...fresh, ...prev]) : prev;
         });
         requestAnimationFrame(() => {
           if (container) {
@@ -3300,7 +3660,7 @@ export default function App() {
         } else {
           try {
             const around = await bridge.loadMessagesAround(hit.thread_id, hit.ts);
-            setMessages(around.messages);
+            setMessages(dedupeOptimisticPollMessages(around.messages));
             setHasMoreHistory(around.has_more);
             setTimeout(() => jumpToMsg(hit.msg_id), 60);
           } catch (err) {
@@ -3317,8 +3677,12 @@ export default function App() {
 
   const visibleThreads = useMemo(() => {
     const byFolder = filterThreadsByFolder(threads, folder, customFolders);
-    const q = filterText.trim().toLowerCase();
-    const base = q ? byFolder.filter((t) => t.title.toLowerCase().includes(q)) : [...byFolder];
+    const q = filterText.trim();
+    const base = q
+      ? byFolder.filter((t) =>
+          matchesSearchQuery(`${t.title}\n${t.last_preview}\n${t.id}`, q),
+        )
+      : [...byFolder];
     return base.sort(compareThreads);
   }, [threads, folder, customFolders, filterText]);
   visibleThreadsRef.current = visibleThreads;
@@ -3385,24 +3749,27 @@ export default function App() {
   }, [authed, selectedId, hasActiveThread, snapScrollToBottom]);
 
   const inChatMatches = useMemo(() => {
-    const q = inChatSearchQuery.trim().toLowerCase();
+    const q = inChatSearchQuery.trim();
     if (!inChatSearchOpen || !q) return [];
-    const norm = (s: string) =>
-      s
-        .normalize("NFD")
-        .replace(/[\u0300-\u036f]/g, "")
-        .replace(/đ/g, "d")
-        .replace(/Đ/g, "d")
-        .toLowerCase();
-    const nq = norm(q);
     return messages
-      .filter(
-        (m) =>
-          !m.is_recalled &&
-          (norm(m.text).includes(nq) ||
-            norm(m.sender_name).includes(nq) ||
-            (m.attachment_name ? norm(m.attachment_name).includes(nq) : false)),
-      )
+      .filter((m) => {
+        if (m.is_recalled) return false;
+        let extra = "";
+        if (m.attachment_name) {
+          if (m.attachment_name.startsWith("teza-poll:")) {
+            const poll = parsePollPayload(m);
+            extra = poll
+              ? `${poll.question} ${poll.options.map((o) => o.content).join(" ")}`
+              : "";
+          } else if (
+            !m.attachment_name.startsWith("teza-reminder:") &&
+            !m.attachment_name.startsWith("teza-call:")
+          ) {
+            extra = m.attachment_name;
+          }
+        }
+        return matchesSearchQuery(`${m.text}\n${m.sender_name}\n${extra}`, q);
+      })
       .map((m) => m.msg_id);
   }, [inChatSearchOpen, inChatSearchQuery, messages]);
 
@@ -3507,6 +3874,7 @@ export default function App() {
       addMembersOpen ||
       createReminderOpen ||
       createPollOpen ||
+      scheduledModalOpen ||
       screenshotEditor ||
       showVideoOverlay ||
       activeCallDevicesOpen ||
@@ -4008,7 +4376,7 @@ export default function App() {
   );
 
   const openLightboxForUrl = useCallback(
-    (url: string, title: string) => {
+    (url: string, title: string, opts?: { threadId?: string; msgId?: string }) => {
       const targetUrl = normalizeMediaRequestUrl(url) || url;
       const gallery: LightboxItem[] = messages
         .filter((m) => {
@@ -4023,6 +4391,7 @@ export default function App() {
             !m.msg_type.includes("video") &&
             m.msg_type !== "4" &&
             (m.msg_type.includes("photo") ||
+              m.msg_type.includes("gif") ||
               m.msg_type === "2" ||
               isDataImageUrl(norm) ||
               /\.(png|jpe?g|webp|gif|bmp)(\?|$)/i.test(norm))
@@ -4038,7 +4407,17 @@ export default function App() {
       if (foundIdx >= 0) {
         setLightboxState({ items: gallery, index: foundIdx });
       } else {
-        setLightboxState({ items: [{ url: targetUrl, title }], index: 0 });
+        setLightboxState({
+          items: [
+            {
+              url: targetUrl,
+              title,
+              threadId: opts?.threadId,
+              msgId: opts?.msgId,
+            },
+          ],
+          index: 0,
+        });
       }
     },
     [messages],
@@ -4139,16 +4518,23 @@ export default function App() {
     [showError, refreshPinnedMessages],
   );
 
-  const handleStartChatFromProfile = useCallback(
-    (profile: UserProfileDto) => {
-      leaveWebApps();
-      setFindUserInitialPhone("");
-      const created: ThreadDto | null = threadsRef.current.some((t) => t.id === profile.uid)
-        ? null
+  const openDirectChatThread = useCallback(
+    (rawUid: string, rawTitle: string, rawAvatar: string) => {
+      const uid = rawUid.trim();
+      if (!uid) return;
+      const title = rawTitle.trim() || uid;
+      const avatar = rawAvatar.trim();
+      const existing = threadsRef.current.find((t) => t.id === uid);
+      const fallbackEntry: ThreadDto = existing
+        ? {
+            ...existing,
+            title: existing.title && existing.title !== existing.id ? existing.title : title,
+            avatar: existing.avatar || avatar,
+          }
         : {
-            id: profile.uid,
-            title: profile.display_name || profile.uid,
-            avatar: profile.avatar,
+            id: uid,
+            title,
+            avatar,
             kind: "direct",
             last_preview: "",
             last_ts: 0,
@@ -4156,69 +4542,67 @@ export default function App() {
             is_pinned: false,
             is_muted: false,
           };
-      const nextList = created
-        ? [created, ...threadsRef.current].sort(compareThreads)
-        : threadsRef.current;
+      const nextList = existing
+        ? threadsRef.current.map((t) => (t.id === uid ? fallbackEntry : t))
+        : [fallbackEntry, ...threadsRef.current].sort(compareThreads);
+      threadsRef.current = nextList;
       setThreads((prev) => {
-        if (prev.some((t) => t.id === profile.uid)) return prev;
-        const entry: ThreadDto = created ?? {
-          id: profile.uid,
-          title: profile.display_name || profile.uid,
-          avatar: profile.avatar,
-          kind: "direct",
-          last_preview: "",
-          last_ts: 0,
-          unread_count: 0,
-          is_pinned: false,
-          is_muted: false,
-        };
-        return [entry, ...prev].sort(compareThreads);
+        const idx = prev.findIndex((t) => t.id === uid);
+        if (idx >= 0) {
+          const cur = prev[idx];
+          const nextTitle = cur.title && cur.title !== cur.id ? cur.title : title;
+          const nextAvatar = cur.avatar || avatar;
+          if (nextTitle === cur.title && nextAvatar === cur.avatar) return prev;
+          return prev.map((t, i) =>
+            i === idx ? { ...t, title: nextTitle, avatar: nextAvatar } : t,
+          );
+        }
+        return [fallbackEntry, ...prev].sort(compareThreads);
       });
-      selectAndRevealThread(profile.uid, { forceScroll: true, listOverride: nextList });
+      selectAndRevealThread(uid, { forceScroll: true, listOverride: nextList });
       setMobilePane("chat");
+      void bridge
+        .ensureDirectThread(uid, title, avatar)
+        .then((ensured) => {
+          setThreads((prev) => {
+            const idx = prev.findIndex((t) => t.id === ensured.id);
+            if (idx >= 0) {
+              const cur = prev[idx];
+              const merged: ThreadDto =
+                cur.last_ts > ensured.last_ts
+                  ? {
+                      ...ensured,
+                      last_ts: cur.last_ts,
+                      last_preview: cur.last_preview || ensured.last_preview,
+                      unread_count: cur.unread_count,
+                    }
+                  : ensured;
+              return prev.map((t, i) => (i === idx ? merged : t)).sort(compareThreads);
+            }
+            return [ensured, ...prev].sort(compareThreads);
+          });
+        })
+        .catch(showError);
     },
-    [leaveWebApps, selectAndRevealThread],
+    [selectAndRevealThread, showError],
+  );
+
+  const handleStartChatFromProfile = useCallback(
+    (profile: UserProfileDto) => {
+      leaveWebApps();
+      setFindUserInitialPhone("");
+      openDirectChatThread(profile.uid, profile.display_name || profile.uid, profile.avatar || "");
+    },
+    [leaveWebApps, openDirectChatThread],
   );
 
   const handleStartChatFromFriendRequest = useCallback(
     (uid: string, name: string, avatar: string) => {
       setFriendRequestsOpen(false);
       leaveWebApps();
-      const created: ThreadDto | null = threadsRef.current.some((t) => t.id === uid)
-        ? null
-        : {
-            id: uid,
-            title: name || uid,
-            avatar: avatar || "",
-            kind: "direct",
-            last_preview: "",
-            last_ts: 0,
-            unread_count: 0,
-            is_pinned: false,
-            is_muted: false,
-          };
-      const nextList = created
-        ? [created, ...threadsRef.current].sort(compareThreads)
-        : threadsRef.current;
-      setThreads((prev) => {
-        if (prev.some((t) => t.id === uid)) return prev;
-        const entry: ThreadDto = created ?? {
-          id: uid,
-          title: name || uid,
-          avatar: avatar || "",
-          kind: "direct",
-          last_preview: "",
-          last_ts: 0,
-          unread_count: 0,
-          is_pinned: false,
-          is_muted: false,
-        };
-        return [entry, ...prev].sort(compareThreads);
-      });
-      selectAndRevealThread(uid, { forceScroll: true, listOverride: nextList });
-      setMobilePane("chat");
+      openDirectChatThread(uid, name || uid, avatar || "");
     },
-    [leaveWebApps, selectAndRevealThread],
+    [leaveWebApps, openDirectChatThread],
   );
 
   const handleSendSticker = useCallback(
@@ -4282,15 +4666,49 @@ export default function App() {
           msg.thread_id,
           msg.msg_id,
         );
-        const nextMsg: MessageDto = {
-          ...msg,
-          msg_type: "chat.poll",
-          attachment_url: null,
-          attachment_name: `teza-poll:${JSON.stringify(updated)}`,
-        };
-        setMessages((prev) => upsertMsg(prev, nextMsg));
+        setMessages((prev) => applyPollUpdateToMessages(prev, poll.poll_id, updated, msg.msg_id));
       } catch (err) {
         showError(err);
+      }
+    },
+    [showError],
+  );
+
+  const handleAddPollOption = useCallback(
+    async (msg: MessageDto, optionText: string, votedOptionIds: number[]): Promise<boolean> => {
+      const poll = parsePollPayload(msg);
+      const trimmed = optionText.trim();
+      if (!poll || poll.poll_id <= 0 || !trimmed) return false;
+      try {
+        const updated = await bridge.addPollOptions(
+          msg.thread_id,
+          poll.poll_id,
+          [trimmed],
+          votedOptionIds,
+        );
+        setMessages((prev) => applyPollUpdateToMessages(prev, poll.poll_id, updated, msg.msg_id));
+        return true;
+      } catch (err) {
+        showError(err);
+        return false;
+      }
+    },
+    [showError],
+  );
+
+  const handleLockPoll = useCallback(
+    async (msg: MessageDto): Promise<boolean> => {
+      const poll = parsePollPayload(msg);
+      if (!poll || poll.poll_id <= 0) return false;
+      try {
+        const updated = await bridge.lockPoll(msg.thread_id, poll.poll_id);
+        setMessages((prev) =>
+          applyPollUpdateToMessages(prev, poll.poll_id, { ...updated, closed: true }, msg.msg_id),
+        );
+        return true;
+      } catch (err) {
+        showError(err);
+        return false;
       }
     },
     [showError],
@@ -4302,13 +4720,7 @@ export default function App() {
       if (!poll || poll.poll_id <= 0) return;
       try {
         const updated = await bridge.getPollDetail(poll.poll_id, msg.thread_id, msg.msg_id);
-        const nextMsg: MessageDto = {
-          ...msg,
-          msg_type: "chat.poll",
-          attachment_url: null,
-          attachment_name: `teza-poll:${JSON.stringify(updated)}`,
-        };
-        setMessages((prev) => upsertMsg(prev, nextMsg));
+        setMessages((prev) => applyPollUpdateToMessages(prev, poll.poll_id, updated, msg.msg_id));
       } catch (err) {
         showError(err);
       }
@@ -4801,6 +5213,10 @@ export default function App() {
             }}
             translateCfg={translateCfg}
             onOpenTranslateModal={() => setTranslateModalOpen(true)}
+            threads={threads}
+            aiConfig={aiConfig}
+            onAiConfigChange={setAiConfig}
+            onOpenAiChat={handleOpenAiChat}
             relayCfg={relayCfg}
             onRelaySaved={(cfg) => {
               applyRelaySummary(cfg);
@@ -4879,6 +5295,42 @@ export default function App() {
           />
         </Suspense>
       )}
+      {authed && scheduledModalOpen && (
+        <Suspense fallback={null}>
+          <ScheduledMessagesModal
+            open={scheduledModalOpen}
+            threads={threads}
+            schedules={schedules}
+            loading={schedulesLoading}
+            initialThreadId={scheduledInitialThreadId}
+            onClose={() => setScheduledModalOpen(false)}
+            onRefresh={refreshSchedules}
+            onCreate={async (input) => {
+              const created = await bridge.scheduleCreate(input);
+              await refreshSchedules();
+              return created;
+            }}
+            onUpdate={async (id, input) => {
+              const updated = await bridge.scheduleUpdate(id, input);
+              await refreshSchedules();
+              return updated ?? undefined;
+            }}
+            onCancel={async (id) => {
+              await bridge.scheduleCancel(id);
+              await refreshSchedules();
+            }}
+            onDelete={async (id) => {
+              await bridge.scheduleDelete(id);
+              await refreshSchedules();
+            }}
+            onSendNow={async (id) => {
+              const updated = await bridge.scheduleSendNow(id);
+              await refreshSchedules();
+              return updated ?? undefined;
+            }}
+          />
+        </Suspense>
+      )}
     </>
   );
 
@@ -4933,12 +5385,19 @@ export default function App() {
         availableUpdate={availableUpdate}
         archivedCount={archivedThreads.length}
         hasPasscode={passcodeCfg.enabled}
+        aiEnabled={Boolean(aiConfig?.enabled)}
+        pendingSchedulesCount={pendingSchedulesCount}
         onOpenMyProfile={() => {
           if (myProfile?.uid) setProfileUid(myProfile.uid);
         }}
         onOpenSavedMessages={() => {
           const cloudId = threads.find((t) => t.kind === "cloud")?.id || "cloud-me";
           openThreadById(cloudId);
+        }}
+        onOpenAiChat={handleOpenAiChat}
+        onOpenScheduledMessages={() => {
+          setScheduledInitialThreadId(selectedId);
+          setScheduledModalOpen(true);
         }}
         onOpenArchived={() => {
           leaveWebApps();
@@ -5369,6 +5828,7 @@ export default function App() {
                   value={filterText}
                   onChange={(e) => setFilterText(e.target.value)}
                   onKeyDown={(e) => {
+                    if (isImeComposingEvent(e)) return;
                     if (e.key === "Escape" && filterText.length > 0) {
                       e.preventDefault();
                       e.stopPropagation();
@@ -5879,28 +6339,57 @@ export default function App() {
         }`}
       >
         {buzzToast && (
-          <div className="absolute left-1/2 top-16 z-40 -translate-x-1/2">
-            <button
+          <div
+            className="absolute left-1/2 top-16 z-40 -translate-x-1/2"
+            onMouseEnter={() => setBuzzToastHovered(true)}
+            onMouseLeave={() => setBuzzToastHovered(false)}
+          >
+            <div
               key={buzzToast.nonce}
-              type="button"
-              onClick={() => {
-                selectAndRevealThread(buzzToast.threadId, { forceScroll: true });
-                setMobilePane("chat");
-                setActiveThreadRootId(null);
-                setBuzzToast(null);
-              }}
-              className="buzz-shaking flex items-center gap-2 rounded-full bg-amber-500 px-4 py-2 text-[13px] font-bold text-slate-950 shadow-2xl transition hover:scale-105"
+              className={`${
+                buzzToastHovered ? "" : "buzz-shaking"
+              } flex items-center gap-1 rounded-full bg-amber-500 pl-4 pr-2 py-1.5 text-[13px] font-bold text-slate-950 shadow-2xl transition`}
             >
-              <Zap className="h-4 w-4 fill-slate-950" />
-              <span>
-                {t("buzzSentByUser", { name: buzzToast.senderName })}
-                {buzzToast.streak >= 2 ? ` (×${buzzToast.streak})` : ""} ({buzzToast.threadTitle})
-              </span>
-            </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const targetThreadId = buzzToast.threadId;
+                  dismissBuzzToast();
+                  selectAndRevealThread(targetThreadId, { forceScroll: true });
+                  setMobilePane("chat");
+                  setActiveThreadRootId(null);
+                }}
+                className="flex items-center gap-2 py-0.5 text-left transition hover:opacity-85"
+              >
+                <Zap className="h-4 w-4 shrink-0 fill-slate-950" />
+                <span>
+                  {t("buzzSentByUser", { name: buzzToast.senderName })}
+                  {buzzToast.streak >= 2 ? ` (×${buzzToast.streak})` : ""} ({buzzToast.threadTitle})
+                </span>
+              </button>
+              <button
+                type="button"
+                onMouseDown={(e) => {
+                  if (e.button !== 0) return;
+                  e.preventDefault();
+                  e.stopPropagation();
+                  dismissBuzzToast();
+                }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  dismissBuzzToast();
+                }}
+                title={t("notifyCloseTitle")}
+                aria-label={t("notifyCloseTitle")}
+                className="ml-1 inline-flex shrink-0 items-center justify-center rounded-full p-1 text-slate-950/80 transition hover:bg-slate-950/15 hover:text-slate-950"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
           </div>
         )}
 
-        {dragHover && activeThread && (
+        {dragHover && activeThread && !aiChatOpen && (
           <div className="pointer-events-none absolute inset-0 z-40 flex flex-col items-center justify-center gap-2 border-2 border-dashed border-sky-400 bg-sky-950/75 text-white backdrop-blur-xs">
             <UploadCloud className="h-10 w-10 text-sky-300" />
             <div className="text-sm font-semibold">Thả tệp hoặc hình ảnh vào đây để gửi</div>
@@ -5915,7 +6404,37 @@ export default function App() {
           </div>
         )}
 
-        {activeThread ? (
+        {aiChatOpen ? (
+          <Suspense
+            fallback={
+              <div
+                className="flex flex-1 items-center justify-center gap-2 text-sm"
+                style={{ color: "var(--text-secondary)" }}
+              >
+                <Loader2 className="h-4 w-4 animate-spin" style={{ color: "var(--accent)" }} />
+                <span>{t("loadingPanelLabel")}</span>
+              </div>
+            }
+          >
+            <AiChatPanel
+              config={aiConfig}
+              messages={aiMessages}
+              streamingText={aiStreamingText}
+              isStreaming={aiIsStreaming}
+              error={aiError}
+              onSend={(prompt) => void handleAiSend(prompt)}
+              onClearHistory={() => void handleAiClearHistory()}
+              onOpenSettings={() => {
+                setSettingsInitialTab("ai");
+                setSettingsOpen(true);
+              }}
+              onClose={() => {
+                setAiChatOpen(false);
+                if (layout.mode === "single") setMobilePane("list");
+              }}
+            />
+          </Suspense>
+        ) : activeThread ? (
           activeThreadRootMsg ? (
             <ReplyThreadPanel
               threadTitle={activeThread.title}
@@ -6072,6 +6591,34 @@ export default function App() {
                       </button>
                     </>
                   )}
+                {aiConfig?.enabled && (
+                  <button
+                    type="button"
+                    disabled={Boolean(aiSummaryByThread[activeThread.id]?.loading)}
+                    onClick={() => void handleSummarizeUnread(activeThread.id)}
+                    title={t("aiSummarizeUnreadBtn")}
+                    className="flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-xs font-medium transition hover:opacity-85 disabled:opacity-60"
+                    style={{
+                      color:
+                        unreadDividerCount > 0 || Boolean(aiSummaryByThread[activeThread.id])
+                          ? "var(--accent)"
+                          : "var(--text-secondary)",
+                      background:
+                        unreadDividerCount > 0 || Boolean(aiSummaryByThread[activeThread.id])
+                          ? "var(--accent-soft)"
+                          : "transparent",
+                    }}
+                  >
+                    {aiSummaryByThread[activeThread.id]?.loading ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Sparkles className="h-4 w-4" />
+                    )}
+                    {unreadDividerCount > 0 && (
+                      <span className="hidden sm:inline">{t("aiSummarizeUnreadBtn")}</span>
+                    )}
+                  </button>
+                )}
                 <button
                   onClick={handleToggleThreadTranslate}
                   title={
@@ -6272,6 +6819,7 @@ export default function App() {
                     setInChatMatchIdx(0);
                   }}
                   onKeyDown={(e) => {
+                    if (isImeComposingEvent(e)) return;
                     if (e.key === "Escape") {
                       e.preventDefault();
                       setInChatSearchOpen(false);
@@ -6407,6 +6955,173 @@ export default function App() {
               </div>
             )}
 
+            {aiSummaryByThread[activeThread.id] && (() => {
+              const summaryEntry = aiSummaryByThread[activeThread.id];
+              return (
+                <div
+                  className="shrink-0 px-4 py-3 text-[13px]"
+                  style={{
+                    background: "var(--bg-surface)",
+                    borderBottom: "1px solid var(--border-subtle)",
+                  }}
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <span
+                        className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg"
+                        style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
+                      >
+                        {summaryEntry.loading ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Sparkles className="h-3.5 w-3.5" />
+                        )}
+                      </span>
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-1.5 font-semibold">
+                          <span>{t("aiSummaryCardTitle")}</span>
+                          {summaryEntry.result && (
+                            <span
+                              className="rounded-full px-2 py-0.5 text-[11px] font-medium"
+                              style={{
+                                background: "var(--bg-sidebar)",
+                                color: "var(--text-secondary)",
+                              }}
+                            >
+                              {t("aiSummaryMessageCount", {
+                                count: summaryEntry.result.message_count,
+                              })}
+                            </span>
+                          )}
+                          {summaryEntry.result?.model && (
+                            <span
+                              className="rounded-full px-2 py-0.5 font-mono text-[10.5px]"
+                              style={{
+                                background: "var(--accent-soft)",
+                                color: "var(--accent)",
+                              }}
+                            >
+                              {summaryEntry.result.model}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-1">
+                      {!summaryEntry.loading && (
+                        <button
+                          type="button"
+                          onClick={() => void handleSummarizeUnread(activeThread.id)}
+                          className="hover-menu rounded-lg px-2 py-1 text-xs font-medium transition"
+                          style={{ color: "var(--accent)" }}
+                        >
+                          {t("aiSummaryRetryBtn")}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => handleDismissSummary(activeThread.id)}
+                        title={t("close")}
+                        className="hover-menu rounded-lg p-1 transition"
+                        style={{ color: "var(--text-secondary)" }}
+                      >
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+                  </div>
+
+                  {summaryEntry.loading && (
+                    <div className="mt-2 space-y-1.5">
+                      <div
+                        className="flex items-center gap-1.5 text-xs"
+                        style={{ color: "var(--text-secondary)" }}
+                      >
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" style={{ color: "var(--accent)" }} />
+                        <span>{t("aiSummarizingLabel")}</span>
+                      </div>
+                      {summaryEntry.streamingText && (
+                        <div
+                          className="max-h-36 overflow-y-auto whitespace-pre-wrap rounded-lg px-3 py-2 text-xs leading-relaxed"
+                          style={{
+                            background: "var(--bg-sidebar)",
+                            border: "1px solid var(--border-subtle)",
+                            color: "var(--text-primary)",
+                          }}
+                        >
+                          {summaryEntry.streamingText}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {summaryEntry.error && (
+                    <div
+                      className="mt-2 flex flex-wrap items-center justify-between gap-2 rounded-lg px-3 py-2 text-xs"
+                      style={{ background: "var(--danger-bg)", color: "var(--danger-text)" }}
+                    >
+                      <span className="wrap-anywhere flex-1">{summaryEntry.error}</span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSettingsInitialTab("ai");
+                          setSettingsOpen(true);
+                        }}
+                        className="rounded-lg px-2.5 py-1 text-xs font-semibold underline"
+                      >
+                        {t("aiSummarySettingsBtn")}
+                      </button>
+                    </div>
+                  )}
+
+                  {summaryEntry.result && (
+                    <div className="mt-2 max-h-56 space-y-2 overflow-y-auto pr-1 text-[13px] leading-relaxed">
+                      {summaryEntry.result.summary && (
+                        <p className="whitespace-pre-wrap" style={{ color: "var(--text-primary)" }}>
+                          {summaryEntry.result.summary}
+                        </p>
+                      )}
+                      {summaryEntry.result.bullet_points.length > 0 && (
+                        <div className="space-y-1">
+                          <div
+                            className="text-[11px] font-semibold uppercase tracking-wider"
+                            style={{ color: "var(--text-secondary)" }}
+                          >
+                            {t("aiSummaryBulletsHeading")}
+                          </div>
+                          <ul className="list-disc space-y-0.5 pl-5 text-[12.5px]">
+                            {summaryEntry.result.bullet_points.map((pt, i) => (
+                              <li key={i}>{pt}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                      {summaryEntry.result.action_items.length > 0 && (
+                        <div className="space-y-1">
+                          <div
+                            className="text-[11px] font-semibold uppercase tracking-wider"
+                            style={{ color: "var(--accent)" }}
+                          >
+                            {t("aiSummaryActionsHeading")}
+                          </div>
+                          <ul className="space-y-1 text-[12.5px]">
+                            {summaryEntry.result.action_items.map((act, i) => (
+                              <li key={i} className="flex items-start gap-1.5">
+                                <Check
+                                  className="mt-0.5 h-3.5 w-3.5 shrink-0"
+                                  style={{ color: "var(--accent)" }}
+                                />
+                                <span>{act}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
             <div
               ref={scrollContainerRef}
               onWheel={(e) => {
@@ -6512,6 +7227,26 @@ export default function App() {
                           >
                             {t("unreadDivider", { count: unreadDividerCount })}
                           </span>
+                          {aiConfig?.enabled && (
+                            <button
+                              type="button"
+                              disabled={Boolean(aiSummaryByThread[activeThread.id]?.loading)}
+                              onClick={() => void handleSummarizeUnread(activeThread.id)}
+                              className="inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-semibold transition hover:opacity-85 disabled:opacity-60"
+                              style={{
+                                background: "var(--bg-sidebar)",
+                                border: "1px solid var(--border-subtle)",
+                                color: "var(--accent)",
+                              }}
+                            >
+                              {aiSummaryByThread[activeThread.id]?.loading ? (
+                                <Loader2 className="h-3 w-3 animate-spin" />
+                              ) : (
+                                <Sparkles className="h-3 w-3" />
+                              )}
+                              <span>{t("aiSummarizeUnreadBtn")}</span>
+                            </button>
+                          )}
                           <div className="h-px flex-1" style={{ background: "var(--accent)", opacity: 0.35 }} />
                         </div>
                       )}
@@ -6555,6 +7290,8 @@ export default function App() {
                         onOpenExternal={handleOpenExternalUrl}
                         onCopyError={showError}
                         onVotePoll={handleVotePoll}
+                        onAddPollOption={handleAddPollOption}
+                        onLockPoll={handleLockPoll}
                         onRefreshPoll={handleRefreshPoll}
                         onStartVoiceCall={handleStartVoiceCall}
                         callDisabledReason={activeCallCheck.disabledReason}
@@ -6671,6 +7408,10 @@ export default function App() {
                 onOpenPoll={
                   activeThread.kind === "group" ? () => setCreatePollOpen(true) : undefined
                 }
+                onOpenSchedule={() => {
+                  setScheduledInitialThreadId(activeThread.id);
+                  setScheduledModalOpen(true);
+                }}
                 buzzCooldownSec={buzzCooldownSec}
                 sendOnEnter={sendOnEnter}
                 globalPasteFallback={!activeThreadRootId}
@@ -6697,7 +7438,7 @@ export default function App() {
       </main>
 
       {/* Right Info Drawer */}
-      {drawerOpen && activeThread && (
+      {drawerOpen && activeThread && !aiChatOpen && (
         <>
           {layout.autoCompactDrawer && (
             <div
@@ -7100,6 +7841,7 @@ export default function App() {
                               openLightboxForUrl(
                                 item.attachment_url,
                                 item.attachment_name || "Hình ảnh",
+                                { threadId: item.thread_id, msgId: item.msg_id },
                               );
                             }
                           }}
@@ -7535,6 +8277,7 @@ export default function App() {
             threads={threads}
             onClose={() => setQuickSearchOpen(false)}
             onSelectMessage={(hit) => void handleSelectSearchResult(hit)}
+            onSelectThread={(threadId) => openThreadById(threadId)}
             onFindPhone={(phone) => {
               setFindUserInitialPhone(phone);
               setFindUserOpen(true);
@@ -7614,19 +8357,28 @@ export default function App() {
             onClose={() => setForwardMessages([])}
             onForwardTo={async (targetThreadId, msgs) => {
               try {
+                let forwardedAny = false;
                 for (const msg of msgs) {
-                  const content =
-                    msg.attachment_url && /^https:\/\//i.test(msg.attachment_url)
-                      ? `${msg.text ? `${msg.text}\n` : ""}${msg.attachment_url}`
-                      : msg.text;
-                  if (!content.trim()) continue;
-                  const sent = await bridge.sendText(targetThreadId, content);
+                  if (msg.is_recalled) continue;
+                  const sent = await bridge.forwardMessage(
+                    msg.thread_id || selectedIdRef.current || selectedId || "",
+                    msg.msg_id,
+                    targetThreadId,
+                    {
+                      text: msg.text,
+                      msgType: msg.msg_type,
+                      attachmentUrl: msg.attachment_url,
+                      attachmentName: msg.attachment_name,
+                    },
+                  );
+                  forwardedAny = true;
                   setThreads((prev) => bumpThreadList(prev, sent, false));
                   if (targetThreadId === selectedIdRef.current) {
                     setMessages((prev) => upsertMsg(prev, sent));
                   }
                 }
-                if (targetThreadId === selectedIdRef.current) {
+                if (forwardedAny && targetThreadId === selectedIdRef.current) {
+                  setDetailsRefreshTick((n) => n + 1);
                   setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
                 }
                 setSelectMode(false);
@@ -7845,21 +8597,23 @@ export default function App() {
         <div
           role="button"
           tabIndex={0}
+          onMouseEnter={() => setWebToastHovered(true)}
+          onMouseLeave={() => setWebToastHovered(false)}
           onClick={() => {
             const targetId = webNotifyToast.thread_id;
-            setWebNotifyToast(null);
+            dismissWebNotifyToast();
             openThreadById(targetId);
           }}
           onKeyDown={(e) => {
             if (e.key === "Enter" || e.key === " ") {
               e.preventDefault();
               const targetId = webNotifyToast.thread_id;
-              setWebNotifyToast(null);
+              dismissWebNotifyToast();
               openThreadById(targetId);
             }
           }}
           className={`fixed z-[75] flex w-[320px] max-w-[calc(100vw-2rem)] cursor-pointer items-center gap-2.5 overflow-hidden rounded-xl px-3 py-2 shadow-2xl transition hover:brightness-105 ${
-            webNotifyToast.is_buzz ? "notify-buzz-shaking" : ""
+            webNotifyToast.is_buzz && !webToastHovered ? "notify-buzz-shaking" : ""
           } ${
             webNotifyToast.position === "top-left"
               ? "left-4 top-4"
@@ -7897,14 +8651,21 @@ export default function App() {
               </div>
               <button
                 type="button"
+                onMouseDown={(e) => {
+                  if (e.button !== 0) return;
+                  e.preventDefault();
+                  e.stopPropagation();
+                  dismissWebNotifyToast();
+                }}
                 onClick={(e) => {
                   e.stopPropagation();
-                  setWebNotifyToast(null);
+                  dismissWebNotifyToast();
                 }}
                 onKeyDown={(e) => e.stopPropagation()}
                 className="hover-menu -mr-1 shrink-0 rounded-md p-0.5 transition"
                 style={{ color: "var(--text-secondary)" }}
                 title={t("notifyCloseTitle")}
+                aria-label={t("notifyCloseTitle")}
               >
                 <X className="h-3.5 w-3.5" />
               </button>
@@ -7930,7 +8691,7 @@ export default function App() {
         callState.active &&
         callState.phase !== "idle" &&
         callState.phase !== "incoming_ringing" &&
-        (showVideoOverlay ? (
+        (showVideoOverlay && videoOverlayMode !== "minimized" ? (
           <Suspense fallback={null}>
             <VideoCallOverlay
               active={callState.active}
@@ -7946,11 +8707,14 @@ export default function App() {
               remoteVideoDims={remoteVideoDims}
               busy={callActionBusy}
               hangupBusy={callHangupBusy}
+              viewMode={videoOverlayMode}
+              onViewModeChange={(mode) => setVideoOverlayMode(mode)}
+              onCollapseToBar={() => setVideoOverlayMode("minimized")}
               onRemoteCanvasChange={handleRemoteCanvasChange}
               onToggleMute={(nextMuted) => void handleToggleCallMute(nextMuted)}
               onToggleCamera={(nextEnabled) => void handleToggleCallCamera(nextEnabled)}
               onHangup={() => void handleHangupCall()}
-              onMinimize={() => setVideoOverlayMinimized(true)}
+              onMinimize={() => setVideoOverlayMode("floating")}
               onSelectThread={(partnerId) => openThreadById(partnerId)}
               onRefreshDevices={refreshCallDevices}
               onRefreshCameras={refreshCameraDevices}
@@ -7969,7 +8733,7 @@ export default function App() {
             localCameraStatus={localCameraStatus}
             onToggleMute={(nextMuted) => void handleToggleCallMute(nextMuted)}
             onToggleCamera={(nextEnabled) => void handleToggleCallCamera(nextEnabled)}
-            onExpandVideo={() => setVideoOverlayMinimized(false)}
+            onExpandVideo={() => setVideoOverlayMode("floating")}
             onHangup={() => void handleHangupCall()}
             onSelectThread={(partnerId) => openThreadById(partnerId)}
             onRefreshDevices={refreshCallDevices}
@@ -7998,7 +8762,8 @@ export default function App() {
         <div className="fixed right-4 top-20 z-[80] max-w-sm">
           <button
             type="button"
-            onClick={() => setCallNotice(null)}
+            onClick={dismissCallNotice}
+            title={t("notifyCloseTitle")}
             className="flex items-center gap-2 rounded-xl px-3.5 py-2 text-left text-xs font-medium shadow-2xl transition hover:opacity-90"
             style={{
               background:
@@ -8024,7 +8789,8 @@ export default function App() {
             ) : (
               <Phone className="h-3.5 w-3.5 shrink-0" />
             )}
-            <span>{callNotice.text}</span>
+            <span className="min-w-0 flex-1">{callNotice.text}</span>
+            <X className="h-3.5 w-3.5 shrink-0 opacity-70" />
           </button>
         </div>
       )}
@@ -8035,7 +8801,8 @@ export default function App() {
         >
           <button
             type="button"
-            onClick={() => setSocialNotice(null)}
+            onClick={dismissSocialNotice}
+            title={t("notifyCloseTitle")}
             className="flex items-center gap-2 rounded-xl px-3.5 py-2 text-left text-xs font-medium shadow-2xl transition hover:opacity-90"
             style={{
               background:
@@ -8069,7 +8836,8 @@ export default function App() {
                         : "var(--accent)",
               }}
             />
-            <span>{socialNotice.text}</span>
+            <span className="min-w-0 flex-1">{socialNotice.text}</span>
+            <X className="h-3.5 w-3.5 shrink-0 opacity-70" />
           </button>
         </div>
       )}
@@ -8077,9 +8845,29 @@ export default function App() {
       {toastError && (
         <div
           role="alert"
-          className="fixed right-4 top-16 z-[90] max-w-md rounded-xl bg-rose-600/95 px-4 py-2 text-xs text-white shadow-2xl"
+          onClick={dismissToastError}
+          title={t("notifyCloseTitle")}
+          className="fixed right-4 top-16 z-[90] flex max-w-md cursor-pointer items-center gap-2 rounded-xl bg-rose-600/95 px-3.5 py-2 text-xs text-white shadow-2xl transition hover:bg-rose-600"
         >
-          {toastError}
+          <span className="min-w-0 flex-1 break-words">{toastError}</span>
+          <button
+            type="button"
+            onMouseDown={(e) => {
+              if (e.button !== 0) return;
+              e.preventDefault();
+              e.stopPropagation();
+              dismissToastError();
+            }}
+            onClick={(e) => {
+              e.stopPropagation();
+              dismissToastError();
+            }}
+            title={t("notifyCloseTitle")}
+            aria-label={t("notifyCloseTitle")}
+            className="shrink-0 rounded-md p-0.5 text-white/85 transition hover:bg-white/15 hover:text-white"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
         </div>
       )}
 

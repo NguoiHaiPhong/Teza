@@ -2,6 +2,7 @@
 //!
 //! Strictly decoupled from any GUI toolkit or local unauthenticated HTTP servers.
 
+pub mod ai;
 pub mod chat;
 pub mod crypto;
 pub mod data_dir;

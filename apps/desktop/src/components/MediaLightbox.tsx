@@ -100,6 +100,7 @@ export function MediaLightbox({
   const [rotation, setRotation] = useState(0);
   const [copied, setCopied] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
 
   const stageRef = useRef<HTMLDivElement | null>(null);
   const zoomRef = useRef(zoom);
@@ -185,7 +186,21 @@ export function MediaLightbox({
     suppressClickRef.current = false;
     setRotation(0);
     setCopied(false);
+    setContextMenu(null);
   }, [activeIndex, current?.url]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const dismiss = () => setContextMenu(null);
+    window.addEventListener("click", dismiss);
+    window.addEventListener("resize", dismiss);
+    window.addEventListener("blur", dismiss);
+    return () => {
+      window.removeEventListener("click", dismiss);
+      window.removeEventListener("resize", dismiss);
+      window.removeEventListener("blur", dismiss);
+    };
+  }, [contextMenu]);
 
   useEffect(() => {
     if (zoomRef.current <= 1) return;
@@ -250,8 +265,13 @@ export function MediaLightbox({
   useEffect(() => {
     if (!valid) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-      else if (e.key === "ArrowLeft") goPrev();
+      if (e.key === "Escape") {
+        if (contextMenu) {
+          setContextMenu(null);
+        } else {
+          onClose();
+        }
+      } else if (e.key === "ArrowLeft") goPrev();
       else if (e.key === "ArrowRight") goNext();
       else if (e.key === "+" || e.key === "=") applyZoom(zoomRef.current + 0.25);
       else if (e.key === "-") applyZoom(zoomRef.current - 0.25);
@@ -259,7 +279,7 @@ export function MediaLightbox({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [valid, onClose, goPrev, goNext, applyZoom]);
+  }, [valid, contextMenu, onClose, goPrev, goNext, applyZoom]);
 
   if (!current) return null;
 
@@ -302,6 +322,10 @@ export function MediaLightbox({
     <div
       className="fixed inset-0 z-50 flex flex-col bg-black/90 backdrop-blur-sm"
       onClick={() => {
+        if (contextMenu) {
+          setContextMenu(null);
+          return;
+        }
         if (suppressClickRef.current) {
           suppressClickRef.current = false;
           return;
@@ -433,8 +457,21 @@ export function MediaLightbox({
           alt={current.title}
           referrerPolicy="no-referrer"
           draggable={false}
+          onContextMenu={(e) => {
+            if (!canExport) return;
+            e.preventDefault();
+            e.stopPropagation();
+            setContextMenu({
+              x: Math.max(8, Math.min(e.clientX, window.innerWidth - 210)),
+              y: Math.max(8, Math.min(e.clientY, window.innerHeight - 108)),
+            });
+          }}
           onClick={(e) => {
             e.stopPropagation();
+            if (contextMenu) {
+              setContextMenu(null);
+              return;
+            }
             if (suppressClickRef.current) {
               suppressClickRef.current = false;
               return;
@@ -452,6 +489,46 @@ export function MediaLightbox({
             dragging ? "" : "transition-transform duration-150"
           } ${zoom > 1 ? (dragging ? "cursor-grabbing" : "cursor-grab") : "cursor-zoom-in"}`}
         />
+
+        {contextMenu && canExport && (
+          <div
+            data-teza-floating-popup="true"
+            onClick={(e) => e.stopPropagation()}
+            onContextMenu={(e) => e.preventDefault()}
+            className="fixed z-[60] w-48 rounded-xl py-1 shadow-2xl"
+            style={{
+              left: `${contextMenu.x}px`,
+              top: `${contextMenu.y}px`,
+              background: "var(--bg-sidebar)",
+              border: "1px solid var(--border-subtle)",
+              color: "var(--text-primary)",
+            }}
+          >
+            <button
+              type="button"
+              disabled={saving}
+              onClick={() => {
+                setContextMenu(null);
+                void handleSaveAs();
+              }}
+              className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px] disabled:opacity-50"
+            >
+              <Download className="h-3.5 w-3.5" />
+              <span>{t("saveImageMenu")}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setContextMenu(null);
+                void handleCopyImage();
+              }}
+              className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
+            >
+              <Copy className="h-3.5 w-3.5" />
+              <span>{t("copyImage")}</span>
+            </button>
+          </div>
+        )}
 
         {hasNext && (
           <button

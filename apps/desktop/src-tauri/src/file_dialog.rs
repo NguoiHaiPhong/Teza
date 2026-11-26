@@ -62,6 +62,19 @@ pub fn is_known_file_extension(ext: &str) -> bool {
             | "odt"
             | "ods"
             | "odp"
+            | "epub"
+            | "mobi"
+            | "djvu"
+            | "pages"
+            | "numbers"
+            | "key"
+            | "vsdx"
+            | "mpp"
+            | "accdb"
+            | "mdb"
+            | "sqlite"
+            | "db"
+            | "bak"
             | "csv"
             | "tsv"
             | "txt"
@@ -79,8 +92,14 @@ pub fn is_known_file_extension(ext: &str) -> bool {
             | "cfg"
             | "conf"
             | "sql"
+            | "srt"
+            | "vtt"
+            | "ass"
+            | "ics"
+            | "vcf"
             | "jpg"
             | "jpeg"
+            | "jfif"
             | "png"
             | "gif"
             | "webp"
@@ -92,9 +111,20 @@ pub fn is_known_file_extension(ext: &str) -> bool {
             | "heic"
             | "heif"
             | "avif"
+            | "jxl"
+            | "raw"
+            | "dng"
+            | "cr2"
+            | "nef"
+            | "arw"
             | "psd"
             | "ai"
             | "eps"
+            | "xcf"
+            | "cdr"
+            | "indd"
+            | "fig"
+            | "sketch"
             | "mp4"
             | "m4v"
             | "mov"
@@ -104,6 +134,10 @@ pub fn is_known_file_extension(ext: &str) -> bool {
             | "wmv"
             | "flv"
             | "3gp"
+            | "ogv"
+            | "mpg"
+            | "mpeg"
+            | "m2ts"
             | "mp3"
             | "wav"
             | "aac"
@@ -121,6 +155,8 @@ pub fn is_known_file_extension(ext: &str) -> bool {
             | "tgz"
             | "bz2"
             | "xz"
+            | "zst"
+            | "lz4"
             | "iso"
             | "cab"
             | "exe"
@@ -139,6 +175,18 @@ pub fn is_known_file_extension(ext: &str) -> bool {
             | "gbr"
             | "pcb"
             | "sch"
+            | "blend"
+            | "obj"
+            | "fbx"
+            | "glb"
+            | "gltf"
+            | "pem"
+            | "crt"
+            | "cer"
+            | "p12"
+            | "pfx"
+            | "ovpn"
+            | "torrent"
             | "bin"
             | "hex"
             | "dll"
@@ -157,6 +205,59 @@ pub fn is_known_file_extension(ext: &str) -> bool {
             | "ps1"
             | "cmd"
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaFamily {
+    Image,
+    Video,
+    Audio,
+    Other,
+}
+
+fn media_family_of(ext: &str) -> MediaFamily {
+    match ext.trim().trim_start_matches('.').to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" | "jfif" | "png" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "svg"
+        | "ico" | "heic" | "heif" | "avif" | "jxl" => MediaFamily::Image,
+        "mp4" | "m4v" | "mov" | "webm" | "mkv" | "avi" | "wmv" | "flv" | "3gp" | "ogv"
+        | "mpg" | "mpeg" | "m2ts" => MediaFamily::Video,
+        "mp3" | "wav" | "aac" | "m4a" | "ogg" | "opus" | "flac" | "wma" | "amr" => {
+            MediaFamily::Audio
+        }
+        _ => MediaFamily::Other,
+    }
+}
+
+fn extensions_equivalent(a: &str, b: &str) -> bool {
+    let la = a.trim().trim_start_matches('.').to_ascii_lowercase();
+    let lb = b.trim().trim_start_matches('.').to_ascii_lowercase();
+    if la == lb {
+        return true;
+    }
+    matches!(
+        (la.as_str(), lb.as_str()),
+        ("jpg" | "jpeg" | "jfif", "jpg" | "jpeg" | "jfif")
+            | ("tif" | "tiff", "tif" | "tiff")
+            | ("heic" | "heif", "heic" | "heif")
+            | ("htm" | "html", "htm" | "html")
+            | ("yml" | "yaml", "yml" | "yaml")
+            | ("mpg" | "mpeg", "mpg" | "mpeg")
+    )
+}
+
+fn extensions_family_compatible(candidate: &str, detected: &str) -> bool {
+    if candidate.eq_ignore_ascii_case(detected) || extensions_equivalent(candidate, detected) {
+        return true;
+    }
+    let cf = media_family_of(candidate);
+    let df = media_family_of(detected);
+    match df {
+        MediaFamily::Image => cf == MediaFamily::Image,
+        MediaFamily::Video | MediaFamily::Audio => {
+            matches!(cf, MediaFamily::Video | MediaFamily::Audio)
+        }
+        MediaFamily::Other => true,
+    }
 }
 
 pub fn is_plausible_extension(ext: &str) -> bool {
@@ -182,11 +283,121 @@ pub fn extract_extension_from_name(name: &str) -> Option<String> {
     }
 }
 
-pub fn extract_extension_from_url(url: &str) -> Option<String> {
-    let path = url.split(['?', '#']).next().unwrap_or("");
+fn percent_decode_url_component(raw: &str, plus_as_space: bool) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if plus_as_space && bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                out.push(((hi << 4) | lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn is_teza_media_vault_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    lower.starts_with("teza-media://")
+        || lower.starts_with("http://teza-media.localhost/")
+        || lower.starts_with("https://teza-media.localhost/")
+}
+
+fn extract_extension_from_url_depth(url: &str, depth: u8) -> Option<String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() || depth > 2 {
+        return None;
+    }
+
+    let without_frag = trimmed.split('#').next().unwrap_or(trimmed);
+    let (path, query_opt) = match without_frag.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (without_frag, None),
+    };
+
+    // Unwrap `teza-media://` / `http://teza-media.localhost/resolve?url=<encoded>` inner remote URL.
+    if is_teza_media_vault_url(trimmed) {
+        if let Some(query) = query_opt {
+            for pair in query.split('&') {
+                if let Some((k, v)) = pair.split_once('=') {
+                    if k.eq_ignore_ascii_case("url") {
+                        let inner = percent_decode_url_component(v, true);
+                        return extract_extension_from_url_depth(&inner, depth + 1);
+                    }
+                }
+            }
+        }
+        return None;
+    }
+
     let seg = path.rsplit('/').next().unwrap_or("");
-    let ext = extract_extension_from_name(seg)?;
-    is_known_file_extension(&ext).then_some(ext)
+    let decoded_seg = percent_decode_url_component(seg, false);
+    if let Some(ext) = extract_extension_from_name(&decoded_seg) {
+        if is_known_file_extension(&ext) {
+            return Some(ext);
+        }
+    }
+
+    // Fallback: inspect common filename query parameters (e.g., `?filename=report.pdf`,
+    // `?response-content-disposition=attachment;filename="pic.jpg"`).
+    if let Some(query) = query_opt {
+        for pair in query.split('&') {
+            let Some((k_raw, v_raw)) = pair.split_once('=') else {
+                continue;
+            };
+            let key = percent_decode_url_component(k_raw, true)
+                .trim()
+                .to_ascii_lowercase();
+            let val = percent_decode_url_component(v_raw, true);
+            if matches!(key.as_str(), "filename" | "file" | "name" | "download") {
+                if let Some(ext) = extract_extension_from_name(&val) {
+                    if is_known_file_extension(&ext) {
+                        return Some(ext);
+                    }
+                }
+            } else if key == "response-content-disposition" {
+                for part in val.split(';') {
+                    let part_trim = part.trim();
+                    let lower_part = part_trim.to_ascii_lowercase();
+                    let fname_raw = if lower_part.starts_with("filename*=") {
+                        part_trim[10..]
+                            .split("''")
+                            .nth(1)
+                            .map(|s| percent_decode_url_component(s, false))
+                    } else if lower_part.starts_with("filename=") {
+                        Some(part_trim[9..].trim_matches('"').to_string())
+                    } else {
+                        None
+                    };
+                    if let Some(fname) = fname_raw {
+                        if let Some(ext) = extract_extension_from_name(&fname) {
+                            if is_known_file_extension(&ext) {
+                                return Some(ext);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn extract_extension_from_url(url: &str) -> Option<String> {
+    extract_extension_from_url_depth(url, 0)
 }
 
 pub fn extension_from_mime(mime: &str) -> Option<&'static str> {
@@ -199,7 +410,10 @@ pub fn extension_from_mime(mime: &str) -> Option<&'static str> {
     match base.as_str() {
         "" | "application/octet-stream" | "binary/octet-stream" | "application/binary" => None,
         // Intentionally leave ZIP MIMEs to magic sniffing so OOXML (.xlsx/.xlsb/.docx/.pptx) wins first.
-        "application/zip" | "application/x-zip-compressed" => None,
+        "application/zip"
+        | "application/x-zip-compressed"
+        | "application/x-zip"
+        | "multipart/x-zip" => None,
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => Some("xlsx"),
         "application/vnd.ms-excel.sheet.binary.macroenabled.12" => Some("xlsb"),
         "application/vnd.ms-excel.sheet.macroenabled.12" => Some("xlsm"),
@@ -213,17 +427,20 @@ pub fn extension_from_mime(mime: &str) -> Option<&'static str> {
         "application/vnd.oasis.opendocument.text" => Some("odt"),
         "application/vnd.oasis.opendocument.spreadsheet" => Some("ods"),
         "application/vnd.oasis.opendocument.presentation" => Some("odp"),
+        "application/epub+zip" => Some("epub"),
+        "application/vnd.android.package-archive" => Some("apk"),
         "application/pdf" => Some("pdf"),
-        "image/jpeg" | "image/jpg" | "image/pjpeg" => Some("jpg"),
-        "image/png" => Some("png"),
+        "image/jpeg" | "image/jpg" | "image/pjpeg" | "image/jfif" => Some("jpg"),
+        "image/png" | "image/x-png" | "image/apng" => Some("png"),
         "image/webp" => Some("webp"),
         "image/gif" => Some("gif"),
-        "image/bmp" | "image/x-ms-bmp" => Some("bmp"),
+        "image/bmp" | "image/x-ms-bmp" | "image/x-bmp" => Some("bmp"),
         "image/svg+xml" => Some("svg"),
-        "image/tiff" => Some("tiff"),
-        "image/heic" => Some("heic"),
-        "image/heif" => Some("heif"),
-        "image/avif" => Some("avif"),
+        "image/tiff" | "image/x-tiff" => Some("tiff"),
+        "image/heic" | "image/heic-sequence" => Some("heic"),
+        "image/heif" | "image/heif-sequence" => Some("heif"),
+        "image/avif" | "image/avif-sequence" => Some("avif"),
+        "image/jxl" => Some("jxl"),
         "image/x-icon" | "image/vnd.microsoft.icon" => Some("ico"),
         "video/mp4" => Some("mp4"),
         "video/webm" => Some("webm"),
@@ -234,20 +451,25 @@ pub fn extension_from_mime(mime: &str) -> Option<&'static str> {
         "video/x-flv" => Some("flv"),
         "video/3gpp" => Some("3gp"),
         "video/x-ms-wmv" => Some("wmv"),
-        "audio/mpeg" | "audio/mp3" => Some("mp3"),
-        "audio/aac" | "audio/x-aac" => Some("aac"),
-        "audio/mp4" | "audio/x-m4a" => Some("m4a"),
-        "audio/ogg" => Some("ogg"),
+        "video/mpeg" => Some("mpg"),
+        "video/ogg" => Some("ogv"),
+        "audio/mpeg" | "audio/mp3" | "audio/x-mpeg" | "audio/x-mp3" => Some("mp3"),
+        "audio/aac" | "audio/x-aac" | "audio/aacp" | "audio/vnd.dlna.adts" => Some("aac"),
+        "audio/mp4" | "audio/x-m4a" | "audio/m4a" => Some("m4a"),
+        "audio/ogg" | "audio/vorbis" | "application/ogg" => Some("ogg"),
         "audio/opus" => Some("opus"),
+        "audio/webm" => Some("webm"),
+        "audio/3gpp" => Some("3gp"),
         "audio/wav" | "audio/x-wav" | "audio/wave" => Some("wav"),
         "audio/flac" | "audio/x-flac" => Some("flac"),
-        "audio/amr" => Some("amr"),
+        "audio/amr" | "audio/amr-wb" => Some("amr"),
         "application/vnd.rar" | "application/x-rar-compressed" => Some("rar"),
-        "application/x-7z-compressed" => Some("7z"),
+        "application/x-7z-compressed" | "application/x-7z" => Some("7z"),
         "application/gzip" | "application/x-gzip" => Some("gz"),
         "application/x-tar" => Some("tar"),
         "application/x-bzip2" => Some("bz2"),
         "application/x-xz" => Some("xz"),
+        "application/zstd" => Some("zst"),
         "text/csv" | "application/csv" => Some("csv"),
         "text/tab-separated-values" => Some("tsv"),
         "text/html" | "application/xhtml+xml" => Some("html"),
@@ -281,6 +503,54 @@ fn bytes_contain_head_or_tail(bytes: &[u8], needle: &[u8]) -> bool {
     false
 }
 
+fn is_valid_aac_adts_header(bytes: &[u8]) -> bool {
+    if bytes.len() < 7 || bytes[0] != 0xFF || (bytes[1] & 0xF6) != 0xF0 {
+        return false;
+    }
+    let sampling_freq_idx = (bytes[2] >> 2) & 0x0F;
+    if sampling_freq_idx >= 13 {
+        return false;
+    }
+    let frame_len = (((bytes[3] & 0x03) as usize) << 11)
+        | ((bytes[4] as usize) << 3)
+        | (((bytes[5] & 0xE0) as usize) >> 5);
+    frame_len >= 7
+}
+
+fn sniff_isobmff_ext(bytes: &[u8]) -> &'static str {
+    match &bytes[8..12] {
+        b"M4A " | b"M4B " => "m4a",
+        b"qt  " => "mov",
+        b"avif" | b"avis" => "avif",
+        b"heic" | b"heix" | b"hevc" | b"hevx" | b"heim" | b"heis" => "heic",
+        b"mif1" | b"msf1" => {
+            let box_len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+            let scan_end = if box_len >= 16 {
+                box_len.min(bytes.len()).min(64)
+            } else {
+                bytes.len().min(64)
+            };
+            let mut off = 16usize;
+            while off + 4 <= scan_end {
+                let brand = &bytes[off..off + 4];
+                if brand == b"avif" || brand == b"avis" {
+                    return "avif";
+                }
+                if matches!(
+                    brand,
+                    b"heic" | b"heix" | b"hevc" | b"hevx" | b"heim" | b"heis"
+                ) {
+                    return "heic";
+                }
+                off += 4;
+            }
+            "heic"
+        }
+        b"3gp4" | b"3gp5" | b"3gp6" | b"3gp7" | b"3g2a" | b"3g2b" => "3gp",
+        _ => "mp4",
+    }
+}
+
 pub fn sniff_extension_from_bytes(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Some("png");
@@ -302,6 +572,20 @@ pub fn sniff_extension_from_bytes(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"BM") && bytes.len() >= 14 && bytes[6..10] == [0, 0, 0, 0] {
         return Some("bmp");
     }
+    if bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*") {
+        return Some("tiff");
+    }
+    if bytes.len() >= 6
+        && bytes[0..4] == [0x00, 0x00, 0x01, 0x00]
+        && u16::from_le_bytes([bytes[4], bytes[5]]) > 0
+    {
+        return Some("ico");
+    }
+    if bytes.starts_with(&[
+        0x00, 0x00, 0x00, 0x0C, 0x4A, 0x58, 0x4C, 0x20, 0x0D, 0x0A, 0x87, 0x0A,
+    ]) {
+        return Some("jxl");
+    }
     if bytes.starts_with(b"%PDF-") {
         return Some("pdf");
     }
@@ -314,14 +598,24 @@ pub fn sniff_extension_from_bytes(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(&[0x1F, 0x8B, 0x08]) {
         return Some("gz");
     }
+    if bytes.len() >= 10
+        && bytes.starts_with(b"BZh")
+        && bytes[3].is_ascii_digit()
+        && &bytes[4..10] == b"\x31\x41\x59\x26\x53\x59"
+    {
+        return Some("bz2");
+    }
+    if bytes.starts_with(&[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]) {
+        return Some("xz");
+    }
+    if bytes.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        return Some("zst");
+    }
+    if bytes.starts_with(b"{\\rtf") {
+        return Some("rtf");
+    }
     if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
-        return match &bytes[8..12] {
-            b"M4A " | b"M4B " => Some("m4a"),
-            b"qt  " => Some("mov"),
-            b"heic" | b"heix" | b"hevc" | b"mif1" => Some("heic"),
-            b"avif" | b"avis" => Some("avif"),
-            _ => Some("mp4"),
-        };
+        return Some(sniff_isobmff_ext(bytes));
     }
     if bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
         let head = &bytes[..bytes.len().min(64)];
@@ -339,10 +633,18 @@ pub fn sniff_extension_from_bytes(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"fLaC") {
         return Some("flac");
     }
+    if bytes.starts_with(b"#!AMR\n") || bytes.starts_with(b"#!AMR-WB\n") {
+        return Some("amr");
+    }
     if bytes.starts_with(b"ID3")
-        || (bytes.len() >= 2 && bytes[0] == 0xFF && matches!(bytes[1], 0xFB | 0xF3 | 0xF2))
+        || (bytes.len() >= 2
+            && bytes[0] == 0xFF
+            && matches!(bytes[1], 0xFB | 0xFA | 0xF3 | 0xF2 | 0xE3 | 0xE2))
     {
         return Some("mp3");
+    }
+    if is_valid_aac_adts_header(bytes) {
+        return Some("aac");
     }
     if bytes.starts_with(b"PK\x03\x04") || bytes.starts_with(b"PK\x05\x06") {
         if bytes_contain_head_or_tail(bytes, b"xl/workbook.bin") {
@@ -351,13 +653,43 @@ pub fn sniff_extension_from_bytes(bytes: &[u8]) -> Option<&'static str> {
         if bytes_contain_head_or_tail(bytes, b"xl/workbook.xml")
             || bytes_contain_head_or_tail(bytes, b"xl/worksheets/")
         {
+            if bytes_contain_head_or_tail(bytes, b"xl/vbaProject.bin") {
+                return Some("xlsm");
+            }
             return Some("xlsx");
         }
         if bytes_contain_head_or_tail(bytes, b"word/document.xml") {
+            if bytes_contain_head_or_tail(bytes, b"word/vbaProject.bin") {
+                return Some("docm");
+            }
             return Some("docx");
         }
         if bytes_contain_head_or_tail(bytes, b"ppt/presentation.xml") {
+            if bytes_contain_head_or_tail(bytes, b"ppt/vbaProject.bin") {
+                return Some("pptm");
+            }
             return Some("pptx");
+        }
+        if bytes_contain_head_or_tail(bytes, b"mimetypeapplication/vnd.oasis.opendocument.text") {
+            return Some("odt");
+        }
+        if bytes_contain_head_or_tail(
+            bytes,
+            b"mimetypeapplication/vnd.oasis.opendocument.spreadsheet",
+        ) {
+            return Some("ods");
+        }
+        if bytes_contain_head_or_tail(
+            bytes,
+            b"mimetypeapplication/vnd.oasis.opendocument.presentation",
+        ) {
+            return Some("odp");
+        }
+        if bytes_contain_head_or_tail(bytes, b"mimetypeapplication/epub+zip") {
+            return Some("epub");
+        }
+        if bytes_contain_head_or_tail(bytes, b"AndroidManifest.xml") {
+            return Some("apk");
         }
         return Some("zip");
     }
@@ -383,8 +715,82 @@ pub fn sniff_extension_from_bytes(bytes: &[u8]) -> Option<&'static str> {
 fn is_generic_placeholder_name(raw: &str) -> bool {
     matches!(
         raw.trim().to_lowercase().as_str(),
-        "" | "download" | "attachment" | "hình ảnh" | "image" | "photo" | "video" | "teza-image" | "file"
+        "" | "download"
+            | "attachment"
+            | "hình ảnh"
+            | "ảnh"
+            | "ảnh gif"
+            | "gif"
+            | "nhãn dán"
+            | "sticker"
+            | "tin nhắn thoại"
+            | "voice"
+            | "voice message"
+            | "audio"
+            | "tập tin"
+            | "tập tin đính kèm"
+            | "attached file"
+            | "image"
+            | "photo"
+            | "video"
+            | "teza-image"
+            | "teza-video"
+            | "teza-voice"
+            | "teza-sticker"
+            | "file"
+            | "media"
+            | "blob"
+            | "resolve"
+            | "untitled"
+            | "사진"
+            | "이미지"
+            | "스티커"
+            | "음성 메시지"
+            | "동영상"
+            | "파일"
     )
+}
+
+/// Detects synthetic placeholder filenames WITH an extension (e.g., `image.jpg` generated by the
+/// parser for untitled Zalo photos or `sticker_12_345.png` for stickers whose true bytes may be
+/// PNG/WebP/GIF).
+fn is_synthetic_media_placeholder_with_ext(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let (stem, ext) = trimmed.rsplit_once('.')?;
+    if !is_plausible_extension(ext) {
+        return None;
+    }
+    let lower_stem = stem.trim().to_ascii_lowercase();
+    let lower_ext = ext.to_ascii_lowercase();
+    let is_placeholder_stem = matches!(
+        lower_stem.as_str(),
+        "image"
+            | "photo"
+            | "teza-image"
+            | "teza-video"
+            | "teza-voice"
+            | "teza-sticker"
+            | "download"
+            | "attachment"
+            | "media"
+            | "resolve"
+            | "blob"
+    ) || (lower_stem.starts_with("sticker_")
+        && lower_stem[8..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b == b'_'));
+    if !is_placeholder_stem {
+        return None;
+    }
+    if matches!(
+        media_family_of(&lower_ext),
+        MediaFamily::Image | MediaFamily::Video | MediaFamily::Audio
+    ) || lower_ext == "bin"
+    {
+        Some(stem.trim().to_string())
+    } else {
+        None
+    }
 }
 
 fn is_windows_reserved_device_name(stem: &str) -> bool {
@@ -424,7 +830,13 @@ fn is_zip_mime(mime: &str) -> bool {
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
-    matches!(base.as_str(), "application/zip" | "application/x-zip-compressed")
+    matches!(
+        base.as_str(),
+        "application/zip"
+            | "application/x-zip-compressed"
+            | "application/x-zip"
+            | "multipart/x-zip"
+    )
 }
 
 fn sanitize_single_line_filename_chars(raw: &str) -> String {
@@ -441,6 +853,20 @@ fn sanitize_single_line_filename_chars(raw: &str) -> String {
     cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn truncate_utf16_units(s: &str, max_units: usize) -> String {
+    let mut out = String::new();
+    let mut units = 0usize;
+    for ch in s.chars() {
+        let len = ch.len_utf16();
+        if units + len > max_units {
+            break;
+        }
+        out.push(ch);
+        units += len;
+    }
+    out
+}
+
 pub fn sanitize_suggested_filename_preserving_ext(
     raw: &str,
     resolved_ext: Option<&str>,
@@ -449,24 +875,17 @@ pub fn sanitize_suggested_filename_preserving_ext(
     if let Some(ext_raw) = resolved_ext {
         let ext = ext_raw.trim().trim_start_matches('.').to_ascii_lowercase();
         if is_plausible_extension(&ext) {
-            let dot_ext_len = ext.len() + 1;
             let without_trailing_dots = cleaned.trim_end_matches([' ', '.']);
-            let mut stem = if without_trailing_dots.len() > dot_ext_len
-                && without_trailing_dots
-                    .get(without_trailing_dots.len() - dot_ext_len..)
-                    .is_some_and(|tail| {
-                        tail.starts_with('.') && tail[1..].eq_ignore_ascii_case(&ext)
-                    }) {
-                without_trailing_dots[..without_trailing_dots.len() - dot_ext_len]
-                    .trim_end_matches([' ', '.'])
-                    .to_string()
+            let mut stem = if let Some((head, tail_ext)) = without_trailing_dots.rsplit_once('.') {
+                if extensions_equivalent(tail_ext, &ext) {
+                    head.trim_end_matches([' ', '.']).to_string()
+                } else {
+                    without_trailing_dots.to_string()
+                }
             } else {
                 without_trailing_dots.to_string()
             };
-            stem = stem
-                .chars()
-                .take(160)
-                .collect::<String>()
+            stem = truncate_utf16_units(&stem, 160)
                 .trim_end_matches([' ', '.'])
                 .to_string();
             if stem.is_empty() {
@@ -478,11 +897,7 @@ pub fn sanitize_suggested_filename_preserving_ext(
         }
     }
 
-    let trimmed = cleaned
-        .trim_end_matches([' ', '.'])
-        .chars()
-        .take(180)
-        .collect::<String>()
+    let trimmed = truncate_utf16_units(cleaned.trim_end_matches([' ', '.']), 180)
         .trim_end_matches([' ', '.'])
         .to_string();
     if trimmed.is_empty() {
@@ -505,19 +920,19 @@ pub fn resolve_download_filename_and_ext(
     let cd_clean = content_disposition_name
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let base_name = if is_generic_placeholder_name(suggested_name) {
-        cd_clean.unwrap_or_else(|| {
-            if suggested_name.trim().is_empty() {
-                "download"
-            } else {
-                suggested_name.trim()
-            }
-        })
-    } else {
-        suggested_name.trim()
-    };
 
-    let known_suggested_ext = extract_extension_from_name(suggested_name)
+    let sniffed_ext = sniff_extension_from_bytes(bytes).map(str::to_string);
+    let mime_ext = extension_from_mime(mime).map(str::to_string);
+    let url_ext =
+        extract_extension_from_url(final_url).or_else(|| extract_extension_from_url(url));
+    let detected_payload_ext = sniffed_ext.clone().or_else(|| mime_ext.clone());
+    let detected_family = detected_payload_ext
+        .as_deref()
+        .map(media_family_of)
+        .unwrap_or(MediaFamily::Other);
+
+    let synthetic_placeholder_stem = is_synthetic_media_placeholder_with_ext(suggested_name);
+    let raw_known_suggested_ext = extract_extension_from_name(suggested_name)
         .filter(|e| is_known_file_extension(e));
     let known_cd_ext = cd_clean
         .and_then(extract_extension_from_name)
@@ -525,19 +940,82 @@ pub fn resolve_download_filename_and_ext(
     let fallback_suggested_ext = extract_extension_from_name(suggested_name);
     let fallback_cd_ext = cd_clean.and_then(extract_extension_from_name);
 
+    // If `suggested_name` is a synthetic placeholder with ext (like `image.jpg` or `sticker_1_2.png`)
+    // and we actually detected a real media/file format from bytes/MIME/CD/URL, let the real
+    // format override the placeholder extension instead of mislabeling PNG/WebP/GIF as `.jpg`.
+    let real_override_for_placeholder = synthetic_placeholder_stem.is_some()
+        && (known_cd_ext.is_some()
+            || matches!(
+                detected_family,
+                MediaFamily::Image | MediaFamily::Video | MediaFamily::Audio
+            )
+            || url_ext.is_some());
+
+    // If actual bytes/MIME prove this is an image/video/audio payload, ignore a non-media suffix
+    // accidentally parsed from a caption or display name (e.g., "Họp lúc 10.h", "Khu A.c", "Bùi V.C").
+    let known_suggested_ext = if real_override_for_placeholder {
+        None
+    } else if let Some(ref sugg) = raw_known_suggested_ext {
+        if matches!(
+            detected_family,
+            MediaFamily::Image | MediaFamily::Video | MediaFamily::Audio
+        ) && !extensions_family_compatible(
+            sugg,
+            detected_payload_ext.as_deref().unwrap_or(""),
+        ) {
+            None
+        } else {
+            Some(sugg.clone())
+        }
+    } else {
+        None
+    };
+
+    let base_name_owned: String = if is_generic_placeholder_name(suggested_name) {
+        cd_clean
+            .unwrap_or_else(|| {
+                let s = suggested_name.trim();
+                if s.is_empty() {
+                    "download"
+                } else {
+                    s
+                }
+            })
+            .to_string()
+    } else if let Some(ref placeholder_stem) = synthetic_placeholder_stem {
+        if let Some(cd) = cd_clean {
+            cd.to_string()
+        } else if real_override_for_placeholder {
+            placeholder_stem.clone()
+        } else {
+            suggested_name.trim().to_string()
+        }
+    } else {
+        suggested_name.trim().to_string()
+    };
+
+    // For unambiguous image/video/audio magic bytes, trust actual bytes over a potentially stale
+    // CDN URL extension (e.g., Zalo CDN serving WebP bytes from a `.jpg` URL).
+    let sniffed_media_ext = sniffed_ext.clone().filter(|e| {
+        matches!(
+            media_family_of(e),
+            MediaFamily::Image | MediaFamily::Video | MediaFamily::Audio
+        )
+    });
+
     let resolved_ext = known_suggested_ext
         .or(known_cd_ext)
-        .or_else(|| {
-            extract_extension_from_url(final_url).or_else(|| extract_extension_from_url(url))
-        })
-        .or_else(|| extension_from_mime(mime).map(str::to_string))
-        .or_else(|| sniff_extension_from_bytes(bytes).map(str::to_string))
+        .or(sniffed_media_ext)
+        .or(url_ext)
+        .or(mime_ext)
+        .or(sniffed_ext)
         .or_else(|| is_zip_mime(mime).then(|| "zip".to_string()))
+        .or(raw_known_suggested_ext)
         .or(fallback_suggested_ext)
         .or(fallback_cd_ext);
 
     let final_name =
-        sanitize_suggested_filename_preserving_ext(base_name, resolved_ext.as_deref());
+        sanitize_suggested_filename_preserving_ext(&base_name_owned, resolved_ext.as_deref());
     (final_name, resolved_ext)
 }
 
@@ -549,16 +1027,28 @@ pub fn ensure_save_path_extension(path: PathBuf, expected_ext: Option<&str>) -> 
         return path;
     };
 
+    let expected_family = media_family_of(&ext);
     let cur_opt = path.extension().and_then(|e| e.to_str());
     let should_append = match cur_opt {
         None => true,
         Some(cur) => {
             let c = cur.trim();
-            c.is_empty()
-                || c.chars().all(|ch| ch.is_ascii_digit())
-                || (is_known_file_extension(&ext)
-                    && !c.eq_ignore_ascii_case(&ext)
-                    && !is_known_file_extension(c))
+            if c.is_empty() || c.chars().all(|ch| ch.is_ascii_digit()) {
+                true
+            } else if c.eq_ignore_ascii_case(&ext) {
+                false
+            } else if c.len() == 1 {
+                // Single-letter suffix (e.g., Vietnamese "10.h" or "khu A.c") is never an
+                // intentional extension replacement for a different file type.
+                true
+            } else if matches!(
+                expected_family,
+                MediaFamily::Image | MediaFamily::Video | MediaFamily::Audio
+            ) {
+                !extensions_family_compatible(c, &ext)
+            } else {
+                !is_known_file_extension(c)
+            }
         }
     };
 
@@ -568,14 +1058,75 @@ pub fn ensure_save_path_extension(path: PathBuf, expected_ext: Option<&str>) -> 
 
     let mut raw: OsString = path.into_os_string();
     if let Some(s) = raw.to_str() {
-        if s.ends_with('.') {
-            let trimmed = s.trim_end_matches('.').to_string();
-            raw = OsString::from(trimmed);
+        // Trim trailing dots/spaces strictly within the final filename component.
+        let sep_end = s.rfind(['\\', '/']).map(|i| i + 1).unwrap_or(0);
+        let (dir_part, file_part) = s.split_at(sep_end);
+        let trimmed_file = file_part.trim_end_matches(['.', ' ']);
+        let mut rebuilt = String::with_capacity(s.len() + ext.len() + 1);
+        rebuilt.push_str(dir_part);
+        if trimmed_file.is_empty() {
+            rebuilt.push_str("download");
+        } else {
+            rebuilt.push_str(trimmed_file);
         }
+        rebuilt.push('.');
+        rebuilt.push_str(&ext);
+        return PathBuf::from(rebuilt);
     }
     raw.push(".");
     raw.push(&ext);
     PathBuf::from(raw)
+}
+
+/// Builds an RFC 6266 / RFC 5987 `Content-Disposition: inline; filename="..."; filename*=UTF-8''...`
+/// header value so WebView2 native "Save image as..." and `<video>`/`<audio>` Download controls
+/// always propose a safe filename with the resolved file extension instead of `/resolve`.
+pub fn build_inline_content_disposition(file_name: &str) -> String {
+    let clean = sanitize_suggested_filename_preserving_ext(file_name, None);
+    let ext_opt = extract_extension_from_name(&clean);
+    let stem_raw = if let Some(ref ext) = ext_opt {
+        let drop_len = ext.len() + 1;
+        if clean.len() > drop_len {
+            &clean[..clean.len() - drop_len]
+        } else {
+            "media"
+        }
+    } else {
+        clean.as_str()
+    };
+
+    let ascii_stem: String = stem_raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches([' ', '.', '_'])
+        .to_string();
+    let ascii_stem_final = if ascii_stem.is_empty() {
+        "media".to_string()
+    } else {
+        ascii_stem
+    };
+    let ascii_name = match ext_opt {
+        Some(ref ext) => format!("{ascii_stem_final}.{ext}"),
+        None => ascii_stem_final,
+    };
+
+    let mut utf8_encoded = String::with_capacity(clean.len() * 3);
+    for &b in clean.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            utf8_encoded.push(b as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(utf8_encoded, "%{b:02X}");
+        }
+    }
+    format!("inline; filename=\"{ascii_name}\"; filename*=UTF-8''{utf8_encoded}")
 }
 
 pub fn is_dangerous_executable_ext(path: &Path) -> bool {
@@ -1053,37 +1604,77 @@ mod win32 {
     const MB_DEFBUTTON2: u32 = 0x0000_0100;
     const IDYES: i32 = 6;
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct SaveDialogConfig {
+        pub effective_ext: Option<String>,
+        pub safe_name: String,
+        pub filter_str: String,
+        /// Value passed to Win32 `OPENFILENAMEW.lpstrDefExt` (without trailing NUL).
+        /// Win32 `GetSaveFileNameW` silently truncates `lpstrDefExt` to 3 characters when the
+        /// wildcard `*.*` filter is active (turning `.xlsx` -> `.xls`, `.docx` -> `.doc`,
+        /// `.avif` -> `.avi`, `.webp` -> `.web`). For extensions > 3 chars we pass `Some("")`
+        /// (non-NULL empty string) so filter 1 (`*.webp`, `*.xlsx`) still auto-appends the full
+        /// extension while `*.*` appends nothing and `ensure_save_path_extension` guarantees the
+        /// exact full extension afterward.
+        pub lpstr_def_ext: Option<String>,
+    }
+
+    pub(super) fn build_save_dialog_config(
+        suggested_name: &str,
+        default_ext: Option<&str>,
+    ) -> SaveDialogConfig {
+        let effective_ext = default_ext
+            .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|e| is_plausible_extension(e))
+            .or_else(|| extract_extension_from_name(suggested_name));
+
+        let filter_str = if let Some(ref ext) = effective_ext {
+            format!(
+                "Tệp {} (*.{ext})\0*.{ext}\0Tất cả tệp (*.*)\0*.*\0\0",
+                ext.to_ascii_uppercase()
+            )
+        } else {
+            "Tất cả tệp (*.*)\0*.*\0\0".to_string()
+        };
+
+        let lpstr_def_ext = effective_ext.as_deref().map(|ext| {
+            if ext.len() <= 3 {
+                ext.to_string()
+            } else {
+                String::new()
+            }
+        });
+
+        let safe_name =
+            sanitize_suggested_filename_preserving_ext(suggested_name, effective_ext.as_deref());
+
+        SaveDialogConfig {
+            effective_ext,
+            safe_name,
+            filter_str,
+            lpstr_def_ext,
+        }
+    }
+
     pub fn run_dialog(
         owner_hwnd: Option<usize>,
         save_mode: bool,
         suggested_name: &str,
         default_ext: Option<&str>,
     ) -> Result<Option<PathBuf>, String> {
-        let effective_ext = if save_mode {
-            default_ext
-                .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
-                .filter(|e| is_plausible_extension(e))
-                .or_else(|| extract_extension_from_name(suggested_name))
-        } else {
-            None
-        };
+        let save_cfg = save_mode.then(|| build_save_dialog_config(suggested_name, default_ext));
+        let effective_ext = save_cfg.as_ref().and_then(|c| c.effective_ext.clone());
 
-        let filter_str = if save_mode {
-            if let Some(ref ext) = effective_ext {
-                format!(
-                    "Tệp {} (*.{ext})\0*.{ext}\0Tất cả tệp (*.*)\0*.*\0\0",
-                    ext.to_ascii_uppercase()
-                )
-            } else {
-                "Tất cả tệp (*.*)\0*.*\0\0".to_string()
-            }
+        let filter_str = if let Some(ref cfg) = save_cfg {
+            cfg.filter_str.clone()
         } else {
             "Tất cả tệp (*.*)\0*.*\0Hình ảnh (*.png;*.jpg;*.jpeg;*.webp;*.gif)\0*.png;*.jpg;*.jpeg;*.webp;*.gif\0\0"
                 .to_string()
         };
         let filter: Vec<u16> = filter_str.encode_utf16().collect();
-        let def_ext_wide: Option<Vec<u16>> = effective_ext
-            .as_deref()
+        let def_ext_wide: Option<Vec<u16>> = save_cfg
+            .as_ref()
+            .and_then(|c| c.lpstr_def_ext.as_deref())
             .map(|ext| format!("{ext}\0").encode_utf16().collect());
 
         let title_str = if save_mode {
@@ -1094,12 +1685,8 @@ mod win32 {
         let title: Vec<u16> = title_str.encode_utf16().collect();
         let mut file_buf = vec![0u16; 32_768];
 
-        if save_mode {
-            let safe_name = sanitize_suggested_filename_preserving_ext(
-                suggested_name,
-                effective_ext.as_deref(),
-            );
-            let encoded: Vec<u16> = safe_name.encode_utf16().collect();
+        if let Some(ref cfg) = save_cfg {
+            let encoded: Vec<u16> = cfg.safe_name.encode_utf16().collect();
             let copy_len = encoded.len().min(file_buf.len() - 1);
             file_buf[..copy_len].copy_from_slice(&encoded[..copy_len]);
         }
@@ -1547,5 +2134,352 @@ mod tests {
         assert!(open_directory(&file).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolves_images_stickers_captions_with_dots_and_teza_media_urls() {
+        let png_hdr = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        let jpeg_hdr = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        let webp_hdr = b"RIFF\x24\x00\x00\x00WEBPVP8 ";
+        let gif_hdr = b"GIF89a\x01\x00\x01\x00";
+        let heic_hdr = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00heic";
+        let avif_mif1_hdr = b"\x00\x00\x00\x1cftypmif1\x00\x00\x00\x00mif1avif";
+
+        // Synthetic parser placeholder `image.jpg` must adopt true PNG/WebP/GIF magic bytes
+        assert_eq!(
+            resolve_download_filename_and_ext(
+                "image.jpg",
+                None,
+                "https://photo-stal-6.zdn.vn/a/blob",
+                "https://photo-stal-6.zdn.vn/a/blob",
+                "application/octet-stream",
+                png_hdr,
+            ),
+            ("image.png".into(), Some("png".into()))
+        );
+        assert_eq!(
+            resolve_download_filename_and_ext(
+                "image.jpg",
+                None,
+                "https://photo-stal-6.zdn.vn/a/pic.jpg",
+                "https://photo-stal-6.zdn.vn/a/pic.jpg",
+                "image/webp",
+                webp_hdr,
+            ),
+            ("image.webp".into(), Some("webp".into()))
+        );
+        assert_eq!(
+            resolve_download_filename_and_ext(
+                "sticker_12_345.png",
+                None,
+                "https://zalo-api.zadn.vn/api/emoticon/sticker/webpc",
+                "https://zalo-api.zadn.vn/api/emoticon/sticker/webpc",
+                "application/octet-stream",
+                webp_hdr,
+            ),
+            ("sticker_12_345.webp".into(), Some("webp".into()))
+        );
+
+        // Photo captions & display names with dots colliding with code/non-image exts (.h, .c, .ai, .go)
+        assert_eq!(
+            resolve_download_filename_and_ext(
+                "Họp lúc 10.h",
+                None,
+                "https://photo-stal-6.zdn.vn/blob",
+                "https://photo-stal-6.zdn.vn/blob",
+                "image/jpeg",
+                &jpeg_hdr,
+            ),
+            ("Họp lúc 10.h.jpg".into(), Some("jpg".into()))
+        );
+        assert_eq!(
+            resolve_download_filename_and_ext(
+                "Nguyễn V.C",
+                None,
+                "https://s120-ava-talk.zadn.vn/avatar",
+                "https://s120-ava-talk.zadn.vn/avatar",
+                "application/octet-stream",
+                &jpeg_hdr,
+            ),
+            ("Nguyễn V.C.jpg".into(), Some("jpg".into()))
+        );
+        assert_eq!(
+            resolve_download_filename_and_ext(
+                "photo 2026.11.26",
+                None,
+                "https://photo-stal-6.zdn.vn/blob",
+                "https://photo-stal-6.zdn.vn/blob",
+                "application/octet-stream",
+                gif_hdr,
+            ),
+            ("photo 2026.11.26.gif".into(), Some("gif".into()))
+        );
+        assert_eq!(
+            resolve_download_filename_and_ext(
+                "Ảnh chụp từ iPhone",
+                None,
+                "https://photo-stal-6.zdn.vn/blob",
+                "https://photo-stal-6.zdn.vn/blob",
+                "application/octet-stream",
+                heic_hdr,
+            ),
+            ("Ảnh chụp từ iPhone.heic".into(), Some("heic".into()))
+        );
+        assert_eq!(
+            resolve_download_filename_and_ext(
+                "사진",
+                Some("holiday_shot.avif"),
+                "https://photo-stal-6.zdn.vn/blob",
+                "https://photo-stal-6.zdn.vn/blob",
+                "application/octet-stream",
+                avif_mif1_hdr,
+            ),
+            ("holiday_shot.avif".into(), Some("avif".into()))
+        );
+
+        // `teza-media://` and `http://teza-media.localhost/resolve?url=...` unwrapping
+        assert_eq!(
+            extract_extension_from_url(
+                "http://teza-media.localhost/resolve?url=https%3A%2F%2Ff10-zpc.zdn.vn%2Fa%2Fpic.webp%3Ft%3D1&kind=image&t=tok123"
+            ),
+            Some("webp".to_string())
+        );
+        assert_eq!(
+            extract_extension_from_url(
+                "teza-media://localhost/resolve?url=https%3A%2F%2Ffile-stal-9.dlfl.vn%2Fdoc%2520final.pdf&kind=file&t=tok123"
+            ),
+            Some("pdf".to_string())
+        );
+        assert_eq!(
+            extract_extension_from_url(
+                "https://file-stal-9.dlfl.vn/download?filename=B%C3%A1o%20c%C3%A1o.xlsx&token=xyz"
+            ),
+            Some("xlsx".to_string())
+        );
+        assert_eq!(
+            resolve_download_filename_and_ext(
+                "teza-image",
+                None,
+                "http://teza-media.localhost/resolve?url=https%3A%2F%2Ff10-zpc.zdn.vn%2Fa%2Fpic.png&kind=image&t=tok",
+                "http://teza-media.localhost/resolve?url=https%3A%2F%2Ff10-zpc.zdn.vn%2Fa%2Fpic.png&kind=image&t=tok",
+                "application/octet-stream",
+                b"",
+            ),
+            ("teza-image.png".into(), Some("png".into()))
+        );
+
+        // `teza-video`, `teza-voice`, `teza-sticker` fallbacks must yield to real Content-Disposition / original_name
+        // and adopt true sniffed extensions when given with synthetic extensions
+        assert_eq!(
+            resolve_download_filename_and_ext(
+                "teza-video",
+                Some("demo_clip.mov"),
+                "https://video-stal-11.dlmd.me/v/raw",
+                "https://video-stal-11.dlmd.me/v/raw",
+                "video/quicktime",
+                b"\x00\x00\x00\x14ftypqt  \x00\x00\x00\x00",
+            ),
+            ("demo_clip.mov".into(), Some("mov".into()))
+        );
+        assert_eq!(
+            resolve_download_filename_and_ext(
+                "teza-voice",
+                Some("ghi_am_cuoc_hop.m4a"),
+                "https://voice-stal-1.dlmd.me/v/raw",
+                "https://voice-stal-1.dlmd.me/v/raw",
+                "audio/mp4",
+                b"\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00",
+            ),
+            ("ghi_am_cuoc_hop.m4a".into(), Some("m4a".into()))
+        );
+        assert_eq!(
+            resolve_download_filename_and_ext(
+                "teza-sticker",
+                Some("cat_wave.webp"),
+                "https://zalo-api.zadn.vn/api/emoticon/sticker/webpc",
+                "https://zalo-api.zadn.vn/api/emoticon/sticker/webpc",
+                "image/webp",
+                webp_hdr,
+            ),
+            ("cat_wave.webp".into(), Some("webp".into()))
+        );
+        assert_eq!(
+            resolve_download_filename_and_ext(
+                "teza-sticker.png",
+                None,
+                "https://zalo-api.zadn.vn/api/emoticon/sticker/webpc",
+                "https://zalo-api.zadn.vn/api/emoticon/sticker/webpc",
+                "application/octet-stream",
+                webp_hdr,
+            ),
+            ("teza-sticker.webp".into(), Some("webp".into()))
+        );
+    }
+
+    #[test]
+    fn sniffs_voice_audio_video_archives_and_macro_ooxml_extensions() {
+        // AAC ADTS & AMR voice messages with octet-stream and extensionless URLs
+        let aac_adts = [0xFF, 0xF1, 0x50, 0x80, 0x02, 0x80, 0xFC, 0x00];
+        assert_eq!(
+            resolve_download_filename_and_ext(
+                "Tin nhắn thoại",
+                None,
+                "https://voice-stal-1.dlmd.me/v/raw",
+                "https://voice-stal-1.dlmd.me/v/raw",
+                "application/octet-stream",
+                &aac_adts,
+            ),
+            ("Tin nhắn thoại.aac".into(), Some("aac".into()))
+        );
+        assert_eq!(
+            resolve_download_filename_and_ext(
+                "attachment",
+                None,
+                "https://voice-stal-1.dlmd.me/v/raw",
+                "https://voice-stal-1.dlmd.me/v/raw",
+                "application/octet-stream",
+                b"#!AMR\n\x3c\x00",
+            ),
+            ("attachment.amr".into(), Some("amr".into()))
+        );
+        assert_eq!(
+            sniff_extension_from_bytes(b"\x00\x00\x00\x18ftypM4A \x00\x00\x00\x00"),
+            Some("m4a")
+        );
+        assert_eq!(
+            sniff_extension_from_bytes(b"\x00\x00\x00\x14ftypqt  \x00\x00\x00\x00"),
+            Some("mov")
+        );
+        assert_eq!(sniff_extension_from_bytes(b"OggS\x00\x02"), Some("ogg"));
+        assert_eq!(sniff_extension_from_bytes(b"RIFF\x24\x00\x00\x00WAVEfmt "), Some("wav"));
+        assert_eq!(sniff_extension_from_bytes(b"%PDF-1.7\n"), Some("pdf"));
+        assert_eq!(sniff_extension_from_bytes(b"Rar!\x1a\x07\x01\x00"), Some("rar"));
+        assert_eq!(
+            sniff_extension_from_bytes(&[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0x00]),
+            Some("7z")
+        );
+        assert_eq!(sniff_extension_from_bytes(b"{\\rtf1\\ansi"), Some("rtf"));
+
+        // Macro-enabled OOXML & ODF & genuine code files
+        let mut xlsm = fake_zip_with_entry(b"xl/workbook.xml");
+        xlsm.extend_from_slice(b"xl/vbaProject.bin");
+        assert_eq!(sniff_extension_from_bytes(&xlsm), Some("xlsm"));
+        assert_eq!(
+            sniff_extension_from_bytes(&fake_zip_with_entry(
+                b"mimetypeapplication/vnd.oasis.opendocument.text"
+            )),
+            Some("odt")
+        );
+
+        // Real `.h` / `.c` source files remain untouched when MIME is text/plain
+        assert_eq!(
+            resolve_download_filename_and_ext(
+                "config.h",
+                None,
+                "https://file-stal-9.dlfl.vn/blob",
+                "https://file-stal-9.dlfl.vn/blob",
+                "text/plain",
+                b"#pragma once\n",
+            ),
+            ("config.h".into(), Some("h".into()))
+        );
+    }
+
+    #[test]
+    fn sanitize_and_ensure_save_path_handle_aliases_bare_ext_trailing_spaces_and_media_families() {
+        assert_eq!(
+            sanitize_suggested_filename_preserving_ext(".jpg", Some("jpg")),
+            "download.jpg"
+        );
+        assert_eq!(
+            sanitize_suggested_filename_preserving_ext("photo.JPEG", Some("jpg")),
+            "photo.jpg"
+        );
+        assert_eq!(
+            sanitize_suggested_filename_preserving_ext("photo.tif", Some("tiff")),
+            "photo.tiff"
+        );
+
+        // Trailing dot + spaces must not produce `photo. .jpg`
+        assert_eq!(
+            ensure_save_path_extension(PathBuf::from(r"C:\Users\Mr.Smith\photo.   "), Some("jpg")),
+            PathBuf::from(r"C:\Users\Mr.Smith\photo.jpg")
+        );
+        assert_eq!(
+            ensure_save_path_extension(PathBuf::from(r"C:\Users\Mr.Smith\photo"), Some("webp")),
+            PathBuf::from(r"C:\Users\Mr.Smith\photo.webp")
+        );
+        // Vietnamese time/zone suffix (`10.h`, `khu A.c`) or non-image suffix on an image must keep `.jpg`
+        assert_eq!(
+            ensure_save_path_extension(PathBuf::from(r"C:\dir\Anh chup 10.h"), Some("jpg")),
+            PathBuf::from(r"C:\dir\Anh chup 10.h.jpg")
+        );
+        assert_eq!(
+            ensure_save_path_extension(PathBuf::from(r"C:\dir\Tang 2 khu A.c"), Some("png")),
+            PathBuf::from(r"C:\dir\Tang 2 khu A.c.png")
+        );
+        assert_eq!(
+            ensure_save_path_extension(PathBuf::from(r"C:\dir\my_photo.go"), Some("jpg")),
+            PathBuf::from(r"C:\dir\my_photo.go.jpg")
+        );
+        // Intentional image-family rename (e.g. `.jpg` -> `.png` or `.JPEG`) is respected
+        assert_eq!(
+            ensure_save_path_extension(PathBuf::from(r"C:\dir\my_photo.png"), Some("jpg")),
+            PathBuf::from(r"C:\dir\my_photo.png")
+        );
+        assert_eq!(
+            ensure_save_path_extension(PathBuf::from(r"C:\dir\my_photo.JPEG"), Some("jpg")),
+            PathBuf::from(r"C:\dir\my_photo.JPEG")
+        );
+        // Uncommon extension preserved when user types a date/dot suffix
+        assert_eq!(
+            ensure_save_path_extension(PathBuf::from(r"C:\dir\mockup 26.Nov"), Some("fig")),
+            PathBuf::from(r"C:\dir\mockup 26.Nov.fig")
+        );
+    }
+
+    #[test]
+    fn build_inline_content_disposition_preserves_extensions_and_utf8_safely() {
+        let cd = build_inline_content_disposition("Hình ảnh 26.11.jpg");
+        assert!(cd.starts_with("inline; filename=\""));
+        assert!(cd.contains(".jpg\""));
+        assert!(cd.contains("filename*=UTF-8''"));
+        assert!(cd.ends_with(".jpg"));
+        assert!(!cd.contains('\r') && !cd.contains('\n'));
+
+        let cd_inject = build_inline_content_disposition("evil\"\r\nX-Injected: 1.png");
+        assert!(!cd_inject.contains('\r') && !cd_inject.contains('\n'));
+        assert!(cd_inject.ends_with(".png"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn win32_save_dialog_config_prevents_3char_lpstr_def_ext_truncation() {
+        // <= 3 char extensions keep lpstrDefExt for native filter + *.* fallback
+        let jpg_cfg = win32::build_save_dialog_config("Hình ảnh", Some("jpg"));
+        assert_eq!(jpg_cfg.effective_ext.as_deref(), Some("jpg"));
+        assert_eq!(jpg_cfg.safe_name, "Hình ảnh.jpg");
+        assert_eq!(jpg_cfg.lpstr_def_ext.as_deref(), Some("jpg"));
+        assert!(jpg_cfg.filter_str.starts_with("Tệp JPG (*.jpg)\0*.jpg\0"));
+
+        // 4+ char extensions must pass empty string "" (not "webp"/"xlsx"/"avif") so Win32
+        // GetSaveFileNameW never truncates to `.web`/`.xls`/`.avi` under `*.*` filter!
+        for ext in ["webp", "jpeg", "heic", "avif", "xlsx", "docx", "pptx", "webm"] {
+            let cfg = win32::build_save_dialog_config("test", Some(ext));
+            assert_eq!(cfg.effective_ext.as_deref(), Some(ext));
+            assert_eq!(cfg.safe_name, format!("test.{ext}"));
+            assert_eq!(
+                cfg.lpstr_def_ext.as_deref(),
+                Some(""),
+                "expected empty lpstrDefExt for 4+ char ext .{ext}"
+            );
+            assert!(cfg.filter_str.contains(&format!("*.{ext}\0")));
+        }
+
+        // No extension -> None
+        let none_cfg = win32::build_save_dialog_config("readme", None);
+        assert_eq!(none_cfg.effective_ext, None);
+        assert_eq!(none_cfg.lpstr_def_ext, None);
+        assert_eq!(none_cfg.filter_str, "Tất cả tệp (*.*)\0*.*\0\0");
     }
 }

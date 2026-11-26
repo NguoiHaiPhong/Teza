@@ -263,7 +263,10 @@ pub fn is_image_extension(file_name: &str) -> bool {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp")
+    matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "jfif" | "webp" | "gif" | "bmp"
+    )
 }
 
 pub fn mime_from_extension(file_name: &str) -> &'static str {
@@ -274,7 +277,7 @@ pub fn mime_from_extension(file_name: &str) -> &'static str {
         .to_ascii_lowercase();
     match ext.as_str() {
         "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
+        "jpg" | "jpeg" | "jfif" => "image/jpeg",
         "webp" => "image/webp",
         "gif" => "image/gif",
         "bmp" => "image/bmp",
@@ -295,6 +298,224 @@ pub fn mime_from_extension(file_name: &str) -> &'static str {
         "mp4" => "video/mp4",
         _ => "application/octet-stream",
     }
+}
+
+fn is_synthetic_media_placeholder_line(line: &str) -> bool {
+    matches!(
+        line.trim().to_lowercase().as_str(),
+        "[hình ảnh]"
+            | "[ảnh gif]"
+            | "[video]"
+            | "[tin nhắn thoại]"
+            | "[nhãn dán]"
+            | "[hình ảnh / tệp đính kèm]"
+            | "[tập tin]"
+    )
+}
+
+fn is_file_placeholder_prefix_line(line: &str) -> bool {
+    let lower = line.trim().to_lowercase();
+    lower == "[tập tin]" || lower.starts_with("[tập tin] ")
+}
+
+/// Strips synthetic Teza media/file placeholder text (`"[Hình ảnh]"`, `"[Ảnh GIF]"`,
+/// `"[Video]"`, `"[Tin nhắn thoại]"`, `"[Nhãn dán]"`, `"[Hình ảnh / Tệp đính kèm]"`,
+/// `"[Tập tin]"`, and `"[Tập tin] <filename>"` prefix lines), returning only the real
+/// user-authored caption (empty string when there is no caption).
+pub fn extract_forward_caption(
+    msg_type: &str,
+    text: &str,
+    attachment_name: Option<&str>,
+) -> String {
+    let raw = text.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+
+    let mt = msg_type.trim().to_ascii_lowercase();
+    if matches!(mt.as_str(), "chat.sticker" | "sticker" | "5" | "35" | "36")
+        || mt.contains("sticker")
+    {
+        return String::new();
+    }
+
+    let (first_line, rest) = match raw.find('\n') {
+        Some(idx) => (raw[..idx].trim(), Some(raw[idx + 1..].trim())),
+        None => (raw, None),
+    };
+
+    if is_synthetic_media_placeholder_line(first_line)
+        || is_file_placeholder_prefix_line(first_line)
+    {
+        return rest.unwrap_or("").to_string();
+    }
+
+    let is_plain_text_msg = matches!(mt.as_str(), "chat.text" | "webchat" | "text" | "1");
+    if !is_plain_text_msg {
+        if let Some(att) = attachment_name.map(str::trim).filter(|s| {
+            !s.is_empty()
+                && !s.starts_with("teza-poll:")
+                && !s.starts_with("teza-reminder:")
+                && !s.starts_with("teza-call:")
+        }) {
+            if first_line.to_lowercase() == att.to_lowercase() {
+                return rest.unwrap_or("").to_string();
+            }
+        }
+    }
+
+    raw.to_string()
+}
+
+/// Parses `(cate_id, sticker_id)` from `attachment_name` matching `sticker_{cid}_{sid}.*`
+/// (with `sid > 0`), or extracts `eid={sid}` / `/thumb/{sid}.png` from `attachment_url`
+/// (with `cate_id = 0` when unknown).
+pub fn parse_sticker_ids_from_message(
+    attachment_name: Option<&str>,
+    attachment_url: Option<&str>,
+) -> Option<(i64, i64)> {
+    if let Some(name) = attachment_name.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(rest) = name.strip_prefix("sticker_") {
+            let stem = rest.split('.').next().unwrap_or(rest);
+            let mut parts = stem.split('_');
+            if let (Some(cid_s), Some(sid_s)) = (parts.next(), parts.next()) {
+                if let (Ok(cid), Ok(sid)) = (cid_s.parse::<i64>(), sid_s.parse::<i64>()) {
+                    if cid >= 0 && sid > 0 {
+                        return Some((cid, sid));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(url) = attachment_url.map(str::trim).filter(|u| !u.is_empty()) {
+        if let Some((_, query)) = url.split_once('?') {
+            let query_no_frag = query.split('#').next().unwrap_or(query);
+            for pair in query_no_frag.split('&') {
+                if let Some((k, v)) = pair.split_once('=') {
+                    if k.eq_ignore_ascii_case("eid") {
+                        if let Ok(sid) = v.trim().parse::<i64>() {
+                            if sid > 0 {
+                                return Some((0, sid));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let path_only = url.split(['?', '#']).next().unwrap_or(url);
+        if let Some((_, after_thumb)) = path_only.rsplit_once("/thumb/") {
+            if !after_thumb.contains('/') {
+                if let Some(stem) = after_thumb.split('.').next() {
+                    if let Ok(sid) = stem.trim().parse::<i64>() {
+                        if sid > 0 {
+                            return Some((0, sid));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Returns `true` when the message represents a real forwardable media/file attachment
+/// (`chat.photo`, `chat.gif`, `chat.file`, `share.file`, `file`, `chat.video`,
+/// `chat.video.msg`, `chat.voice`, `"2"`, `"3"`, `"4"`, `"19"`, etc.), and `false` for
+/// link/card/poll/reminder/call/sticker/text messages whose `attachment_url` or
+/// `attachment_name` is only a thumbnail or structured metadata.
+pub fn is_forwardable_media_message(
+    msg_type: &str,
+    attachment_url: Option<&str>,
+    attachment_name: Option<&str>,
+) -> bool {
+    let has_url = attachment_url.map(str::trim).is_some_and(|s| !s.is_empty());
+    let clean_name = attachment_name.map(str::trim).filter(|s| !s.is_empty());
+    if !has_url && clean_name.is_none() {
+        return false;
+    }
+    if let Some(name) = clean_name {
+        if name.starts_with("teza-poll:")
+            || name.starts_with("teza-reminder:")
+            || name.starts_with("teza-call:")
+        {
+            return false;
+        }
+    }
+
+    let mt = msg_type.trim().to_ascii_lowercase();
+    if mt.is_empty()
+        || matches!(
+            mt.as_str(),
+            "chat.text"
+                | "webchat"
+                | "text"
+                | "1"
+                | "chat.link"
+                | "link"
+                | "38"
+                | "chat.location"
+                | "chat.location.new"
+                | "43"
+                | "chat.recommended"
+                | "chat.ecard"
+                | "chat.poll"
+                | "group.poll"
+                | "poll"
+                | "chat.reminder"
+                | "reminder"
+                | "chat.call"
+                | "call"
+                | "chat.sticker"
+                | "sticker"
+                | "5"
+                | "35"
+                | "36"
+        )
+        || mt.contains("poll")
+        || mt.contains("reminder")
+        || mt.contains("call")
+        || mt.contains("sticker")
+        || mt.contains("undo")
+        || mt.starts_with("group.")
+    {
+        return false;
+    }
+
+    matches!(
+        mt.as_str(),
+        "chat.photo"
+            | "photo"
+            | "2"
+            | "32"
+            | "chat.gif"
+            | "gif"
+            | "49"
+            | "chat.file"
+            | "share.file"
+            | "file"
+            | "19"
+            | "46"
+            | "chat.video"
+            | "chat.video.msg"
+            | "video"
+            | "4"
+            | "44"
+            | "chat.voice"
+            | "voice"
+            | "chat.audio"
+            | "audio"
+            | "3"
+            | "31"
+            | "chat.doodle"
+            | "37"
+    ) || mt.contains("photo")
+        || mt.contains("gif")
+        || mt.contains("file")
+        || mt.contains("video")
+        || mt.contains("voice")
+        || mt.contains("audio")
 }
 
 pub fn validate_attachment_size(total_size: u64) -> Result<()> {
@@ -1181,6 +1402,7 @@ async fn send_file_reader<R: AsyncRead + Unpin>(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_attachment_reader<R: AsyncRead + AsyncSeek + Unpin>(
     session: &Session,
     thread_id: &str,
@@ -1188,22 +1410,68 @@ async fn send_attachment_reader<R: AsyncRead + AsyncSeek + Unpin>(
     file_name: &str,
     total_size: u64,
     caption: &str,
+    force_image: Option<bool>,
     reader: &mut R,
 ) -> Result<MessageDto> {
     if !session.is_authenticated() {
         anyhow::bail!("Chưa đăng nhập");
     }
     validate_attachment_size(total_size)?;
-    let mime = mime_from_extension(file_name);
+    let send_as_image = force_image.unwrap_or_else(|| is_image_extension(file_name));
+    let mut mime = mime_from_extension(file_name);
+    if send_as_image && !mime.starts_with("image/") {
+        mime = "image/jpeg";
+    }
     let is_group = kind == ThreadKind::Group;
     let ctx = UploadTarget::new(
         session, thread_id, is_group, file_name, mime, total_size, caption,
     );
-    if is_image_extension(file_name) {
+    if send_as_image {
         send_photo_reader(session, thread_id, &ctx, reader).await
     } else {
         send_file_reader(session, thread_id, &ctx, reader).await
     }
+}
+
+pub async fn send_attachment_file_named(
+    session: &Session,
+    thread_id: &str,
+    kind: ThreadKind,
+    path: &Path,
+    file_name: &str,
+    caption: &str,
+    force_image: Option<bool>,
+) -> Result<MessageDto> {
+    let meta = tokio::fs::metadata(path).await?;
+    if !meta.is_file() {
+        anyhow::bail!("Đường dẫn không phải tệp hợp lệ");
+    }
+    let total_size = meta.len();
+    validate_attachment_size(total_size)?;
+    let effective_name = Path::new(file_name.trim())
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .or_else(|| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+        })
+        .unwrap_or("attachment.bin");
+    let mut file = tokio::fs::File::open(path).await?;
+    send_attachment_reader(
+        session,
+        thread_id,
+        kind,
+        effective_name,
+        total_size,
+        caption,
+        force_image,
+        &mut file,
+    )
+    .await
 }
 
 pub async fn send_attachment_file(
@@ -1213,28 +1481,12 @@ pub async fn send_attachment_file(
     path: &Path,
     caption: &str,
 ) -> Result<MessageDto> {
-    let meta = tokio::fs::metadata(path).await?;
-    if !meta.is_file() {
-        anyhow::bail!("Đường dẫn không phải tệp hợp lệ");
-    }
-    let total_size = meta.len();
-    validate_attachment_size(total_size)?;
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
         .filter(|n| !n.trim().is_empty())
         .unwrap_or("attachment.bin");
-    let mut file = tokio::fs::File::open(path).await?;
-    send_attachment_reader(
-        session,
-        thread_id,
-        kind,
-        file_name,
-        total_size,
-        caption,
-        &mut file,
-    )
-    .await
+    send_attachment_file_named(session, thread_id, kind, path, file_name, caption, None).await
 }
 
 pub async fn send_attachment_bytes(
@@ -1255,6 +1507,7 @@ pub async fn send_attachment_bytes(
         file_name,
         total_size,
         caption,
+        None,
         &mut cursor,
     )
     .await
@@ -1509,5 +1762,170 @@ mod tests {
         assert_eq!(reaction_client_msg_type("chat.video"), 44);
         assert_eq!(reaction_client_msg_type("chat.file"), 46);
         assert_eq!(reaction_client_msg_type("chat.gif"), 49);
+    }
+
+    #[test]
+    fn jfif_extension_is_recognized_as_jpeg_image() {
+        assert!(is_image_extension("a.jfif"));
+        assert!(is_image_extension("PHOTO.JFIF"));
+        assert_eq!(mime_from_extension("a.jfif"), "image/jpeg");
+        assert_eq!(mime_from_extension("PHOTO.JFIF"), "image/jpeg");
+    }
+
+    #[test]
+    fn extract_forward_caption_strips_synthetic_placeholders_and_preserves_real_captions() {
+        assert_eq!(extract_forward_caption("chat.photo", "[Hình ảnh]", Some("a.jpg")), "");
+        assert_eq!(extract_forward_caption("chat.gif", "[Ảnh GIF]", None), "");
+        assert_eq!(extract_forward_caption("chat.video", "[Video]", None), "");
+        assert_eq!(extract_forward_caption("chat.voice", "[Tin nhắn thoại]", None), "");
+        assert_eq!(extract_forward_caption("chat.sticker", "[Nhãn dán]", None), "");
+        assert_eq!(extract_forward_caption("chat.sticker", "Bất kỳ văn bản nào", None), "");
+        assert_eq!(
+            extract_forward_caption("chat.file", "[Hình ảnh / Tệp đính kèm]", None),
+            ""
+        );
+        assert_eq!(extract_forward_caption("chat.file", "[Tập tin]", Some("doc.pdf")), "");
+        assert_eq!(
+            extract_forward_caption("chat.file", "[Tập tin] bao_cao.pdf", Some("bao_cao.pdf")),
+            ""
+        );
+        assert_eq!(
+            extract_forward_caption(
+                "chat.file",
+                "[Tập tin] bao_cao.pdf\nGửi anh bản chốt",
+                Some("bao_cao.pdf")
+            ),
+            "Gửi anh bản chốt"
+        );
+        assert_eq!(
+            extract_forward_caption("chat.file", "bao_cao.pdf", Some("bao_cao.pdf")),
+            ""
+        );
+        assert_eq!(
+            extract_forward_caption("chat.file", "bao_cao.pdf\nXem giúp em", Some("bao_cao.pdf")),
+            "Xem giúp em"
+        );
+        assert_eq!(
+            extract_forward_caption("chat.photo", "Ảnh chụp sáng nay", Some("img.jpg")),
+            "Ảnh chụp sáng nay"
+        );
+        assert_eq!(
+            extract_forward_caption("chat.photo", "[Hình ảnh]\nChuyến đi Đà Lạt", Some("img.jpg")),
+            "Chuyến đi Đà Lạt"
+        );
+        assert_eq!(
+            extract_forward_caption("chat.text", "report.pdf", Some("report.pdf")),
+            "report.pdf"
+        );
+    }
+
+    #[test]
+    fn parse_sticker_ids_from_message_extracts_from_attachment_name_and_url() {
+        assert_eq!(
+            parse_sticker_ids_from_message(Some("sticker_1002_2005.png"), None),
+            Some((1002, 2005))
+        );
+        assert_eq!(
+            parse_sticker_ids_from_message(Some("sticker_0_15.webp"), None),
+            Some((0, 15))
+        );
+        assert_eq!(
+            parse_sticker_ids_from_message(Some("sticker_10_0.png"), None),
+            None
+        );
+        assert_eq!(
+            parse_sticker_ids_from_message(
+                None,
+                Some("https://api.zaloapp.com/api/emoticon/sticker/webpc?eid=2005&size=130")
+            ),
+            Some((0, 2005))
+        );
+        assert_eq!(
+            parse_sticker_ids_from_message(
+                None,
+                Some("https://stc-chat.zdn.vn/images/stickers/default/thumb/15.png")
+            ),
+            Some((0, 15))
+        );
+        assert_eq!(
+            parse_sticker_ids_from_message(
+                Some("sticker_10_0.png"),
+                Some("https://api.zaloapp.com/api/emoticon/sticker/webpc?size=130&eid=777")
+            ),
+            Some((0, 777))
+        );
+        assert_eq!(
+            parse_sticker_ids_from_message(
+                Some("photo.jpg"),
+                Some("https://cdn.zdn.vn/photo/12345.jpg")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn is_forwardable_media_message_matches_real_media_and_rejects_cards_or_text() {
+        for mt in [
+            "chat.photo",
+            "chat.gif",
+            "chat.file",
+            "share.file",
+            "file",
+            "chat.video",
+            "chat.video.msg",
+            "chat.voice",
+            "2",
+            "3",
+            "4",
+            "19",
+            "31",
+            "32",
+            "44",
+            "46",
+            "49",
+        ] {
+            assert!(
+                is_forwardable_media_message(mt, Some("https://cdn.zdn.vn/media/a.bin"), None),
+                "expected {mt} to be forwardable media"
+            );
+        }
+        // Vault-only file with attachment_name but no remote URL is still forwardable.
+        assert!(is_forwardable_media_message("chat.file", None, Some("report.pdf")));
+
+        // Recalled / empty media without URL or filename is NOT forwardable.
+        assert!(!is_forwardable_media_message("chat.photo", None, None));
+
+        // Link/card/poll/reminder/call/sticker/text messages are NOT forwardable media.
+        for mt in [
+            "chat.link",
+            "link",
+            "chat.location",
+            "chat.location.new",
+            "chat.recommended",
+            "chat.ecard",
+            "chat.poll",
+            "chat.reminder",
+            "chat.call",
+            "chat.text",
+            "webchat",
+            "chat.sticker",
+            "5",
+            "36",
+            "group.action",
+        ] {
+            assert!(
+                !is_forwardable_media_message(
+                    mt,
+                    Some("https://cdn.zdn.vn/thumb.jpg"),
+                    Some("thumb.jpg")
+                ),
+                "expected {mt} NOT to be forwardable media"
+            );
+        }
+        assert!(!is_forwardable_media_message(
+            "chat.file",
+            None,
+            Some("teza-poll:{\"poll_id\":1}")
+        ));
     }
 }

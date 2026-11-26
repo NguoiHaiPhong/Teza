@@ -5,6 +5,7 @@ import {
   AtSign,
   Bell,
   Bookmark,
+  Bot,
   CheckCircle2,
   Cloud,
   ExternalLink,
@@ -35,6 +36,7 @@ import {
   Shield,
   SlidersHorizontal,
   Sparkles,
+  Terminal,
   Trash2,
   User,
   Users,
@@ -48,11 +50,16 @@ import { useEmojiStyle } from "../utils/emojiStyleContext";
 import { RetroEmoticon } from "./RetroEmoticon";
 import type {
   AccountProfile,
+  AiConfigDto,
+  ApiAuditLogDto,
+  ApiClientDto,
   AppUpdateInfo,
   BuiltInRailFolderId,
   CallAudioTestResultDto,
   CallDevicesDto,
   ConnectionStatus,
+  LocalApiConfigDto,
+  LocalApiStatusDto,
   MediaVaultConfigDto,
   MediaVaultStatsDto,
   NotificationPrefs,
@@ -64,6 +71,7 @@ import type {
   RelayConfigSummary,
   RelayMode,
   ThemeMode,
+  ThreadDto,
   TranslateConfigSummary,
 } from "../types";
 import { resolveEffectiveCallDevices } from "../utils/callState";
@@ -79,6 +87,8 @@ import { ThreadAvatar } from "./ThreadAvatar";
 import { WEBAPP_ICON_OPTIONS, renderWebAppIcon } from "./WebAppWorkspace";
 
 const CloudStoragePanel = lazy(() => import("./CloudStoragePanel"));
+const AiSettingsSection = lazy(() => import("./AiSettingsSection"));
+const LocalApiPanel = lazy(() => import("./LocalApiPanel"));
 
 export type FontSizeScale = "sm" | "md" | "lg";
 export type DensityMode = "comfortable" | "compact";
@@ -90,6 +100,8 @@ export type SettingsTab =
   | "webapps"
   | "calls"
   | "translate"
+  | "ai"
+  | "local-api"
   | "storage"
   | "network"
   | "system";
@@ -131,6 +143,10 @@ interface Props {
   onLockNow: () => void;
   translateCfg: TranslateConfigSummary | null;
   onOpenTranslateModal: () => void;
+  threads?: ThreadDto[];
+  aiConfig?: AiConfigDto | null;
+  onAiConfigChange?: (cfg: AiConfigDto) => void;
+  onOpenAiChat?: () => void;
   relayCfg: RelayConfigSummary | null;
   onRelaySaved: (cfg: RelayConfigSummary) => void;
   focusRelay?: boolean;
@@ -161,6 +177,8 @@ const NAV_TABS: { id: SettingsTab; labelKey: TranslationKey; icon: typeof Bell }
   { id: "webapps", labelKey: "tabWebApps", icon: Globe },
   { id: "calls", labelKey: "tabCalls", icon: Phone },
   { id: "translate", labelKey: "tabTranslate", icon: Languages },
+  { id: "ai", labelKey: "tabAiAssistant", icon: Bot },
+  { id: "local-api", labelKey: "tabLocalApi", icon: Terminal },
   { id: "storage", labelKey: "settingsTabStorage", icon: HardDrive },
   { id: "network", labelKey: "tabNetwork", icon: Network },
   { id: "account", labelKey: "tabAccount", icon: User },
@@ -275,6 +293,10 @@ export function SettingsModal({
   onLockNow,
   translateCfg,
   onOpenTranslateModal,
+  threads = [],
+  aiConfig = null,
+  onAiConfigChange,
+  onOpenAiChat,
   relayCfg,
   onRelaySaved,
   focusRelay = false,
@@ -330,7 +352,16 @@ export function SettingsModal({
   const [storageFeedback, setStorageFeedback] = useState<{ ok: boolean; text: string } | null>(
     null,
   );
+  const [aiLocalConfig, setAiLocalConfig] = useState<AiConfigDto | null>(aiConfig);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [localApiConfig, setLocalApiConfig] = useState<LocalApiConfigDto | null>(null);
+  const [localApiStatus, setLocalApiStatus] = useState<LocalApiStatusDto | null>(null);
+  const [localApiClients, setLocalApiClients] = useState<ApiClientDto[]>([]);
+  const [localApiAuditLogs, setLocalApiAuditLogs] = useState<ApiAuditLogDto[]>([]);
+  const [localApiLoading, setLocalApiLoading] = useState(false);
   const mountedRef = useRef(true);
+  const onAiConfigChangeRef = useRef(onAiConfigChange);
+  onAiConfigChangeRef.current = onAiConfigChange;
   const storageReqSeqRef = useRef(0);
   const storageConfigRef = useRef<MediaVaultConfigDto | null>(null);
   storageConfigRef.current = storageConfig;
@@ -415,6 +446,84 @@ export function SettingsModal({
     return () => {
       cancelled = true;
       setStorageLoading(false);
+    };
+  }, [open, activeTab]);
+
+  useEffect(() => {
+    setAiLocalConfig(aiConfig);
+  }, [aiConfig]);
+
+  useEffect(() => {
+    if (!open || activeTab !== "ai") return;
+    let cancelled = false;
+    setAiLoading(true);
+    void bridge
+      .aiGetConfig()
+      .then((cfg) => {
+        if (cancelled || !mountedRef.current) return;
+        setAiLocalConfig(cfg);
+        onAiConfigChangeRef.current?.(cfg);
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (!cancelled && mountedRef.current) setAiLoading(false);
+      });
+    return () => {
+      cancelled = true;
+      setAiLoading(false);
+    };
+  }, [open, activeTab]);
+
+  useEffect(() => {
+    if (!open || activeTab !== "local-api") return;
+    let cancelled = false;
+    let unlistenAudit: (() => void) | null = null;
+    setLocalApiLoading(true);
+    void Promise.all([
+      bridge.localApiGetConfig(),
+      bridge.localApiGetStatus(),
+      bridge.localApiListClients(),
+      bridge.localApiListAuditLogs(100),
+    ])
+      .then(([cfg, st, clients, logs]) => {
+        if (cancelled || !mountedRef.current) return;
+        setLocalApiConfig(cfg);
+        setLocalApiStatus(st);
+        setLocalApiClients(clients);
+        setLocalApiAuditLogs(logs);
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (!cancelled && mountedRef.current) setLocalApiLoading(false);
+      });
+
+    void bridge
+      .onLocalApiAudit((entry) => {
+        if (cancelled || !mountedRef.current) return;
+        setLocalApiAuditLogs((prev) => {
+          if (prev.some((row) => row.id === entry.id)) return prev;
+          return [entry, ...prev].slice(0, 100);
+        });
+        void bridge
+          .localApiListClients()
+          .then((clients) => {
+            if (!cancelled && mountedRef.current) setLocalApiClients(clients);
+          })
+          .catch(() => undefined);
+      })
+      .then((fn) => {
+        if (cancelled) {
+          fn();
+        } else {
+          unlistenAudit = fn;
+        }
+      })
+      .catch(() => undefined);
+
+    return () => {
+      cancelled = true;
+      setLocalApiLoading(false);
+      unlistenAudit?.();
     };
   }, [open, activeTab]);
 
@@ -1865,6 +1974,122 @@ export function SettingsModal({
                   </button>
                 </div>
               </section>
+            )}
+
+            {activeTab === "ai" && (
+              <Suspense
+                fallback={
+                  <div
+                    className="flex items-center justify-center gap-2 rounded-xl p-6 text-xs"
+                    style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
+                  >
+                    <Loader2 className="h-4 w-4 animate-spin" style={{ color: "var(--accent)" }} />
+                    <span>{t("loadingPanelLabel")}</span>
+                  </div>
+                }
+              >
+                <AiSettingsSection
+                  config={aiLocalConfig}
+                  loading={aiLoading}
+                  translateHasGeminiKey={Boolean(translateCfg?.has_gemini_key)}
+                  translateGeminiPreview={translateCfg?.gemini_preview || ""}
+                  onSave={async (update) => {
+                    const saved = await bridge.aiUpdateConfig(update);
+                    setAiLocalConfig(saved);
+                    onAiConfigChange?.(saved);
+                    return saved;
+                  }}
+                  onProbeCli={(cliPath) => bridge.aiProbeCli(cliPath)}
+                  onOpenAiChat={
+                    onOpenAiChat
+                      ? () => {
+                          onClose();
+                          onOpenAiChat();
+                        }
+                      : undefined
+                  }
+                  onOpenTranslateSettings={() => setActiveTab("translate")}
+                />
+              </Suspense>
+            )}
+
+            {activeTab === "local-api" && (
+              <Suspense
+                fallback={
+                  <div
+                    className="flex items-center justify-center gap-2 rounded-xl p-6 text-xs"
+                    style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
+                  >
+                    <Loader2 className="h-4 w-4 animate-spin" style={{ color: "var(--accent)" }} />
+                    <span>{t("loadingPanelLabel")}</span>
+                  </div>
+                }
+              >
+                <LocalApiPanel
+                  config={localApiConfig}
+                  status={localApiStatus}
+                  clients={localApiClients}
+                  auditLogs={localApiAuditLogs}
+                  threads={threads}
+                  loading={localApiLoading}
+                  onSaveConfig={async (nextCfg) => {
+                    const st = await bridge.localApiUpdateConfig(nextCfg);
+                    setLocalApiConfig(nextCfg);
+                    setLocalApiStatus(st);
+                    return st;
+                  }}
+                  onCreateClient={async (input) => {
+                    const created = await bridge.localApiCreateClient(input);
+                    setLocalApiClients((prev) => [created.client, ...prev]);
+                    void bridge
+                      .localApiGetStatus()
+                      .then((st) => {
+                        if (mountedRef.current) setLocalApiStatus(st);
+                      })
+                      .catch(() => undefined);
+                    return created;
+                  }}
+                  onUpdateClient={async (id, input) => {
+                    const updated = await bridge.localApiUpdateClient(id, input);
+                    if (updated) {
+                      setLocalApiClients((prev) =>
+                        prev.map((c) => (c.id === id ? updated : c)),
+                      );
+                    }
+                    void bridge
+                      .localApiGetStatus()
+                      .then((st) => {
+                        if (mountedRef.current) setLocalApiStatus(st);
+                      })
+                      .catch(() => undefined);
+                    return updated ?? undefined;
+                  }}
+                  onDeleteClient={async (id) => {
+                    await bridge.localApiDeleteClient(id);
+                    setLocalApiClients((prev) => prev.filter((c) => c.id !== id));
+                    void bridge
+                      .localApiGetStatus()
+                      .then((st) => {
+                        if (mountedRef.current) setLocalApiStatus(st);
+                      })
+                      .catch(() => undefined);
+                  }}
+                  onRefreshAudit={async () => {
+                    const [logs, st, clients] = await Promise.all([
+                      bridge.localApiListAuditLogs(100),
+                      bridge.localApiGetStatus(),
+                      bridge.localApiListClients(),
+                    ]);
+                    setLocalApiAuditLogs(logs);
+                    setLocalApiStatus(st);
+                    setLocalApiClients(clients);
+                  }}
+                  onClearAudit={async () => {
+                    await bridge.localApiClearAuditLogs();
+                    setLocalApiAuditLogs([]);
+                  }}
+                />
+              </Suspense>
             )}
 
             {activeTab === "storage" && (
