@@ -24,12 +24,14 @@ import { bridge } from "../bridge";
 import { useI18n } from "../i18n";
 import type { UserProfileDto } from "../types";
 import { copyTextReliable } from "../utils/clipboard";
+import { isImeComposingEvent } from "../utils/searchNormalize";
 import { formatThreadTime } from "../utils/threadState";
 import { RelayImage } from "./RelayImage";
 import { ThreadAvatar } from "./ThreadAvatar";
 
 export interface UserProfileModalProps {
   userId: string | null;
+  isLocked?: boolean;
   initialProfile?: UserProfileDto | null;
   onClose: () => void;
   onStartChat: (profile: UserProfileDto) => void;
@@ -40,6 +42,7 @@ export interface UserProfileModalProps {
 
 type PendingRequestState = { kind: "received" | "sent"; message: string } | null;
 type ConfirmAction = "unfriend" | "block" | null;
+type BusyActionKind = "send" | "accept" | "reject" | "undo" | "unfriend" | "block" | "unblock" | null;
 
 function cleanError(err: unknown): string {
   return String(err).replace(/^Error:\s*/i, "").trim() || String(err);
@@ -47,6 +50,7 @@ function cleanError(err: unknown): string {
 
 export function UserProfileModal({
   userId,
+  isLocked = false,
   initialProfile = null,
   onClose,
   onStartChat,
@@ -64,15 +68,21 @@ export function UserProfileModal({
   const [confirmAction, setConfirmAction] = useState<ConfirmAction>(null);
   const [addFormOpen, setAddFormOpen] = useState(false);
   const [greetingText, setGreetingText] = useState("");
-  const [actionBusy, setActionBusy] = useState(false);
+  const [actionBusyKind, setActionBusyKind] = useState<BusyActionKind>(null);
+  const actionBusy = actionBusyKind !== null;
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
   const copiedTimerRef = useRef<number | null>(null);
   const copiedPhoneTimerRef = useRef<number | null>(null);
   const relationshipMutatedRef = useRef(false);
+  const mountedRef = useRef(true);
+  const activeUserIdRef = useRef<string | null>(userId);
+  activeUserIdRef.current = userId;
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
       if (copiedTimerRef.current !== null) {
         window.clearTimeout(copiedTimerRef.current);
         copiedTimerRef.current = null;
@@ -85,13 +95,25 @@ export function UserProfileModal({
   }, []);
 
   useEffect(() => {
-    if (!userId) return;
+    if (!userId || isLocked) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (isLocked || isImeComposingEvent(e)) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        if (actionBusy) return;
+        if (confirmAction !== null) {
+          setConfirmAction(null);
+        } else if (addFormOpen) {
+          setAddFormOpen(false);
+        } else {
+          onClose();
+        }
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [userId, onClose]);
+  }, [userId, isLocked, actionBusy, confirmAction, addFormOpen, onClose]);
 
   useEffect(() => {
     if (!userId) {
@@ -101,7 +123,7 @@ export function UserProfileModal({
       setConfirmAction(null);
       setAddFormOpen(false);
       setGreetingText("");
-      setActionBusy(false);
+      setActionBusyKind(null);
       setActionError(null);
       setActionNotice(null);
       relationshipMutatedRef.current = false;
@@ -117,7 +139,7 @@ export function UserProfileModal({
     setConfirmAction(null);
     setAddFormOpen(false);
     setGreetingText("");
-    setActionBusy(false);
+    setActionBusyKind(null);
     setActionError(null);
     setActionNotice(null);
 
@@ -216,12 +238,14 @@ export function UserProfileModal({
 
   const handleSendFriendRequest = async () => {
     if (!profile || profile.is_self || actionBusy) return;
+    const targetUid = profile.uid;
     const msg = greetingText.trim() || t("friendRequestDefaultGreeting");
-    setActionBusy(true);
+    setActionBusyKind("send");
     setActionError(null);
     setActionNotice(null);
     try {
-      const res = await bridge.friendSendRequest(profile.uid, msg);
+      const res = await bridge.friendSendRequest(targetUid, msg);
+      if (!mountedRef.current || activeUserIdRef.current !== targetUid) return;
       if (!res.ok) {
         setActionError(res.message || t("friendRequestSendBtn"));
         return;
@@ -229,11 +253,11 @@ export function UserProfileModal({
       relationshipMutatedRef.current = true;
       setAddFormOpen(false);
       if (res.already_friends) {
-        setProfile((prev) => (prev ? { ...prev, is_friend: true } : prev));
+        setProfile((prev) => (prev && prev.uid === targetUid ? { ...prev, is_friend: true } : prev));
         setPendingRequest(null);
         setActionNotice(t("friendAlreadyFriends"));
       } else if (res.auto_accepted) {
-        setProfile((prev) => (prev ? { ...prev, is_friend: true } : prev));
+        setProfile((prev) => (prev && prev.uid === targetUid ? { ...prev, is_friend: true } : prev));
         setPendingRequest(null);
         setActionNotice(t("friendRequestAutoAccepted"));
       } else {
@@ -242,42 +266,53 @@ export function UserProfileModal({
       }
       onRelationshipChanged?.();
     } catch (err) {
+      if (!mountedRef.current || activeUserIdRef.current !== targetUid) return;
       setActionError(cleanError(err));
     } finally {
-      setActionBusy(false);
+      if (mountedRef.current && activeUserIdRef.current === targetUid) {
+        setActionBusyKind(null);
+      }
     }
   };
 
   const handleAcceptRequest = async () => {
     if (!profile || profile.is_self || actionBusy) return;
-    setActionBusy(true);
+    const targetUid = profile.uid;
+    const targetName = profile.display_name;
+    setActionBusyKind("accept");
     setActionError(null);
     setActionNotice(null);
     try {
-      const res = await bridge.friendAcceptRequest(profile.uid);
+      const res = await bridge.friendAcceptRequest(targetUid);
+      if (!mountedRef.current || activeUserIdRef.current !== targetUid) return;
       if (!res.ok) {
         setActionError(res.message || t("friendRequestAcceptBtn"));
         return;
       }
       relationshipMutatedRef.current = true;
-      setProfile((prev) => (prev ? { ...prev, is_friend: true } : prev));
+      setProfile((prev) => (prev && prev.uid === targetUid ? { ...prev, is_friend: true } : prev));
       setPendingRequest(null);
-      setActionNotice(t("friendAcceptedSuccess", { name: profile.display_name }));
+      setActionNotice(t("friendAcceptedSuccess", { name: targetName }));
       onRelationshipChanged?.();
     } catch (err) {
+      if (!mountedRef.current || activeUserIdRef.current !== targetUid) return;
       setActionError(cleanError(err));
     } finally {
-      setActionBusy(false);
+      if (mountedRef.current && activeUserIdRef.current === targetUid) {
+        setActionBusyKind(null);
+      }
     }
   };
 
   const handleRejectRequest = async () => {
     if (!profile || profile.is_self || actionBusy) return;
-    setActionBusy(true);
+    const targetUid = profile.uid;
+    setActionBusyKind("reject");
     setActionError(null);
     setActionNotice(null);
     try {
-      const res = await bridge.friendRejectRequest(profile.uid);
+      const res = await bridge.friendRejectRequest(targetUid);
+      if (!mountedRef.current || activeUserIdRef.current !== targetUid) return;
       if (!res.ok) {
         setActionError(res.message || t("friendRequestRejectBtn"));
         return;
@@ -287,19 +322,24 @@ export function UserProfileModal({
       setActionNotice(t("friendRejectedSuccess"));
       onRelationshipChanged?.();
     } catch (err) {
+      if (!mountedRef.current || activeUserIdRef.current !== targetUid) return;
       setActionError(cleanError(err));
     } finally {
-      setActionBusy(false);
+      if (mountedRef.current && activeUserIdRef.current === targetUid) {
+        setActionBusyKind(null);
+      }
     }
   };
 
   const handleUndoRequest = async () => {
     if (!profile || profile.is_self || actionBusy) return;
-    setActionBusy(true);
+    const targetUid = profile.uid;
+    setActionBusyKind("undo");
     setActionError(null);
     setActionNotice(null);
     try {
-      const res = await bridge.friendUndoRequest(profile.uid);
+      const res = await bridge.friendUndoRequest(targetUid);
+      if (!mountedRef.current || activeUserIdRef.current !== targetUid) return;
       if (!res.ok) {
         setActionError(res.message || t("friendRequestUndoBtn"));
         return;
@@ -309,86 +349,112 @@ export function UserProfileModal({
       setActionNotice(t("friendUndoneSuccess"));
       onRelationshipChanged?.();
     } catch (err) {
+      if (!mountedRef.current || activeUserIdRef.current !== targetUid) return;
       setActionError(cleanError(err));
     } finally {
-      setActionBusy(false);
+      if (mountedRef.current && activeUserIdRef.current === targetUid) {
+        setActionBusyKind(null);
+      }
     }
   };
 
   const handleConfirmUnfriend = async () => {
     if (!profile || profile.is_self || actionBusy) return;
-    setActionBusy(true);
+    const targetUid = profile.uid;
+    const targetName = profile.display_name;
+    setActionBusyKind("unfriend");
     setActionError(null);
     setActionNotice(null);
     try {
-      const res = await bridge.friendRemove(profile.uid);
+      const res = await bridge.friendRemove(targetUid);
+      if (!mountedRef.current || activeUserIdRef.current !== targetUid) return;
       if (!res.ok) {
         setActionError(res.message || t("friendUnfriendBtn"));
         return;
       }
       relationshipMutatedRef.current = true;
-      setProfile((prev) => (prev ? { ...prev, is_friend: false } : prev));
+      setProfile((prev) => (prev && prev.uid === targetUid ? { ...prev, is_friend: false } : prev));
       setPendingRequest(null);
       setConfirmAction(null);
-      setActionNotice(t("friendUnfriendSuccess", { name: profile.display_name }));
+      setActionNotice(t("friendUnfriendSuccess", { name: targetName }));
       onRelationshipChanged?.();
     } catch (err) {
+      if (!mountedRef.current || activeUserIdRef.current !== targetUid) return;
       setActionError(cleanError(err));
     } finally {
-      setActionBusy(false);
+      if (mountedRef.current && activeUserIdRef.current === targetUid) {
+        setActionBusyKind(null);
+      }
     }
   };
 
   const handleConfirmBlock = async () => {
     if (!profile || profile.is_self || actionBusy) return;
-    setActionBusy(true);
+    const targetUid = profile.uid;
+    const targetName = profile.display_name;
+    setActionBusyKind("block");
     setActionError(null);
     setActionNotice(null);
     try {
-      const res = await bridge.friendBlockUser(profile.uid);
+      const res = await bridge.friendBlockUser(targetUid);
+      if (!mountedRef.current || activeUserIdRef.current !== targetUid) return;
       if (!res.ok) {
         setActionError(res.message || t("friendBlockBtn"));
         return;
       }
       relationshipMutatedRef.current = true;
-      setProfile((prev) => (prev ? { ...prev, is_blocked: true } : prev));
+      setProfile((prev) => (prev && prev.uid === targetUid ? { ...prev, is_blocked: true } : prev));
       setConfirmAction(null);
-      setActionNotice(t("friendBlockedSuccess", { name: profile.display_name }));
+      setActionNotice(t("friendBlockedSuccess", { name: targetName }));
       onRelationshipChanged?.();
     } catch (err) {
+      if (!mountedRef.current || activeUserIdRef.current !== targetUid) return;
       setActionError(cleanError(err));
     } finally {
-      setActionBusy(false);
+      if (mountedRef.current && activeUserIdRef.current === targetUid) {
+        setActionBusyKind(null);
+      }
     }
   };
 
   const handleUnblock = async () => {
     if (!profile || profile.is_self || actionBusy) return;
-    setActionBusy(true);
+    const targetUid = profile.uid;
+    const targetName = profile.display_name;
+    setActionBusyKind("unblock");
     setActionError(null);
     setActionNotice(null);
     try {
-      const res = await bridge.friendUnblockUser(profile.uid);
+      const res = await bridge.friendUnblockUser(targetUid);
+      if (!mountedRef.current || activeUserIdRef.current !== targetUid) return;
       if (!res.ok) {
         setActionError(res.message || t("friendUnblockBtn"));
         return;
       }
       relationshipMutatedRef.current = true;
-      setProfile((prev) => (prev ? { ...prev, is_blocked: false } : prev));
+      setProfile((prev) => (prev && prev.uid === targetUid ? { ...prev, is_blocked: false } : prev));
       setConfirmAction(null);
-      setActionNotice(t("friendUnblockedSuccess", { name: profile.display_name }));
+      setActionNotice(t("friendUnblockedSuccess", { name: targetName }));
       onRelationshipChanged?.();
     } catch (err) {
+      if (!mountedRef.current || activeUserIdRef.current !== targetUid) return;
       setActionError(cleanError(err));
     } finally {
-      setActionBusy(false);
+      if (mountedRef.current && activeUserIdRef.current === targetUid) {
+        setActionBusyKind(null);
+      }
     }
+  };
+
+  const handleRequestClose = () => {
+    if (actionBusy) return;
+    onClose();
   };
 
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-xs"
-      onClick={onClose}
+      onClick={handleRequestClose}
     >
       <div
         className="relative flex max-h-[86vh] w-full max-w-md flex-col overflow-hidden rounded-2xl shadow-2xl"
@@ -397,9 +463,10 @@ export function UserProfileModal({
       >
         <button
           type="button"
-          onClick={onClose}
+          disabled={actionBusy}
+          onClick={handleRequestClose}
           title={t("close")}
-          className="absolute right-3 top-3 z-30 rounded-full bg-black/45 p-1.5 text-white transition hover:bg-black/65"
+          className="absolute right-3 top-3 z-30 rounded-full bg-black/45 p-1.5 text-white transition hover:bg-black/65 disabled:cursor-not-allowed disabled:opacity-45"
         >
           <X className="h-4 w-4" />
         </button>
@@ -724,7 +791,7 @@ export function UserProfileModal({
                             onClick={() => void handleAcceptRequest()}
                             className="tf-btn flex items-center justify-center gap-1.5 rounded-xl px-3 py-2 text-xs font-semibold disabled:opacity-50"
                           >
-                            {actionBusy ? (
+                            {actionBusyKind === "accept" ? (
                               <Loader2 className="h-3.5 w-3.5 animate-spin" />
                             ) : (
                               <Check className="h-3.5 w-3.5" />
@@ -742,7 +809,11 @@ export function UserProfileModal({
                               color: "var(--danger-text)",
                             }}
                           >
-                            <X className="h-3.5 w-3.5" />
+                            {actionBusyKind === "reject" ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <X className="h-3.5 w-3.5" />
+                            )}
                             <span>{t("friendRequestRejectBtn")}</span>
                           </button>
                         </div>
@@ -801,7 +872,7 @@ export function UserProfileModal({
                             color: "var(--text-primary)",
                           }}
                         >
-                          {actionBusy ? (
+                          {actionBusyKind === "undo" ? (
                             <Loader2 className="h-3.5 w-3.5 animate-spin" />
                           ) : (
                             <Undo2 className="h-3.5 w-3.5" />
@@ -847,7 +918,7 @@ export function UserProfileModal({
                             color: "#34d399",
                           }}
                         >
-                          {actionBusy ? (
+                          {actionBusyKind === "unblock" ? (
                             <Loader2 className="h-3.5 w-3.5 animate-spin" />
                           ) : (
                             <ShieldCheck className="h-3.5 w-3.5" />

@@ -223,8 +223,11 @@ export function shouldShowVideoOverlay(
   );
 }
 
-export function shouldCaptureLocalVideo(active: CallSnapshotDto | null): boolean {
-  if (!active) return false;
+export function shouldCaptureLocalVideo(
+  active: CallSnapshotDto | null,
+  isLocked = false,
+): boolean {
+  if (!active || isLocked) return false;
   return (
     active.call_type === "DirectVideo" &&
     active.phase === "connected" &&

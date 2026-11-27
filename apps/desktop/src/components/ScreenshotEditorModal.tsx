@@ -36,9 +36,11 @@ import {
   renderAnnotatedCanvas,
   resizeCropRect,
 } from "../utils/screenshotEditor";
+import { isImeComposingEvent } from "../utils/searchNormalize";
 
 interface Props {
   open: boolean;
+  isLocked?: boolean;
   sourceUrl: string;
   initialMode: "crop" | "annotate";
   monitors: MonitorInfoDto[];
@@ -49,9 +51,63 @@ interface Props {
   onToggleHideWindow: (val: boolean) => void;
   onRecapture?: (opts: { monitorIndex: number | null; captureAll: boolean }) => void;
   onClose: () => void;
-  onAttach: (attachment: PendingAttachment, caption: string) => void;
+  onAttach: (
+    attachment: PendingAttachment,
+    caption: string,
+  ) => boolean | void | Promise<boolean | void>;
   onSend: (attachment: PendingAttachment, caption: string) => Promise<void | unknown> | void;
   onError: (err: unknown) => void;
+}
+
+interface AnnotationHistory {
+  ops: AnnotationOp[];
+  past: AnnotationOp[][];
+  future: AnnotationOp[][];
+}
+
+const EMPTY_HISTORY: AnnotationHistory = {
+  ops: [],
+  past: [],
+  future: [],
+};
+
+const MAX_HISTORY_DEPTH = 100;
+
+function clampTextCoordsToView(
+  x: number,
+  y: number,
+  text: string,
+  fontSize: number,
+  view: CropRect,
+  canvas?: HTMLCanvasElement | null,
+): { x: number; y: number } {
+  if (view.w <= 0 || view.h <= 0) return { x, y };
+  const lines = text.split(/\r?\n/);
+  const lineHeight = Math.round(fontSize * 1.24);
+  const totalHeight = Math.max(lineHeight, lines.length * lineHeight);
+  let maxWidth = 0;
+  const ctx = canvas?.getContext("2d");
+  if (ctx) {
+    ctx.save();
+    ctx.font = `700 ${fontSize}px "Segoe UI", system-ui, -apple-system, sans-serif`;
+    for (const line of lines) {
+      maxWidth = Math.max(maxWidth, ctx.measureText(line).width);
+    }
+    ctx.restore();
+  } else {
+    for (const line of lines) {
+      maxWidth = Math.max(maxWidth, line.length * fontSize * 0.6);
+    }
+  }
+  const pad = Math.max(4, Math.round(fontSize * 0.18));
+  const minX = view.x + pad;
+  const maxX = Math.max(minX, view.x + view.w - maxWidth - pad);
+  const minY = view.y + pad;
+  const maxY = Math.max(minY, view.y + view.h - totalHeight - pad);
+  return {
+    x: Math.max(minX, Math.min(maxX, x)),
+    y: Math.max(minY, Math.min(maxY, y)),
+  };
 }
 
 const COLORS = ["#ef4444", "#facc15", "#22c55e", "#3b82f6", "#ffffff", "#111827"] as const;
@@ -75,6 +131,7 @@ const HANDLES: { id: CropHandle; cursor: string; posClass: string }[] = [
 
 export function ScreenshotEditorModal({
   open,
+  isLocked = false,
   sourceUrl,
   initialMode,
   monitors,
@@ -93,6 +150,7 @@ export function ScreenshotEditorModal({
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const textInputRef = useRef<HTMLInputElement | null>(null);
+  const noticeTimerRef = useRef<number | null>(null);
   const drawDragRef = useRef<
     | null
     | { kind: "crop-draw"; startX: number; startY: number }
@@ -105,8 +163,10 @@ export function ScreenshotEditorModal({
   const [tool, setTool] = useState<EditorTool>(initialMode === "crop" ? "crop" : "arrow");
   const [color, setColor] = useState<string>(COLORS[0]);
   const [sizeIdx, setSizeIdx] = useState<number>(1);
-  const [ops, setOps] = useState<AnnotationOp[]>([]);
-  const [redoOps, setRedoOps] = useState<AnnotationOp[]>([]);
+  const [history, setHistory] = useState<AnnotationHistory>(EMPTY_HISTORY);
+  const ops = history.ops;
+  const canUndo = history.past.length > 0;
+  const canRedo = history.future.length > 0;
   const [activeOp, setActiveOp] = useState<AnnotationOp | null>(null);
   const activeOpRef = useRef<AnnotationOp | null>(null);
   const updateActiveOp = (next: AnnotationOp | null) => {
@@ -123,21 +183,50 @@ export function ScreenshotEditorModal({
     value: string;
   } | null>(null);
   const [caption, setCaption] = useState("");
-  const [busyAction, setBusyAction] = useState<"copy" | "save" | "send" | null>(null);
+  const [busyAction, setBusyAction] = useState<"copy" | "save" | "attach" | "send" | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
+
+  const showTransientNotice = useCallback((msg: string) => {
+    setNotice(msg);
+    if (noticeTimerRef.current !== null) {
+      window.clearTimeout(noticeTimerRef.current);
+    }
+    noticeTimerRef.current = window.setTimeout(() => {
+      noticeTimerRef.current = null;
+      setNotice(null);
+    }, 2600);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (noticeTimerRef.current !== null) {
+        window.clearTimeout(noticeTimerRef.current);
+        noticeTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const pushAnnotationOp = useCallback((op: AnnotationOp) => {
+    setHistory((prev) => ({
+      ops: [...prev.ops, op],
+      past: [...prev.past.slice(-(MAX_HISTORY_DEPTH - 1)), prev.ops],
+      future: [],
+    }));
+  }, []);
 
   // Reset state whenever modal opens or source capture image changes
   useEffect(() => {
     if (!open || !sourceUrl) return;
     setImgEl(null);
     setNatSize({ w: 0, h: 0 });
-    setOps([]);
-    setRedoOps([]);
+    setHistory(EMPTY_HISTORY);
     updateActiveOp(null);
     setAppliedCrop(null);
     setCropDraft(null);
     setTextDraft(null);
     setNotice(null);
+    setConfirmDiscard(false);
     setTool(initialMode === "crop" ? "crop" : "arrow");
 
     let cancelled = false;
@@ -162,6 +251,7 @@ export function ScreenshotEditorModal({
     if (!open) {
       setCaption("");
       setTextDraft(null);
+      setConfirmDiscard(false);
     }
   }, [open]);
 
@@ -230,22 +320,49 @@ export function ScreenshotEditorModal({
   }, []);
 
   const handleUndo = useCallback(() => {
-    setOps((prev) => {
-      if (prev.length === 0) return prev;
-      const last = prev[prev.length - 1];
-      setRedoOps((r) => [...r, last]);
-      return prev.slice(0, -1);
+    setHistory((prev) => {
+      if (prev.past.length === 0) return prev;
+      const previousOps = prev.past[prev.past.length - 1];
+      return {
+        ops: previousOps,
+        past: prev.past.slice(0, -1),
+        future: [...prev.future, prev.ops],
+      };
     });
   }, []);
 
   const handleRedo = useCallback(() => {
-    setRedoOps((prev) => {
-      if (prev.length === 0) return prev;
-      const last = prev[prev.length - 1];
-      setOps((o) => [...o, last]);
-      return prev.slice(0, -1);
+    setHistory((prev) => {
+      if (prev.future.length === 0) return prev;
+      const nextOps = prev.future[prev.future.length - 1];
+      return {
+        ops: nextOps,
+        past: [...prev.past.slice(-(MAX_HISTORY_DEPTH - 1)), prev.ops],
+        future: prev.future.slice(0, -1),
+      };
     });
   }, []);
+
+  const handleClearAll = useCallback(() => {
+    setHistory((prev) => {
+      if (prev.ops.length === 0) return prev;
+      return {
+        ops: [],
+        past: [...prev.past.slice(-(MAX_HISTORY_DEPTH - 1)), prev.ops],
+        future: [],
+      };
+    });
+  }, []);
+
+  const requestClose = useCallback(() => {
+    if (busyAction !== null) return;
+    const pendingTextCount = textDraft && textDraft.value.trim() ? 1 : 0;
+    if (ops.length + pendingTextCount > 0) {
+      setConfirmDiscard(true);
+      return;
+    }
+    onClose();
+  }, [busyAction, ops.length, textDraft, onClose]);
 
   const commitTextDraft = useCallback(() => {
     if (!textDraft) return;
@@ -253,19 +370,26 @@ export function ScreenshotEditorModal({
     if (trimmed) {
       const preset = SIZE_PRESETS[sizeIdx] ?? SIZE_PRESETS[1];
       const fontSize = Math.round(preset.font * resScale);
+      const clamped = clampTextCoordsToView(
+        textDraft.natX,
+        textDraft.natY,
+        trimmed,
+        fontSize,
+        activeView,
+        canvasRef.current,
+      );
       const op: AnnotationOp = {
         kind: "text",
         color,
         fontSize,
-        x: textDraft.natX,
-        y: textDraft.natY,
+        x: clamped.x,
+        y: clamped.y,
         text: trimmed,
       };
-      setOps((prev) => [...prev, op]);
-      setRedoOps([]);
+      pushAnnotationOp(op);
     }
     setTextDraft(null);
-  }, [textDraft, sizeIdx, resScale, color]);
+  }, [textDraft, sizeIdx, resScale, activeView, color, pushAnnotationOp]);
 
   const effectiveExportRect = useCallback((): CropRect => {
     if (tool === "crop" && cropDraft && cropDraft.w >= 8 && cropDraft.h >= 8) {
@@ -286,22 +410,34 @@ export function ScreenshotEditorModal({
     if (!imgEl || natSize.w <= 0 || natSize.h <= 0) {
       throw new Error("Ảnh chưa sẵn sàng để xuất");
     }
+    const rect = effectiveExportRect();
+    const pendingFontSize = Math.round((SIZE_PRESETS[sizeIdx] ?? SIZE_PRESETS[1]).font * resScale);
+    const pendingTrimmed = textDraft?.value.trim() ?? "";
     const pendingOps =
-      textDraft && textDraft.value.trim()
-        ? [
-            ...ops,
-            {
-              kind: "text" as const,
-              color,
-              fontSize: Math.round((SIZE_PRESETS[sizeIdx] ?? SIZE_PRESETS[1]).font * resScale),
-              x: textDraft.natX,
-              y: textDraft.natY,
-              text: textDraft.value.trim(),
-            },
-          ]
+      textDraft && pendingTrimmed
+        ? (() => {
+            const clamped = clampTextCoordsToView(
+              textDraft.natX,
+              textDraft.natY,
+              pendingTrimmed,
+              pendingFontSize,
+              rect,
+              canvasRef.current,
+            );
+            return [
+              ...ops,
+              {
+                kind: "text" as const,
+                color,
+                fontSize: pendingFontSize,
+                x: clamped.x,
+                y: clamped.y,
+                text: pendingTrimmed,
+              },
+            ];
+          })()
         : ops;
 
-    const rect = effectiveExportRect();
     const off = document.createElement("canvas");
     off.width = Math.max(1, rect.w);
     off.height = Math.max(1, rect.h);
@@ -332,14 +468,13 @@ export function ScreenshotEditorModal({
     try {
       const { dataUrl } = await exportPng();
       await copyImageReliable(dataUrl);
-      setNotice(t("screenshotCopiedNotice"));
-      setTimeout(() => setNotice(null), 2600);
+      showTransientNotice(t("screenshotCopiedNotice"));
     } catch (err) {
       onError(err);
     } finally {
       setBusyAction(null);
     }
-  }, [busyAction, imgEl, exportPng, t, onError]);
+  }, [busyAction, imgEl, exportPng, showTransientNotice, t, onError]);
 
   const handleSave = useCallback(async () => {
     if (busyAction || !imgEl) return;
@@ -348,22 +483,21 @@ export function ScreenshotEditorModal({
       const { dataUrl, fileName } = await exportPng();
       const savedPath = await bridge.saveRemoteFile(dataUrl, fileName);
       if (savedPath) {
-        setNotice(t("screenshotSavedNotice"));
-        setTimeout(() => setNotice(null), 2600);
+        showTransientNotice(t("screenshotSavedNotice"));
       }
     } catch (err) {
       onError(err);
     } finally {
       setBusyAction(null);
     }
-  }, [busyAction, imgEl, exportPng, t, onError]);
+  }, [busyAction, imgEl, exportPng, showTransientNotice, t, onError]);
 
   const handleAttachOnly = useCallback(async () => {
     if (busyAction || !imgEl) return;
-    setBusyAction("send");
+    setBusyAction("attach");
     try {
       const { file, dataUrl, fileName, sizeBytes } = await exportPng();
-      onAttach(
+      const attached = await onAttach(
         {
           kind: "raw",
           file,
@@ -374,6 +508,7 @@ export function ScreenshotEditorModal({
         },
         caption.trim(),
       );
+      if (attached === false) return;
       onClose();
     } catch (err) {
       onError(err);
@@ -408,8 +543,10 @@ export function ScreenshotEditorModal({
   }, [busyAction, imgEl, exportPng, onSend, caption, onClose, onError]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || isLocked) return;
     const onKeyDown = (e: KeyboardEvent) => {
+      if (isLocked) return;
+      if (isImeComposingEvent(e)) return;
       const inInput =
         document.activeElement instanceof HTMLInputElement ||
         document.activeElement instanceof HTMLTextAreaElement;
@@ -417,13 +554,17 @@ export function ScreenshotEditorModal({
       if (e.key === "Escape") {
         e.preventDefault();
         e.stopPropagation();
-        if (textDraft) {
+        if (confirmDiscard) {
+          setConfirmDiscard(false);
+        } else if (textDraft) {
           setTextDraft(null);
         } else {
-          onClose();
+          requestClose();
         }
         return;
       }
+
+      if (confirmDiscard) return;
 
       if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
         e.preventDefault();
@@ -457,10 +598,12 @@ export function ScreenshotEditorModal({
     return () => window.removeEventListener("keydown", onKeyDown, true);
   }, [
     open,
+    isLocked,
+    confirmDiscard,
     textDraft,
     tool,
     cropDraft,
-    onClose,
+    requestClose,
     handleUndo,
     handleRedo,
     applyCropSelection,
@@ -495,7 +638,17 @@ export function ScreenshotEditorModal({
 
     if (tool === "text") {
       e.preventDefault();
-      setTextDraft({ natX, natY, pctX, pctY, value: "" });
+      const clampedPctX = Math.min(82, Math.max(2, pctX));
+      const clampedPctY = Math.min(88, Math.max(2, pctY));
+      const clampedNatX = activeView.x + (clampedPctX / 100) * activeView.w;
+      const clampedNatY = activeView.y + (clampedPctY / 100) * activeView.h;
+      setTextDraft({
+        natX: clampedNatX,
+        natY: clampedNatY,
+        pctX: clampedPctX,
+        pctY: clampedPctY,
+        value: "",
+      });
       setTimeout(() => textInputRef.current?.focus(), 20);
       return;
     }
@@ -594,8 +747,7 @@ export function ScreenshotEditorModal({
       updateActiveOp(null);
       if (!done) return;
       if (done.kind === "pen" || done.kind === "highlighter") {
-        setOps((o) => [...o, done]);
-        setRedoOps([]);
+        pushAnnotationOp(done);
       } else if (
         done.kind === "arrow" ||
         done.kind === "rect" ||
@@ -604,8 +756,7 @@ export function ScreenshotEditorModal({
       ) {
         const dist = Math.hypot(done.x2 - done.x1, done.y2 - done.y1);
         if (dist >= 3) {
-          setOps((o) => [...o, done]);
-          setRedoOps([]);
+          pushAnnotationOp(done);
         }
       }
     }
@@ -750,8 +901,9 @@ export function ScreenshotEditorModal({
           )}
           <button
             type="button"
-            onClick={onClose}
-            className="hover-surface rounded-lg p-1.5 transition"
+            disabled={busyAction !== null}
+            onClick={requestClose}
+            className="hover-surface rounded-lg p-1.5 transition disabled:opacity-40"
             style={{ color: "var(--text-secondary)" }}
             title={t("close")}
           >
@@ -794,6 +946,7 @@ export function ScreenshotEditorModal({
             <button
               key={swatch}
               type="button"
+              onMouseDown={(e) => e.preventDefault()}
               onClick={() => setColor(swatch)}
               className="h-5 w-5 rounded-full transition"
               style={{
@@ -816,6 +969,7 @@ export function ScreenshotEditorModal({
             <button
               key={sz.id}
               type="button"
+              onMouseDown={(e) => e.preventDefault()}
               onClick={() => setSizeIdx(idx)}
               className="rounded-lg px-2 py-1 text-xs font-semibold transition"
               style={{
@@ -832,7 +986,7 @@ export function ScreenshotEditorModal({
         <div className="flex items-center gap-1 rounded-xl p-1" style={{ background: "var(--bg-surface)" }}>
           <button
             type="button"
-            disabled={ops.length === 0}
+            disabled={!canUndo}
             onClick={handleUndo}
             title={t("screenshotUndoTitle")}
             className="hover-surface rounded-lg p-1.5 transition disabled:opacity-35"
@@ -842,7 +996,7 @@ export function ScreenshotEditorModal({
           </button>
           <button
             type="button"
-            disabled={redoOps.length === 0}
+            disabled={!canRedo}
             onClick={handleRedo}
             title={t("screenshotRedoTitle")}
             className="hover-surface rounded-lg p-1.5 transition disabled:opacity-35"
@@ -853,10 +1007,7 @@ export function ScreenshotEditorModal({
           <button
             type="button"
             disabled={ops.length === 0}
-            onClick={() => {
-              setOps([]);
-              setRedoOps([]);
-            }}
+            onClick={handleClearAll}
             title={t("screenshotClearAnnotationsTitle")}
             className="hover-surface rounded-lg p-1.5 transition disabled:opacity-35"
             style={{ color: "var(--text-primary)" }}
@@ -910,16 +1061,32 @@ export function ScreenshotEditorModal({
 
             {/* Interactive Crop Selection Overlay */}
             {tool === "crop" && natSize.w > 0 && natSize.h > 0 && (
-              <div className="pointer-events-none absolute inset-0 overflow-hidden rounded">
-                {!cropDraft ? (
-                  <div className="flex h-full w-full items-start justify-center pt-4">
-                    <span className="rounded-full bg-black/70 px-3 py-1 text-xs text-slate-200 backdrop-blur">
-                      {t("toolCrop")} — {natSize.w} × {natSize.h}
-                    </span>
-                  </div>
-                ) : (
-                  <>
-                    {/* Outer dark mask via large box-shadow */}
+              <>
+                {/* Layer 1: Clipped outer dark mask */}
+                <div className="pointer-events-none absolute inset-0 overflow-hidden rounded">
+                  {!cropDraft ? (
+                    <div className="flex h-full w-full items-start justify-center pt-4">
+                      <span className="rounded-full bg-black/70 px-3 py-1 text-xs text-slate-200 backdrop-blur">
+                        {t("toolCrop")} — {natSize.w} × {natSize.h}
+                      </span>
+                    </div>
+                  ) : (
+                    <div
+                      className="pointer-events-none absolute"
+                      style={{
+                        left: `${(cropDraft.x / natSize.w) * 100}%`,
+                        top: `${(cropDraft.y / natSize.h) * 100}%`,
+                        width: `${(cropDraft.w / natSize.w) * 100}%`,
+                        height: `${(cropDraft.h / natSize.h) * 100}%`,
+                        boxShadow: "0 0 0 9999px rgba(0, 0, 0, 0.56)",
+                      }}
+                    />
+                  )}
+                </div>
+
+                {/* Layer 2: Unclipped crop frame, resize handles, and floating toolbar */}
+                {cropDraft && (
+                  <div className="pointer-events-none absolute inset-0">
                     <div
                       className="pointer-events-auto absolute border-2"
                       onPointerDown={(e) => startCropHandleDrag("move", e)}
@@ -932,7 +1099,6 @@ export function ScreenshotEditorModal({
                         width: `${(cropDraft.w / natSize.w) * 100}%`,
                         height: `${(cropDraft.h / natSize.h) * 100}%`,
                         borderColor: "var(--accent)",
-                        boxShadow: "0 0 0 9999px rgba(0, 0, 0, 0.56)",
                         cursor: "move",
                       }}
                     >
@@ -943,7 +1109,7 @@ export function ScreenshotEditorModal({
                         ))}
                       </div>
 
-                      {/* 8 Resize Handles */}
+                      {/* 8 Resize Handles (outside overflow-hidden so edges never clip) */}
                       {cropDraft.w >= 8 &&
                         cropDraft.h >= 8 &&
                         HANDLES.map((h) => (
@@ -953,44 +1119,62 @@ export function ScreenshotEditorModal({
                             onPointerMove={handleCanvasPointerMove}
                             onPointerUp={finishCanvasDrag}
                             onPointerCancel={finishCanvasDrag}
-                            className={`absolute h-3 w-3 rounded-sm border border-black/60 bg-white shadow ${h.posClass}`}
+                            className={`absolute z-10 h-3 w-3 rounded-sm border border-black/60 bg-white shadow ${h.posClass}`}
                             style={{ cursor: h.cursor }}
                           />
                         ))}
 
-                      {/* Floating Dimensions + Quick Crop Actions */}
-                      {cropDraft.w >= 8 && cropDraft.h >= 8 && (
-                        <div
-                          onPointerDown={(e) => e.stopPropagation()}
-                          className={`absolute left-0 flex items-center gap-1.5 rounded-lg px-2 py-1 text-[11px] shadow-xl ${
-                            cropDraft.y / natSize.h > 0.14 ? "-top-9" : "top-2 left-2"
-                          }`}
-                          style={{ background: "rgba(18,18,22,0.92)", border: "1px solid var(--border-subtle)" }}
-                        >
-                          <span className="tabular-nums text-slate-200">
-                            {cropDraft.w} × {cropDraft.h}
-                          </span>
-                          <button
-                            type="button"
-                            onClick={applyCropSelection}
-                            className="tf-btn flex items-center gap-1 rounded px-2 py-0.5 font-semibold"
+                      {/* Floating Dimensions + Quick Crop Actions clamped inside stage */}
+                      {cropDraft.w >= 8 && cropDraft.h >= 8 && (() => {
+                        const nearTop = cropDraft.y / natSize.h <= 0.14;
+                        const roomBelow = (cropDraft.y + cropDraft.h) / natSize.h < 0.86;
+                        const vPosClass = !nearTop
+                          ? "-top-10"
+                          : roomBelow
+                            ? "-bottom-10"
+                            : "top-2";
+                        const hPosClass =
+                          cropDraft.x / natSize.w > 0.52
+                            ? nearTop && !roomBelow
+                              ? "right-2"
+                              : "right-0"
+                            : nearTop && !roomBelow
+                              ? "left-2"
+                              : "left-0";
+                        return (
+                          <div
+                            onPointerDown={(e) => e.stopPropagation()}
+                            className={`absolute z-20 flex items-center gap-1.5 whitespace-nowrap rounded-lg px-2 py-1 text-[11px] shadow-xl ${vPosClass} ${hPosClass}`}
+                            style={{
+                              background: "rgba(18,18,22,0.92)",
+                              border: "1px solid var(--border-subtle)",
+                            }}
                           >
-                            <Check className="h-3 w-3" />
-                            <span>{t("screenshotApplyCropBtn")}</span>
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setCropDraft(null)}
-                            className="hover-surface rounded px-1.5 py-0.5 text-slate-300"
-                          >
-                            {t("screenshotFullImageBtn")}
-                          </button>
-                        </div>
-                      )}
+                            <span className="tabular-nums text-slate-200">
+                              {cropDraft.w} × {cropDraft.h}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={applyCropSelection}
+                              className="tf-btn flex items-center gap-1 rounded px-2 py-0.5 font-semibold"
+                            >
+                              <Check className="h-3 w-3" />
+                              <span>{t("screenshotApplyCropBtn")}</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={handleResetCrop}
+                              className="hover-surface rounded px-1.5 py-0.5 text-slate-300"
+                            >
+                              {t("screenshotFullImageBtn")}
+                            </button>
+                          </div>
+                        );
+                      })()}
                     </div>
-                  </>
+                  </div>
                 )}
-              </div>
+              </>
             )}
 
             {/* Inline Text Placement Input */}
@@ -998,8 +1182,8 @@ export function ScreenshotEditorModal({
               <div
                 className="absolute z-20"
                 style={{
-                  left: `${Math.min(82, Math.max(2, textDraft.pctX))}%`,
-                  top: `${Math.min(88, Math.max(2, textDraft.pctY))}%`,
+                  left: `${textDraft.pctX}%`,
+                  top: `${textDraft.pctY}%`,
                 }}
               >
                 <input
@@ -1009,21 +1193,29 @@ export function ScreenshotEditorModal({
                     setTextDraft((prev) => (prev ? { ...prev, value: e.target.value } : prev))
                   }
                   onKeyDown={(e) => {
+                    if (isImeComposingEvent(e)) return;
                     if (e.key === "Enter") {
                       e.preventDefault();
                       commitTextDraft();
                     } else if (e.key === "Escape") {
                       e.preventDefault();
+                      e.stopPropagation();
                       setTextDraft(null);
                     }
                   }}
                   onBlur={() => commitTextDraft()}
                   placeholder={t("screenshotTextPlaceholder")}
-                  className="min-w-[180px] rounded-lg border px-2.5 py-1 text-sm font-bold shadow-xl outline-none"
+                  className="min-w-[180px] rounded-lg border px-2.5 py-1 font-bold shadow-xl outline-none"
                   style={{
                     background: "rgba(15, 15, 20, 0.88)",
                     borderColor: "var(--accent)",
                     color,
+                    fontSize:
+                      SIZE_PRESETS[sizeIdx]?.id === "sm"
+                        ? "13px"
+                        : SIZE_PRESETS[sizeIdx]?.id === "lg"
+                          ? "19px"
+                          : "15px",
                   }}
                 />
               </div>
@@ -1085,7 +1277,11 @@ export function ScreenshotEditorModal({
               color: "var(--text-primary)",
             }}
           >
-            <Copy className="h-4 w-4" />
+            {busyAction === "copy" ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Copy className="h-4 w-4" />
+            )}
             <span>{t("screenshotCopyBtn")}</span>
           </button>
           <button
@@ -1099,7 +1295,11 @@ export function ScreenshotEditorModal({
               color: "var(--text-primary)",
             }}
           >
-            <Download className="h-4 w-4" />
+            {busyAction === "save" ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Download className="h-4 w-4" />
+            )}
             <span>{t("screenshotSaveBtn")}</span>
           </button>
           <button
@@ -1113,7 +1313,11 @@ export function ScreenshotEditorModal({
               color: "var(--text-primary)",
             }}
           >
-            <Paperclip className="h-4 w-4" />
+            {busyAction === "attach" ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Paperclip className="h-4 w-4" />
+            )}
             <span>{t("screenshotAttachBtn")}</span>
           </button>
           <button
@@ -1131,6 +1335,57 @@ export function ScreenshotEditorModal({
           </button>
         </div>
       </div>
+
+      {confirmDiscard && (
+        <div
+          className="fixed inset-0 z-[75] flex items-center justify-center bg-black/65 p-4 backdrop-blur-xs"
+          onClick={() => setConfirmDiscard(false)}
+        >
+          <div
+            role="alertdialog"
+            aria-modal="true"
+            aria-label={t("screenshotDiscardTitle")}
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-sm space-y-3 rounded-2xl p-5 shadow-2xl"
+            style={{
+              background: "var(--bg-sidebar)",
+              border: "1px solid var(--border-subtle)",
+              color: "var(--text-primary)",
+            }}
+          >
+            <h3 className="text-[15px] font-semibold">{t("screenshotDiscardTitle")}</h3>
+            <p className="text-xs leading-relaxed" style={{ color: "var(--text-secondary)" }}>
+              {t("screenshotDiscardDesc", {
+                count: ops.length + (textDraft && textDraft.value.trim() ? 1 : 0),
+              })}
+            </p>
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setConfirmDiscard(false)}
+                className="hover-menu rounded-xl px-3.5 py-2 text-xs font-medium"
+                style={{
+                  background: "var(--bg-surface)",
+                  border: "1px solid var(--border-subtle)",
+                  color: "var(--text-primary)",
+                }}
+              >
+                {t("screenshotKeepEditingBtn")}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setConfirmDiscard(false);
+                  onClose();
+                }}
+                className="rounded-xl bg-rose-600 px-3.5 py-2 text-xs font-semibold text-white transition hover:bg-rose-500"
+              >
+                {t("screenshotDiscardConfirmBtn")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

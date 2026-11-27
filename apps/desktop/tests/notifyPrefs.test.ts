@@ -2,10 +2,15 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { MessageDto, ThreadDto } from "../src/types.ts";
 import {
+  addBlockedStickerRule,
+  DEFAULT_BLOCKED_STICKERS_CONFIG,
+} from "../src/utils/blockedStickers.ts";
+import {
   computeTotalUnreadBadge,
   DEFAULT_NOTIFY_PREFS,
   formatNotificationContent,
   isMessageMentioningMe,
+  isMessageRecentForNotification,
   isThreadCurrentlyMuted,
   normalizeNotifyPrefs,
   shouldNotifyMessage,
@@ -277,5 +282,237 @@ test("isMessageMentioningMe handles boundaries, emails, Vietnamese folding/NFD, 
       "An",
     ),
     true,
+  );
+});
+
+test("isMessageRecentForNotification handles offline Relay PC clock drift and live WS flags", () => {
+  const realServerTs = 1_700_000_000_000;
+  // Simulate an offline intranet Relay PC whose clock is 15 minutes behind server UTC
+  const driftedLocalNow = realServerTs - 15 * 60 * 1000;
+
+  // Live WS push MUST notify even when local PC clock is off by 15 minutes or 2 hours
+  assert.equal(
+    isMessageRecentForNotification({ ts: realServerTs, is_live: true }, driftedLocalNow, 0),
+    true,
+  );
+  assert.equal(
+    isMessageRecentForNotification(
+      { ts: realServerTs, is_live: true },
+      realServerTs + 2 * 3600 * 1000,
+      0,
+    ),
+    true,
+  );
+
+  // Duplicate / already-read messages marked is_live: false are always suppressed
+  assert.equal(
+    isMessageRecentForNotification({ ts: realServerTs, is_live: false }, realServerTs, 0),
+    false,
+  );
+
+  // Pull/catchup messages without is_live use clock-skew-compensated server offset
+  const observedOffset = realServerTs - driftedLocalNow;
+  assert.equal(
+    isMessageRecentForNotification(
+      { ts: realServerTs - 20_000 },
+      driftedLocalNow,
+      observedOffset,
+    ),
+    true,
+  );
+  // Old historical backlog (10 minutes old in real server time) stays suppressed
+  assert.equal(
+    isMessageRecentForNotification(
+      { ts: realServerTs - 10 * 60 * 1000 },
+      driftedLocalNow,
+      observedOffset,
+    ),
+    false,
+  );
+});
+
+test("shouldNotifyMessage suppresses popup and sound for blocked received stickers only", () => {
+  const dmA = makeThread({ id: "t-a", title: "Trần Minh", kind: "direct", is_muted: false });
+  const dmB = makeThread({ id: "t-b", title: "Đào Nụ", kind: "direct", is_muted: false });
+
+  let cfg = DEFAULT_BLOCKED_STICKERS_CONFIG;
+  cfg = addBlockedStickerRule(cfg, {
+    id: "r-thread",
+    kind: "sticker",
+    value: "2005",
+    scopeThreadId: "t-a",
+    createdAt: 1,
+  });
+  cfg = addBlockedStickerRule(cfg, {
+    id: "r-global-pack",
+    kind: "category",
+    value: "99",
+    scopeThreadId: null,
+    createdAt: 2,
+  });
+
+  const stickerInA = makeMsg({
+    thread_id: "t-a",
+    msg_type: "chat.sticker",
+    text: "[Nhãn dán]",
+    attachment_name: "sticker_1002_2005.png",
+    attachment_url: "https://stickers.example.invalid/webpc?eid=2005&size=130",
+  });
+  const sameStickerInB = makeMsg({
+    thread_id: "t-b",
+    msg_type: "chat.sticker",
+    text: "[Nhãn dán]",
+    attachment_name: "sticker_1002_2005.png",
+    attachment_url: "https://stickers.example.invalid/webpc?eid=2005&size=130",
+  });
+  const globalPackStickerInB = makeMsg({
+    thread_id: "t-b",
+    msg_type: "chat.sticker",
+    text: "[Nhãn dán]",
+    attachment_name: "sticker_99_3333.png",
+    attachment_url: "https://stickers.example.invalid/webpc?eid=3333&size=130",
+  });
+
+  // Thread-scoped blocked sticker in t-a is completely silent
+  assert.deepEqual(
+    shouldNotifyMessage({
+      msg: stickerInA,
+      thread: dmA,
+      isActiveThread: false,
+      windowFocused: false,
+      prefs: DEFAULT_NOTIFY_PREFS,
+      myUid: "me",
+      myName: "Tuan",
+      blockedStickerRules: cfg.rules,
+    }),
+    { showPopup: false, playSound: false },
+  );
+
+  // Same sticker in unblocked thread t-b still notifies normally
+  assert.deepEqual(
+    shouldNotifyMessage({
+      msg: sameStickerInB,
+      thread: dmB,
+      isActiveThread: false,
+      windowFocused: false,
+      prefs: DEFAULT_NOTIFY_PREFS,
+      myUid: "me",
+      myName: "Tuan",
+      blockedStickerRules: cfg.rules,
+    }),
+    { showPopup: true, playSound: true },
+  );
+
+  // Global category-blocked sticker in t-b is completely silent
+  assert.deepEqual(
+    shouldNotifyMessage({
+      msg: globalPackStickerInB,
+      thread: dmB,
+      isActiveThread: false,
+      windowFocused: false,
+      prefs: DEFAULT_NOTIFY_PREFS,
+      myUid: "me",
+      myName: "Tuan",
+      blockedStickerRules: cfg.rules,
+    }),
+    { showPopup: false, playSound: false },
+  );
+
+  // Normal text message in t-a still notifies normally
+  assert.deepEqual(
+    shouldNotifyMessage({
+      msg: makeMsg({ thread_id: "t-a", text: "Họp lúc 3h nhé" }),
+      thread: dmA,
+      isActiveThread: false,
+      windowFocused: false,
+      prefs: DEFAULT_NOTIFY_PREFS,
+      myUid: "me",
+      myName: "Tuan",
+      blockedStickerRules: cfg.rules,
+    }),
+    { showPopup: true, playSound: true },
+  );
+});
+
+test("isMessageMentioningMe and shouldNotifyMessage disable @all/@everyone/@mọi người in 1:1 direct and cloud chats", () => {
+  const mutedDm = makeThread({
+    id: "u2",
+    kind: "direct",
+    is_muted: true,
+    muted_until_ts: 0,
+  });
+  const mutedGroup = makeThread({
+    id: "g1",
+    kind: "group",
+    is_muted: true,
+    muted_until_ts: 0,
+  });
+
+  for (const broadcastText of [
+    "@All kiểm tra giúp nhé",
+    "@everyone please check",
+    "@Mọi người xem file nhé",
+    "@tất cả vào họp",
+  ]) {
+    assert.equal(
+      isMessageMentioningMe(makeMsg({ text: broadcastText }), "u-me", "Tuan", {
+        allowAll: false,
+      }),
+      false,
+    );
+    assert.equal(
+      isMessageMentioningMe(makeMsg({ text: broadcastText }), "u-me", "Tuan", {
+        threadKind: "direct",
+      }),
+      false,
+    );
+    assert.equal(
+      isMessageMentioningMe(makeMsg({ text: broadcastText }), "u-me", "Tuan", {
+        threadKind: "group",
+      }),
+      true,
+    );
+
+    // Muted 1:1 direct chat MUST NOT wake up on @all / @everyone / @mọi người
+    assert.deepEqual(
+      shouldNotifyMessage({
+        msg: makeMsg({ thread_id: "u2", text: broadcastText }),
+        thread: mutedDm,
+        isActiveThread: false,
+        windowFocused: false,
+        prefs: DEFAULT_NOTIFY_PREFS,
+        myUid: "u-me",
+        myName: "Tuan",
+      }),
+      { showPopup: false, playSound: false },
+    );
+
+    // Muted group chat STILL wakes up on @all / @everyone / @mọi người when mentionOverride is on
+    assert.deepEqual(
+      shouldNotifyMessage({
+        msg: makeMsg({ thread_id: "g1", text: broadcastText }),
+        thread: mutedGroup,
+        isActiveThread: false,
+        windowFocused: false,
+        prefs: DEFAULT_NOTIFY_PREFS,
+        myUid: "u-me",
+        myName: "Tuan",
+      }),
+      { showPopup: true, playSound: true },
+    );
+  }
+
+  // Direct mention of my own name in a muted 1:1 chat still triggers mentionOverride
+  assert.deepEqual(
+    shouldNotifyMessage({
+      msg: makeMsg({ thread_id: "u2", text: "Nhờ @Tuan check giúp" }),
+      thread: mutedDm,
+      isActiveThread: false,
+      windowFocused: false,
+      prefs: DEFAULT_NOTIFY_PREFS,
+      myUid: "u-me",
+      myName: "Tuan",
+    }),
+    { showPopup: true, playSound: true },
   );
 });

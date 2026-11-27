@@ -1,11 +1,15 @@
 import { type MouseEvent, useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { X, Zap } from "lucide-react";
 import { bridge, isTauri } from "../bridge";
 import { useI18n } from "../i18n";
 import type { NotifyToastPayload } from "../types";
 import { ThreadAvatar } from "./ThreadAvatar";
+import {
+  classifyNotifyPopupKey,
+  isExplicitPointerClick,
+  isPrimaryMouseDown,
+} from "./notifyPopupInteraction";
 
 const FALLBACK_RETRY_DELAYS_MS = [150, 450] as const;
 const FALLBACK_AUTO_DISMISS_MS = 2500;
@@ -21,6 +25,7 @@ export function NotifyToastWindow() {
   const [shakeSuppressed, setShakeSuppressed] = useState(false);
 
   const payloadSeqRef = useRef(0);
+  const hiddenAtSeqRef = useRef(-1);
   const hasEventPayloadRef = useRef(false);
   const suppressOpenForSeqRef = useRef(-1);
   const lastPointerDismissAtRef = useRef(0);
@@ -33,29 +38,30 @@ export function NotifyToastWindow() {
     }
   }, []);
 
-  const applyIncomingPayload = useCallback((next: NotifyToastPayload) => {
-    const nextSeq = payloadSeqRef.current + 1;
-    payloadSeqRef.current = nextSeq;
-    suppressOpenForSeqRef.current = -1;
-    setPayload(next);
-    setPayloadSeq(nextSeq);
-    setIsHovered(false);
-    setShakeSuppressed(false);
-    if (next.is_buzz) {
-      setBuzzPulseKey((k) => k + 1);
-    }
-    document.documentElement.setAttribute("data-theme", next.theme || "triforce");
-  }, []);
+  const applyIncomingPayload = useCallback(
+    (next: NotifyToastPayload) => {
+      clearFailsafeTimer();
+      const nextSeq = payloadSeqRef.current + 1;
+      payloadSeqRef.current = nextSeq;
+      hiddenAtSeqRef.current = -1;
+      suppressOpenForSeqRef.current = -1;
+      setPayload(next);
+      setPayloadSeq(nextSeq);
+      setIsHovered(false);
+      setShakeSuppressed(false);
+      if (next.is_buzz) {
+        setBuzzPulseKey((k) => k + 1);
+      }
+      document.documentElement.setAttribute("data-theme", next.theme || "triforce");
+    },
+    [clearFailsafeTimer],
+  );
 
   const dismissNow = useCallback(() => {
     clearFailsafeTimer();
+    hiddenAtSeqRef.current = payloadSeqRef.current;
     suppressOpenForSeqRef.current = payloadSeqRef.current;
     void bridge.dismissNotifyPopup().catch(() => undefined);
-    if (isTauri()) {
-      void getCurrentWindow()
-        .hide()
-        .catch(() => undefined);
-    }
   }, [clearFailsafeTimer]);
 
   const openThreadNow = useCallback(
@@ -64,20 +70,16 @@ export function NotifyToastWindow() {
         return;
       }
       clearFailsafeTimer();
+      hiddenAtSeqRef.current = payloadSeqRef.current;
       suppressOpenForSeqRef.current = payloadSeqRef.current;
       void bridge.clickNotifyPopup(threadId).catch(() => undefined);
-      if (isTauri()) {
-        void getCurrentWindow()
-          .hide()
-          .catch(() => undefined);
-      }
     },
     [clearFailsafeTimer],
   );
 
   const handleDismissMouseDown = useCallback(
     (e: MouseEvent) => {
-      if (e.button !== 0) return;
+      if (!isPrimaryMouseDown(e)) return;
       e.preventDefault();
       e.stopPropagation();
       lastPointerDismissAtRef.current = Date.now();
@@ -90,6 +92,9 @@ export function NotifyToastWindow() {
     (e: MouseEvent) => {
       e.preventDefault();
       e.stopPropagation();
+      if (!isExplicitPointerClick(e)) {
+        return;
+      }
       if (Date.now() - lastPointerDismissAtRef.current < POINTER_DISMISS_DEDUPE_MS) {
         return;
       }
@@ -98,7 +103,7 @@ export function NotifyToastWindow() {
     [dismissNow],
   );
 
-  // Initial fetch, live event subscription, theme bootstrap, and global Escape shortcut.
+  // Initial fetch, live event subscription, theme bootstrap, and keyboard/focus defense.
   useEffect(() => {
     try {
       const savedTheme = localStorage.getItem("litechat.theme");
@@ -110,7 +115,8 @@ export function NotifyToastWindow() {
     }
 
     let cancelled = false;
-    let unlisten: (() => void) | undefined;
+    let unlistenPayload: (() => void) | undefined;
+    let unlistenHidden: (() => void) | undefined;
 
     void bridge
       .getCurrentNotifyPopup()
@@ -127,24 +133,53 @@ export function NotifyToastWindow() {
         applyIncomingPayload(ev.payload);
       }).then((fn) => {
         if (cancelled) fn();
-        else unlisten = fn;
+        else unlistenPayload = fn;
+      });
+      void listen("core://notify-hidden", () => {
+        if (cancelled) return;
+        hiddenAtSeqRef.current = payloadSeqRef.current;
+        clearFailsafeTimer();
+      }).then((fn) => {
+        if (cancelled) fn();
+        else unlistenHidden = fn;
       });
     }
 
     const onWindowKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
+      const action = classifyNotifyPopupKey(e);
+      if (action === "dismiss") {
         e.preventDefault();
         dismissNow();
+      } else if (action === "block") {
+        // Never allow Enter/Space in the floating popup to activate or switch chats.
+        e.preventDefault();
+        e.stopPropagation();
       }
     };
-    window.addEventListener("keydown", onWindowKeyDown);
+    const onWindowFocus = () => {
+      if (document.activeElement instanceof HTMLElement) {
+        document.activeElement.blur();
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== "visible") {
+        hiddenAtSeqRef.current = payloadSeqRef.current;
+        clearFailsafeTimer();
+      }
+    };
+    window.addEventListener("keydown", onWindowKeyDown, true);
+    window.addEventListener("focus", onWindowFocus, true);
+    document.addEventListener("visibilitychange", onVisibilityChange);
 
     return () => {
       cancelled = true;
-      unlisten?.();
-      window.removeEventListener("keydown", onWindowKeyDown);
+      unlistenPayload?.();
+      unlistenHidden?.();
+      window.removeEventListener("keydown", onWindowKeyDown, true);
+      window.removeEventListener("focus", onWindowFocus, true);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [applyIncomingPayload, dismissNow]);
+  }, [applyIncomingPayload, clearFailsafeTimer, dismissNow]);
 
   // If mounted before payload arrives (or if initial event was missed), retry
   // fetching current payload at 150ms & 450ms and auto-dismiss after 2500ms.
@@ -166,7 +201,7 @@ export function NotifyToastWindow() {
       window.setTimeout(retryFetch, delayMs),
     );
     const autoDismissTimer = window.setTimeout(() => {
-      if (!cancelled) {
+      if (!cancelled && document.visibilityState === "visible") {
         dismissNow();
       }
     }, FALLBACK_AUTO_DISMISS_MS);
@@ -182,9 +217,17 @@ export function NotifyToastWindow() {
   useEffect(() => {
     clearFailsafeTimer();
     if (!payload || payloadSeq === 0) return;
+    const armedSeq = payloadSeq;
     const clampedMs = Math.min(Math.max(payload.duration_ms || 4500, 2500), 15000);
     failsafeTimerRef.current = window.setTimeout(() => {
       failsafeTimerRef.current = null;
+      if (
+        document.visibilityState !== "visible" ||
+        payloadSeqRef.current !== armedSeq ||
+        hiddenAtSeqRef.current === armedSeq
+      ) {
+        return;
+      }
       dismissNow();
     }, clampedMs + CLIENT_FAILSAFE_GRACE_MS);
 
@@ -198,16 +241,10 @@ export function NotifyToastWindow() {
     return (
       <div
         role="button"
-        tabIndex={0}
+        tabIndex={-1}
         onMouseDown={handleDismissMouseDown}
         onClick={handleDismissClick}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " " || e.key === "Escape") {
-            e.preventDefault();
-            dismissNow();
-          }
-        }}
-        className="relative flex h-full w-full cursor-pointer items-center justify-between gap-2 overflow-hidden rounded-none px-3 py-2"
+        className="relative flex h-full w-full cursor-pointer select-none items-center justify-between gap-2 overflow-hidden rounded-none px-3 py-2"
         style={{
           background: "var(--bg-sidebar)",
           color: "var(--text-primary)",
@@ -235,6 +272,7 @@ export function NotifyToastWindow() {
         </div>
         <button
           type="button"
+          tabIndex={-1}
           data-notify-close="true"
           aria-label={t("notifyCloseTitle")}
           title={t("notifyCloseTitle")}
@@ -256,7 +294,7 @@ export function NotifyToastWindow() {
   return (
     <div
       role="button"
-      tabIndex={0}
+      tabIndex={-1}
       onMouseEnter={() => {
         setIsHovered(true);
         setShakeSuppressed(true);
@@ -269,28 +307,21 @@ export function NotifyToastWindow() {
       }}
       onMouseLeave={() => setIsHovered(false)}
       onMouseDown={(e) => {
-        if (e.button !== 0) return;
+        if (!isPrimaryMouseDown(e)) return;
         if (e.target instanceof Element && e.target.closest("[data-notify-close]")) {
           return;
         }
+        e.preventDefault();
         openThreadNow(payload.thread_id);
       }}
       onClick={(e) => {
+        if (!isExplicitPointerClick(e)) return;
         if (e.target instanceof Element && e.target.closest("[data-notify-close]")) {
           return;
         }
         openThreadNow(payload.thread_id);
       }}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          openThreadNow(payload.thread_id);
-        } else if (e.key === "Escape") {
-          e.preventDefault();
-          dismissNow();
-        }
-      }}
-      className="relative flex h-full w-full cursor-pointer items-center overflow-hidden rounded-none transition hover:brightness-105"
+      className="relative flex h-full w-full cursor-pointer select-none items-center overflow-hidden rounded-none transition hover:brightness-105"
       style={{
         background: "var(--bg-sidebar)",
         color: "var(--text-primary)",
@@ -334,6 +365,7 @@ export function NotifyToastWindow() {
             </div>
             <button
               type="button"
+              tabIndex={-1}
               data-notify-close="true"
               aria-label={t("notifyCloseTitle")}
               title={t("notifyCloseTitle")}

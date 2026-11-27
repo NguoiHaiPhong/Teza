@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   buildComposerMentionMembers,
+  extractCompletedMentionSpans,
   filterMentionCandidates,
   findActiveMentionQuery,
   foldVietnameseText,
@@ -480,4 +481,70 @@ test("reconcileCompletedMentions preserves multi-mention spans across prepends a
 
   // Clearing draft drops all spans
   assert.deepEqual(reconcileCompletedMentions(initial, "@An @Lộc ", ""), []);
+});
+
+test("tokenizeMentions suppresses @all/@everyone/@mọi người when allowAll is false (direct/cloud chats)", () => {
+  const candidates = [{ id: "u-an", name: "An" }];
+
+  for (const sample of [
+    "@all gửi file giúp nhé",
+    "Chào @everyone nhé",
+    "@Mọi người kiểm tra lại",
+    "@tất cả xem giúp",
+  ]) {
+    const tokens = tokenizeMentions(sample, candidates, { allowAll: false });
+    assert.deepEqual(tokens, [{ kind: "text", text: sample }]);
+  }
+
+  // Personal mentions in the same 1:1 message still tokenize cleanly
+  const mixed = tokenizeMentions("Chào @An và @all nhé", candidates, { allowAll: false });
+  assert.deepEqual(mixed, [
+    { kind: "text", text: "Chào " },
+    { kind: "mention", text: "@An", userId: "u-an", displayName: "An" },
+    { kind: "text", text: " và @all nhé" },
+  ]);
+
+  // Member name starting with "All" (e.g. "Allen") still matches in direct chat
+  const allen = tokenizeMentions("Hi @Allen!", [{ id: "u-allen", name: "Allen" }], {
+    allowAll: false,
+  });
+  assert.deepEqual(allen, [
+    { kind: "text", text: "Hi " },
+    { kind: "mention", text: "@Allen", userId: "u-allen", displayName: "Allen" },
+    { kind: "text", text: "!" },
+  ]);
+});
+
+test("extractCompletedMentionSpans seeds already-complete @Name spans on restored drafts", () => {
+  const members = [
+    { id: MENTION_ALL_ID, name: "All" },
+    { id: "u-thanh", name: "Nguyễn Thanh" },
+    { id: "u-tung", name: "Nguyễn Thanh Tùng" },
+    { id: "u-nu", name: "Đào Nụ" },
+    { id: "u-an", name: "An" },
+  ];
+
+  // Longest-first multi-word match with trailing space
+  assert.deepEqual(extractCompletedMentionSpans("@Nguyễn Thanh Tùng ", members), [
+    { start: 0, text: "@Nguyễn Thanh Tùng " },
+  ]);
+
+  // Multiple completed mentions + @All in a group draft
+  assert.deepEqual(extractCompletedMentionSpans("Chào @An @Đào Nụ @All ", members), [
+    { start: 5, text: "@An " },
+    { start: 9, text: "@Đào Nụ " },
+    { start: 17, text: "@All " },
+  ]);
+
+  // Incomplete trailing mention without space is NOT seeded (allows resuming completion)
+  assert.deepEqual(extractCompletedMentionSpans("@Đào Nụ", members), []);
+
+  // Emails and unknown handles are ignored
+  assert.deepEqual(extractCompletedMentionSpans("mail user@An @Unknown ", members), []);
+
+  // NFD decomposed Vietnamese draft matches NFC member name while preserving exact draft slice
+  const nfdDraft = "@Đa\u0300o Nu\u0323 ";
+  assert.deepEqual(extractCompletedMentionSpans(nfdDraft, members), [
+    { start: 0, text: nfdDraft },
+  ]);
 });

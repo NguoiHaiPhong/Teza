@@ -7,7 +7,10 @@ use base64::{
     engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64_URL},
     Engine,
 };
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, Months, Utc};
+use chrono::{
+    DateTime, Datelike, Days, Duration as ChronoDuration, Local, NaiveDate, NaiveDateTime, TimeZone,
+    Utc,
+};
 use md5::{Digest, Md5};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -193,6 +196,10 @@ fn ai_msg_aad(id: &str) -> Vec<u8> {
     format!("ai_msg:{id}").into_bytes()
 }
 
+fn ai_session_aad(id: &str) -> Vec<u8> {
+    format!("ai_session:{id}").into_bytes()
+}
+
 fn sched_aad(id: &str) -> Vec<u8> {
     format!("sched:{id}").into_bytes()
 }
@@ -326,6 +333,35 @@ pub struct HistoryCloudMediaRecord {
     pub cloud_synced_ts: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryDeletedMessageTombstone {
+    pub thread_id: String,
+    pub msg_id: String,
+    pub deleted_ts: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryDeletedThreadTombstone {
+    pub thread_id: String,
+    pub deleted_ts: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingCloudDeleteRecord {
+    pub sha256: String,
+    pub cloud_file_id: String,
+    pub reason: String,
+    pub queued_ts: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistoryDeltaImportReport {
+    pub applied_messages: usize,
+    pub deleted_messages: usize,
+    pub deleted_threads: usize,
+    pub orphaned_local_paths: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryDeltaBatch {
     pub version: u32,
@@ -344,15 +380,28 @@ pub struct HistoryDeltaBatch {
     pub translations: Vec<HistoryTranslationRecord>,
     #[serde(default)]
     pub cloud_media: Vec<HistoryCloudMediaRecord>,
+    #[serde(default)]
+    pub deleted_messages: Vec<HistoryDeletedMessageTombstone>,
+    #[serde(default)]
+    pub deleted_threads: Vec<HistoryDeletedThreadTombstone>,
     /// True when more messages exist strictly after `max_message_ts()` beyond `limit_msgs`.
     #[serde(skip)]
     pub messages_truncated: bool,
     /// True when more cloud media links exist strictly after `max_cloud_media_cursor_ts`.
     #[serde(skip)]
     pub cloud_media_truncated: bool,
+    /// True when more message mutations or deletion tombstones exist strictly after `max_mutation_ts_cursor`.
+    #[serde(skip)]
+    pub mutations_truncated: bool,
+    /// Maximum `messages.ts` across messages selected via `ts >= since_ts` (server-clock cursor).
+    #[serde(skip)]
+    pub max_message_ts_cursor: Option<i64>,
     /// Maximum `MAX(cloud_synced_ts, message_media.updated_ts)` across exported `cloud_media` rows.
     #[serde(skip)]
     pub max_cloud_media_cursor_ts: Option<i64>,
+    /// Maximum local mutation timestamp across mutated messages and deletion tombstones.
+    #[serde(skip)]
+    pub max_mutation_ts_cursor: Option<i64>,
 }
 
 impl HistoryDeltaBatch {
@@ -365,8 +414,17 @@ impl HistoryDeltaBatch {
 
 const API_AUDIT_LOG_MAX_ROWS: i64 = 500;
 const API_IDEMPOTENCY_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
+#[cfg(test)]
 const DAY_MS: i64 = 86_400_000;
+#[cfg(test)]
 const WEEK_MS: i64 = 7 * DAY_MS;
+
+const AI_SESSION_DEFAULT_TITLE: &str = "Cuộc trò chuyện mới";
+const AI_SESSION_LEGACY_FALLBACK_TITLE: &str = "Cuộc trò chuyện AI";
+const AI_SESSION_MAX_ID_CHARS: usize = 64;
+const AI_SESSION_MAX_TITLE_CHARS: usize = 120;
+const AI_SESSION_AUTO_TITLE_CHARS: usize = 48;
+const AI_SESSION_PREVIEW_CHARS: usize = 96;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiStoredMessageDto {
@@ -381,6 +439,16 @@ pub struct AiStoredMessageDto {
     pub ts: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AiSessionDto {
+    pub id: String,
+    pub title: String,
+    pub created_ts: i64,
+    pub updated_ts: i64,
+    pub message_count: usize,
+    pub last_preview: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduledMessageDto {
     pub id: String,
@@ -391,6 +459,12 @@ pub struct ScheduledMessageDto {
     #[serde(default)]
     pub attachment_path: String,
     pub send_at_ts: i64,
+    #[serde(default)]
+    pub next_attempt_ts: Option<i64>,
+    #[serde(default)]
+    pub bypass_misfire: bool,
+    #[serde(default)]
+    pub anchor_day: Option<u32>,
     pub recurrence: String,
     pub misfire_policy: String,
     pub misfire_grace_secs: i64,
@@ -501,43 +575,133 @@ pub struct ApiAuditLogDto {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiIdempotencyRecord {
+    pub status_code: u16,
+    pub response_json: String,
+    #[serde(default)]
+    pub request_hash: String,
+}
+
+fn days_in_month(year: i32, month: u32) -> Option<u32> {
+    let next_month_first = if month == 12 {
+        NaiveDate::from_ymd_opt(year.checked_add(1)?, 1, 1)?
+    } else {
+        NaiveDate::from_ymd_opt(year, month + 1, 1)?
+    };
+    next_month_first.pred_opt().map(|d| d.day())
+}
+
+fn add_months_with_anchor(
+    base_year: i32,
+    base_month: u32,
+    months_to_add: u32,
+    desired_day: u32,
+) -> Option<NaiveDate> {
+    let zero_based = (base_month.checked_sub(1)? as i64).checked_add(i64::from(months_to_add))?;
+    let year_delta = zero_based.div_euclid(12);
+    let target_month = (zero_based.rem_euclid(12) + 1) as u32;
+    let target_year = base_year.checked_add(i32::try_from(year_delta).ok()?)?;
+    let max_day = days_in_month(target_year, target_month)?;
+    let clamped_day = desired_day.clamp(1, max_day);
+    NaiveDate::from_ymd_opt(target_year, target_month, clamped_day)
+}
+
+fn resolve_local_datetime_in_tz<Tz: TimeZone>(
+    tz: &Tz,
+    naive: NaiveDateTime,
+) -> Option<DateTime<Tz>> {
+    match tz.from_local_datetime(&naive) {
+        chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => {
+            return Some(dt);
+        }
+        chrono::LocalResult::None => {}
+    }
+    // Spring-forward DST gap (`LocalResult::None`): advance minute-by-minute (up to 4 hours)
+    // to the earliest valid local instant right after the skipped window so recurring schedules
+    // never degrade into `None` (one-off).
+    for mins in 1..=240_i64 {
+        let shifted = naive.checked_add_signed(ChronoDuration::minutes(mins))?;
+        match tz.from_local_datetime(&shifted) {
+            chrono::LocalResult::Single(dt) | chrono::LocalResult::Ambiguous(dt, _) => {
+                return Some(dt);
+            }
+            chrono::LocalResult::None => {}
+        }
+    }
+    None
+}
+
+fn local_day_of_month(ts_ms: i64) -> Option<u32> {
+    let ms = normalize_ts_ms(ts_ms);
+    DateTime::<Utc>::from_timestamp_millis(ms).map(|dt| dt.with_timezone(&Local).day())
+}
+
 /// Computes the next occurrence timestamp (in Unix ms) strictly after `max(send_at_ts_ms, now_ms)`
-/// for recurring schedules (`"daily"`, `"weekly"`, `"monthly"`). Returns `None` for `"once"` or
-/// unrecognized recurrence values.
-pub fn compute_next_occurrence_ts(
+/// for recurring schedules (`"daily"`, `"weekly"`, `"monthly"`) in the given timezone `tz`,
+/// preserving local wall-clock `HH:MM:SS` across DST transitions and clamping `anchor_day`
+/// (`1..=31`) to each target month's last day.
+/// Returns `None` for `"once"` or unrecognized recurrence values.
+pub fn compute_next_occurrence_in_tz<Tz: TimeZone>(
+    tz: &Tz,
     send_at_ts_ms: i64,
+    anchor_day: Option<u32>,
     recurrence: &str,
     now_ms: i64,
 ) -> Option<i64> {
     let base_ms = normalize_ts_ms(send_at_ts_ms);
     let target_min = normalize_ts_ms(now_ms).max(base_ms);
-    let base = DateTime::<Utc>::from_timestamp_millis(base_ms)?;
+    let base_local = DateTime::<Utc>::from_timestamp_millis(base_ms)?.with_timezone(tz);
+    let target_local = DateTime::<Utc>::from_timestamp_millis(target_min)?.with_timezone(tz);
+    let base_date = base_local.date_naive();
+    let wall_time = base_local.time();
+
     match recurrence.trim().to_ascii_lowercase().as_str() {
         "daily" => {
-            let step_days = target_min.saturating_sub(base_ms) / DAY_MS + 1;
-            let mut next = base.checked_add_signed(ChronoDuration::days(step_days))?;
-            while next.timestamp_millis() <= target_min {
-                next = next.checked_add_signed(ChronoDuration::days(1))?;
+            let day_diff = (target_local.date_naive() - base_date).num_days();
+            let mut step_days = (day_diff - 1).max(1);
+            loop {
+                let cand_date = base_date.checked_add_days(Days::new(step_days as u64))?;
+                let cand_dt = resolve_local_datetime_in_tz(tz, cand_date.and_time(wall_time))?;
+                let cand_ms = cand_dt.timestamp_millis();
+                if cand_ms > target_min {
+                    return Some(cand_ms);
+                }
+                step_days = step_days.checked_add(1)?;
             }
-            Some(next.timestamp_millis())
         }
         "weekly" => {
-            let step_weeks = target_min.saturating_sub(base_ms) / WEEK_MS + 1;
-            let mut next = base.checked_add_signed(ChronoDuration::weeks(step_weeks))?;
-            while next.timestamp_millis() <= target_min {
-                next = next.checked_add_signed(ChronoDuration::weeks(1))?;
+            let day_diff = (target_local.date_naive() - base_date).num_days();
+            let approx_weeks = day_diff.max(0) / 7;
+            let mut step_weeks = (approx_weeks - 1).max(1);
+            loop {
+                let days = (step_weeks as u64).checked_mul(7)?;
+                let cand_date = base_date.checked_add_days(Days::new(days))?;
+                let cand_dt = resolve_local_datetime_in_tz(tz, cand_date.and_time(wall_time))?;
+                let cand_ms = cand_dt.timestamp_millis();
+                if cand_ms > target_min {
+                    return Some(cand_ms);
+                }
+                step_weeks = step_weeks.checked_add(1)?;
             }
-            Some(next.timestamp_millis())
         }
         "monthly" => {
-            let target_dt = DateTime::<Utc>::from_timestamp_millis(target_min)?;
-            let approx_months = ((target_dt.year() - base.year()) * 12
-                + (target_dt.month() as i32 - base.month() as i32))
+            let desired_day = anchor_day
+                .filter(|&d| (1..=31).contains(&d))
+                .unwrap_or_else(|| base_date.day());
+            let approx_months = ((target_local.year() - base_local.year()) * 12
+                + (target_local.month() as i32 - base_local.month() as i32))
                 .max(1) as u32;
             let mut months = approx_months.saturating_sub(1).max(1);
             loop {
-                let candidate = base.checked_add_months(Months::new(months))?;
-                let cand_ms = candidate.timestamp_millis();
+                let cand_date = add_months_with_anchor(
+                    base_local.year(),
+                    base_local.month(),
+                    months,
+                    desired_day,
+                )?;
+                let cand_dt = resolve_local_datetime_in_tz(tz, cand_date.and_time(wall_time))?;
+                let cand_ms = cand_dt.timestamp_millis();
                 if cand_ms > target_min {
                     return Some(cand_ms);
                 }
@@ -546,6 +710,28 @@ pub fn compute_next_occurrence_ts(
         }
         _ => None,
     }
+}
+
+/// Computes the next occurrence timestamp (in Unix ms) strictly after `max(send_at_ts_ms, now_ms)`
+/// in `chrono::Local` time using an optional persisted `anchor_day` (`1..=31`) for monthly schedules.
+pub fn compute_next_occurrence_ts_with_anchor(
+    send_at_ts_ms: i64,
+    anchor_day: Option<u32>,
+    recurrence: &str,
+    now_ms: i64,
+) -> Option<i64> {
+    compute_next_occurrence_in_tz(&Local, send_at_ts_ms, anchor_day, recurrence, now_ms)
+}
+
+/// Computes the next occurrence timestamp (in Unix ms) strictly after `max(send_at_ts_ms, now_ms)`
+/// for recurring schedules (`"daily"`, `"weekly"`, `"monthly"`) in `chrono::Local` time.
+/// Returns `None` for `"once"` or unrecognized recurrence values.
+pub fn compute_next_occurrence_ts(
+    send_at_ts_ms: i64,
+    recurrence: &str,
+    now_ms: i64,
+) -> Option<i64> {
+    compute_next_occurrence_ts_with_anchor(send_at_ts_ms, None, recurrence, now_ms)
 }
 
 /// Computes the SHA-256 lowercase hex digest of a raw Local Automation API token.
@@ -870,6 +1056,7 @@ impl MessageStore {
                 reactions_json TEXT NOT NULL DEFAULT '[]',
                 attachment_url TEXT,
                 attachment_name TEXT,
+                updated_ts INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (thread_id, msg_id)
             );
             CREATE INDEX IF NOT EXISTS idx_messages_thread_ts
@@ -909,7 +1096,9 @@ impl MessageStore {
                 cloud_encrypted INTEGER NOT NULL DEFAULT 1,
                 cloud_key_ver INTEGER NOT NULL DEFAULT 1,
                 cloud_synced_ts INTEGER,
-                cloud_excluded INTEGER NOT NULL DEFAULT 0
+                cloud_excluded INTEGER NOT NULL DEFAULT 0,
+                cloud_upload_fail_count INTEGER NOT NULL DEFAULT 0,
+                cloud_upload_next_retry_ts INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_media_objects_lru
                 ON media_objects(local_state, pin_count, last_accessed_ts ASC);
@@ -938,6 +1127,36 @@ impl MessageStore {
                 applied_ts INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS gdrive_deleted_messages (
+                thread_id TEXT NOT NULL,
+                msg_id TEXT NOT NULL,
+                deleted_ts INTEGER NOT NULL,
+                local_mutation_ts INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (thread_id, msg_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_gdrive_deleted_messages_mut
+                ON gdrive_deleted_messages(local_mutation_ts);
+
+            CREATE TABLE IF NOT EXISTS gdrive_deleted_threads (
+                thread_id TEXT PRIMARY KEY,
+                deleted_ts INTEGER NOT NULL,
+                local_mutation_ts INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_gdrive_deleted_threads_mut
+                ON gdrive_deleted_threads(local_mutation_ts);
+
+            CREATE TABLE IF NOT EXISTS gdrive_pending_cloud_deletes (
+                sha256 TEXT PRIMARY KEY,
+                cloud_file_id TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                queued_ts INTEGER NOT NULL,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                next_retry_ts INTEGER NOT NULL DEFAULT 0,
+                queued_pull_seq INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_gdrive_pending_cloud_deletes_ts
+                ON gdrive_pending_cloud_deletes(queued_ts ASC);
+
             CREATE TABLE IF NOT EXISTS ai_messages (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -950,6 +1169,15 @@ impl MessageStore {
             CREATE INDEX IF NOT EXISTS idx_ai_messages_session_ts
                 ON ai_messages(session_id, ts);
 
+            CREATE TABLE IF NOT EXISTS ai_sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                created_ts INTEGER NOT NULL,
+                updated_ts INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ai_sessions_updated_ts
+                ON ai_sessions(updated_ts DESC);
+
             CREATE TABLE IF NOT EXISTS scheduled_messages (
                 id TEXT PRIMARY KEY,
                 thread_id TEXT NOT NULL,
@@ -958,6 +1186,9 @@ impl MessageStore {
                 text TEXT NOT NULL,
                 attachment_path TEXT NOT NULL DEFAULT '',
                 send_at_ts INTEGER NOT NULL,
+                next_attempt_ts INTEGER,
+                bypass_misfire INTEGER NOT NULL DEFAULT 0,
+                anchor_day INTEGER,
                 recurrence TEXT NOT NULL DEFAULT 'once',
                 misfire_policy TEXT NOT NULL DEFAULT 'send_on_resume',
                 misfire_grace_secs INTEGER NOT NULL DEFAULT 600,
@@ -1004,6 +1235,7 @@ impl MessageStore {
                 idem_key TEXT NOT NULL,
                 status_code INTEGER NOT NULL,
                 response_json TEXT NOT NULL,
+                request_hash TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL,
                 PRIMARY KEY (client_id, idem_key)
             );
@@ -1015,15 +1247,116 @@ impl MessageStore {
         self.ensure_column("messages", "reactions_json", "TEXT NOT NULL DEFAULT '[]'")?;
         self.ensure_column("messages", "cli_msg_id", "TEXT NOT NULL DEFAULT ''")?;
         self.ensure_column("messages", "reaction_actors_json", "TEXT NOT NULL DEFAULT ''")?;
+        self.ensure_column("messages", "updated_ts", "INTEGER NOT NULL DEFAULT 0")?;
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_thread_cli_msg_id ON messages(thread_id, cli_msg_id)",
             [],
         )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_updated_ts ON messages(updated_ts)",
+            [],
+        )?;
+        let backfilled_recalled_updated_ts: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT v FROM store_meta WHERE k = 'backfilled_recalled_updated_ts_v1' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if backfilled_recalled_updated_ts.is_none() {
+            let tx = self.conn.unchecked_transaction()?;
+            let has_unbackfilled_recalled: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE is_recalled = 1 AND updated_ts = 0)",
+                [],
+                |r| r.get(0),
+            )?;
+            if has_unbackfilled_recalled {
+                let mut_ts = Self::next_local_mutation_ts_in_tx(&tx)?;
+                tx.execute(
+                    "UPDATE messages SET updated_ts = ?1 WHERE is_recalled = 1 AND updated_ts = 0",
+                    params![mut_ts],
+                )?;
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO store_meta (k, v) VALUES ('backfilled_recalled_updated_ts_v1', '1')",
+                [],
+            )?;
+            tx.commit()?;
+        }
         self.ensure_column("threads", "last_read_in_ts", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("threads", "peer_read_ts", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("threads", "muted_until_ts", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("threads", "is_archived", "INTEGER NOT NULL DEFAULT 0")?;
         self.ensure_column("media_objects", "cloud_excluded", "INTEGER NOT NULL DEFAULT 0")?;
+        self.ensure_column(
+            "media_objects",
+            "cloud_upload_fail_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.ensure_column(
+            "media_objects",
+            "cloud_upload_next_retry_ts",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.ensure_column(
+            "gdrive_pending_cloud_deletes",
+            "retry_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.ensure_column(
+            "gdrive_pending_cloud_deletes",
+            "next_retry_ts",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.ensure_column(
+            "gdrive_pending_cloud_deletes",
+            "queued_pull_seq",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_gdrive_pending_cloud_deletes_retry
+             ON gdrive_pending_cloud_deletes(next_retry_ts ASC, queued_ts ASC)",
+            [],
+        )?;
+        self.ensure_column("scheduled_messages", "next_attempt_ts", "INTEGER")?;
+        self.ensure_column(
+            "scheduled_messages",
+            "bypass_misfire",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        self.ensure_column("scheduled_messages", "anchor_day", "INTEGER")?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scheduled_messages_status_next_attempt
+             ON scheduled_messages(status, next_attempt_ts)",
+            [],
+        )?;
+        self.ensure_column(
+            "api_idempotency",
+            "request_hash",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        let missing_anchors: Vec<(String, i64)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, send_at_ts FROM scheduled_messages WHERE anchor_day IS NULL",
+            )?;
+            let out = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            out
+        };
+        if !missing_anchors.is_empty() {
+            let tx = self.conn.unchecked_transaction()?;
+            for (id, send_at_ts) in missing_anchors {
+                if let Some(day) = local_day_of_month(send_at_ts) {
+                    tx.execute(
+                        "UPDATE scheduled_messages SET anchor_day = ?2 WHERE id = ?1 AND anchor_day IS NULL",
+                        params![id, i64::from(day)],
+                    )?;
+                }
+            }
+            tx.commit()?;
+        }
 
         let existing_check: Option<String> = self
             .conn
@@ -1261,14 +1594,18 @@ impl MessageStore {
         Ok(())
     }
 
-    fn ensure_column(&self, table: &str, col: &str, def: &str) -> Result<()> {
+    fn has_column(&self, table: &str, col: &str) -> Result<bool> {
         let sql = format!("PRAGMA table_info({table})");
         let mut stmt = self.conn.prepare(&sql)?;
         let exists = stmt
             .query_map([], |row| row.get::<_, String>(1))?
             .filter_map(std::result::Result::ok)
             .any(|name| name == col);
-        if !exists {
+        Ok(exists)
+    }
+
+    fn ensure_column(&self, table: &str, col: &str, def: &str) -> Result<()> {
+        if !self.has_column(table, col)? {
             self.conn
                 .execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {def}"), [])?;
         }
@@ -1455,11 +1792,273 @@ impl MessageStore {
         Ok(out)
     }
 
+    fn next_local_mutation_ts_on_conn(conn: &Connection) -> Result<i64> {
+        let now_ms = chrono::Utc::now().timestamp_millis().max(1);
+        let last_sync_mut: i64 = conn
+            .query_row(
+                "SELECT v FROM store_meta WHERE k = 'gdrive_last_mutation_sync_ts' LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        let last_issued: i64 = conn
+            .query_row(
+                "SELECT v FROM store_meta WHERE k = 'local_mutation_seq_ts' LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        let next = now_ms
+            .max(last_sync_mut)
+            .max(last_issued.saturating_add(1))
+            .max(1);
+        conn.execute(
+            "INSERT OR REPLACE INTO store_meta (k, v) VALUES ('local_mutation_seq_ts', ?1)",
+            params![next.to_string()],
+        )?;
+        Ok(next)
+    }
+
+    fn advance_local_mutation_seq_on_conn(conn: &Connection, ts: i64) -> Result<()> {
+        if ts <= 0 {
+            return Ok(());
+        }
+        let last_issued: i64 = conn
+            .query_row(
+                "SELECT v FROM store_meta WHERE k = 'local_mutation_seq_ts' LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        if ts > last_issued {
+            conn.execute(
+                "INSERT OR REPLACE INTO store_meta (k, v) VALUES ('local_mutation_seq_ts', ?1)",
+                params![ts.to_string()],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn next_local_mutation_ts_in_tx(tx: &rusqlite::Transaction<'_>) -> Result<i64> {
+        Self::next_local_mutation_ts_on_conn(tx)
+    }
+
+    pub(crate) fn next_local_mutation_ts(&self) -> Result<i64> {
+        Self::next_local_mutation_ts_on_conn(&self.conn)
+    }
+
+    fn get_gdrive_history_pull_seq_on_conn(conn: &Connection) -> Result<i64> {
+        let seq = conn
+            .query_row(
+                "SELECT v FROM store_meta WHERE k = 'gdrive_history_pull_seq' LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        Ok(seq.max(0))
+    }
+
+    fn cleanup_orphaned_media_for_shas_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        shas: Vec<String>,
+        queue_cloud_delete_reason: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let mut orphaned_paths: Vec<String> = Vec::new();
+        let mut thumb_candidates: Vec<String> = Vec::new();
+        let now_ms = chrono::Utc::now().timestamp_millis().max(1);
+        let current_pull_seq = if queue_cloud_delete_reason.is_some() {
+            Self::get_gdrive_history_pull_seq_on_conn(tx)?
+        } else {
+            0
+        };
+
+        for sha in shas {
+            let still_referenced: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM message_media WHERE sha256 = ?1)
+                     OR EXISTS(SELECT 1 FROM media_objects WHERE thumb_sha256 = ?1)",
+                params![&sha],
+                |r| r.get(0),
+            )?;
+            if still_referenced {
+                continue;
+            }
+            struct OrphanMediaRow {
+                local_state: i32,
+                local_rel_path: Option<String>,
+                thumb_sha256: Option<String>,
+                cloud_file_id: Option<String>,
+            }
+            let row: Option<OrphanMediaRow> = tx
+                .query_row(
+                    "SELECT local_state, local_rel_path, thumb_sha256, cloud_file_id
+                     FROM media_objects
+                     WHERE sha256 = ?1
+                     LIMIT 1",
+                    params![&sha],
+                    |r| {
+                        Ok(OrphanMediaRow {
+                            local_state: r.get(0)?,
+                            local_rel_path: r.get(1)?,
+                            thumb_sha256: r.get(2)?,
+                            cloud_file_id: r.get(3)?,
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(OrphanMediaRow {
+                local_state,
+                local_rel_path,
+                thumb_sha256,
+                cloud_file_id,
+            }) = row
+            {
+                if local_state == MEDIA_LOCAL_STATE_LOCAL {
+                    if let Some(rel) = local_rel_path {
+                        if !orphaned_paths.contains(&rel) {
+                            orphaned_paths.push(rel);
+                        }
+                    }
+                }
+                if let Some(cid) = cloud_file_id.as_deref().filter(|s| !s.is_empty()) {
+                    if let Some(reason) = queue_cloud_delete_reason {
+                        tx.execute(
+                            "UPDATE media_objects SET local_state = 0, local_rel_path = NULL, thumb_sha256 = NULL WHERE sha256 = ?1",
+                            params![&sha],
+                        )?;
+                        tx.execute(
+                            "INSERT INTO gdrive_pending_cloud_deletes (
+                                 sha256, cloud_file_id, reason, queued_ts, retry_count, next_retry_ts, queued_pull_seq
+                             )
+                             VALUES (?1, ?2, ?3, ?4, 0, 0, ?5)
+                             ON CONFLICT(sha256) DO UPDATE SET
+                                 cloud_file_id = excluded.cloud_file_id,
+                                 reason = excluded.reason,
+                                 queued_ts = excluded.queued_ts,
+                                 retry_count = 0,
+                                 next_retry_ts = 0,
+                                 queued_pull_seq = excluded.queued_pull_seq",
+                            params![&sha, cid, reason, now_ms, current_pull_seq],
+                        )?;
+                    } else {
+                        tx.execute("DELETE FROM media_objects WHERE sha256 = ?1", params![&sha])?;
+                        tx.execute(
+                            "DELETE FROM gdrive_pending_cloud_deletes WHERE sha256 = ?1",
+                            params![&sha],
+                        )?;
+                    }
+                } else {
+                    tx.execute("DELETE FROM media_objects WHERE sha256 = ?1", params![&sha])?;
+                }
+                if let Some(tsha) = thumb_sha256.filter(|s| !s.is_empty()) {
+                    thumb_candidates.push(tsha);
+                }
+            }
+        }
+
+        for tsha in thumb_candidates {
+            let still_referenced: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM message_media WHERE sha256 = ?1)
+                     OR EXISTS(SELECT 1 FROM media_objects WHERE thumb_sha256 = ?1)",
+                params![&tsha],
+                |r| r.get(0),
+            )?;
+            if still_referenced {
+                continue;
+            }
+            let row: Option<(i32, Option<String>, Option<String>)> = tx
+                .query_row(
+                    "SELECT local_state, local_rel_path, cloud_file_id
+                     FROM media_objects
+                     WHERE sha256 = ?1
+                     LIMIT 1",
+                    params![&tsha],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            if let Some((local_state, local_rel_path, cloud_file_id)) = row {
+                if local_state == MEDIA_LOCAL_STATE_LOCAL {
+                    if let Some(rel) = local_rel_path {
+                        if !orphaned_paths.contains(&rel) {
+                            orphaned_paths.push(rel);
+                        }
+                    }
+                }
+                if let Some(cid) = cloud_file_id.as_deref().filter(|s| !s.is_empty()) {
+                    if let Some(reason) = queue_cloud_delete_reason {
+                        tx.execute(
+                            "UPDATE media_objects SET local_state = 0, local_rel_path = NULL WHERE sha256 = ?1",
+                            params![&tsha],
+                        )?;
+                        tx.execute(
+                            "INSERT INTO gdrive_pending_cloud_deletes (
+                                 sha256, cloud_file_id, reason, queued_ts, retry_count, next_retry_ts, queued_pull_seq
+                             )
+                             VALUES (?1, ?2, ?3, ?4, 0, 0, ?5)
+                             ON CONFLICT(sha256) DO UPDATE SET
+                                 cloud_file_id = excluded.cloud_file_id,
+                                 reason = excluded.reason,
+                                 queued_ts = excluded.queued_ts,
+                                 retry_count = 0,
+                                 next_retry_ts = 0,
+                                 queued_pull_seq = excluded.queued_pull_seq",
+                            params![&tsha, cid, reason, now_ms, current_pull_seq],
+                        )?;
+                    } else {
+                        tx.execute("DELETE FROM media_objects WHERE sha256 = ?1", params![&tsha])?;
+                        tx.execute(
+                            "DELETE FROM gdrive_pending_cloud_deletes WHERE sha256 = ?1",
+                            params![&tsha],
+                        )?;
+                    }
+                } else {
+                    tx.execute("DELETE FROM media_objects WHERE sha256 = ?1", params![&tsha])?;
+                }
+            }
+        }
+
+        Ok(orphaned_paths)
+    }
+
+    fn cleanup_orphaned_media_for_msg_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        thread_id: &str,
+        msg_id: &str,
+        queue_cloud_delete_reason: Option<&str>,
+    ) -> Result<Vec<String>> {
+        let shas: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT sha256
+                 FROM message_media
+                 WHERE thread_id = ?1 AND msg_id = ?2 AND sha256 IS NOT NULL AND sha256 != ''",
+            )?;
+            let out = stmt
+                .query_map(params![thread_id, msg_id], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            out
+        };
+
+        tx.execute(
+            "DELETE FROM message_media WHERE thread_id = ?1 AND msg_id = ?2",
+            params![thread_id, msg_id],
+        )?;
+
+        Self::cleanup_orphaned_media_for_shas_in_tx(tx, shas, queue_cloud_delete_reason)
+    }
+
     fn upsert_message_row_in_tx(
         cipher: &DbCipher,
         tx: &rusqlite::Transaction<'_>,
         m: &MessageDto,
-    ) -> Result<(i64, String, String)> {
+        force_updated_ts: bool,
+    ) -> Result<(i64, String, String, Vec<String>)> {
         let sender_norm = strip_vi_accents(&m.sender_name);
         let text_norm = strip_vi_accents(&m.text);
         let quote_json = m
@@ -1471,14 +2070,104 @@ impl MessageStore {
         let reactions_empty = m.reactions.is_empty() as i64;
 
         let aad = msg_aad(&m.thread_id, &m.msg_id);
+        let ts = normalize_ts_ms(m.ts);
+        struct ExistingUpsertMsg {
+            is_recalled: i64,
+            is_pinned: i64,
+            enc_text: String,
+            enc_att_name: Option<String>,
+        }
+        let existing_row: Option<ExistingUpsertMsg> = tx
+            .query_row(
+                "SELECT is_recalled, is_pinned, text, attachment_name
+                 FROM messages
+                 WHERE thread_id = ?1 AND msg_id = ?2
+                 LIMIT 1",
+                params![&m.thread_id, &m.msg_id],
+                |r| {
+                    Ok(ExistingUpsertMsg {
+                        is_recalled: r.get(0)?,
+                        is_pinned: r.get(1)?,
+                        enc_text: r.get(2)?,
+                        enc_att_name: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+
+        let mut effective_force_updated = force_updated_ts;
+        if !effective_force_updated
+            && m.msg_type.eq_ignore_ascii_case("chat.poll")
+            && m.attachment_name.is_some()
+        {
+            if let Some(existing_enc_att) = existing_row
+                .as_ref()
+                .and_then(|row| row.enc_att_name.as_deref())
+            {
+                let existing_plain = cipher.decrypt_or_legacy(&aad, existing_enc_att).ok();
+                if existing_plain.as_deref() != m.attachment_name.as_deref() {
+                    effective_force_updated = true;
+                }
+            }
+        }
+
+        let last_history_sync_ts: i64 = tx
+            .query_row(
+                "SELECT v FROM store_meta WHERE k = 'gdrive_last_history_sync_ts' LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+
+        let preserve_existing_recall = existing_row
+            .as_ref()
+            .is_some_and(|row| row.is_recalled != 0 && !m.is_recalled);
+        let fts_text_norm = if preserve_existing_recall {
+            existing_row
+                .as_ref()
+                .and_then(|row| cipher.decrypt_or_legacy(&aad, &row.enc_text).ok())
+                .map(|plain| strip_vi_accents(&plain))
+                .unwrap_or(text_norm)
+        } else {
+            text_norm
+        };
+
+        let insert_needs_mut_ts = effective_force_updated
+            || m.is_recalled
+            || (last_history_sync_ts > 0 && ts < last_history_sync_ts);
+        let update_needs_mut_ts = match &existing_row {
+            None => false,
+            Some(_) if preserve_existing_recall => false,
+            Some(cur) => {
+                effective_force_updated
+                    || (m.is_recalled && cur.is_recalled == 0)
+                    || (m.is_pinned && cur.is_pinned == 0)
+            }
+        };
+        let mut_ts = if (existing_row.is_none() && insert_needs_mut_ts) || update_needs_mut_ts {
+            Self::next_local_mutation_ts_in_tx(tx)?
+        } else {
+            0
+        };
+        let insert_updated_ts = if insert_needs_mut_ts { mut_ts } else { 0 };
+
         let enc_sender_id = cipher.encrypt_str(&aad, &m.sender_id)?;
         let enc_sender_name = cipher.encrypt_str(&aad, &m.sender_name)?;
         let enc_text = cipher.encrypt_str(&aad, &m.text)?;
         let enc_quote = cipher.encrypt_opt(&aad, quote_json.as_deref())?;
         let enc_reactions = cipher.encrypt_str(&aad, &reactions_json)?;
-        let enc_att_url = cipher.encrypt_opt(&aad, m.attachment_url.as_deref())?;
-        let enc_att_name = cipher.encrypt_opt(&aad, m.attachment_name.as_deref())?;
-        let ts = normalize_ts_ms(m.ts);
+        let enc_att_url = if m.is_recalled {
+            None
+        } else {
+            cipher.encrypt_opt(&aad, m.attachment_url.as_deref())?
+        };
+        let enc_att_name = if m.is_recalled {
+            None
+        } else {
+            cipher.encrypt_opt(&aad, m.attachment_name.as_deref())?
+        };
         let cli_msg_id = m
             .cli_msg_id
             .as_deref()
@@ -1488,26 +2177,46 @@ impl MessageStore {
 
         tx.execute(
             r#"
-            INSERT INTO messages (msg_id, thread_id, sender_id, sender_name, text, text_norm, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id)
-            VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            INSERT INTO messages (msg_id, thread_id, sender_id, sender_name, text, text_norm, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id, updated_ts)
+            VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?19)
             ON CONFLICT(thread_id, msg_id) DO UPDATE SET
-                text = excluded.text,
+                text = CASE
+                    WHEN messages.is_recalled = 1 AND excluded.is_recalled = 0 THEN messages.text
+                    ELSE excluded.text
+                END,
                 text_norm = '',
-                msg_type = excluded.msg_type,
-                is_recalled = excluded.is_recalled,
+                msg_type = CASE
+                    WHEN messages.is_recalled = 1 AND excluded.is_recalled = 0 THEN messages.msg_type
+                    ELSE excluded.msg_type
+                END,
+                is_recalled = MAX(messages.is_recalled, excluded.is_recalled),
                 is_pinned = MAX(messages.is_pinned, excluded.is_pinned),
-                quote_json = COALESCE(excluded.quote_json, messages.quote_json),
-                reactions_json = CASE WHEN ?16 = 1 THEN messages.reactions_json ELSE excluded.reactions_json END,
+                quote_json = CASE
+                    WHEN messages.is_recalled = 1 AND excluded.is_recalled = 0 THEN messages.quote_json
+                    ELSE COALESCE(excluded.quote_json, messages.quote_json)
+                END,
+                reactions_json = CASE
+                    WHEN (messages.is_recalled = 1 AND excluded.is_recalled = 0) OR ?16 = 1 THEN messages.reactions_json
+                    ELSE excluded.reactions_json
+                END,
                 cli_msg_id = CASE WHEN excluded.cli_msg_id != '' THEN excluded.cli_msg_id ELSE messages.cli_msg_id END,
                 attachment_url = CASE
-                    WHEN excluded.is_recalled = 1 OR LOWER(excluded.msg_type) IN ('chat.reminder', 'chat.poll') THEN NULL
+                    WHEN messages.is_recalled = 1 OR excluded.is_recalled = 1 OR LOWER(excluded.msg_type) IN ('chat.reminder', 'chat.poll') THEN NULL
                     WHEN LOWER(excluded.msg_type) IN ('chat.link', 'link', 'chat.location', 'chat.location.new', 'chat.recommended', 'chat.ecard') THEN excluded.attachment_url
                     ELSE COALESCE(excluded.attachment_url, messages.attachment_url)
                 END,
                 attachment_name = CASE
-                    WHEN excluded.is_recalled = 1 THEN NULL
+                    WHEN messages.is_recalled = 1 OR excluded.is_recalled = 1 THEN NULL
                     WHEN LOWER(excluded.msg_type) IN ('chat.link', 'link', 'chat.location', 'chat.location.new', 'chat.recommended', 'chat.ecard') AND excluded.attachment_url IS NULL THEN NULL
                     ELSE COALESCE(excluded.attachment_name, messages.attachment_name)
+                END,
+                updated_ts = CASE
+                    WHEN messages.is_recalled = 1 AND excluded.is_recalled = 0 THEN messages.updated_ts
+                    WHEN ?18 = 1
+                      OR excluded.is_recalled > messages.is_recalled
+                      OR excluded.is_pinned > messages.is_pinned
+                    THEN ?17
+                    ELSE messages.updated_ts
                 END
             "#,
             params![
@@ -1527,6 +2236,9 @@ impl MessageStore {
                 enc_att_name,
                 cli_msg_id,
                 reactions_empty,
+                mut_ts,
+                effective_force_updated as i64,
+                insert_updated_ts,
             ],
         )?;
         if !m.is_outgoing {
@@ -1535,22 +2247,26 @@ impl MessageStore {
                 params![m.thread_id, ts],
             )?;
         }
+        let mut orphaned_paths = Vec::new();
         if m.is_recalled {
             tx.execute(
                 "DELETE FROM message_translations WHERE msg_id = ?1",
                 params![m.msg_id],
             )?;
-            tx.execute(
-                "DELETE FROM message_media WHERE thread_id = ?1 AND msg_id = ?2",
-                params![m.thread_id, m.msg_id],
+            orphaned_paths = Self::cleanup_orphaned_media_for_msg_in_tx(
+                tx,
+                &m.thread_id,
+                &m.msg_id,
+                Some("msg_recalled"),
             )?;
         }
-        Ok((ts, sender_norm, text_norm))
+        Ok((ts, sender_norm, fts_text_norm, orphaned_paths))
     }
 
-    pub fn upsert_message(&mut self, m: &MessageDto) -> Result<()> {
+    fn upsert_message_inner(&mut self, m: &MessageDto, force_updated_ts: bool) -> Result<Vec<String>> {
         let tx = self.conn.transaction()?;
-        let (ts, sender_norm, text_norm) = Self::upsert_message_row_in_tx(&self.cipher, &tx, m)?;
+        let (ts, sender_norm, text_norm, orphaned_paths) =
+            Self::upsert_message_row_in_tx(&self.cipher, &tx, m, force_updated_ts)?;
         tx.commit()?;
 
         let fts_tx = self.fts_conn.transaction()?;
@@ -1563,7 +2279,16 @@ impl MessageStore {
             params![m.msg_id, m.thread_id, ts, sender_norm, text_norm],
         )?;
         fts_tx.commit()?;
+        Ok(orphaned_paths)
+    }
+
+    pub fn upsert_message(&mut self, m: &MessageDto) -> Result<()> {
+        let _ = self.upsert_message_inner(m, false)?;
         Ok(())
+    }
+
+    pub fn upsert_message_returning_orphans(&mut self, m: &MessageDto) -> Result<Vec<String>> {
+        self.upsert_message_inner(m, false)
     }
 
     fn query_poll_candidates_in_tx(
@@ -1646,8 +2371,8 @@ impl MessageStore {
                 params![&incoming.thread_id, &incoming.msg_id],
                 |r| r.get::<_, i64>(0),
             )? != 0;
-            let (ts, sender_norm, text_norm) =
-                Self::upsert_message_row_in_tx(&self.cipher, &tx, incoming)?;
+            let (ts, sender_norm, text_norm, _) =
+                Self::upsert_message_row_in_tx(&self.cipher, &tx, incoming, false)?;
             tx.commit()?;
 
             let fts_tx = self.fts_conn.unchecked_transaction()?;
@@ -1771,8 +2496,8 @@ impl MessageStore {
             Self::delete_message_row_in_tx(&tx, del_tid, del_mid)?;
         }
 
-        let (ts, sender_norm, text_norm) =
-            Self::upsert_message_row_in_tx(&self.cipher, &tx, &saved)?;
+        let (ts, sender_norm, text_norm, _) =
+            Self::upsert_message_row_in_tx(&self.cipher, &tx, &saved, was_updated_existing)?;
         saved.ts = ts;
         tx.commit()?;
 
@@ -1879,8 +2604,8 @@ impl MessageStore {
                 }
             }
 
-            let (ts, sender_norm, text_norm) =
-                Self::upsert_message_row_in_tx(&self.cipher, &tx, &canonical)?;
+            let (ts, sender_norm, text_norm, _) =
+                Self::upsert_message_row_in_tx(&self.cipher, &tx, &canonical, true)?;
             fts_updates.push((
                 canonical.thread_id,
                 canonical.msg_id,
@@ -2089,12 +2814,25 @@ impl MessageStore {
         msg.text = "[Tin nhắn đã thu hồi]".to_string();
         msg.attachment_url = None;
         msg.attachment_name = None;
-        self.upsert_message(&msg)?;
+        let _ = self.upsert_message_inner(&msg, true)?;
         Ok(Some(msg))
     }
 
     pub fn delete_message(&mut self, thread_id: &str, msg_id: &str) -> Result<bool> {
         let tx = self.conn.transaction()?;
+        let existing_ts: Option<i64> = tx
+            .query_row(
+                "SELECT ts FROM messages WHERE thread_id = ?1 AND msg_id = ?2 LIMIT 1",
+                params![thread_id, msg_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let _ = Self::cleanup_orphaned_media_for_msg_in_tx(
+            &tx,
+            thread_id,
+            msg_id,
+            Some("msg_deleted"),
+        )?;
         let affected = tx.execute(
             "DELETE FROM messages WHERE thread_id = ?1 AND msg_id = ?2",
             params![thread_id, msg_id],
@@ -2103,10 +2841,18 @@ impl MessageStore {
             "DELETE FROM message_translations WHERE msg_id = ?1",
             params![msg_id],
         )?;
-        tx.execute(
-            "DELETE FROM message_media WHERE thread_id = ?1 AND msg_id = ?2",
-            params![thread_id, msg_id],
-        )?;
+        if affected > 0 {
+            let mut_ts = Self::next_local_mutation_ts_in_tx(&tx)?;
+            let deleted_ts = mut_ts.max(existing_ts.unwrap_or(0));
+            tx.execute(
+                "INSERT INTO gdrive_deleted_messages (thread_id, msg_id, deleted_ts, local_mutation_ts)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(thread_id, msg_id) DO UPDATE SET
+                     deleted_ts = MAX(gdrive_deleted_messages.deleted_ts, excluded.deleted_ts),
+                     local_mutation_ts = MAX(gdrive_deleted_messages.local_mutation_ts, excluded.local_mutation_ts)",
+                params![thread_id, msg_id, deleted_ts, mut_ts],
+            )?;
+        }
         tx.commit()?;
 
         self.fts_conn.execute(
@@ -2126,6 +2872,22 @@ impl MessageStore {
         }
 
         let tx = self.conn.transaction()?;
+
+        let max_msg_ts: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(ts), 0) FROM messages WHERE thread_id = ?1",
+                params![tid],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let thread_last_ts: i64 = tx
+            .query_row(
+                "SELECT COALESCE(last_ts, 0) FROM threads WHERE id = ?1 LIMIT 1",
+                params![tid],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
 
         // Delete cached translations for messages belonging exclusively to this thread.
         tx.execute(
@@ -2150,111 +2912,8 @@ impl MessageStore {
 
         tx.execute("DELETE FROM message_media WHERE thread_id = ?1", params![tid])?;
 
-        let mut orphaned_paths: Vec<String> = Vec::new();
-        let mut thumb_candidates: Vec<String> = Vec::new();
-
-        for sha in shas {
-            let still_referenced: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM message_media WHERE sha256 = ?1)
-                     OR EXISTS(SELECT 1 FROM media_objects WHERE thumb_sha256 = ?1)",
-                params![&sha],
-                |r| r.get(0),
-            )?;
-            if still_referenced {
-                continue;
-            }
-            struct OrphanMediaRow {
-                local_state: i32,
-                local_rel_path: Option<String>,
-                thumb_sha256: Option<String>,
-                cloud_file_id: Option<String>,
-            }
-            let row: Option<OrphanMediaRow> = tx
-                .query_row(
-                    "SELECT local_state, local_rel_path, thumb_sha256, cloud_file_id
-                     FROM media_objects
-                     WHERE sha256 = ?1
-                     LIMIT 1",
-                    params![&sha],
-                    |r| {
-                        Ok(OrphanMediaRow {
-                            local_state: r.get(0)?,
-                            local_rel_path: r.get(1)?,
-                            thumb_sha256: r.get(2)?,
-                            cloud_file_id: r.get(3)?,
-                        })
-                    },
-                )
-                .optional()?;
-            if let Some(OrphanMediaRow {
-                local_state,
-                local_rel_path,
-                thumb_sha256,
-                cloud_file_id,
-            }) = row
-            {
-                if local_state == MEDIA_LOCAL_STATE_LOCAL {
-                    if let Some(rel) = local_rel_path {
-                        if !orphaned_paths.contains(&rel) {
-                            orphaned_paths.push(rel);
-                        }
-                    }
-                }
-                if cloud_file_id.as_deref().is_some_and(|s| !s.is_empty()) {
-                    tx.execute(
-                        "UPDATE media_objects SET local_state = 0, local_rel_path = NULL, thumb_sha256 = NULL WHERE sha256 = ?1",
-                        params![&sha],
-                    )?;
-                } else {
-                    tx.execute("DELETE FROM media_objects WHERE sha256 = ?1", params![&sha])?;
-                }
-                if let Some(tsha) = thumb_sha256.filter(|s| !s.is_empty()) {
-                    thumb_candidates.push(tsha);
-                }
-            }
-        }
-
-        for tsha in thumb_candidates {
-            let still_referenced: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM message_media WHERE sha256 = ?1)
-                     OR EXISTS(SELECT 1 FROM media_objects WHERE thumb_sha256 = ?1)",
-                params![&tsha],
-                |r| r.get(0),
-            )?;
-            if still_referenced {
-                continue;
-            }
-            let row: Option<(i32, Option<String>, Option<String>)> = tx
-                .query_row(
-                    "SELECT local_state, local_rel_path, cloud_file_id
-                     FROM media_objects
-                     WHERE sha256 = ?1
-                     LIMIT 1",
-                    params![&tsha],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .optional()?;
-            if let Some((local_state, local_rel_path, cloud_file_id)) = row {
-                if local_state == MEDIA_LOCAL_STATE_LOCAL {
-                    if let Some(rel) = local_rel_path {
-                        if !orphaned_paths.contains(&rel) {
-                            orphaned_paths.push(rel);
-                        }
-                    }
-                }
-                if cloud_file_id.as_deref().is_some_and(|s| !s.is_empty()) {
-                    tx.execute(
-                        "UPDATE media_objects SET local_state = 0, local_rel_path = NULL WHERE sha256 = ?1",
-                        params![&tsha],
-                    )?;
-                } else {
-                    tx.execute(
-                        "DELETE FROM media_objects WHERE sha256 = ?1",
-                        params![&tsha],
-                    )?;
-                }
-            }
-        }
+        let orphaned_paths =
+            Self::cleanup_orphaned_media_for_shas_in_tx(&tx, shas, Some("thread_deleted"))?;
 
         // Scrub thread membership from any encrypted `chat_folders` entries.
         let folder_rows: Vec<(String, String)> = {
@@ -2285,8 +2944,25 @@ impl MessageStore {
             }
         }
 
-        tx.execute("DELETE FROM messages WHERE thread_id = ?1", params![tid])?;
-        tx.execute("DELETE FROM threads WHERE id = ?1", params![tid])?;
+        let del_msgs = tx.execute("DELETE FROM messages WHERE thread_id = ?1", params![tid])?;
+        let del_threads = tx.execute("DELETE FROM threads WHERE id = ?1", params![tid])?;
+        if del_msgs > 0 || del_threads > 0 {
+            let mut_ts = Self::next_local_mutation_ts_in_tx(&tx)?;
+            let server_anchor_ts = max_msg_ts.max(thread_last_ts);
+            let deleted_ts = if server_anchor_ts > 0 {
+                server_anchor_ts
+            } else {
+                mut_ts
+            };
+            tx.execute(
+                "INSERT INTO gdrive_deleted_threads (thread_id, deleted_ts, local_mutation_ts)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(thread_id) DO UPDATE SET
+                     deleted_ts = MAX(gdrive_deleted_threads.deleted_ts, excluded.deleted_ts),
+                     local_mutation_ts = MAX(gdrive_deleted_threads.local_mutation_ts, excluded.local_mutation_ts)",
+                params![tid, deleted_ts, mut_ts],
+            )?;
+        }
         tx.commit()?;
 
         self.fts_conn.execute(
@@ -2436,9 +3112,10 @@ impl MessageStore {
         msg_id: &str,
         pinned: bool,
     ) -> Result<Option<MessageDto>> {
+        let mut_ts = self.next_local_mutation_ts()?;
         let affected = self.conn.execute(
-            "UPDATE messages SET is_pinned = ?3 WHERE thread_id = ?1 AND msg_id = ?2",
-            params![thread_id, msg_id, pinned as i64],
+            "UPDATE messages SET is_pinned = ?3, updated_ts = ?4 WHERE thread_id = ?1 AND msg_id = ?2",
+            params![thread_id, msg_id, pinned as i64, mut_ts],
         )?;
         if affected == 0 {
             return Ok(None);
@@ -2488,11 +3165,12 @@ impl MessageStore {
             let actors_json = serde_json::to_string(actors).unwrap_or_else(|_| "{}".to_string());
             self.cipher.encrypt_str(&aad, &actors_json)?
         };
+        let mut_ts = self.next_local_mutation_ts()?;
         self.conn.execute(
             "UPDATE messages
-             SET reactions_json = ?3, reaction_actors_json = ?4
+             SET reactions_json = ?3, reaction_actors_json = ?4, updated_ts = ?5
              WHERE thread_id = ?1 AND msg_id = ?2",
-            params![thread_id, msg_id, enc_reactions, enc_actors],
+            params![thread_id, msg_id, enc_reactions, enc_actors, mut_ts],
         )?;
         Ok(())
     }
@@ -2812,18 +3490,20 @@ impl MessageStore {
     /// Updates thread preview & unread counters, returning `true` when a brand-new thread row
     /// was inserted locally because `thread_id` did not exist in SQLite yet.
     ///
-    /// When inserting a new stub thread, prefers `fallback_title` (if non-empty and not raw
-    /// numeric) over raw `thread_id`, and `fallback_avatar` if non-empty. When the thread row
-    /// already exists with a placeholder title (`title == id`, empty, or raw numeric), upgrades
-    /// `title` (and `avatar` if currently empty) without clobbering real names or avatars.
+    /// When inserting a new stub thread, uses `fallback_kind` (defaulting to [`ThreadKind::Direct`]),
+    /// prefers `fallback_title` (if non-empty and not raw numeric) over raw `thread_id`, and
+    /// `fallback_avatar` if non-empty. When the thread row already exists with a placeholder title
+    /// (`title == id`, empty, or raw numeric), upgrades `title` (and `avatar` if currently empty)
+    /// without clobbering real names or avatars.
     #[allow(clippy::too_many_arguments)]
-    pub fn update_thread_preview_with_fallback_meta(
+    pub fn update_thread_preview_with_fallback_kind_and_meta(
         &self,
         thread_id: &str,
         preview: &str,
         ts: i64,
         inc_unread: bool,
         clear_unread: bool,
+        fallback_kind: Option<ThreadKind>,
         fallback_title: Option<&str>,
         fallback_avatar: Option<&str>,
     ) -> Result<bool> {
@@ -2861,7 +3541,7 @@ impl MessageStore {
                 id: thread_id.to_string(),
                 title: clean_fallback_title.unwrap_or(thread_id).to_string(),
                 avatar: clean_fallback_avatar.unwrap_or("").to_string(),
-                kind: ThreadKind::Direct,
+                kind: fallback_kind.unwrap_or(ThreadKind::Direct),
                 last_preview: preview.to_string(),
                 last_ts: ts,
                 unread_count: if inc_unread && !clear_unread { 1 } else { 0 },
@@ -2907,6 +3587,32 @@ impl MessageStore {
             }
         }
         Ok(false)
+    }
+
+    /// Updates thread preview & unread counters, returning `true` when a brand-new thread row
+    /// was inserted locally because `thread_id` did not exist in SQLite yet (defaulting to
+    /// [`ThreadKind::Direct`] when creating a new row).
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_thread_preview_with_fallback_meta(
+        &self,
+        thread_id: &str,
+        preview: &str,
+        ts: i64,
+        inc_unread: bool,
+        clear_unread: bool,
+        fallback_title: Option<&str>,
+        fallback_avatar: Option<&str>,
+    ) -> Result<bool> {
+        self.update_thread_preview_with_fallback_kind_and_meta(
+            thread_id,
+            preview,
+            ts,
+            inc_unread,
+            clear_unread,
+            None,
+            fallback_title,
+            fallback_avatar,
+        )
     }
 
     /// Updates thread preview & unread counters, returning `true` when a brand-new thread row
@@ -3618,6 +4324,44 @@ impl MessageStore {
     }
 
     /// Load messages starting from a historical timestamp (with `context_before` earlier messages
+    /// and up to `max_after` messages from `target_ts` onward), returning `(messages, has_newer)`
+    /// where `has_newer` is `true` iff additional messages exist after the returned slice.
+    pub fn load_messages_around_with_meta(
+        &self,
+        thread_id: &str,
+        target_ts: i64,
+        context_before: usize,
+        max_after: usize,
+    ) -> Result<(Vec<MessageDto>, bool)> {
+        let mut msgs = if context_before > 0 {
+            let mut before = self.query_messages(
+                "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id
+                 FROM messages WHERE thread_id = ?1 AND ts < ?2
+                 ORDER BY ts DESC, msg_id DESC LIMIT ?3",
+                params![thread_id, target_ts, context_before as i64],
+            )?;
+            before.reverse();
+            before
+        } else {
+            Vec::new()
+        };
+
+        let fetch_after = i64::try_from(max_after.saturating_add(1)).unwrap_or(i64::MAX);
+        let mut after = self.query_messages(
+            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id
+             FROM messages WHERE thread_id = ?1 AND ts >= ?2
+             ORDER BY ts ASC, msg_id ASC LIMIT ?3",
+            params![thread_id, target_ts, fetch_after],
+        )?;
+        let has_newer = after.len() > max_after;
+        if has_newer {
+            after.truncate(max_after);
+        }
+        msgs.extend(after);
+        Ok((msgs, has_newer))
+    }
+
+    /// Load messages starting from a historical timestamp (with `context_before` earlier messages
     /// and up to `max_after` messages from `target_ts` onward) so jumping to a search hit renders it.
     pub fn load_messages_around(
         &self,
@@ -3626,21 +4370,8 @@ impl MessageStore {
         context_before: usize,
         max_after: usize,
     ) -> Result<Vec<MessageDto>> {
-        let mut msgs = self.query_messages(
-            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id
-             FROM messages WHERE thread_id = ?1 AND ts < ?2
-             ORDER BY ts DESC LIMIT ?3",
-            params![thread_id, target_ts, context_before as i64],
-        )?;
-        msgs.reverse();
-
-        let after = self.query_messages(
-            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id
-             FROM messages WHERE thread_id = ?1 AND ts >= ?2
-             ORDER BY ts ASC LIMIT ?3",
-            params![thread_id, target_ts, max_after as i64],
-        )?;
-        msgs.extend(after);
+        let (msgs, _has_newer) =
+            self.load_messages_around_with_meta(thread_id, target_ts, context_before, max_after)?;
         Ok(msgs)
     }
 
@@ -3874,7 +4605,15 @@ impl MessageStore {
                 cloud_file_id = COALESCE(excluded.cloud_file_id, media_objects.cloud_file_id),
                 cloud_encrypted = excluded.cloud_encrypted,
                 cloud_key_ver = MAX(media_objects.cloud_key_ver, excluded.cloud_key_ver),
-                cloud_synced_ts = COALESCE(excluded.cloud_synced_ts, media_objects.cloud_synced_ts)
+                cloud_synced_ts = COALESCE(excluded.cloud_synced_ts, media_objects.cloud_synced_ts),
+                cloud_upload_fail_count = CASE
+                    WHEN excluded.local_state = 1 THEN 0
+                    ELSE media_objects.cloud_upload_fail_count
+                END,
+                cloud_upload_next_retry_ts = CASE
+                    WHEN excluded.local_state = 1 THEN 0
+                    ELSE media_objects.cloud_upload_next_retry_ts
+                END
             "#,
             params![
                 obj.sha256,
@@ -3957,6 +4696,12 @@ impl MessageStore {
                 rec.updated_ts,
             ],
         )?;
+        if let Some(sha) = rec.sha256.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            tx.execute(
+                "DELETE FROM gdrive_pending_cloud_deletes WHERE sha256 = ?1",
+                params![sha],
+            )?;
+        }
         if rec.thread_id != "__url__" && !rec.url_hash.is_empty() {
             tx.execute(
                 "DELETE FROM message_media WHERE thread_id = '__url__' AND url_hash = ?1 AND variant = ?2",
@@ -4169,12 +4914,11 @@ impl MessageStore {
     }
 
     pub fn mark_media_cdn_status(&self, url_hash: &str, status: i32) -> Result<usize> {
-        let now = chrono::Utc::now().timestamp_millis();
         let affected = self.conn.execute(
             "UPDATE message_media
-             SET cdn_status = ?2, updated_ts = ?3
+             SET cdn_status = ?2
              WHERE url_hash = ?1",
-            params![url_hash, status, now],
+            params![url_hash, status],
         )?;
         Ok(affected)
     }
@@ -4202,16 +4946,14 @@ impl MessageStore {
         let variant = "primary";
         let aad = message_media_aad(thread_id, msg_id, variant);
         let enc_path = self.cipher.encrypt_str(&aad, path)?;
-        let now = chrono::Utc::now().timestamp_millis();
         self.conn.execute(
             "INSERT INTO message_media (
                 thread_id, msg_id, variant, url_hash, saved_user_path, updated_ts
              )
-             VALUES (?1, ?2, ?3, '', ?4, ?5)
+             VALUES (?1, ?2, ?3, '', ?4, 0)
              ON CONFLICT(thread_id, msg_id, variant) DO UPDATE SET
-                 saved_user_path = excluded.saved_user_path,
-                 updated_ts = excluded.updated_ts",
-            params![thread_id, msg_id, variant, enc_path, now],
+                 saved_user_path = excluded.saved_user_path",
+            params![thread_id, msg_id, variant, enc_path],
         )?;
         Ok(())
     }
@@ -4298,140 +5040,241 @@ impl MessageStore {
     }
 
     /// Removes `message_media` rows for `(thread_id, msg_id)` and deletes/evicts any now-unreferenced
-    /// `media_objects` (plus their orphaned thumbnails), returning `local_rel_path`s to unlink outside DB lock.
+    /// `media_objects` (plus their orphaned thumbnails), queueing unreferenced cloud blobs for Drive
+    /// pruning and returning `local_rel_path`s to unlink outside DB lock.
     pub fn cleanup_orphaned_media_for_msg(
         &self,
         thread_id: &str,
         msg_id: &str,
     ) -> Result<Vec<String>> {
         let tx = self.conn.unchecked_transaction()?;
-        let shas: Vec<String> = {
-            let mut stmt = tx.prepare(
-                "SELECT DISTINCT sha256
-                 FROM message_media
-                 WHERE thread_id = ?1 AND msg_id = ?2 AND sha256 IS NOT NULL AND sha256 != ''",
-            )?;
-            let out = stmt
-                .query_map(params![thread_id, msg_id], |r| r.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            out
-        };
-
-        tx.execute(
-            "DELETE FROM message_media WHERE thread_id = ?1 AND msg_id = ?2",
-            params![thread_id, msg_id],
+        let orphaned_paths = Self::cleanup_orphaned_media_for_msg_in_tx(
+            &tx,
+            thread_id,
+            msg_id,
+            Some("msg_media_removed"),
         )?;
-
-        let mut orphaned_paths = Vec::new();
-        let mut thumb_candidates = Vec::new();
-
-        for sha in shas {
-            let still_referenced: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM message_media WHERE sha256 = ?1)
-                     OR EXISTS(SELECT 1 FROM media_objects WHERE thumb_sha256 = ?1)",
-                params![&sha],
-                |r| r.get(0),
-            )?;
-            if still_referenced {
-                continue;
-            }
-            struct OrphanRow {
-                local_state: i32,
-                local_rel_path: Option<String>,
-                thumb_sha256: Option<String>,
-                cloud_file_id: Option<String>,
-            }
-            let row: Option<OrphanRow> = tx
-                .query_row(
-                    "SELECT local_state, local_rel_path, thumb_sha256, cloud_file_id
-                     FROM media_objects
-                     WHERE sha256 = ?1
-                     LIMIT 1",
-                    params![&sha],
-                    |r| {
-                        Ok(OrphanRow {
-                            local_state: r.get(0)?,
-                            local_rel_path: r.get(1)?,
-                            thumb_sha256: r.get(2)?,
-                            cloud_file_id: r.get(3)?,
-                        })
-                    },
-                )
-                .optional()?;
-            if let Some(OrphanRow {
-                local_state,
-                local_rel_path,
-                thumb_sha256,
-                cloud_file_id,
-            }) = row
-            {
-                if local_state == MEDIA_LOCAL_STATE_LOCAL {
-                    if let Some(rel) = local_rel_path {
-                        orphaned_paths.push(rel);
-                    }
-                }
-                if cloud_file_id.as_deref().is_some_and(|s| !s.is_empty()) {
-                    tx.execute(
-                        "UPDATE media_objects SET local_state = 0, local_rel_path = NULL, thumb_sha256 = NULL WHERE sha256 = ?1",
-                        params![&sha],
-                    )?;
-                } else {
-                    tx.execute("DELETE FROM media_objects WHERE sha256 = ?1", params![&sha])?;
-                }
-                if let Some(tsha) = thumb_sha256.filter(|s| !s.is_empty()) {
-                    thumb_candidates.push(tsha);
-                }
-            }
-        }
-
-        for tsha in thumb_candidates {
-            let still_referenced: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM message_media WHERE sha256 = ?1)
-                     OR EXISTS(SELECT 1 FROM media_objects WHERE thumb_sha256 = ?1)",
-                params![&tsha],
-                |r| r.get(0),
-            )?;
-            if still_referenced {
-                continue;
-            }
-            let row: Option<(i32, Option<String>, Option<String>)> = tx
-                .query_row(
-                    "SELECT local_state, local_rel_path, cloud_file_id
-                     FROM media_objects
-                     WHERE sha256 = ?1
-                     LIMIT 1",
-                    params![&tsha],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .optional()?;
-            if let Some((local_state, local_rel_path, cloud_file_id)) = row {
-                if local_state == MEDIA_LOCAL_STATE_LOCAL {
-                    if let Some(rel) = local_rel_path {
-                        orphaned_paths.push(rel);
-                    }
-                }
-                if cloud_file_id.as_deref().is_some_and(|s| !s.is_empty()) {
-                    tx.execute(
-                        "UPDATE media_objects SET local_state = 0, local_rel_path = NULL WHERE sha256 = ?1",
-                        params![&tsha],
-                    )?;
-                } else {
-                    tx.execute(
-                        "DELETE FROM media_objects WHERE sha256 = ?1",
-                        params![&tsha],
-                    )?;
-                }
-            }
-        }
-
         tx.commit()?;
         Ok(orphaned_paths)
+    }
+
+    pub fn list_pending_cloud_deletes(&self, limit: usize) -> Result<Vec<PendingCloudDeleteRecord>> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        self.list_ready_pending_cloud_deletes(limit, false, 0, now_ms)
+    }
+
+    pub fn list_ready_pending_cloud_deletes(
+        &self,
+        limit: usize,
+        require_history_pull: bool,
+        min_grace_ms: i64,
+        now_ms: i64,
+    ) -> Result<Vec<PendingCloudDeleteRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Automatically cancel any queued delete whose blob was re-referenced by a live message or thumb.
+        self.conn.execute(
+            "DELETE FROM gdrive_pending_cloud_deletes
+             WHERE EXISTS (SELECT 1 FROM message_media WHERE sha256 = gdrive_pending_cloud_deletes.sha256)
+                OR EXISTS (SELECT 1 FROM media_objects WHERE thumb_sha256 = gdrive_pending_cloud_deletes.sha256)",
+            [],
+        )?;
+        let current_pull_seq = Self::get_gdrive_history_pull_seq_on_conn(&self.conn)?;
+        if require_history_pull && current_pull_seq <= 0 {
+            return Ok(Vec::new());
+        }
+        let max_queued_ts = if min_grace_ms > 0 {
+            now_ms.saturating_sub(min_grace_ms)
+        } else {
+            i64::MAX
+        };
+        let mut stmt = if require_history_pull {
+            self.conn.prepare(
+                "SELECT sha256, cloud_file_id, reason, queued_ts
+                 FROM gdrive_pending_cloud_deletes
+                 WHERE next_retry_ts <= ?1
+                   AND queued_pull_seq < ?2
+                   AND queued_ts <= ?3
+                 ORDER BY next_retry_ts ASC, queued_ts ASC, sha256 ASC
+                 LIMIT ?4",
+            )?
+        } else {
+            self.conn.prepare(
+                "SELECT sha256, cloud_file_id, reason, queued_ts
+                 FROM gdrive_pending_cloud_deletes
+                 WHERE next_retry_ts <= ?1
+                   AND queued_ts <= ?3
+                 ORDER BY next_retry_ts ASC, queued_ts ASC, sha256 ASC
+                 LIMIT ?4",
+            )?
+        };
+        let rows = stmt
+            .query_map(
+                params![now_ms, current_pull_seq, max_queued_ts, limit as i64],
+                |r| {
+                    Ok(PendingCloudDeleteRecord {
+                        sha256: r.get(0)?,
+                        cloud_file_id: r.get(1)?,
+                        reason: r.get(2)?,
+                        queued_ts: r.get(3)?,
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn record_gdrive_history_pull_completed(&self, now_ms: i64) -> Result<i64> {
+        let tx = self.conn.unchecked_transaction()?;
+        let next_seq = Self::get_gdrive_history_pull_seq_on_conn(&tx)?.saturating_add(1);
+        tx.execute(
+            "INSERT OR REPLACE INTO store_meta (k, v) VALUES ('gdrive_history_pull_seq', ?1)",
+            params![next_seq.to_string()],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO store_meta (k, v) VALUES ('gdrive_last_history_pull_ts', ?1)",
+            params![now_ms.max(1).to_string()],
+        )?;
+        tx.commit()?;
+        Ok(next_seq)
+    }
+
+    pub fn get_gdrive_history_pull_seq(&self) -> Result<i64> {
+        Self::get_gdrive_history_pull_seq_on_conn(&self.conn)
+    }
+
+    /// Records a failed cloud delete attempt with exponential backoff so failing/poison rows yield
+    /// the queue head immediately. Permanent client errors (HTTP 400/403) are dropped after 3 attempts
+    /// and return `Ok(true)`.
+    pub fn record_pending_cloud_delete_failure(
+        &self,
+        sha256: &str,
+        cloud_file_id: &str,
+        permanent: bool,
+        now_ms: i64,
+    ) -> Result<bool> {
+        const PERMANENT_MAX_ATTEMPTS: i64 = 3;
+        const BASE_BACKOFF_MS: i64 = 60_000;
+        const MAX_BACKOFF_MS: i64 = 3_600_000;
+
+        let cur_retries: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT retry_count
+                 FROM gdrive_pending_cloud_deletes
+                 WHERE sha256 = ?1 AND cloud_file_id = ?2
+                 LIMIT 1",
+                params![sha256, cloud_file_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(prev) = cur_retries else {
+            return Ok(false);
+        };
+        let next_retries = prev.saturating_add(1);
+        if permanent && next_retries >= PERMANENT_MAX_ATTEMPTS {
+            self.complete_pending_cloud_delete_for_file(sha256, cloud_file_id)?;
+            return Ok(true);
+        }
+        let shift = (next_retries - 1).clamp(0, 6) as u32;
+        let backoff_ms = BASE_BACKOFF_MS
+            .saturating_mul(1i64 << shift)
+            .min(MAX_BACKOFF_MS);
+        let next_retry_ts = now_ms.saturating_add(backoff_ms);
+        self.conn.execute(
+            "UPDATE gdrive_pending_cloud_deletes
+             SET retry_count = ?3, next_retry_ts = ?4
+             WHERE sha256 = ?1 AND cloud_file_id = ?2",
+            params![sha256, cloud_file_id, next_retries, next_retry_ts],
+        )?;
+        Ok(false)
+    }
+
+    pub fn is_media_unreferenced(&self, sha256: &str) -> Result<bool> {
+        let referenced: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM message_media WHERE sha256 = ?1)
+                 OR EXISTS(SELECT 1 FROM media_objects WHERE thumb_sha256 = ?1)",
+            params![sha256],
+            |r| r.get(0),
+        )?;
+        Ok(!referenced)
+    }
+
+    pub fn cancel_pending_cloud_delete(&self, sha256: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM gdrive_pending_cloud_deletes WHERE sha256 = ?1",
+            params![sha256],
+        )?;
+        Ok(())
+    }
+
+    pub fn complete_pending_cloud_delete(&self, sha256: &str) -> Result<()> {
+        let queued_cid: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT cloud_file_id FROM gdrive_pending_cloud_deletes WHERE sha256 = ?1 LIMIT 1",
+                params![sha256],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(cid) = queued_cid {
+            self.complete_pending_cloud_delete_for_file(sha256, &cid)?;
+        }
+        Ok(())
+    }
+
+    pub fn complete_pending_cloud_delete_for_file(
+        &self,
+        sha256: &str,
+        cloud_file_id: &str,
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM gdrive_pending_cloud_deletes WHERE sha256 = ?1 AND cloud_file_id = ?2",
+            params![sha256, cloud_file_id],
+        )?;
+        let still_referenced: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM message_media WHERE sha256 = ?1)
+                 OR EXISTS(SELECT 1 FROM media_objects WHERE thumb_sha256 = ?1)",
+            params![sha256],
+            |r| r.get(0),
+        )?;
+        let row: Option<(i32, Option<String>)> = tx
+            .query_row(
+                "SELECT local_state, cloud_file_id FROM media_objects WHERE sha256 = ?1 LIMIT 1",
+                params![sha256],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if !still_referenced
+            && row.as_ref().is_some_and(|(ls, cid)| {
+                *ls == MEDIA_LOCAL_STATE_MISSING && cid.as_deref() == Some(cloud_file_id)
+            })
+        {
+            tx.execute(
+                "DELETE FROM media_objects WHERE sha256 = ?1 AND cloud_file_id = ?2",
+                params![sha256, cloud_file_id],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE media_objects
+                 SET cloud_provider = NULL,
+                     cloud_file_id = NULL,
+                     cloud_synced_ts = NULL
+                 WHERE sha256 = ?1 AND cloud_file_id = ?2",
+                params![sha256, cloud_file_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn list_pending_cloud_uploads(&self, limit: usize) -> Result<Vec<MediaObjectRecord>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let now_ms = chrono::Utc::now().timestamp_millis();
         let mut stmt = self.conn.prepare(
             "SELECT sha256, kind, mime, size_bytes, thumb_sha256, width, height, duration_ms,
                     local_state, local_rel_path, is_encrypted, pin_count, created_ts, last_accessed_ts,
@@ -4441,13 +5284,56 @@ impl MessageStore {
                AND (cloud_file_id IS NULL OR cloud_file_id = '')
                AND cloud_excluded = 0
                AND LOWER(kind) != 'thumb'
-             ORDER BY created_ts ASC, size_bytes ASC
-             LIMIT ?1",
+               AND cloud_upload_next_retry_ts <= ?1
+             ORDER BY cloud_upload_fail_count ASC, cloud_upload_next_retry_ts ASC, created_ts ASC, size_bytes ASC
+             LIMIT ?2",
         )?;
         let rows = stmt
-            .query_map(params![limit as i64], Self::decode_media_object_row)?
+            .query_map(params![now_ms, limit as i64], Self::decode_media_object_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Marks a pending local media blob upload failure with exponential backoff (5m -> 24h)
+    /// so a single unreadable/corrupted blob never starves newer pending uploads.
+    pub fn record_media_cloud_upload_failure(&self, sha256: &str, now_ms: i64) -> Result<i64> {
+        const BASE_UPLOAD_BACKOFF_MS: i64 = 5 * 60 * 1000;
+        const MAX_UPLOAD_BACKOFF_MS: i64 = 24 * 60 * 60 * 1000;
+
+        let prev: i64 = self
+            .conn
+            .query_row(
+                "SELECT cloud_upload_fail_count FROM media_objects WHERE sha256 = ?1 LIMIT 1",
+                params![sha256],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let next_fail = prev.saturating_add(1);
+        let shift = (next_fail - 1).clamp(0, 8) as u32;
+        let backoff = BASE_UPLOAD_BACKOFF_MS
+            .saturating_mul(1i64 << shift)
+            .min(MAX_UPLOAD_BACKOFF_MS);
+        let next_retry_ts = now_ms.saturating_add(backoff);
+        self.conn.execute(
+            "UPDATE media_objects
+             SET cloud_upload_fail_count = ?2,
+                 cloud_upload_next_retry_ts = ?3
+             WHERE sha256 = ?1",
+            params![sha256, next_fail, next_retry_ts],
+        )?;
+        Ok(next_retry_ts)
+    }
+
+    pub fn clear_media_cloud_upload_failure(&self, sha256: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE media_objects
+             SET cloud_upload_fail_count = 0,
+                 cloud_upload_next_retry_ts = 0
+             WHERE sha256 = ?1",
+            params![sha256],
+        )?;
+        Ok(())
     }
 
     pub fn mark_media_cloud_synced(
@@ -4459,17 +5345,26 @@ impl MessageStore {
         synced_ts: i64,
     ) -> Result<()> {
         let safe_ver = key_ver.clamp(1, i64::from(i32::MAX));
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        let mut_ts = Self::next_local_mutation_ts_on_conn(&tx)?;
+        let effective_synced_ts = mut_ts.max(synced_ts);
+        if effective_synced_ts > mut_ts {
+            Self::advance_local_mutation_seq_on_conn(&tx, effective_synced_ts)?;
+        }
+        tx.execute(
             "UPDATE media_objects
              SET cloud_provider = ?2,
                  cloud_file_id = ?3,
                  cloud_encrypted = 1,
                  cloud_key_ver = ?4,
                  cloud_synced_ts = ?5,
-                 cloud_excluded = 0
+                 cloud_excluded = 0,
+                 cloud_upload_fail_count = 0,
+                 cloud_upload_next_retry_ts = 0
              WHERE sha256 = ?1",
-            params![sha256, cloud_provider, cloud_file_id, safe_ver, synced_ts],
+            params![sha256, cloud_provider, cloud_file_id, safe_ver, effective_synced_ts],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -4484,7 +5379,9 @@ impl MessageStore {
                 "UPDATE media_objects
                  SET cloud_provider = NULL,
                      cloud_file_id = NULL,
-                     cloud_synced_ts = NULL
+                     cloud_synced_ts = NULL,
+                     cloud_upload_fail_count = 0,
+                     cloud_upload_next_retry_ts = 0
                  WHERE sha256 = ?1",
             )?;
             for sha in sha256s {
@@ -4493,6 +5390,53 @@ impl MessageStore {
         }
         tx.commit()?;
         Ok(affected)
+    }
+
+    /// Resets stale cloud file links and/or delta sync cursors when remote Google Drive vault
+    /// folders (`Teza Vault/<uid>/{blobs,history}`) were newly recreated after deletion/trashing.
+    pub fn reset_gdrive_sync_state_for_vault_recovery(
+        &self,
+        reset_media_links: bool,
+        reset_history_cursors: bool,
+    ) -> Result<()> {
+        if !reset_media_links && !reset_history_cursors {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        if reset_media_links {
+            tx.execute(
+                "UPDATE media_objects
+                 SET cloud_provider = NULL,
+                     cloud_file_id = NULL,
+                     cloud_synced_ts = NULL,
+                     cloud_upload_fail_count = 0,
+                     cloud_upload_next_retry_ts = 0
+                 WHERE cloud_file_id IS NOT NULL AND cloud_file_id != ''",
+                [],
+            )?;
+            tx.execute("DELETE FROM gdrive_pending_cloud_deletes", [])?;
+            tx.execute(
+                "DELETE FROM media_objects
+                 WHERE local_state = 0
+                   AND (cloud_file_id IS NULL OR cloud_file_id = '')
+                   AND NOT EXISTS(SELECT 1 FROM message_media WHERE sha256 = media_objects.sha256)
+                   AND NOT EXISTS(SELECT 1 FROM media_objects m2 WHERE m2.thumb_sha256 = media_objects.sha256)",
+                [],
+            )?;
+        }
+        if reset_history_cursors {
+            tx.execute(
+                "INSERT OR REPLACE INTO store_meta (k, v) VALUES ('gdrive_last_history_sync_ts', '0')",
+                [],
+            )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO store_meta (k, v) VALUES ('gdrive_last_mutation_sync_ts', '0')",
+                [],
+            )?;
+            tx.execute("DELETE FROM gdrive_applied_deltas", [])?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Clears Google Drive cloud links after user-initiated Cloud Storage Manager deletion and
@@ -4512,8 +5456,20 @@ impl MessageStore {
                      cloud_excluded = 1
                  WHERE sha256 = ?1",
             )?;
+            let mut del_q = tx.prepare(
+                "DELETE FROM gdrive_pending_cloud_deletes WHERE sha256 = ?1",
+            )?;
+            let mut del_orphan = tx.prepare(
+                "DELETE FROM media_objects
+                 WHERE sha256 = ?1
+                   AND local_state = 0
+                   AND NOT EXISTS(SELECT 1 FROM message_media WHERE sha256 = ?1)
+                   AND NOT EXISTS(SELECT 1 FROM media_objects WHERE thumb_sha256 = ?1)",
+            )?;
             for sha in sha256s {
                 affected += stmt.execute(params![sha])?;
+                let _ = del_q.execute(params![sha])?;
+                let _ = del_orphan.execute(params![sha])?;
             }
         }
         tx.commit()?;
@@ -4860,6 +5816,26 @@ impl MessageStore {
         Ok(())
     }
 
+    pub fn get_gdrive_last_mutation_sync_ts(&self) -> Result<Option<i64>> {
+        let val: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT v FROM store_meta WHERE k = 'gdrive_last_mutation_sync_ts' LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(val.and_then(|s| s.parse::<i64>().ok()))
+    }
+
+    pub fn set_gdrive_last_mutation_sync_ts(&self, ts: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO store_meta (k, v) VALUES ('gdrive_last_mutation_sync_ts', ?1)",
+            params![ts.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn export_history_delta_since(
         &self,
         uid: &str,
@@ -4867,10 +5843,30 @@ impl MessageStore {
         since_ts: i64,
         limit_msgs: usize,
     ) -> Result<HistoryDeltaBatch> {
+        self.export_history_delta_since_with_mutation_cursor(
+            uid,
+            device_id,
+            since_ts,
+            since_ts,
+            limit_msgs,
+        )
+    }
+
+    pub fn export_history_delta_since_with_mutation_cursor(
+        &self,
+        uid: &str,
+        device_id: &str,
+        since_ts: i64,
+        since_mutation_ts: i64,
+        limit_msgs: usize,
+    ) -> Result<HistoryDeltaBatch> {
         const HISTORY_CLOUD_MEDIA_BATCH_LIMIT: usize = 2000;
+        const HISTORY_TOMBSTONE_BATCH_LIMIT: usize = 2000;
 
         let exported_ts = chrono::Utc::now().timestamp_millis();
-        let (messages, messages_truncated) = if limit_msgs == 0 {
+
+        // 1A. Export new/unexported messages ordered by server-clock `ts >= since_ts`.
+        let (mut messages, messages_truncated) = if limit_msgs == 0 {
             let has_any: bool = self.conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM messages WHERE ts >= ?1)",
                 params![since_ts],
@@ -4920,6 +5916,245 @@ impl MessageStore {
             } else {
                 (msgs, false)
             }
+        };
+
+        let max_message_ts_cursor = messages.iter().map(|m| m.ts).max();
+        let mut seen_msg_keys: std::collections::HashSet<(String, String)> = messages
+            .iter()
+            .map(|m| (m.thread_id.clone(), m.msg_id.clone()))
+            .collect();
+
+        // 1B. Export mutated existing messages (e.g. recalls, pins, reactions, poll updates)
+        // whose `updated_ts > 0 AND updated_ts >= since_mutation_ts`, independent of original `ts`.
+        let (mut_msgs_max_ts, mut_msgs_truncated) = if limit_msgs == 0 {
+            let has_any: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE updated_ts > 0 AND updated_ts >= ?1)",
+                params![since_mutation_ts],
+                |r| r.get(0),
+            )?;
+            (None, has_any)
+        } else {
+            let probe_limit = limit_msgs.saturating_add(1) as i64;
+            let mut stmt = self.conn.prepare(
+                "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing,
+                        is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name,
+                        cli_msg_id, updated_ts
+                 FROM messages
+                 WHERE updated_ts > 0 AND updated_ts >= ?1
+                 ORDER BY updated_ts ASC, thread_id ASC, msg_id ASC
+                 LIMIT ?2",
+            )?;
+            let mut mut_rows: Vec<(MessageDto, i64)> = {
+                let mut rows = stmt.query(params![since_mutation_ts, probe_limit])?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next()? {
+                    let dto = self.decrypt_raw_message_tuple(row)?;
+                    let upd_ts: i64 = row.get(15)?;
+                    out.push((dto, upd_ts));
+                }
+                out
+            };
+            let hit_limit = mut_rows.len() > limit_msgs;
+            let truncated = if hit_limit {
+                mut_rows.truncate(limit_msgs);
+                if let Some(boundary_upd) = mut_rows.last().map(|(_, u)| *u) {
+                    let mut existing_at_boundary: std::collections::HashSet<(String, String)> =
+                        mut_rows
+                            .iter()
+                            .filter(|(_, u)| *u == boundary_upd)
+                            .map(|(m, _)| (m.thread_id.clone(), m.msg_id.clone()))
+                            .collect();
+                    let mut tie_stmt = self.conn.prepare(
+                        "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing,
+                                is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name,
+                                cli_msg_id, updated_ts
+                         FROM messages
+                         WHERE updated_ts = ?1
+                         ORDER BY thread_id ASC, msg_id ASC",
+                    )?;
+                    let mut tie_rows = tie_stmt.query(params![boundary_upd])?;
+                    while let Some(row) = tie_rows.next()? {
+                        let dto = self.decrypt_raw_message_tuple(row)?;
+                        let upd_ts: i64 = row.get(15)?;
+                        if existing_at_boundary.insert((dto.thread_id.clone(), dto.msg_id.clone())) {
+                            mut_rows.push((dto, upd_ts));
+                        }
+                    }
+                    self.conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM messages WHERE updated_ts > ?1)",
+                        params![boundary_upd],
+                        |r| r.get(0),
+                    )?
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            let max_upd = mut_rows.iter().map(|(_, u)| *u).max();
+            for (dto, _) in mut_rows {
+                if seen_msg_keys.insert((dto.thread_id.clone(), dto.msg_id.clone())) {
+                    messages.push(dto);
+                }
+            }
+            (max_upd, truncated)
+        };
+
+        // 1C. Export local message deletion tombstones (`gdrive_deleted_messages`).
+        let mut del_msg_stmt = self.conn.prepare(
+            "SELECT thread_id, msg_id, deleted_ts, local_mutation_ts
+             FROM gdrive_deleted_messages
+             WHERE local_mutation_ts > 0 AND local_mutation_ts >= ?1
+             ORDER BY local_mutation_ts ASC, thread_id ASC, msg_id ASC
+             LIMIT ?2",
+        )?;
+        let mut del_msg_rows: Vec<(HistoryDeletedMessageTombstone, i64)> = del_msg_stmt
+            .query_map(
+                params![since_mutation_ts, (HISTORY_TOMBSTONE_BATCH_LIMIT + 1) as i64],
+                |r| {
+                    Ok((
+                        HistoryDeletedMessageTombstone {
+                            thread_id: r.get(0)?,
+                            msg_id: r.get(1)?,
+                            deleted_ts: r.get(2)?,
+                        },
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut del_msgs_truncated = false;
+        if del_msg_rows.len() > HISTORY_TOMBSTONE_BATCH_LIMIT {
+            del_msg_rows.truncate(HISTORY_TOMBSTONE_BATCH_LIMIT);
+            if let Some(boundary_dm) = del_msg_rows.last().map(|(_, m)| *m) {
+                let mut existing_dm: std::collections::HashSet<(String, String)> = del_msg_rows
+                    .iter()
+                    .filter(|(_, m)| *m == boundary_dm)
+                    .map(|(t, _)| (t.thread_id.clone(), t.msg_id.clone()))
+                    .collect();
+                let mut tie_stmt = self.conn.prepare(
+                    "SELECT thread_id, msg_id, deleted_ts, local_mutation_ts
+                     FROM gdrive_deleted_messages
+                     WHERE local_mutation_ts = ?1
+                     ORDER BY thread_id ASC, msg_id ASC",
+                )?;
+                let tie_rows = tie_stmt
+                    .query_map(params![boundary_dm], |r| {
+                        Ok((
+                            HistoryDeletedMessageTombstone {
+                                thread_id: r.get(0)?,
+                                msg_id: r.get(1)?,
+                                deleted_ts: r.get(2)?,
+                            },
+                            r.get::<_, i64>(3)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (tomb, mut_ts) in tie_rows {
+                    if existing_dm.insert((tomb.thread_id.clone(), tomb.msg_id.clone())) {
+                        del_msg_rows.push((tomb, mut_ts));
+                    }
+                }
+                del_msgs_truncated = self.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM gdrive_deleted_messages WHERE local_mutation_ts > ?1)",
+                    params![boundary_dm],
+                    |r| r.get(0),
+                )?;
+            }
+        }
+        let del_msgs_max_ts = del_msg_rows.iter().map(|(_, m)| *m).max();
+        let deleted_messages: Vec<HistoryDeletedMessageTombstone> =
+            del_msg_rows.into_iter().map(|(t, _)| t).collect();
+
+        // 1D. Export local thread deletion tombstones (`gdrive_deleted_threads`).
+        let mut del_thr_stmt = self.conn.prepare(
+            "SELECT thread_id, deleted_ts, local_mutation_ts
+             FROM gdrive_deleted_threads
+             WHERE local_mutation_ts > 0 AND local_mutation_ts >= ?1
+             ORDER BY local_mutation_ts ASC, thread_id ASC
+             LIMIT ?2",
+        )?;
+        let mut del_thr_rows: Vec<(HistoryDeletedThreadTombstone, i64)> = del_thr_stmt
+            .query_map(
+                params![since_mutation_ts, (HISTORY_TOMBSTONE_BATCH_LIMIT + 1) as i64],
+                |r| {
+                    Ok((
+                        HistoryDeletedThreadTombstone {
+                            thread_id: r.get(0)?,
+                            deleted_ts: r.get(1)?,
+                        },
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut del_threads_truncated = false;
+        if del_thr_rows.len() > HISTORY_TOMBSTONE_BATCH_LIMIT {
+            del_thr_rows.truncate(HISTORY_TOMBSTONE_BATCH_LIMIT);
+            if let Some(boundary_dt) = del_thr_rows.last().map(|(_, m)| *m) {
+                let mut existing_dt: std::collections::HashSet<String> = del_thr_rows
+                    .iter()
+                    .filter(|(_, m)| *m == boundary_dt)
+                    .map(|(t, _)| t.thread_id.clone())
+                    .collect();
+                let mut tie_stmt = self.conn.prepare(
+                    "SELECT thread_id, deleted_ts, local_mutation_ts
+                     FROM gdrive_deleted_threads
+                     WHERE local_mutation_ts = ?1
+                     ORDER BY thread_id ASC",
+                )?;
+                let tie_rows = tie_stmt
+                    .query_map(params![boundary_dt], |r| {
+                        Ok((
+                            HistoryDeletedThreadTombstone {
+                                thread_id: r.get(0)?,
+                                deleted_ts: r.get(1)?,
+                            },
+                            r.get::<_, i64>(2)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                for (tomb, mut_ts) in tie_rows {
+                    if existing_dt.insert(tomb.thread_id.clone()) {
+                        del_thr_rows.push((tomb, mut_ts));
+                    }
+                }
+                del_threads_truncated = self.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM gdrive_deleted_threads WHERE local_mutation_ts > ?1)",
+                    params![boundary_dt],
+                    |r| r.get(0),
+                )?;
+            }
+        }
+        let del_threads_max_ts = del_thr_rows.iter().map(|(_, m)| *m).max();
+        let deleted_threads: Vec<HistoryDeletedThreadTombstone> =
+            del_thr_rows.into_iter().map(|(t, _)| t).collect();
+
+        let mutations_truncated = mut_msgs_truncated || del_msgs_truncated || del_threads_truncated;
+        let max_mutation_ts_cursor = if mutations_truncated {
+            let mut cap: Option<i64> = None;
+            for (trunc, max_opt) in [
+                (mut_msgs_truncated, mut_msgs_max_ts),
+                (del_msgs_truncated, del_msgs_max_ts),
+                (del_threads_truncated, del_threads_max_ts),
+            ] {
+                if trunc {
+                    if let Some(v) = max_opt {
+                        cap = Some(cap.map_or(v, |c| c.min(v)));
+                    }
+                }
+            }
+            cap.or_else(|| {
+                [mut_msgs_max_ts, del_msgs_max_ts, del_threads_max_ts]
+                    .into_iter()
+                    .flatten()
+                    .max()
+            })
+        } else {
+            [mut_msgs_max_ts, del_msgs_max_ts, del_threads_max_ts]
+                .into_iter()
+                .flatten()
+                .max()
         };
 
         let msg_thread_ids: std::collections::HashSet<&str> =
@@ -5050,7 +6285,7 @@ impl MessageStore {
         )?;
         let mut cm_rows = cm_stmt
             .query_map(
-                params![since_ts, (HISTORY_CLOUD_MEDIA_BATCH_LIMIT + 1) as i64],
+                params![since_mutation_ts, (HISTORY_CLOUD_MEDIA_BATCH_LIMIT + 1) as i64],
                 decode_cm_row,
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -5137,17 +6372,212 @@ impl MessageStore {
             thread_folders,
             translations,
             cloud_media,
+            deleted_messages,
+            deleted_threads,
             messages_truncated,
             cloud_media_truncated,
+            mutations_truncated,
+            max_message_ts_cursor,
             max_cloud_media_cursor_ts,
+            max_mutation_ts_cursor,
         })
     }
 
     pub fn import_history_delta_idempotent(&self, batch: &HistoryDeltaBatch) -> Result<usize> {
-        let tx = self.conn.unchecked_transaction()?;
+        Ok(self.import_history_delta_idempotent_detailed(batch)?.applied_messages)
+    }
 
-        // 1. Upsert threads without regressing newer local timestamps, previews, or read watermarks.
+    pub fn import_history_delta_idempotent_detailed(
+        &self,
+        batch: &HistoryDeltaBatch,
+    ) -> Result<HistoryDeltaImportReport> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut report = HistoryDeltaImportReport::default();
+        let mut fts_deletes: Vec<(String, Option<String>)> = Vec::new();
+
+        // 0A. Apply thread deletion tombstones first (with `local_mutation_ts = 0` to prevent re-export ping-pong).
+        for dt in &batch.deleted_threads {
+            let tid = dt.thread_id.trim();
+            if tid.is_empty() {
+                continue;
+            }
+            let del_ts = normalize_ts_ms(dt.deleted_ts);
+            tx.execute(
+                "INSERT INTO gdrive_deleted_threads (thread_id, deleted_ts, local_mutation_ts)
+                 VALUES (?1, ?2, 0)
+                 ON CONFLICT(thread_id) DO UPDATE SET
+                     deleted_ts = MAX(gdrive_deleted_threads.deleted_ts, excluded.deleted_ts)",
+                params![tid, del_ts],
+            )?;
+
+            // Collect & remove messages belonging to this thread up to `del_ts`.
+            let doomed_msg_ids: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT msg_id FROM messages WHERE thread_id = ?1 AND ts <= ?2",
+                )?;
+                let out = stmt
+                    .query_map(params![tid, del_ts], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                out
+            };
+            let mut shas_to_check: Vec<String> = Vec::new();
+            for mid in &doomed_msg_ids {
+                tx.execute(
+                    "DELETE FROM message_translations
+                     WHERE msg_id = ?1
+                       AND msg_id NOT IN (SELECT msg_id FROM messages WHERE thread_id != ?2)",
+                    params![mid, tid],
+                )?;
+                let mut mstmt = tx.prepare(
+                    "SELECT DISTINCT sha256 FROM message_media
+                     WHERE thread_id = ?1 AND msg_id = ?2 AND sha256 IS NOT NULL AND sha256 != ''",
+                )?;
+                let mshas = mstmt
+                    .query_map(params![tid, mid], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                shas_to_check.extend(mshas);
+                tx.execute(
+                    "DELETE FROM message_media WHERE thread_id = ?1 AND msg_id = ?2",
+                    params![tid, mid],
+                )?;
+                tx.execute(
+                    "DELETE FROM messages WHERE thread_id = ?1 AND msg_id = ?2",
+                    params![tid, mid],
+                )?;
+                fts_deletes.push((tid.to_string(), Some(mid.clone())));
+            }
+            if !shas_to_check.is_empty() {
+                shas_to_check.sort();
+                shas_to_check.dedup();
+                let orphans = Self::cleanup_orphaned_media_for_shas_in_tx(
+                    &tx,
+                    shas_to_check,
+                    Some("remote_thread_deleted"),
+                )?;
+                report.orphaned_local_paths.extend(orphans);
+            }
+
+            let has_newer_msgs: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE thread_id = ?1)",
+                params![tid],
+                |r| r.get(0),
+            )?;
+            let cur_last_ts: Option<i64> = tx
+                .query_row(
+                    "SELECT last_ts FROM threads WHERE id = ?1 LIMIT 1",
+                    params![tid],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if !has_newer_msgs && cur_last_ts.is_none_or(|lt| lt <= del_ts) {
+                // Also remove any lingering thread media refs if messages table was already empty
+                let extra_shas: Vec<String> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT DISTINCT sha256 FROM message_media
+                         WHERE thread_id = ?1 AND sha256 IS NOT NULL AND sha256 != ''",
+                    )?;
+                    let out = stmt
+                        .query_map(params![tid], |r| r.get::<_, String>(0))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    out
+                };
+                if !extra_shas.is_empty() {
+                    tx.execute("DELETE FROM message_media WHERE thread_id = ?1", params![tid])?;
+                    let orphans = Self::cleanup_orphaned_media_for_shas_in_tx(
+                        &tx,
+                        extra_shas,
+                        Some("remote_thread_deleted"),
+                    )?;
+                    report.orphaned_local_paths.extend(orphans);
+                }
+                let deleted_t = tx.execute("DELETE FROM threads WHERE id = ?1", params![tid])?;
+                if deleted_t > 0 || !doomed_msg_ids.is_empty() {
+                    report.deleted_threads += 1;
+                }
+                fts_deletes.push((tid.to_string(), None));
+
+                // Scrub thread from local chat_folders
+                let folder_rows: Vec<(String, String)> = {
+                    let mut stmt = tx.prepare("SELECT id, config_json FROM chat_folders")?;
+                    let out = stmt
+                        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    out
+                };
+                for (fid, enc_json) in folder_rows {
+                    let aad = folder_aad(&fid);
+                    if let Ok(raw_json) = self.cipher.decrypt_str(&aad, &enc_json) {
+                        if let Ok(mut dto) = serde_json::from_str::<ChatFolderDto>(&raw_json) {
+                            let prev_inc = dto.thread_ids.len();
+                            let prev_exc = dto.excluded_thread_ids.len();
+                            dto.thread_ids.retain(|id| id != tid);
+                            dto.excluded_thread_ids.retain(|id| id != tid);
+                            if dto.thread_ids.len() != prev_inc
+                                || dto.excluded_thread_ids.len() != prev_exc
+                            {
+                                let updated_json = serde_json::to_string(&dto)?;
+                                let updated_enc = self.cipher.encrypt_str(&aad, &updated_json)?;
+                                tx.execute(
+                                    "UPDATE chat_folders SET config_json = ?2 WHERE id = ?1",
+                                    params![fid, updated_enc],
+                                )?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 0B. Apply message deletion tombstones (with `local_mutation_ts = 0` to prevent re-export ping-pong).
+        for dm in &batch.deleted_messages {
+            let tid = dm.thread_id.trim();
+            let mid = dm.msg_id.trim();
+            if tid.is_empty() || mid.is_empty() {
+                continue;
+            }
+            let del_ts = normalize_ts_ms(dm.deleted_ts);
+            tx.execute(
+                "INSERT INTO gdrive_deleted_messages (thread_id, msg_id, deleted_ts, local_mutation_ts)
+                 VALUES (?1, ?2, ?3, 0)
+                 ON CONFLICT(thread_id, msg_id) DO UPDATE SET
+                     deleted_ts = MAX(gdrive_deleted_messages.deleted_ts, excluded.deleted_ts)",
+                params![tid, mid, del_ts],
+            )?;
+            let orphans = Self::cleanup_orphaned_media_for_msg_in_tx(
+                &tx,
+                tid,
+                mid,
+                Some("remote_msg_deleted"),
+            )?;
+            report.orphaned_local_paths.extend(orphans);
+            let del_cnt = tx.execute(
+                "DELETE FROM messages WHERE thread_id = ?1 AND msg_id = ?2",
+                params![tid, mid],
+            )?;
+            tx.execute(
+                "DELETE FROM message_translations WHERE msg_id = ?1",
+                params![mid],
+            )?;
+            if del_cnt > 0 {
+                report.deleted_messages += 1;
+                fts_deletes.push((tid.to_string(), Some(mid.to_string())));
+            }
+        }
+
+        // 1. Upsert threads without regressing newer local timestamps, previews, or read watermarks,
+        // and without resurrecting threads covered by a deletion tombstone.
         for t in &batch.threads {
+            let last_ts = normalize_ts_ms(t.last_ts);
+            let tombstoned_ts: Option<i64> = tx
+                .query_row(
+                    "SELECT deleted_ts FROM gdrive_deleted_threads WHERE thread_id = ?1 LIMIT 1",
+                    params![&t.id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if tombstoned_ts.is_some_and(|del_ts| del_ts >= last_ts) {
+                continue;
+            }
             let kind_str = match t.kind {
                 ThreadKind::Direct => "direct",
                 ThreadKind::Group => "group",
@@ -5160,7 +6590,6 @@ impl MessageStore {
             let title_fallback = (t.title.trim().is_empty() || t.title == t.id) as i64;
             let avatar_empty = t.avatar.is_empty() as i64;
             let preview_empty = t.last_preview.is_empty() as i64;
-            let last_ts = normalize_ts_ms(t.last_ts);
             let last_read_in_ts = normalize_ts_ms(t.last_read_in_ts);
             let peer_read_ts = normalize_ts_ms(t.peer_read_ts);
             let muted_until_ts = normalize_ts_ms(t.muted_until_ts);
@@ -5212,11 +6641,26 @@ impl MessageStore {
             )?;
         }
 
-        // 2. Idempotently merge folders + thread_folders without discarding existing local thread_ids.
+        // 2. Idempotently merge folders + thread_folders without discarding existing local thread_ids
+        // and without re-adding threads that are deleted (tombstoned and absent from `threads`).
         if !batch.folders.is_empty() || !batch.thread_folders.is_empty() {
+            let dead_tombstoned_threads: std::collections::HashSet<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT dt.thread_id
+                     FROM gdrive_deleted_threads dt
+                     WHERE NOT EXISTS (SELECT 1 FROM threads t WHERE t.id = dt.thread_id)",
+                )?;
+                let out = stmt
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<std::result::Result<std::collections::HashSet<_>, _>>()?;
+                out
+            };
+
             let mut extra_links: HashMap<&str, Vec<&str>> = HashMap::new();
             for (fid, tid) in &batch.thread_folders {
-                extra_links.entry(fid.as_str()).or_default().push(tid.as_str());
+                if !dead_tombstoned_threads.contains(tid.as_str()) {
+                    extra_links.entry(fid.as_str()).or_default().push(tid.as_str());
+                }
             }
 
             let mut existing_folders: HashMap<String, ChatFolderDto> = HashMap::new();
@@ -5263,6 +6707,12 @@ impl MessageStore {
                         }
                     }
                 }
+                merged
+                    .thread_ids
+                    .retain(|tid| !dead_tombstoned_threads.contains(tid.as_str()));
+                merged
+                    .excluded_thread_ids
+                    .retain(|tid| !dead_tombstoned_threads.contains(tid.as_str()));
                 let aad = folder_aad(&merged.id);
                 let enc_name = self.cipher.encrypt_str(&aad, &merged.name)?;
                 let raw_json = serde_json::to_string(&merged)?;
@@ -5307,7 +6757,7 @@ impl MessageStore {
             }
         }
 
-        // 3. Idempotently merge messages without un-recalling or duplicating.
+        // 3. Idempotently merge messages without un-recalling, duplicating, or resurrecting tombstoned items.
         struct ExistingMsgMeta {
             is_recalled: i64,
             is_pinned: i64,
@@ -5322,10 +6772,31 @@ impl MessageStore {
         let mut msg_text_map: HashMap<&str, &str> = HashMap::new();
 
         for m in &batch.messages {
+            let ts = normalize_ts_ms(m.ts);
+
+            // Never resurrect a message covered by a message or thread deletion tombstone.
+            let msg_tombstoned: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM gdrive_deleted_messages WHERE thread_id = ?1 AND msg_id = ?2)",
+                params![&m.thread_id, &m.msg_id],
+                |r| r.get(0),
+            )?;
+            if msg_tombstoned {
+                continue;
+            }
+            let thread_tombstoned_ts: Option<i64> = tx
+                .query_row(
+                    "SELECT deleted_ts FROM gdrive_deleted_threads WHERE thread_id = ?1 LIMIT 1",
+                    params![&m.thread_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if thread_tombstoned_ts.is_some_and(|del_ts| del_ts >= ts) {
+                continue;
+            }
+
             if !m.is_recalled {
                 msg_text_map.insert(m.msg_id.as_str(), m.text.as_str());
             }
-            let ts = normalize_ts_ms(m.ts);
             let aad = msg_aad(&m.thread_id, &m.msg_id);
             let incoming_cli_msg_id = m
                 .cli_msg_id
@@ -5378,8 +6849,8 @@ impl MessageStore {
                         self.cipher.encrypt_opt(&aad, m.attachment_name.as_deref())?
                     };
                     tx.execute(
-                        "INSERT INTO messages (msg_id, thread_id, sender_id, sender_name, text, text_norm, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id)
-                         VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                        "INSERT INTO messages (msg_id, thread_id, sender_id, sender_name, text, text_norm, msg_type, ts, is_outgoing, is_recalled, is_pinned, quote_json, reactions_json, attachment_url, attachment_name, cli_msg_id, updated_ts)
+                         VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0)",
                         params![
                             m.msg_id,
                             m.thread_id,
@@ -5430,10 +6901,13 @@ impl MessageStore {
                             "DELETE FROM message_translations WHERE msg_id = ?1",
                             params![m.msg_id],
                         )?;
-                        tx.execute(
-                            "DELETE FROM message_media WHERE thread_id = ?1 AND msg_id = ?2",
-                            params![m.thread_id, m.msg_id],
+                        let orphans = Self::cleanup_orphaned_media_for_msg_in_tx(
+                            &tx,
+                            &m.thread_id,
+                            &m.msg_id,
+                            Some("remote_msg_recalled"),
                         )?;
+                        report.orphaned_local_paths.extend(orphans);
                         fts_updates.push((
                             m.msg_id.clone(),
                             m.thread_id.clone(),
@@ -5452,20 +6926,56 @@ impl MessageStore {
                         cur.attachment_name.is_none() && m.attachment_name.is_some();
                     let fill_cli_msg_id =
                         cur.cli_msg_id.trim().is_empty() && !incoming_cli_msg_id.is_empty();
-                    let cur_reactions_empty = self
+                    let cur_reactions = self
                         .cipher
                         .decrypt_or_legacy(&aad, &cur.reactions_json)
                         .ok()
                         .and_then(|s| serde_json::from_str::<Vec<ReactionSummary>>(&s).ok())
-                        .is_none_or(|v| v.is_empty());
-                    let fill_reactions = cur_reactions_empty && !m.reactions.is_empty();
+                        .unwrap_or_default();
+                    let cur_reaction_total: u32 = cur_reactions.iter().map(|r| r.count).sum();
+                    let incoming_reaction_total: u32 = m.reactions.iter().map(|r| r.count).sum();
+                    let upgrade_reactions = (cur_reactions.is_empty() && !m.reactions.is_empty())
+                        || incoming_reaction_total > cur_reaction_total;
+
+                    // Merge poll JSON updates monotonically for `chat.poll` messages.
+                    let merged_poll_att_name: Option<String> = if m
+                        .msg_type
+                        .eq_ignore_ascii_case("chat.poll")
+                    {
+                        let incoming_poll =
+                            parse_poll_dto_from_attachment_name(m.attachment_name.as_deref());
+                        if incoming_poll.is_some() {
+                            let cur_att_plain = cur
+                                .attachment_name
+                                .as_deref()
+                                .and_then(|s| self.cipher.decrypt_or_legacy(&aad, s).ok());
+                            let cur_poll =
+                                parse_poll_dto_from_attachment_name(cur_att_plain.as_deref());
+                            if let Some(folded) = fold_poll_dto(cur_poll, incoming_poll) {
+                                if let Ok(json) = serde_json::to_string(&folded) {
+                                    let candidate = format!("teza-poll:{json}");
+                                    (cur_att_plain.as_deref() != Some(candidate.as_str()))
+                                        .then_some(candidate)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
 
                     if pin_upgraded
                         || fill_quote
                         || fill_att_url
                         || fill_att_name
-                        || fill_reactions
+                        || upgrade_reactions
                         || fill_cli_msg_id
+                        || merged_poll_att_name.is_some()
                     {
                         let new_pinned = (cur.is_pinned != 0 || m.is_pinned) as i64;
                         let new_quote = if fill_quote {
@@ -5477,7 +6987,7 @@ impl MessageStore {
                         } else {
                             cur.quote_json
                         };
-                        let new_reactions = if fill_reactions {
+                        let new_reactions = if upgrade_reactions {
                             let rj = serde_json::to_string(&m.reactions)
                                 .unwrap_or_else(|_| "[]".to_string());
                             self.cipher.encrypt_str(&aad, &rj)?
@@ -5489,7 +6999,9 @@ impl MessageStore {
                         } else {
                             cur.attachment_url
                         };
-                        let new_att_name = if fill_att_name {
+                        let new_att_name = if let Some(ref poll_att) = merged_poll_att_name {
+                            self.cipher.encrypt_opt(&aad, Some(poll_att.as_str()))?
+                        } else if fill_att_name {
                             self.cipher
                                 .encrypt_opt(&aad, m.attachment_name.as_deref())?
                         } else {
@@ -5552,11 +7064,43 @@ impl MessageStore {
             )?;
         }
 
-        // 5. Import cloud media metadata (local_state = 0 if absent; preserves local_state = 1 if already local)
+        // 5. Import cloud media metadata (skipping recalled or tombstoned messages and respecting `cloud_excluded = 1`).
         for cm in &batch.cloud_media {
             if cm.sha256.is_empty() || cm.cloud_file_id.is_empty() {
                 continue;
             }
+            if !cm.thread_id.is_empty() && cm.thread_id != "__url__" {
+                let msg_tombstoned: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM gdrive_deleted_messages WHERE thread_id = ?1 AND msg_id = ?2)",
+                    params![&cm.thread_id, &cm.msg_id],
+                    |r| r.get(0),
+                )?;
+                if msg_tombstoned {
+                    continue;
+                }
+                let msg_state: Option<(i64, i64)> = tx
+                    .query_row(
+                        "SELECT is_recalled, ts FROM messages WHERE thread_id = ?1 AND msg_id = ?2 LIMIT 1",
+                        params![&cm.thread_id, &cm.msg_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((is_recalled, _)) = msg_state {
+                    if is_recalled != 0 {
+                        continue;
+                    }
+                } else {
+                    let has_thread_tombstone: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM gdrive_deleted_threads WHERE thread_id = ?1)",
+                        params![&cm.thread_id],
+                        |r| r.get(0),
+                    )?;
+                    if has_thread_tombstone {
+                        continue;
+                    }
+                }
+            }
+
             let size_i64 = i64::try_from(cm.size_bytes).unwrap_or(i64::MAX);
             tx.execute(
                 r#"
@@ -5567,10 +7111,10 @@ impl MessageStore {
                 )
                 VALUES (?1, ?2, ?3, ?4, 0, 1, 0, ?5, ?5, ?6, ?7, 1, ?8, ?9)
                 ON CONFLICT(sha256) DO UPDATE SET
-                    cloud_provider = COALESCE(media_objects.cloud_provider, excluded.cloud_provider),
-                    cloud_file_id = COALESCE(media_objects.cloud_file_id, excluded.cloud_file_id),
+                    cloud_provider = CASE WHEN media_objects.cloud_excluded = 1 THEN media_objects.cloud_provider ELSE COALESCE(media_objects.cloud_provider, excluded.cloud_provider) END,
+                    cloud_file_id = CASE WHEN media_objects.cloud_excluded = 1 THEN media_objects.cloud_file_id ELSE COALESCE(media_objects.cloud_file_id, excluded.cloud_file_id) END,
                     cloud_key_ver = MAX(media_objects.cloud_key_ver, excluded.cloud_key_ver),
-                    cloud_synced_ts = COALESCE(media_objects.cloud_synced_ts, excluded.cloud_synced_ts)
+                    cloud_synced_ts = CASE WHEN media_objects.cloud_excluded = 1 THEN media_objects.cloud_synced_ts ELSE COALESCE(media_objects.cloud_synced_ts, excluded.cloud_synced_ts) END
                 "#,
                 params![
                     cm.sha256,
@@ -5614,12 +7158,29 @@ impl MessageStore {
                     cm.cloud_synced_ts,
                 ],
             )?;
+            tx.execute(
+                "DELETE FROM gdrive_pending_cloud_deletes WHERE sha256 = ?1",
+                params![&cm.sha256],
+            )?;
         }
 
         tx.commit()?;
 
-        if !fts_updates.is_empty() {
+        if !fts_deletes.is_empty() || !fts_updates.is_empty() {
             let fts_tx = self.fts_conn.unchecked_transaction()?;
+            for (tid, mid_opt) in fts_deletes {
+                if let Some(mid) = mid_opt {
+                    fts_tx.execute(
+                        "DELETE FROM messages_fts WHERE thread_id = ?1 AND msg_id = ?2",
+                        params![tid, mid],
+                    )?;
+                } else {
+                    fts_tx.execute(
+                        "DELETE FROM messages_fts WHERE thread_id = ?1",
+                        params![tid],
+                    )?;
+                }
+            }
             for (mid, tid, ts, sender_norm, text_norm) in fts_updates {
                 fts_tx.execute(
                     "DELETE FROM messages_fts WHERE thread_id = ?1 AND msg_id = ?2",
@@ -5634,22 +7195,319 @@ impl MessageStore {
             fts_tx.commit()?;
         }
 
-        Ok(applied_count)
+        report.applied_messages = applied_count;
+        report.orphaned_local_paths.sort();
+        report.orphaned_local_paths.dedup();
+        Ok(report)
     }
 
     // -------------------------------------------------------------------------
-    // Item 1: Local AI Chat History & Unread Summary Query
+    // Item 1: Local AI Chat History, Encrypted Sessions & Unread Summary Query
     // -------------------------------------------------------------------------
+
+    fn normalize_ai_single_line(raw: &str) -> String {
+        raw.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn truncate_ai_text_with_ellipsis(raw: &str, max_chars: usize) -> String {
+        let cleaned = Self::normalize_ai_single_line(raw);
+        if cleaned.is_empty() || max_chars == 0 {
+            return String::new();
+        }
+        let mut chars = cleaned.chars();
+        let prefix: String = chars.by_ref().take(max_chars).collect();
+        if chars.next().is_none() {
+            return prefix;
+        }
+        if max_chars == 1 {
+            return "…".to_string();
+        }
+        let head: String = cleaned.chars().take(max_chars - 1).collect();
+        format!("{}…", head.trim_end())
+    }
+
+    fn truncate_ai_title_plain(raw: &str, max_chars: usize) -> String {
+        let cleaned = Self::normalize_ai_single_line(raw);
+        if cleaned.chars().count() <= max_chars {
+            return cleaned;
+        }
+        cleaned
+            .chars()
+            .take(max_chars)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    fn derive_ai_session_auto_title(content: &str, fallback: &str) -> String {
+        let derived = Self::truncate_ai_text_with_ellipsis(content, AI_SESSION_AUTO_TITLE_CHARS);
+        if derived.is_empty() {
+            fallback.to_string()
+        } else {
+            derived
+        }
+    }
+
+    fn validate_ai_session_id(id: &str) -> Result<&str> {
+        let clean = id.trim();
+        if clean.is_empty() {
+            bail!("session_id cuộc trò chuyện AI không được để trống");
+        }
+        if clean.chars().count() > AI_SESSION_MAX_ID_CHARS {
+            bail!("session_id cuộc trò chuyện AI tối đa {AI_SESSION_MAX_ID_CHARS} ký tự");
+        }
+        Ok(clean)
+    }
+
+    fn backfill_orphan_ai_sessions(&self) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.session_id, MIN(m.ts), MAX(m.ts)
+             FROM ai_messages m
+             LEFT JOIN ai_sessions s ON s.id = m.session_id
+             WHERE s.id IS NULL AND TRIM(m.session_id) != ''
+             GROUP BY m.session_id",
+        )?;
+        let orphans: Vec<(String, i64, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        if orphans.is_empty() {
+            return Ok(());
+        }
+
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        for (session_id, min_ts, max_ts) in orphans {
+            let first_user_msg: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT id, content
+                     FROM ai_messages
+                     WHERE session_id = ?1 AND role = 'user'
+                     ORDER BY ts ASC, id ASC
+                     LIMIT 1",
+                    params![&session_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let title = match first_user_msg {
+                Some((msg_id, enc_content)) => {
+                    let plain = self.cipher.decrypt_str(&ai_msg_aad(&msg_id), &enc_content)?;
+                    Self::derive_ai_session_auto_title(&plain, AI_SESSION_LEGACY_FALLBACK_TITLE)
+                }
+                None => AI_SESSION_LEGACY_FALLBACK_TITLE.to_string(),
+            };
+            let created_ts = normalize_ts_ms(min_ts);
+            let updated_ts = normalize_ts_ms(max_ts).max(created_ts);
+            let enc_title = self
+                .cipher
+                .encrypt_str(&ai_session_aad(&session_id), &title)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO ai_sessions (id, title, created_ts, updated_ts)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![session_id, enc_title, created_ts, updated_ts],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn load_ai_session_stats(&self, session_id: &str) -> Result<(usize, String)> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM ai_messages WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+        let message_count = usize::try_from(count).unwrap_or(0);
+        if message_count == 0 {
+            return Ok((0, String::new()));
+        }
+        let last_msg: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT id, content
+                 FROM ai_messages
+                 WHERE session_id = ?1
+                 ORDER BY ts DESC, id DESC
+                 LIMIT 1",
+                params![session_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let last_preview = match last_msg {
+            Some((msg_id, enc_content)) => {
+                let plain = self.cipher.decrypt_str(&ai_msg_aad(&msg_id), &enc_content)?;
+                Self::truncate_ai_text_with_ellipsis(&plain, AI_SESSION_PREVIEW_CHARS)
+            }
+            None => String::new(),
+        };
+        Ok((message_count, last_preview))
+    }
+
+    pub fn list_ai_sessions(&self, limit: usize) -> Result<Vec<AiSessionDto>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.backfill_orphan_ai_sessions()?;
+
+        let safe_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, created_ts, updated_ts
+             FROM ai_sessions
+             ORDER BY updated_ts DESC, id DESC
+             LIMIT ?1",
+        )?;
+        let rows: Vec<(String, String, i64, i64)> = stmt
+            .query_map(params![safe_limit], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, enc_title, created_ts, updated_ts) in rows {
+            let title = self.cipher.decrypt_str(&ai_session_aad(&id), &enc_title)?;
+            let (message_count, last_preview) = self.load_ai_session_stats(&id)?;
+            out.push(AiSessionDto {
+                id,
+                title,
+                created_ts,
+                updated_ts,
+                message_count,
+                last_preview,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn create_ai_session(&self, id: &str, title: &str, now_ts: i64) -> Result<AiSessionDto> {
+        let clean_id = Self::validate_ai_session_id(id)?;
+        let clean_title = Self::truncate_ai_title_plain(title, AI_SESSION_MAX_TITLE_CHARS);
+        let has_custom_title = !clean_title.is_empty();
+        let final_title = if has_custom_title {
+            clean_title
+        } else {
+            AI_SESSION_DEFAULT_TITLE.to_string()
+        };
+        let ts = normalize_ts_ms(now_ts);
+        let enc_title = self
+            .cipher
+            .encrypt_str(&ai_session_aad(clean_id), &final_title)?;
+
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO ai_sessions (id, title, created_ts, updated_ts)
+             VALUES (?1, ?2, ?3, ?3)",
+            params![clean_id, enc_title, ts],
+        )?;
+        let (stored_title, created_ts, updated_ts) = if inserted > 0 {
+            (final_title, ts, ts)
+        } else {
+            let (existing_enc_title, existing_created_ts, existing_updated_ts): (String, i64, i64) =
+                tx.query_row(
+                    "SELECT title, created_ts, updated_ts FROM ai_sessions WHERE id = ?1 LIMIT 1",
+                    params![clean_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?;
+            if has_custom_title {
+                let next_updated_ts = existing_updated_ts.max(ts);
+                tx.execute(
+                    "UPDATE ai_sessions SET title = ?1, updated_ts = ?2 WHERE id = ?3",
+                    params![enc_title, next_updated_ts, clean_id],
+                )?;
+                (final_title, existing_created_ts, next_updated_ts)
+            } else {
+                let existing_title = self
+                    .cipher
+                    .decrypt_str(&ai_session_aad(clean_id), &existing_enc_title)?;
+                (existing_title, existing_created_ts, existing_updated_ts)
+            }
+        };
+        tx.commit()?;
+
+        let (message_count, last_preview) = self.load_ai_session_stats(clean_id)?;
+        Ok(AiSessionDto {
+            id: clean_id.to_string(),
+            title: stored_title,
+            created_ts,
+            updated_ts,
+            message_count,
+            last_preview,
+        })
+    }
+
+    pub fn rename_ai_session(&self, id: &str, title: &str) -> Result<AiSessionDto> {
+        let clean_id = Self::validate_ai_session_id(id)?;
+        let clean_title = Self::normalize_ai_single_line(title);
+        if clean_title.is_empty() {
+            bail!("Tên cuộc trò chuyện AI không được để trống");
+        }
+        if clean_title.chars().count() > AI_SESSION_MAX_TITLE_CHARS {
+            bail!("Tên cuộc trò chuyện AI tối đa {AI_SESSION_MAX_TITLE_CHARS} ký tự");
+        }
+
+        let mut existing: Option<(i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT created_ts, updated_ts FROM ai_sessions WHERE id = ?1 LIMIT 1",
+                params![clean_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if existing.is_none() {
+            self.backfill_orphan_ai_sessions()?;
+            existing = self
+                .conn
+                .query_row(
+                    "SELECT created_ts, updated_ts FROM ai_sessions WHERE id = ?1 LIMIT 1",
+                    params![clean_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+        }
+        let Some((created_ts, updated_ts)) = existing else {
+            bail!("Không tìm thấy cuộc trò chuyện AI: {clean_id}");
+        };
+
+        let enc_title = self
+            .cipher
+            .encrypt_str(&ai_session_aad(clean_id), &clean_title)?;
+        self.conn.execute(
+            "UPDATE ai_sessions SET title = ?1 WHERE id = ?2",
+            params![enc_title, clean_id],
+        )?;
+
+        let (message_count, last_preview) = self.load_ai_session_stats(clean_id)?;
+        Ok(AiSessionDto {
+            id: clean_id.to_string(),
+            title: clean_title,
+            created_ts,
+            updated_ts,
+            message_count,
+            last_preview,
+        })
+    }
+
+    pub fn delete_ai_session(&self, id: &str) -> Result<usize> {
+        let clean_id = id.trim();
+        if clean_id.is_empty() {
+            return Ok(0);
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let deleted_messages = tx.execute(
+            "DELETE FROM ai_messages WHERE session_id = ?1",
+            params![clean_id],
+        )?;
+        tx.execute("DELETE FROM ai_sessions WHERE id = ?1", params![clean_id])?;
+        tx.commit()?;
+        Ok(deleted_messages)
+    }
 
     pub fn insert_ai_message(&self, msg: &AiStoredMessageDto) -> Result<()> {
         let id = msg.id.trim();
-        let session_id = msg.session_id.trim();
         if id.is_empty() {
             bail!("ID tin nhắn AI không được để trống");
         }
-        if session_id.is_empty() {
-            bail!("session_id tin nhắn AI không được để trống");
-        }
+        let session_id = Self::validate_ai_session_id(&msg.session_id)?;
         let role = match msg.role.trim().to_ascii_lowercase().as_str() {
             "user" => "user",
             "model" | "assistant" => "model",
@@ -5657,11 +7515,100 @@ impl MessageStore {
         };
         let ts = normalize_ts_ms(msg.ts);
         let enc_content = self.cipher.encrypt_str(&ai_msg_aad(id), &msg.content)?;
-        self.conn.execute(
+
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        tx.execute(
             "INSERT OR REPLACE INTO ai_messages (id, session_id, role, content, model, backend, ts)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![id, session_id, role, enc_content, msg.model, msg.backend, ts],
         )?;
+
+        let existing_session: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT title, updated_ts FROM ai_sessions WHERE id = ?1 LIMIT 1",
+                params![session_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+
+        match existing_session {
+            None => {
+                let (min_ts, max_ts): (i64, i64) = tx.query_row(
+                    "SELECT MIN(ts), MAX(ts) FROM ai_messages WHERE session_id = ?1",
+                    params![session_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                let created_ts = normalize_ts_ms(min_ts).min(ts);
+                let updated_ts = normalize_ts_ms(max_ts).max(ts);
+                let first_user_msg: Option<(String, String)> = tx
+                    .query_row(
+                        "SELECT id, content
+                         FROM ai_messages
+                         WHERE session_id = ?1 AND role = 'user'
+                         ORDER BY ts ASC, id ASC
+                         LIMIT 1",
+                        params![session_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                let auto_title = match first_user_msg {
+                    Some((first_id, first_enc)) => {
+                        let plain = self
+                            .cipher
+                            .decrypt_str(&ai_msg_aad(&first_id), &first_enc)?;
+                        Self::derive_ai_session_auto_title(&plain, AI_SESSION_DEFAULT_TITLE)
+                    }
+                    None => AI_SESSION_DEFAULT_TITLE.to_string(),
+                };
+                let enc_title = self
+                    .cipher
+                    .encrypt_str(&ai_session_aad(session_id), &auto_title)?;
+                tx.execute(
+                    "INSERT INTO ai_sessions (id, title, created_ts, updated_ts)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![session_id, enc_title, created_ts, updated_ts],
+                )?;
+            }
+            Some((enc_existing_title, existing_updated_ts)) => {
+                let existing_title = self
+                    .cipher
+                    .decrypt_str(&ai_session_aad(session_id), &enc_existing_title)?;
+                let next_updated_ts = existing_updated_ts.max(ts);
+                let is_placeholder_title = {
+                    let trimmed = existing_title.trim();
+                    trimmed.is_empty() || trimmed == AI_SESSION_DEFAULT_TITLE
+                };
+                let upgraded_title = if is_placeholder_title && role == "user" {
+                    let derived = Self::truncate_ai_text_with_ellipsis(
+                        &msg.content,
+                        AI_SESSION_AUTO_TITLE_CHARS,
+                    );
+                    if derived.is_empty() {
+                        None
+                    } else {
+                        Some(derived)
+                    }
+                } else {
+                    None
+                };
+                if let Some(new_title) = upgraded_title {
+                    let enc_new_title = self
+                        .cipher
+                        .encrypt_str(&ai_session_aad(session_id), &new_title)?;
+                    tx.execute(
+                        "UPDATE ai_sessions SET title = ?1, updated_ts = ?2 WHERE id = ?3",
+                        params![enc_new_title, next_updated_ts, session_id],
+                    )?;
+                } else if next_updated_ts != existing_updated_ts {
+                    tx.execute(
+                        "UPDATE ai_sessions SET updated_ts = ?1 WHERE id = ?2",
+                        params![next_updated_ts, session_id],
+                    )?;
+                }
+            }
+        }
+
+        tx.commit()?;
         Ok(())
     }
 
@@ -5670,7 +7617,8 @@ impl MessageStore {
         session_id: &str,
         limit: usize,
     ) -> Result<Vec<AiStoredMessageDto>> {
-        if limit == 0 {
+        let clean_id = session_id.trim();
+        if limit == 0 || clean_id.is_empty() {
             return Ok(Vec::new());
         }
         let safe_limit = i64::try_from(limit).unwrap_or(i64::MAX);
@@ -5681,7 +7629,7 @@ impl MessageStore {
              ORDER BY ts DESC, id DESC
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![session_id, safe_limit], |r| {
+        let rows = stmt.query_map(params![clean_id, safe_limit], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -5711,9 +7659,13 @@ impl MessageStore {
     }
 
     pub fn clear_ai_messages(&self, session_id: &str) -> Result<usize> {
+        let clean_id = session_id.trim();
+        if clean_id.is_empty() {
+            return Ok(0);
+        }
         let affected = self.conn.execute(
             "DELETE FROM ai_messages WHERE session_id = ?1",
-            params![session_id],
+            params![clean_id],
         )?;
         Ok(affected)
     }
@@ -5794,6 +7746,11 @@ impl MessageStore {
         Ok(Some((title, kind)))
     }
 
+    const SCHEDULED_MSG_SELECT_COLS: &'static str = "id, thread_id, thread_title, thread_kind, text, attachment_path,
+                    send_at_ts, recurrence, misfire_policy, misfire_grace_secs,
+                    status, retry_count, last_error, created_at, updated_at, sent_at_ts,
+                    next_attempt_ts, bypass_misfire, anchor_day";
+
     fn decode_scheduled_message_row(
         &self,
         row: &rusqlite::Row<'_>,
@@ -5814,6 +7771,13 @@ impl MessageStore {
         let created_at: i64 = row.get(13)?;
         let updated_at: i64 = row.get(14)?;
         let sent_at_ts: i64 = row.get(15)?;
+        let next_attempt_ts: Option<i64> = row.get(16)?;
+        let bypass_misfire: i64 = row.get(17)?;
+        let raw_anchor_day: Option<i64> = row.get(18)?;
+        let anchor_day = raw_anchor_day
+            .and_then(|d| u32::try_from(d).ok())
+            .filter(|&d| (1..=31).contains(&d))
+            .or_else(|| local_day_of_month(send_at_ts));
 
         let aad = sched_aad(&id);
         let thread_title = self.cipher.decrypt_str(&aad, &enc_thread_title)?;
@@ -5829,6 +7793,9 @@ impl MessageStore {
             text,
             attachment_path,
             send_at_ts,
+            next_attempt_ts,
+            bypass_misfire: bypass_misfire != 0,
+            anchor_day,
             recurrence,
             misfire_policy,
             misfire_grace_secs,
@@ -5856,6 +7823,7 @@ impl MessageStore {
         if send_at_ts <= 0 {
             bail!("Thời gian gửi hẹn giờ không hợp lệ");
         }
+        let anchor_day = local_day_of_month(send_at_ts);
 
         let thread_meta = self.lookup_thread_title_and_kind(thread_id)?;
         let thread_title = if !input.thread_title.trim().is_empty() {
@@ -5894,10 +7862,11 @@ impl MessageStore {
         self.conn.execute(
             "INSERT INTO scheduled_messages (
                 id, thread_id, thread_title, thread_kind, text, attachment_path,
-                send_at_ts, recurrence, misfire_policy, misfire_grace_secs,
+                send_at_ts, next_attempt_ts, bypass_misfire, anchor_day,
+                recurrence, misfire_policy, misfire_grace_secs,
                 status, retry_count, last_error, created_at, updated_at, sent_at_ts
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', 0, ?11, ?12, ?12, 0)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 0, ?8, ?9, ?10, ?11, 'pending', 0, ?12, ?13, ?13, 0)",
             params![
                 id,
                 thread_id,
@@ -5906,6 +7875,7 @@ impl MessageStore {
                 enc_text,
                 enc_att,
                 send_at_ts,
+                anchor_day.map(i64::from),
                 recurrence,
                 misfire_policy,
                 misfire_grace_secs,
@@ -5922,6 +7892,9 @@ impl MessageStore {
             text: input.text.clone(),
             attachment_path,
             send_at_ts,
+            next_attempt_ts: None,
+            bypass_misfire: false,
+            anchor_day,
             recurrence: recurrence.to_string(),
             misfire_policy: misfire_policy.to_string(),
             misfire_grace_secs,
@@ -5967,20 +7940,38 @@ impl MessageStore {
         if cur.text.trim().is_empty() && cur.attachment_path.trim().is_empty() {
             bail!("Cần nhập nội dung tin nhắn hoặc tệp đính kèm");
         }
+        let mut send_at_changed = false;
+        let mut recurrence_changed = false;
         if let Some(raw_ts) = input.send_at_ts {
             let send_at_ts = normalize_ts_ms(raw_ts);
             if send_at_ts <= 0 {
                 bail!("Thời gian gửi hẹn giờ không hợp lệ");
             }
+            if send_at_ts != cur.send_at_ts {
+                send_at_changed = true;
+            }
             cur.send_at_ts = send_at_ts;
+            cur.anchor_day = local_day_of_month(send_at_ts);
             if cur.status != "pending" {
                 cur.status = "pending".to_string();
                 cur.retry_count = 0;
                 cur.last_error.clear();
+                cur.next_attempt_ts = None;
+                cur.bypass_misfire = false;
             }
         }
         if let Some(ref rec) = input.recurrence {
-            cur.recurrence = normalize_sched_recurrence(rec)?.to_string();
+            let normalized = normalize_sched_recurrence(rec)?;
+            if normalized != cur.recurrence {
+                recurrence_changed = true;
+            }
+            cur.recurrence = normalized.to_string();
+        }
+        if cur.status == "pending" && (send_at_changed || recurrence_changed) {
+            cur.retry_count = 0;
+            cur.last_error.clear();
+            cur.next_attempt_ts = None;
+            cur.bypass_misfire = false;
         }
         if let Some(ref policy) = input.misfire_policy {
             cur.misfire_policy = normalize_sched_misfire_policy(policy)?.to_string();
@@ -6003,13 +7994,16 @@ impl MessageStore {
                  text = ?4,
                  attachment_path = ?5,
                  send_at_ts = ?6,
-                 recurrence = ?7,
-                 misfire_policy = ?8,
-                 misfire_grace_secs = ?9,
-                 status = ?10,
-                 retry_count = ?11,
-                 last_error = ?12,
-                 updated_at = ?13
+                 next_attempt_ts = ?7,
+                 bypass_misfire = ?8,
+                 anchor_day = ?9,
+                 recurrence = ?10,
+                 misfire_policy = ?11,
+                 misfire_grace_secs = ?12,
+                 status = ?13,
+                 retry_count = ?14,
+                 last_error = ?15,
+                 updated_at = ?16
              WHERE id = ?1 AND status NOT IN ('sending', 'sent')",
             params![
                 cur.id,
@@ -6018,6 +8012,9 @@ impl MessageStore {
                 enc_text,
                 enc_att,
                 cur.send_at_ts,
+                cur.next_attempt_ts,
+                cur.bypass_misfire as i64,
+                cur.anchor_day.map(i64::from),
                 cur.recurrence,
                 cur.misfire_policy,
                 cur.misfire_grace_secs,
@@ -6036,6 +8033,20 @@ impl MessageStore {
     pub fn list_scheduled_messages(
         &self,
         status_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ScheduledMessageDto>> {
+        self.list_scheduled_messages_filtered(status_filter, None, limit)
+    }
+
+    /// Lists scheduled messages filtered by optional status CSV and optional `allowed_thread_ids`
+    /// BEFORE applying `LIMIT`.
+    ///
+    /// Following [`ApiClientDto::allowed_thread_ids`] semantics, `None` or an empty slice means
+    /// unrestricted (all threads); a non-empty slice restricts results via `thread_id IN (...)`.
+    pub fn list_scheduled_messages_filtered(
+        &self,
+        status_filter: Option<&str>,
+        allowed_thread_ids: Option<&[String]>,
         limit: usize,
     ) -> Result<Vec<ScheduledMessageDto>> {
         if limit == 0 {
@@ -6059,24 +8070,35 @@ impl MessageStore {
                 parsed
             }
         };
+        let allowed_threads: Vec<String> = match allowed_thread_ids {
+            Some(ids) => sanitize_allowed_thread_ids(ids),
+            None => Vec::new(),
+        };
 
-        let mut sql = String::from(
-            "SELECT id, thread_id, thread_title, thread_kind, text, attachment_path,
-                    send_at_ts, recurrence, misfire_policy, misfire_grace_secs,
-                    status, retry_count, last_error, created_at, updated_at, sent_at_ts
-             FROM scheduled_messages",
+        let mut sql = format!(
+            "SELECT {} FROM scheduled_messages",
+            Self::SCHEDULED_MSG_SELECT_COLS
         );
-        let mut bound: Vec<rusqlite::types::Value> = Vec::with_capacity(statuses.len() + 1);
+        let mut clauses: Vec<String> = Vec::new();
+        let mut bound: Vec<rusqlite::types::Value> =
+            Vec::with_capacity(statuses.len() + allowed_threads.len() + 1);
         if !statuses.is_empty() {
-            sql.push_str(" WHERE status IN (");
-            for (idx, st) in statuses.iter().enumerate() {
-                if idx > 0 {
-                    sql.push_str(", ");
-                }
-                sql.push('?');
+            let placeholders = vec!["?"; statuses.len()].join(", ");
+            clauses.push(format!("status IN ({placeholders})"));
+            for st in &statuses {
                 bound.push(rusqlite::types::Value::Text((*st).to_string()));
             }
-            sql.push(')');
+        }
+        if !allowed_threads.is_empty() {
+            let placeholders = vec!["?"; allowed_threads.len()].join(", ");
+            clauses.push(format!("thread_id IN ({placeholders})"));
+            for tid in &allowed_threads {
+                bound.push(rusqlite::types::Value::Text(tid.clone()));
+            }
+        }
+        if !clauses.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&clauses.join(" AND "));
         }
         let only_active = !statuses.is_empty()
             && statuses.iter().all(|s| matches!(*s, "pending" | "sending"));
@@ -6085,13 +8107,15 @@ impl MessageStore {
                 .iter()
                 .all(|s| !matches!(*s, "pending" | "sending"));
         if only_active {
-            sql.push_str(" ORDER BY send_at_ts ASC, created_at ASC, id ASC LIMIT ?");
+            sql.push_str(
+                " ORDER BY COALESCE(next_attempt_ts, send_at_ts) ASC, send_at_ts ASC, created_at ASC, id ASC LIMIT ?",
+            );
         } else if only_history {
             sql.push_str(" ORDER BY updated_at DESC, send_at_ts DESC, id DESC LIMIT ?");
         } else {
             sql.push_str(
                 " ORDER BY CASE WHEN status IN ('pending', 'sending') THEN 0 ELSE 1 END ASC,
-                           CASE WHEN status IN ('pending', 'sending') THEN send_at_ts ELSE -updated_at END ASC,
+                           CASE WHEN status IN ('pending', 'sending') THEN COALESCE(next_attempt_ts, send_at_ts) ELSE -updated_at END ASC,
                            id ASC
                   LIMIT ?",
             );
@@ -6108,14 +8132,11 @@ impl MessageStore {
     }
 
     pub fn get_scheduled_message(&self, id: &str) -> Result<Option<ScheduledMessageDto>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, thread_id, thread_title, thread_kind, text, attachment_path,
-                    send_at_ts, recurrence, misfire_policy, misfire_grace_secs,
-                    status, retry_count, last_error, created_at, updated_at, sent_at_ts
-             FROM scheduled_messages
-             WHERE id = ?1
-             LIMIT 1",
-        )?;
+        let sql = format!(
+            "SELECT {} FROM scheduled_messages WHERE id = ?1 LIMIT 1",
+            Self::SCHEDULED_MSG_SELECT_COLS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = stmt.query(params![id])?;
         if let Some(row) = rows.next()? {
             Ok(Some(self.decode_scheduled_message_row(row)?))
@@ -6128,7 +8149,10 @@ impl MessageStore {
         let now_ms = Utc::now().timestamp_millis();
         let affected = self.conn.execute(
             "UPDATE scheduled_messages
-             SET status = 'cancelled', updated_at = ?2
+             SET status = 'cancelled',
+                 next_attempt_ts = NULL,
+                 bypass_misfire = 0,
+                 updated_at = ?2
              WHERE id = ?1 AND status IN ('pending', 'missed', 'failed')",
             params![id, now_ms],
         )?;
@@ -6137,7 +8161,7 @@ impl MessageStore {
 
     pub fn delete_scheduled_message(&self, id: &str) -> Result<bool> {
         let affected = self.conn.execute(
-            "DELETE FROM scheduled_messages WHERE id = ?1",
+            "DELETE FROM scheduled_messages WHERE id = ?1 AND status != 'sending'",
             params![id],
         )?;
         Ok(affected > 0)
@@ -6145,7 +8169,9 @@ impl MessageStore {
 
     pub fn next_pending_schedule_ts(&self) -> Result<Option<i64>> {
         let next_ts: Option<i64> = self.conn.query_row(
-            "SELECT MIN(send_at_ts) FROM scheduled_messages WHERE status = 'pending'",
+            "SELECT MIN(COALESCE(next_attempt_ts, send_at_ts))
+             FROM scheduled_messages
+             WHERE status = 'pending'",
             [],
             |r| r.get(0),
         )?;
@@ -6179,7 +8205,12 @@ impl MessageStore {
                     )?;
                     recovered += self.conn.execute(
                         "UPDATE scheduled_messages
-                         SET status = 'failed', retry_count = ?2, last_error = ?3, updated_at = ?4
+                         SET status = 'failed',
+                             next_attempt_ts = NULL,
+                             bypass_misfire = 0,
+                             retry_count = ?2,
+                             last_error = ?3,
+                             updated_at = ?4
                          WHERE id = ?1 AND status = 'sending'",
                         params![id, next_retry, enc_err, now_ms],
                     )?;
@@ -6190,7 +8221,12 @@ impl MessageStore {
                     )?;
                     recovered += self.conn.execute(
                         "UPDATE scheduled_messages
-                         SET status = 'pending', retry_count = ?2, last_error = ?3, updated_at = ?4
+                         SET status = 'pending',
+                             next_attempt_ts = NULL,
+                             bypass_misfire = 0,
+                             retry_count = ?2,
+                             last_error = ?3,
+                             updated_at = ?4
                          WHERE id = ?1 AND status = 'sending'",
                         params![id, next_retry, enc_err, now_ms],
                     )?;
@@ -6210,8 +8246,9 @@ impl MessageStore {
         }
     }
 
-    /// Atomically claims up to `max_batch` due `'pending'` rows (`send_at_ts <= now_ms`)
-    /// by marking them `'sending'` inside an `IMMEDIATE` transaction so double-send is impossible.
+    /// Atomically claims up to `max_batch` due `'pending'` rows
+    /// (`COALESCE(next_attempt_ts, send_at_ts) <= now_ms`) by marking them `'sending'` inside
+    /// an `IMMEDIATE` transaction so double-send is impossible.
     pub fn claim_due_scheduled_messages(
         &self,
         now_ms: i64,
@@ -6225,15 +8262,14 @@ impl MessageStore {
         self.conn.execute_batch("BEGIN IMMEDIATE;")?;
         let res = (|| -> Result<Vec<ScheduledMessageDto>> {
             let candidates = {
-                let mut stmt = self.conn.prepare(
-                    "SELECT id, thread_id, thread_title, thread_kind, text, attachment_path,
-                            send_at_ts, recurrence, misfire_policy, misfire_grace_secs,
-                            status, retry_count, last_error, created_at, updated_at, sent_at_ts
-                     FROM scheduled_messages
-                     WHERE status = 'pending' AND send_at_ts <= ?1
-                     ORDER BY send_at_ts ASC, id ASC
+                let sql = format!(
+                    "SELECT {} FROM scheduled_messages
+                     WHERE status = 'pending' AND COALESCE(next_attempt_ts, send_at_ts) <= ?1
+                     ORDER BY COALESCE(next_attempt_ts, send_at_ts) ASC, id ASC
                      LIMIT ?2",
-                )?;
+                    Self::SCHEDULED_MSG_SELECT_COLS
+                );
+                let mut stmt = self.conn.prepare(&sql)?;
                 let mut rows = stmt.query(params![now_ms, safe_limit])?;
                 let mut items = Vec::new();
                 while let Some(row) = rows.next()? {
@@ -6271,7 +8307,8 @@ impl MessageStore {
     }
 
     /// Marks a scheduled message as completed. For recurring schedules (`"daily"`, `"weekly"`,
-    /// `"monthly"`), advances `send_at_ts` via `compute_next_occurrence_ts` and resets
+    /// `"monthly"`), computes the next occurrence from canonical `send_at_ts` (preserving
+    /// `anchor_day`), clears `next_attempt_ts` / `bypass_misfire`, and resets
     /// `status = 'pending'`, `retry_count = 0`, `last_error = ''`, `sent_at_ts = now_ms`.
     /// For `"once"`, transitions to `status = 'sent'`.
     pub fn complete_scheduled_message(
@@ -6289,10 +8326,19 @@ impl MessageStore {
             cur.last_error.clear();
             cur.updated_at = now_ms;
             cur.sent_at_ts = now_ms;
+            cur.next_attempt_ts = None;
+            cur.bypass_misfire = false;
+            let anchor_day = cur
+                .anchor_day
+                .or_else(|| local_day_of_month(cur.send_at_ts));
+            cur.anchor_day = anchor_day;
 
-            if let Some(next_ts) =
-                compute_next_occurrence_ts(cur.send_at_ts, &cur.recurrence, now_ms)
-            {
+            if let Some(next_ts) = compute_next_occurrence_ts_with_anchor(
+                cur.send_at_ts,
+                anchor_day,
+                &cur.recurrence,
+                now_ms,
+            ) {
                 cur.send_at_ts = next_ts;
                 cur.status = "pending".to_string();
                 cur.retry_count = 0;
@@ -6300,18 +8346,29 @@ impl MessageStore {
                     "UPDATE scheduled_messages
                      SET status = 'pending',
                          send_at_ts = ?2,
+                         next_attempt_ts = NULL,
+                         bypass_misfire = 0,
+                         anchor_day = ?3,
                          retry_count = 0,
-                         last_error = ?3,
-                         updated_at = ?4,
-                         sent_at_ts = ?4
+                         last_error = ?4,
+                         updated_at = ?5,
+                         sent_at_ts = ?5
                      WHERE id = ?1",
-                    params![cur.id, cur.send_at_ts, enc_empty_err, now_ms],
+                    params![
+                        cur.id,
+                        cur.send_at_ts,
+                        anchor_day.map(i64::from),
+                        enc_empty_err,
+                        now_ms
+                    ],
                 )?;
             } else {
                 cur.status = "sent".to_string();
                 self.conn.execute(
                     "UPDATE scheduled_messages
                      SET status = 'sent',
+                         next_attempt_ts = NULL,
+                         bypass_misfire = 0,
                          last_error = ?2,
                          updated_at = ?3,
                          sent_at_ts = ?3
@@ -6333,6 +8390,9 @@ impl MessageStore {
         }
     }
 
+    /// Records a delivery failure. When `next_retry_ts` is `Some(retry_ts)`, requeues the
+    /// item by setting `next_attempt_ts = retry_ts` WITHOUT overwriting canonical `send_at_ts`.
+    /// When `next_retry_ts` is `None`, marks the schedule permanently `'failed'`.
     pub fn fail_or_retry_scheduled_message(
         &self,
         id: &str,
@@ -6350,19 +8410,20 @@ impl MessageStore {
         cur.updated_at = now_ms;
 
         if let Some(retry_ts) = next_retry_ts {
-            cur.send_at_ts = normalize_ts_ms(retry_ts);
+            let next_attempt = normalize_ts_ms(retry_ts);
+            cur.next_attempt_ts = Some(next_attempt);
             cur.status = "pending".to_string();
             self.conn.execute(
                 "UPDATE scheduled_messages
                  SET status = 'pending',
-                     send_at_ts = ?2,
+                     next_attempt_ts = ?2,
                      retry_count = ?3,
                      last_error = ?4,
                      updated_at = ?5
                  WHERE id = ?1",
                 params![
                     cur.id,
-                    cur.send_at_ts,
+                    next_attempt,
                     i64::from(cur.retry_count),
                     enc_err,
                     now_ms
@@ -6370,9 +8431,13 @@ impl MessageStore {
             )?;
         } else {
             cur.status = "failed".to_string();
+            cur.next_attempt_ts = None;
+            cur.bypass_misfire = false;
             self.conn.execute(
                 "UPDATE scheduled_messages
                  SET status = 'failed',
+                     next_attempt_ts = NULL,
+                     bypass_misfire = 0,
                      retry_count = ?2,
                      last_error = ?3,
                      updated_at = ?4
@@ -6383,9 +8448,32 @@ impl MessageStore {
         Ok(Some(cur))
     }
 
+    /// Reverts a `'sending'` schedule back to `'pending'` without incrementing `retry_count`
+    /// and clears `next_attempt_ts` / `bypass_misfire` (used when `SessionError::Expired`
+    /// interrupts delivery so `misfire_policy` evaluates cleanly after re-authentication).
+    pub fn revert_scheduled_message_to_pending(
+        &self,
+        id: &str,
+    ) -> Result<Option<ScheduledMessageDto>> {
+        let now_ms = Utc::now().timestamp_millis();
+        let affected = self.conn.execute(
+            "UPDATE scheduled_messages
+             SET status = 'pending',
+                 next_attempt_ts = NULL,
+                 bypass_misfire = 0,
+                 updated_at = ?2
+             WHERE id = ?1 AND status = 'sending'",
+            params![id, now_ms],
+        )?;
+        if affected == 0 {
+            return Ok(None);
+        }
+        self.get_scheduled_message(id)
+    }
+
     /// Marks a misfired schedule as `'missed'`. For recurring schedules configured with
     /// `misfire_policy == "skip"`, skips the missed occurrence and advances `send_at_ts`
-    /// to the next future occurrence with `status = 'pending'`.
+    /// to the next future occurrence (preserving `anchor_day`) with `status = 'pending'`.
     pub fn mark_scheduled_message_missed(
         &self,
         id: &str,
@@ -6399,11 +8487,20 @@ impl MessageStore {
         let enc_reason = self.cipher.encrypt_str(&sched_aad(&cur.id), reason)?;
         cur.last_error = reason.to_string();
         cur.updated_at = now_ms;
+        cur.next_attempt_ts = None;
+        cur.bypass_misfire = false;
+        let anchor_day = cur
+            .anchor_day
+            .or_else(|| local_day_of_month(cur.send_at_ts));
+        cur.anchor_day = anchor_day;
 
         if cur.misfire_policy == "skip" {
-            if let Some(next_ts) =
-                compute_next_occurrence_ts(cur.send_at_ts, &cur.recurrence, now_ms)
-            {
+            if let Some(next_ts) = compute_next_occurrence_ts_with_anchor(
+                cur.send_at_ts,
+                anchor_day,
+                &cur.recurrence,
+                now_ms,
+            ) {
                 cur.send_at_ts = next_ts;
                 cur.status = "pending".to_string();
                 cur.retry_count = 0;
@@ -6411,11 +8508,20 @@ impl MessageStore {
                     "UPDATE scheduled_messages
                      SET status = 'pending',
                          send_at_ts = ?2,
+                         next_attempt_ts = NULL,
+                         bypass_misfire = 0,
+                         anchor_day = ?3,
                          retry_count = 0,
-                         last_error = ?3,
-                         updated_at = ?4
+                         last_error = ?4,
+                         updated_at = ?5
                      WHERE id = ?1",
-                    params![cur.id, cur.send_at_ts, enc_reason, now_ms],
+                    params![
+                        cur.id,
+                        cur.send_at_ts,
+                        anchor_day.map(i64::from),
+                        enc_reason,
+                        now_ms
+                    ],
                 )?;
                 return Ok(Some(cur));
             }
@@ -6424,14 +8530,20 @@ impl MessageStore {
         cur.status = "missed".to_string();
         self.conn.execute(
             "UPDATE scheduled_messages
-             SET status = 'missed', last_error = ?2, updated_at = ?3
+             SET status = 'missed',
+                 next_attempt_ts = NULL,
+                 bypass_misfire = 0,
+                 last_error = ?2,
+                 updated_at = ?3
              WHERE id = ?1",
             params![cur.id, enc_reason, now_ms],
         )?;
         Ok(Some(cur))
     }
 
-    /// Re-queues a missed/failed/cancelled schedule for immediate sending (`send_at_ts = now_ms`).
+    /// Re-queues a missed/failed/cancelled/pending schedule for immediate sending by setting
+    /// `next_attempt_ts = now_ms` and `bypass_misfire = true` WITHOUT overwriting canonical
+    /// `send_at_ts` so recurring cadences never drift.
     pub fn reschedule_now(&self, id: &str, now_ms: i64) -> Result<Option<ScheduledMessageDto>> {
         let now_ms = normalize_ts_ms(now_ms);
         let Some(mut cur) = self.get_scheduled_message(id)? else {
@@ -6445,21 +8557,26 @@ impl MessageStore {
         }
         let enc_empty_err = self.cipher.encrypt_str(&sched_aad(&cur.id), "")?;
         cur.status = "pending".to_string();
-        cur.send_at_ts = now_ms;
+        cur.next_attempt_ts = Some(now_ms);
+        cur.bypass_misfire = true;
         cur.retry_count = 0;
         cur.last_error.clear();
         cur.updated_at = now_ms;
 
-        self.conn.execute(
+        let affected = self.conn.execute(
             "UPDATE scheduled_messages
              SET status = 'pending',
-                 send_at_ts = ?2,
+                 next_attempt_ts = ?2,
+                 bypass_misfire = 1,
                  retry_count = 0,
                  last_error = ?3,
                  updated_at = ?2
-             WHERE id = ?1",
+             WHERE id = ?1 AND status NOT IN ('sending', 'sent')",
             params![cur.id, now_ms, enc_empty_err],
         )?;
+        if affected == 0 {
+            return Ok(None);
+        }
         Ok(Some(cur))
     }
 
@@ -6836,29 +8953,29 @@ impl MessageStore {
         Ok(affected)
     }
 
-    pub fn get_api_idempotency(
+    pub fn get_api_idempotency_record(
         &self,
         client_id: &str,
         idem_key: &str,
         ttl_ms: i64,
         now_ms: i64,
-    ) -> Result<Option<(u16, String)>> {
+    ) -> Result<Option<ApiIdempotencyRecord>> {
         if client_id.trim().is_empty() || idem_key.trim().is_empty() {
             return Ok(None);
         }
         let now_ms = normalize_ts_ms(now_ms);
-        let row: Option<(i64, String, i64)> = self
+        let row: Option<(i64, String, String, i64)> = self
             .conn
             .query_row(
-                "SELECT status_code, response_json, created_at
+                "SELECT status_code, response_json, request_hash, created_at
                  FROM api_idempotency
                  WHERE client_id = ?1 AND idem_key = ?2
                  LIMIT 1",
                 params![client_id, idem_key],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        let Some((status_code, enc_response, created_at)) = row else {
+        let Some((status_code, enc_response, request_hash, created_at)) = row else {
             return Ok(None);
         };
         if ttl_ms <= 0 || now_ms.saturating_sub(created_at) > ttl_ms {
@@ -6871,15 +8988,32 @@ impl MessageStore {
         let response_json = self
             .cipher
             .decrypt_str(&api_idem_aad(client_id, idem_key), &enc_response)?;
-        Ok(Some((u16::try_from(status_code).unwrap_or(200), response_json)))
+        Ok(Some(ApiIdempotencyRecord {
+            status_code: u16::try_from(status_code).unwrap_or(200),
+            response_json,
+            request_hash,
+        }))
     }
 
-    pub fn put_api_idempotency(
+    pub fn get_api_idempotency(
+        &self,
+        client_id: &str,
+        idem_key: &str,
+        ttl_ms: i64,
+        now_ms: i64,
+    ) -> Result<Option<(u16, String)>> {
+        Ok(self
+            .get_api_idempotency_record(client_id, idem_key, ttl_ms, now_ms)?
+            .map(|r| (r.status_code, r.response_json)))
+    }
+
+    pub fn put_api_idempotency_with_hash(
         &self,
         client_id: &str,
         idem_key: &str,
         status_code: u16,
         response_json: &str,
+        request_hash: &str,
         now_ms: i64,
     ) -> Result<()> {
         if client_id.trim().is_empty() || idem_key.trim().is_empty() {
@@ -6892,20 +9026,22 @@ impl MessageStore {
         let enc_response = self
             .cipher
             .encrypt_str(&api_idem_aad(client_id, idem_key), response_json)?;
+        let clean_hash = request_hash.trim();
         let prune_cutoff = now_ms.saturating_sub(API_IDEMPOTENCY_RETENTION_MS);
 
         self.conn.execute_batch("BEGIN IMMEDIATE;")?;
         let res = (|| -> Result<()> {
             self.conn.execute(
                 "INSERT OR REPLACE INTO api_idempotency (
-                    client_id, idem_key, status_code, response_json, created_at
+                    client_id, idem_key, status_code, response_json, request_hash, created_at
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     client_id,
                     idem_key,
                     i64::from(status_code),
                     enc_response,
+                    clean_hash,
                     now_ms,
                 ],
             )?;
@@ -6925,6 +9061,17 @@ impl MessageStore {
                 Err(e)
             }
         }
+    }
+
+    pub fn put_api_idempotency(
+        &self,
+        client_id: &str,
+        idem_key: &str,
+        status_code: u16,
+        response_json: &str,
+        now_ms: i64,
+    ) -> Result<()> {
+        self.put_api_idempotency_with_hash(client_id, idem_key, status_code, response_json, "", now_ms)
     }
 }
 
@@ -9359,8 +11506,27 @@ mod tests {
         );
         assert!(store.list_cloud_items_exclusive_to_thread("t2").unwrap().is_empty());
 
-        // Older than 25_000 -> img (10k) and vid (20k), skipping shared (30k)
-        let older = store.list_cloud_items_older_than(25_000).unwrap();
+        // Monotonic cloud_synced_ts ordering: img < vid < shared; older than shared_ts -> img & vid only!
+        let ts_img = store
+            .get_media_object(&sha_img)
+            .unwrap()
+            .unwrap()
+            .cloud_synced_ts
+            .unwrap();
+        let ts_vid = store
+            .get_media_object(&sha_vid)
+            .unwrap()
+            .unwrap()
+            .cloud_synced_ts
+            .unwrap();
+        let ts_shared = store
+            .get_media_object(&sha_shared)
+            .unwrap()
+            .unwrap()
+            .cloud_synced_ts
+            .unwrap();
+        assert!(ts_img < ts_vid && ts_vid < ts_shared);
+        let older = store.list_cloud_items_older_than(ts_shared).unwrap();
         assert_eq!(
             older,
             vec![
@@ -10316,6 +12482,300 @@ mod tests {
     }
 
     #[test]
+    fn ai_session_legacy_orphan_messages_backfill_on_list() {
+        let dir = std::env::temp_dir().join(format!(
+            "teza-store-ai-session-legacy-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("ai_legacy.db");
+        let store = MessageStore::open(&db_path).unwrap();
+
+        let long_first_prompt =
+            "  Phân tích   chi tiết\nkế hoạch triển khai quý IV năm 2026 cho toàn bộ đội ngũ kỹ thuật  ";
+        let long_last_reply = format!(
+            "  Báo cáo\ttổng hợp\n{}",
+            "Nội dung phản hồi dài để kiểm tra cắt ngắn preview sạch sẽ ".repeat(3)
+        );
+        for msg in [
+            AiStoredMessageDto {
+                id: "legacy-1".into(),
+                session_id: "default".into(),
+                role: "user".into(),
+                content: long_first_prompt.into(),
+                model: "gpt-4.1".into(),
+                backend: "openai".into(),
+                ts: 1_700_000_010_000,
+            },
+            AiStoredMessageDto {
+                id: "legacy-2".into(),
+                session_id: "default".into(),
+                role: "assistant".into(),
+                content: "Đã tiếp nhận yêu cầu.".into(),
+                model: "gpt-4.1".into(),
+                backend: "openai".into(),
+                ts: 1_700_000_020_000,
+            },
+            AiStoredMessageDto {
+                id: "legacy-3".into(),
+                session_id: "default".into(),
+                role: "model".into(),
+                content: long_last_reply,
+                model: "gpt-4.1".into(),
+                backend: "openai".into(),
+                ts: 1_700_000_030_000,
+            },
+            AiStoredMessageDto {
+                id: "legacy-model-only-1".into(),
+                session_id: "model-only".into(),
+                role: "model".into(),
+                content: "Xin chào! Tôi có thể giúp gì cho bạn?".into(),
+                model: "gpt-4.1".into(),
+                backend: "openai".into(),
+                ts: 1_700_000_005_000,
+            },
+        ] {
+            store.insert_ai_message(&msg).unwrap();
+        }
+
+        // Simulate a pre-upgrade DB where ai_messages existed before ai_sessions rows were written.
+        let raw = Connection::open(&db_path).unwrap();
+        raw.execute("DELETE FROM ai_sessions", []).unwrap();
+        drop(raw);
+
+        let sessions = store.list_ai_sessions(10).unwrap();
+        assert_eq!(sessions.len(), 2);
+
+        let def = &sessions[0];
+        assert_eq!(def.id, "default");
+        assert_eq!(def.created_ts, 1_700_000_010_000);
+        assert_eq!(def.updated_ts, 1_700_000_030_000);
+        assert_eq!(def.message_count, 3);
+        assert!(def.title.starts_with("Phân tích chi tiết kế hoạch"));
+        assert!(def.title.ends_with('…'));
+        assert!(def.title.chars().count() <= AI_SESSION_AUTO_TITLE_CHARS);
+        assert!(!def.title.contains('\n'));
+        assert!(def.last_preview.starts_with("Báo cáo tổng hợp Nội dung"));
+        assert!(def.last_preview.ends_with('…'));
+        assert!(def.last_preview.chars().count() <= AI_SESSION_PREVIEW_CHARS);
+        assert!(!def.last_preview.contains('\n'));
+        assert!(!def.last_preview.contains('\t'));
+
+        let model_only = &sessions[1];
+        assert_eq!(model_only.id, "model-only");
+        assert_eq!(model_only.title, AI_SESSION_LEGACY_FALLBACK_TITLE);
+        assert_eq!(model_only.created_ts, 1_700_000_005_000);
+        assert_eq!(model_only.updated_ts, 1_700_000_005_000);
+        assert_eq!(model_only.message_count, 1);
+        assert_eq!(
+            model_only.last_preview,
+            "Xin chào! Tôi có thể giúp gì cho bạn?"
+        );
+
+        // Raw SQLite row for backfilled session title must be encrypted on disk.
+        let raw = Connection::open(&db_path).unwrap();
+        let raw_title: String = raw
+            .query_row(
+                "SELECT title FROM ai_sessions WHERE id = 'default'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(raw_title.starts_with(ENC_PREFIX));
+        assert!(!raw_title.contains("Phân tích"));
+        drop(raw);
+
+        // Calling list_ai_sessions again is idempotent.
+        let sessions_again = store.list_ai_sessions(10).unwrap();
+        assert_eq!(sessions_again, sessions);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ai_session_create_auto_title_rename_preview_and_delete() {
+        let dir = std::env::temp_dir().join(format!(
+            "teza-store-ai-session-crud-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("ai_sessions.db");
+        let store = MessageStore::open(&db_path).unwrap();
+
+        // Validation errors on create_ai_session.
+        assert!(store
+            .create_ai_session("   ", "Hợp lệ", 1_700_000_000_000)
+            .is_err());
+        let too_long_id = "s".repeat(AI_SESSION_MAX_ID_CHARS + 1);
+        assert!(store
+            .create_ai_session(&too_long_id, "Hợp lệ", 1_700_000_000_000)
+            .is_err());
+
+        // Empty title defaults to "Cuộc trò chuyện mới".
+        let s1 = store
+            .create_ai_session("sess-1", "   ", 1_700_000_001_000)
+            .unwrap();
+        assert_eq!(s1.id, "sess-1");
+        assert_eq!(s1.title, AI_SESSION_DEFAULT_TITLE);
+        assert_eq!(s1.created_ts, 1_700_000_001_000);
+        assert_eq!(s1.updated_ts, 1_700_000_001_000);
+        assert_eq!(s1.message_count, 0);
+        assert_eq!(s1.last_preview, "");
+
+        // Overlong title on create is truncated cleanly to 120 chars.
+        let long_custom_title = "Đ".repeat(AI_SESSION_MAX_TITLE_CHARS + 30);
+        let s_long = store
+            .create_ai_session("sess-long", &long_custom_title, 1_700_000_000_500)
+            .unwrap();
+        assert_eq!(s_long.title.chars().count(), AI_SESSION_MAX_TITLE_CHARS);
+
+        // Duplicate create with empty title preserves existing custom title.
+        let s_long_dup = store
+            .create_ai_session("sess-long", "", 1_700_000_009_999)
+            .unwrap();
+        assert_eq!(s_long_dup.title, s_long.title);
+        assert_eq!(s_long_dup.created_ts, 1_700_000_000_500);
+
+        // Model message first keeps placeholder title but bumps updated_ts.
+        store
+            .insert_ai_message(&AiStoredMessageDto {
+                id: "m-1".into(),
+                session_id: "sess-1".into(),
+                role: "assistant".into(),
+                content: "Chào bạn, hãy đặt câu hỏi!".into(),
+                model: "m1".into(),
+                backend: "b1".into(),
+                ts: 1_700_000_002_000,
+            })
+            .unwrap();
+        let after_model = store.list_ai_sessions(10).unwrap();
+        let s1_after_model = after_model.iter().find(|s| s.id == "sess-1").unwrap();
+        assert_eq!(s1_after_model.title, AI_SESSION_DEFAULT_TITLE);
+        assert_eq!(s1_after_model.updated_ts, 1_700_000_002_000);
+        assert_eq!(s1_after_model.message_count, 1);
+
+        // First user message upgrades placeholder title to single-line <= 48 chars with ellipsis.
+        store
+            .insert_ai_message(&AiStoredMessageDto {
+                id: "m-2".into(),
+                session_id: "sess-1".into(),
+                role: "user".into(),
+                content: "  Tóm tắt\nnhanh danh sách công việc ưu tiên trong tuần tới giúp mình nhé! "
+                    .into(),
+                model: "m1".into(),
+                backend: "b1".into(),
+                ts: 1_700_000_003_000,
+            })
+            .unwrap();
+        let after_first_user = store.list_ai_sessions(10).unwrap();
+        let s1_upgraded = after_first_user.iter().find(|s| s.id == "sess-1").unwrap();
+        assert!(s1_upgraded.title.starts_with("Tóm tắt nhanh danh sách"));
+        assert!(s1_upgraded.title.ends_with('…'));
+        assert!(s1_upgraded.title.chars().count() <= AI_SESSION_AUTO_TITLE_CHARS);
+        assert!(!s1_upgraded.title.contains('\n'));
+        assert_eq!(s1_upgraded.updated_ts, 1_700_000_003_000);
+        let auto_title = s1_upgraded.title.clone();
+
+        // Second user message preserves auto-upgraded title and updates last_preview + count.
+        let long_followup = format!(
+            "Câu hỏi tiếp theo:\n{}",
+            "Chi tiết hạng mục số một cần kiểm tra kỹ lưỡng ".repeat(3)
+        );
+        store
+            .insert_ai_message(&AiStoredMessageDto {
+                id: "m-3".into(),
+                session_id: "sess-1".into(),
+                role: "user".into(),
+                content: long_followup,
+                model: "m1".into(),
+                backend: "b1".into(),
+                ts: 1_700_000_004_000,
+            })
+            .unwrap();
+        let after_second_user = store.list_ai_sessions(10).unwrap();
+        let s1_second = after_second_user.iter().find(|s| s.id == "sess-1").unwrap();
+        assert_eq!(s1_second.title, auto_title);
+        assert_eq!(s1_second.message_count, 3);
+        assert_eq!(s1_second.updated_ts, 1_700_000_004_000);
+        assert!(s1_second.last_preview.starts_with("Câu hỏi tiếp theo: Chi tiết"));
+        assert!(s1_second.last_preview.ends_with('…'));
+        assert!(s1_second.last_preview.chars().count() <= AI_SESSION_PREVIEW_CHARS);
+
+        // Inserting into an unseen session auto-creates an ai_sessions entry.
+        store
+            .insert_ai_message(&AiStoredMessageDto {
+                id: "m-s2-1".into(),
+                session_id: "sess-2".into(),
+                role: "user".into(),
+                content: "Viết email cảm ơn khách hàng".into(),
+                model: "m1".into(),
+                backend: "b1".into(),
+                ts: 1_700_000_010_000,
+            })
+            .unwrap();
+
+        // Rename validation and happy path.
+        assert!(store.rename_ai_session("", "Hợp lệ").is_err());
+        assert!(store.rename_ai_session("sess-1", "   ").is_err());
+        assert!(store
+            .rename_ai_session("sess-1", &"A".repeat(AI_SESSION_MAX_TITLE_CHARS + 1))
+            .is_err());
+        assert!(store.rename_ai_session("non-existent", "Hợp lệ").is_err());
+
+        let renamed = store
+            .rename_ai_session("sess-1", "  Bí mật Kế hoạch   Phát hành 2026  ")
+            .unwrap();
+        assert_eq!(renamed.id, "sess-1");
+        assert_eq!(renamed.title, "Bí mật Kế hoạch Phát hành 2026");
+        assert_eq!(renamed.created_ts, 1_700_000_001_000);
+        assert_eq!(renamed.updated_ts, 1_700_000_004_000);
+        assert_eq!(renamed.message_count, 3);
+        assert_eq!(renamed.last_preview, s1_second.last_preview);
+
+        // Raw SQLite title must be encrypted with zero plaintext leakage.
+        let raw = Connection::open(&db_path).unwrap();
+        let raw_title: String = raw
+            .query_row(
+                "SELECT title FROM ai_sessions WHERE id = 'sess-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(raw_title.starts_with(ENC_PREFIX));
+        assert!(!raw_title.contains("Phát hành"));
+        assert!(!raw_title.contains("2026"));
+        drop(raw);
+
+        // Ordering is updated_ts DESC, id DESC; limit is respected.
+        assert!(store.list_ai_sessions(0).unwrap().is_empty());
+        let top1 = store.list_ai_sessions(1).unwrap();
+        assert_eq!(top1.len(), 1);
+        assert_eq!(top1[0].id, "sess-2");
+        assert_eq!(top1[0].title, "Viết email cảm ơn khách hàng");
+
+        let all = store.list_ai_sessions(10).unwrap();
+        let ids: Vec<&str> = all.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["sess-2", "sess-1", "sess-long"]);
+
+        // clear_ai_messages keeps the ai_sessions row intact with 0 messages and empty preview.
+        assert_eq!(store.clear_ai_messages("sess-1").unwrap(), 3);
+        let after_clear = store.list_ai_sessions(10).unwrap();
+        let s1_cleared = after_clear.iter().find(|s| s.id == "sess-1").unwrap();
+        assert_eq!(s1_cleared.title, "Bí mật Kế hoạch Phát hành 2026");
+        assert_eq!(s1_cleared.message_count, 0);
+        assert_eq!(s1_cleared.last_preview, "");
+
+        // delete_ai_session removes messages and session row without touching other sessions.
+        assert_eq!(store.delete_ai_session("sess-2").unwrap(), 1);
+        assert!(store.list_ai_messages("sess-2", 10).unwrap().is_empty());
+        let remaining = store.list_ai_sessions(10).unwrap();
+        let remaining_ids: Vec<&str> = remaining.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(remaining_ids, vec!["sess-1", "sess-long"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn list_unread_messages_for_summary_respects_watermark_and_fallback() {
         let dir =
             std::env::temp_dir().join(format!("teza-store-unread-sum-{}", std::process::id()));
@@ -10458,28 +12918,49 @@ mod tests {
             .unwrap()
             .timestamp_millis();
 
-        assert_eq!(compute_next_occurrence_ts(jan31_2026, "once", jan31_2026), None);
         assert_eq!(
-            compute_next_occurrence_ts(jan31_2026, "daily", jan31_2026),
+            compute_next_occurrence_in_tz(&Utc, jan31_2026, Some(31), "once", jan31_2026),
+            None
+        );
+        assert_eq!(
+            compute_next_occurrence_in_tz(&Utc, jan31_2026, Some(31), "daily", jan31_2026),
             Some(jan31_2026 + DAY_MS)
         );
         // Catch-up past 3.5 days jumps straight to day +4 at same wall time.
         assert_eq!(
-            compute_next_occurrence_ts(jan31_2026, "daily", jan31_2026 + 3 * DAY_MS + 10_000),
+            compute_next_occurrence_in_tz(
+                &Utc,
+                jan31_2026,
+                Some(31),
+                "daily",
+                jan31_2026 + 3 * DAY_MS + 10_000
+            ),
             Some(jan31_2026 + 4 * DAY_MS)
         );
         assert_eq!(
-            compute_next_occurrence_ts(jan31_2026, "weekly", jan31_2026),
+            compute_next_occurrence_in_tz(&Utc, jan31_2026, Some(31), "weekly", jan31_2026),
             Some(jan31_2026 + WEEK_MS)
         );
         // Monthly rollover clamps Jan 31 -> Feb 28 (non-leap 2026).
         assert_eq!(
-            compute_next_occurrence_ts(jan31_2026, "monthly", jan31_2026 + 1_000),
+            compute_next_occurrence_in_tz(
+                &Utc,
+                jan31_2026,
+                Some(31),
+                "monthly",
+                jan31_2026 + 1_000
+            ),
             Some(feb28_2026)
         );
         // Catch-up past Feb 28 preserves anchor day 31 -> Mar 31!
         assert_eq!(
-            compute_next_occurrence_ts(jan31_2026, "monthly", feb28_2026 + 60_000),
+            compute_next_occurrence_in_tz(
+                &Utc,
+                jan31_2026,
+                Some(31),
+                "monthly",
+                feb28_2026 + 60_000
+            ),
             Some(mar31_2026)
         );
         // Leap year 2028: Jan 31 -> Feb 29.
@@ -10490,8 +12971,51 @@ mod tests {
             .unwrap()
             .timestamp_millis();
         assert_eq!(
-            compute_next_occurrence_ts(jan31_2028, "monthly", jan31_2028),
+            compute_next_occurrence_in_tz(&Utc, jan31_2028, Some(31), "monthly", jan31_2028),
             Some(feb29_2028)
+        );
+
+        // Local-timezone convenience wrapper matches local calendar wall-clock time.
+        let local_jan31 = resolve_local_datetime_in_tz(
+            &Local,
+            NaiveDate::from_ymd_opt(2026, 1, 31)
+                .unwrap()
+                .and_hms_opt(9, 30, 0)
+                .unwrap(),
+        )
+        .unwrap()
+        .timestamp_millis();
+        let local_feb28 = resolve_local_datetime_in_tz(
+            &Local,
+            NaiveDate::from_ymd_opt(2026, 2, 28)
+                .unwrap()
+                .and_hms_opt(9, 30, 0)
+                .unwrap(),
+        )
+        .unwrap()
+        .timestamp_millis();
+        let local_mar31 = resolve_local_datetime_in_tz(
+            &Local,
+            NaiveDate::from_ymd_opt(2026, 3, 31)
+                .unwrap()
+                .and_hms_opt(9, 30, 0)
+                .unwrap(),
+        )
+        .unwrap()
+        .timestamp_millis();
+        assert_eq!(compute_next_occurrence_ts(local_jan31, "once", local_jan31), None);
+        assert_eq!(
+            compute_next_occurrence_ts(local_jan31, "monthly", local_jan31 + 1_000),
+            Some(local_feb28)
+        );
+        assert_eq!(
+            compute_next_occurrence_ts_with_anchor(
+                local_feb28,
+                Some(31),
+                "monthly",
+                local_feb28 + 1_000
+            ),
+            Some(local_mar31)
         );
     }
 
@@ -10632,34 +13156,48 @@ mod tests {
         assert_eq!(s2_rec.status, "failed");
         assert_eq!(s2_rec.retry_count, 3);
 
-        // 1-click reschedule_now on failed s2 brings it back to pending at now_ms.
+        // 1-click reschedule_now on failed s2 sets next_attempt_ts + bypass_misfire WITHOUT
+        // overwriting canonical send_at_ts!
         let s2_now = store
             .reschedule_now(&s2.id, base_ts + 20_000)
             .unwrap()
             .unwrap();
         assert_eq!(s2_now.status, "pending");
-        assert_eq!(s2_now.send_at_ts, base_ts + 20_000);
+        assert_eq!(s2_now.send_at_ts, base_ts + 5_000);
+        assert_eq!(s2_now.next_attempt_ts, Some(base_ts + 20_000));
+        assert!(s2_now.bypass_misfire);
         assert_eq!(s2_now.retry_count, 0);
         assert!(s2_now.last_error.is_empty());
 
-        // Complete recurring s2 -> advances +1 day & stays pending!
+        // Complete recurring s2 -> advances from canonical send_at_ts (base_ts + 5_000), clearing
+        // next_attempt_ts & bypass_misfire!
+        let expected_s2_next1 =
+            compute_next_occurrence_ts(base_ts + 5_000, "daily", base_ts + 20_000).unwrap();
         let s2_done = store
             .complete_scheduled_message(&s2.id, base_ts + 20_000)
             .unwrap()
             .unwrap();
         assert_eq!(s2_done.status, "pending");
-        assert_eq!(s2_done.send_at_ts, base_ts + 20_000 + DAY_MS);
+        assert_eq!(s2_done.send_at_ts, expected_s2_next1);
+        assert_eq!(s2_done.next_attempt_ts, None);
+        assert!(!s2_done.bypass_misfire);
         assert_eq!(s2_done.sent_at_ts, base_ts + 20_000);
 
         // Misfire "skip" on recurring s2 -> advances another day & stays pending!
+        let skip_now = expected_s2_next1 + 700_000;
+        let expected_s2_next2 =
+            compute_next_occurrence_ts(expected_s2_next1, "daily", skip_now).unwrap();
         let s2_skipped = store
-            .mark_scheduled_message_missed(&s2.id, "Bỏ qua do tắt máy", base_ts + 20_000 + DAY_MS + 700_000)
+            .mark_scheduled_message_missed(&s2.id, "Bỏ qua do tắt máy", skip_now)
             .unwrap()
             .unwrap();
         assert_eq!(s2_skipped.status, "pending");
-        assert_eq!(s2_skipped.send_at_ts, base_ts + 20_000 + 2 * DAY_MS);
+        assert_eq!(s2_skipped.send_at_ts, expected_s2_next2);
+        assert_eq!(s2_skipped.next_attempt_ts, None);
+        assert!(!s2_skipped.bypass_misfire);
 
-        // Retry then fail on s1; then mark missed ("ask"), then reschedule_now, then complete ("once" -> sent).
+        // Retry on s1 sets next_attempt_ts WITHOUT overwriting canonical send_at_ts;
+        // then mark missed ("ask"), then reschedule_now, then complete ("once" -> sent).
         let s1_retry = store
             .fail_or_retry_scheduled_message(
                 &s1.id,
@@ -10670,7 +13208,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(s1_retry.status, "pending");
-        assert_eq!(s1_retry.send_at_ts, base_ts + 50_000);
+        assert_eq!(s1_retry.send_at_ts, base_ts);
+        assert_eq!(s1_retry.next_attempt_ts, Some(base_ts + 50_000));
         assert_eq!(s1_retry.retry_count, 2);
 
         let s1_missed = store
@@ -12063,6 +14602,1785 @@ mod tests {
             .list_unresolved_direct_thread_ids(10)
             .unwrap()
             .is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recall_of_old_synced_message_exports_via_updated_ts_and_cleans_media_on_import() {
+        let dir = std::env::temp_dir().join(format!(
+            "teza-store-recall-delta-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut src = MessageStore::open(&dir.join("src.db")).unwrap();
+        let dst = MessageStore::open(&dir.join("dst.db")).unwrap();
+
+        let make_msg = |mid: &str, text: &str, ts: i64, att: Option<&str>| MessageDto {
+            msg_id: mid.into(),
+            cli_msg_id: None,
+            thread_id: "t1".into(),
+            sender_id: "u1".into(),
+            sender_name: "Alice".into(),
+            text: text.into(),
+            msg_type: if att.is_some() { "chat.photo" } else { "chat.text" }.into(),
+            ts,
+            is_outgoing: true,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
+            reactions: Vec::new(),
+            attachment_url: att.map(str::to_string),
+            attachment_name: att.map(|_| "secret.jpg".into()),
+        };
+
+        src.upsert_message(&make_msg(
+            "m1",
+            "Confidential photo",
+            1_600_000_001_000,
+            Some("https://f10-zpc.zdn.vn/secret.jpg"),
+        ))
+        .unwrap();
+        src.upsert_message(&make_msg("m2", "Followup", 1_600_000_002_000, None))
+            .unwrap();
+        src.upsert_cached_translations(
+            &[(
+                "m1".into(),
+                "Confidential photo".into(),
+                TranslationResult {
+                    msg_id: "m1".into(),
+                    translated_text: "Anh bi mat".into(),
+                    detected_source_lang: Some("EN".into()),
+                    skipped: false,
+                },
+            )],
+            "VI",
+            "deepl",
+        )
+        .unwrap();
+
+        let sha_m1 = "a".repeat(64);
+        src.upsert_media_object(&MediaObjectRecord {
+            sha256: sha_m1.clone(),
+            kind: "image".into(),
+            mime: "image/jpeg".into(),
+            size_bytes: 50_000,
+            thumb_sha256: None,
+            width: None,
+            height: None,
+            duration_ms: None,
+            local_state: MEDIA_LOCAL_STATE_LOCAL,
+            local_rel_path: Some("blobs/aa/aa/src_m1.enc".into()),
+            is_encrypted: true,
+            pin_count: 0,
+            created_ts: 1_600_000_001_000,
+            last_accessed_ts: 1_600_000_001_000,
+            cloud_provider: Some("gdrive".into()),
+            cloud_file_id: Some("drv-m1-secret".into()),
+            cloud_encrypted: true,
+            cloud_key_ver: 1,
+            cloud_synced_ts: Some(1_600_000_001_500),
+        })
+        .unwrap();
+        src.link_message_media(&MessageMediaRecord {
+            thread_id: "t1".into(),
+            msg_id: "m1".into(),
+            variant: "primary".into(),
+            url_hash: "uh-m1".into(),
+            sha256: Some(sha_m1.clone()),
+            original_name: Some("secret.jpg".into()),
+            saved_user_path: None,
+            cdn_status: MEDIA_CDN_STATUS_OK,
+            updated_ts: 1_600_000_001_500,
+        })
+        .unwrap();
+
+        // Initial delta sync
+        let delta1 = src
+            .export_history_delta_since_with_mutation_cursor("u1", "dev-A", 0, 0, 500)
+            .unwrap();
+        assert_eq!(delta1.messages.len(), 2);
+        assert_eq!(delta1.cloud_media.len(), 1);
+        assert_eq!(delta1.max_message_ts_cursor, Some(1_600_000_002_000));
+        assert_eq!(delta1.max_mutation_ts_cursor, None);
+
+        let imp1 = dst.import_history_delta_idempotent_detailed(&delta1).unwrap();
+        assert_eq!(imp1.applied_messages, 2);
+        // Simulate dst having also hydrated the blob locally on disk
+        dst.upsert_media_object(&MediaObjectRecord {
+            sha256: sha_m1.clone(),
+            kind: "image".into(),
+            mime: "image/jpeg".into(),
+            size_bytes: 50_000,
+            thumb_sha256: None,
+            width: None,
+            height: None,
+            duration_ms: None,
+            local_state: MEDIA_LOCAL_STATE_LOCAL,
+            local_rel_path: Some("blobs/aa/aa/dst_m1.enc".into()),
+            is_encrypted: true,
+            pin_count: 0,
+            created_ts: 1_600_000_001_000,
+            last_accessed_ts: 1_600_000_001_000,
+            cloud_provider: Some("gdrive".into()),
+            cloud_file_id: Some("drv-m1-secret".into()),
+            cloud_encrypted: true,
+            cloud_key_ver: 1,
+            cloud_synced_ts: Some(1_600_000_001_500),
+        })
+        .unwrap();
+
+        // Recall OLD m1 (ts < cursor_ts = 1_600_000_002_001) on src
+        let recalled = src.mark_recalled("t1", "m1").unwrap().unwrap();
+        assert!(recalled.is_recalled);
+
+        // Cloud delete queue must contain m1's blob on src!
+        let pending_del = src.list_pending_cloud_deletes(10).unwrap();
+        assert_eq!(pending_del.len(), 1);
+        assert_eq!(pending_del[0].sha256, sha_m1);
+        assert_eq!(pending_del[0].cloud_file_id, "drv-m1-secret");
+
+        // Export since (cursor_ts=1_600_000_002_001, mut_cursor=0) MUST include old recalled m1!
+        let delta2 = src
+            .export_history_delta_since_with_mutation_cursor(
+                "u1",
+                "dev-A",
+                1_600_000_002_001,
+                0,
+                500,
+            )
+            .unwrap();
+        assert_eq!(delta2.messages.len(), 1);
+        assert_eq!(delta2.messages[0].msg_id, "m1");
+        assert!(delta2.messages[0].is_recalled);
+        assert!(delta2.messages[0].attachment_url.is_none());
+        assert_eq!(delta2.max_message_ts_cursor, None);
+        assert!(delta2.max_mutation_ts_cursor.is_some());
+
+        // Import recall delta on dst -> overwrites m1, deletes translation & media, returns local orphan path!
+        let imp2 = dst.import_history_delta_idempotent_detailed(&delta2).unwrap();
+        assert_eq!(imp2.applied_messages, 1);
+        assert_eq!(imp2.orphaned_local_paths, vec!["blobs/aa/aa/dst_m1.enc"]);
+        let dst_m1 = dst.get_message("t1", "m1").unwrap().unwrap();
+        assert!(dst_m1.is_recalled);
+        assert!(dst_m1.attachment_url.is_none());
+        assert!(dst
+            .get_message_media_record("t1", "m1", "primary")
+            .unwrap()
+            .is_none());
+        // Remote recall evicts local blob AND queues cloud deletion for known cloud_file_id
+        let dst_obj = dst.get_media_object(&sha_m1).unwrap().unwrap();
+        assert_eq!(dst_obj.local_state, MEDIA_LOCAL_STATE_MISSING);
+        assert!(dst_obj.local_rel_path.is_none());
+        let dst_pending = dst.list_pending_cloud_deletes(10).unwrap();
+        assert_eq!(dst_pending.len(), 1);
+        assert_eq!(dst_pending[0].sha256, sha_m1);
+        assert_eq!(dst_pending[0].cloud_file_id, "drv-m1-secret");
+        dst.complete_pending_cloud_delete_for_file(&sha_m1, "drv-m1-secret")
+            .unwrap();
+        assert!(dst.get_media_object(&sha_m1).unwrap().is_none());
+        // Importing recall must NOT trigger echo re-export on dst (updated_ts stays 0)
+        let dst_echo = dst
+            .export_history_delta_since_with_mutation_cursor("u1", "dev-B", 1_600_000_002_001, 0, 500)
+            .unwrap();
+        assert!(dst_echo.messages.is_empty());
+
+        // Re-importing OLD pre-recall delta1 on dst must NOT un-recall m1 OR re-link cloud_media!
+        let imp_old = dst.import_history_delta_idempotent_detailed(&delta1).unwrap();
+        assert_eq!(imp_old.applied_messages, 0);
+        assert!(dst.get_message("t1", "m1").unwrap().unwrap().is_recalled);
+        assert!(dst
+            .get_message_media_record("t1", "m1", "primary")
+            .unwrap()
+            .is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_message_and_delete_thread_tombstones_sync_prevent_resurrection_and_handle_rejoin() {
+        let dir = std::env::temp_dir().join(format!(
+            "teza-store-tombstones-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut src = MessageStore::open(&dir.join("src.db")).unwrap();
+        let dst_in_order = MessageStore::open(&dir.join("dst_in_order.db")).unwrap();
+        let dst_ooo = MessageStore::open(&dir.join("dst_ooo.db")).unwrap();
+
+        let make_thread = |id: &str, title: &str, last_ts: i64| ThreadDto {
+            id: id.into(),
+            title: title.into(),
+            avatar: String::new(),
+            kind: ThreadKind::Group,
+            last_preview: "hi".into(),
+            last_ts,
+            unread_count: 0,
+            is_pinned: false,
+            is_muted: false,
+            last_read_in_ts: 0,
+            peer_read_ts: 0,
+            muted_until_ts: 0,
+            is_archived: false,
+        };
+        let make_msg = |tid: &str, mid: &str, text: &str, ts: i64| MessageDto {
+            msg_id: mid.into(),
+            cli_msg_id: None,
+            thread_id: tid.into(),
+            sender_id: "u1".into(),
+            sender_name: "Alice".into(),
+            text: text.into(),
+            msg_type: "chat.text".into(),
+            ts,
+            is_outgoing: false,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
+            reactions: Vec::new(),
+            attachment_url: None,
+            attachment_name: None,
+        };
+
+        src.upsert_thread(&make_thread("t_keep", "Keep", 1_600_000_010_000))
+            .unwrap();
+        src.upsert_thread(&make_thread("g_leave", "Leave Group", 1_600_000_020_000))
+            .unwrap();
+        src.save_chat_folder(&ChatFolderDto {
+            id: "f-work".into(),
+            name: "Work".into(),
+            icon: "folder".into(),
+            color: String::new(),
+            thread_ids: vec!["t_keep".into(), "g_leave".into()],
+            excluded_thread_ids: Vec::new(),
+            include_kinds: Vec::new(),
+            only_unread: false,
+            exclude_muted: false,
+            position: 0,
+            remote_label_id: None,
+        })
+        .unwrap();
+        src.upsert_message(&make_msg("t_keep", "m_keep", "keep me", 1_600_000_005_000))
+            .unwrap();
+        src.upsert_message(&make_msg("t_keep", "m_del", "delete me", 1_600_000_010_000))
+            .unwrap();
+        src.upsert_message(&make_msg("g_leave", "m_grp", "group msg", 1_600_000_020_000))
+            .unwrap();
+
+        let delta1 = src
+            .export_history_delta_since_with_mutation_cursor("u1", "dev-A", 0, 0, 500)
+            .unwrap();
+
+        // Delete m_del locally and leave g_leave
+        assert!(src.delete_message("t_keep", "m_del").unwrap());
+        let _ = src.delete_thread("g_leave").unwrap();
+
+        let delta2 = src
+            .export_history_delta_since_with_mutation_cursor(
+                "u1",
+                "dev-A",
+                1_600_000_020_001,
+                0,
+                500,
+            )
+            .unwrap();
+        assert_eq!(delta2.deleted_messages.len(), 1);
+        assert_eq!(delta2.deleted_messages[0].msg_id, "m_del");
+        assert_eq!(delta2.deleted_threads.len(), 1);
+        assert_eq!(delta2.deleted_threads[0].thread_id, "g_leave");
+        let thread_del_ts = delta2.deleted_threads[0].deleted_ts;
+
+        // 1) In-order restore (delta1 -> delta2)
+        dst_in_order
+            .import_history_delta_idempotent_detailed(&delta1)
+            .unwrap();
+        let rep2 = dst_in_order
+            .import_history_delta_idempotent_detailed(&delta2)
+            .unwrap();
+        assert_eq!(rep2.deleted_messages, 1);
+        assert_eq!(rep2.deleted_threads, 1);
+        assert!(dst_in_order.get_message("t_keep", "m_keep").unwrap().is_some());
+        assert!(dst_in_order.get_message("t_keep", "m_del").unwrap().is_none());
+        assert!(dst_in_order.get_message("g_leave", "m_grp").unwrap().is_none());
+        assert_eq!(dst_in_order.list_threads(FolderFilter::All).unwrap().len(), 1);
+        assert_eq!(
+            dst_in_order.list_chat_folders().unwrap()[0].thread_ids,
+            vec!["t_keep".to_string()]
+        );
+        // Must not echo imported tombstones back out
+        let echo_batch = dst_in_order
+            .export_history_delta_since_with_mutation_cursor(
+                "u1",
+                "dev-B",
+                1_600_000_020_001,
+                0,
+                500,
+            )
+            .unwrap();
+        assert!(echo_batch.deleted_messages.is_empty());
+        assert!(echo_batch.deleted_threads.is_empty());
+
+        // 2) Out-of-order restore (delta2 -> delta1) MUST converge to exact same state!
+        dst_ooo
+            .import_history_delta_idempotent_detailed(&delta2)
+            .unwrap();
+        dst_ooo
+            .import_history_delta_idempotent_detailed(&delta1)
+            .unwrap();
+        assert!(dst_ooo.get_message("t_keep", "m_keep").unwrap().is_some());
+        assert!(dst_ooo.get_message("t_keep", "m_del").unwrap().is_none());
+        assert!(dst_ooo.get_message("g_leave", "m_grp").unwrap().is_none());
+        assert_eq!(dst_ooo.list_threads(FolderFilter::All).unwrap().len(), 1);
+        assert_eq!(
+            dst_ooo.list_chat_folders().unwrap()[0].thread_ids,
+            vec!["t_keep".to_string()]
+        );
+
+        // 3) Re-joining g_leave later (timestamps strictly after thread_del_ts) MUST succeed while keeping old m_grp blocked!
+        let rejoin_ts = thread_del_ts + 5_000;
+        let delta3 = HistoryDeltaBatch {
+            version: HistoryDeltaBatch::CURRENT_VERSION,
+            uid: "u1".into(),
+            device_id: "dev-A".into(),
+            exported_ts: rejoin_ts,
+            threads: vec![make_thread("g_leave", "Leave Group (Rejoined)", rejoin_ts)],
+            messages: vec![
+                make_msg("g_leave", "m_grp", "stale pre-leave msg", 1_600_000_020_000),
+                make_msg("g_leave", "m_rejoin", "welcome back!", rejoin_ts),
+            ],
+            folders: Vec::new(),
+            thread_folders: Vec::new(),
+            translations: Vec::new(),
+            cloud_media: Vec::new(),
+            deleted_messages: Vec::new(),
+            deleted_threads: Vec::new(),
+            messages_truncated: false,
+            cloud_media_truncated: false,
+            mutations_truncated: false,
+            max_message_ts_cursor: None,
+            max_cloud_media_cursor_ts: None,
+            max_mutation_ts_cursor: None,
+        };
+        dst_ooo
+            .import_history_delta_idempotent_detailed(&delta3)
+            .unwrap();
+        assert!(dst_ooo.get_message("g_leave", "m_grp").unwrap().is_none());
+        assert_eq!(
+            dst_ooo
+                .get_message("g_leave", "m_rejoin")
+                .unwrap()
+                .unwrap()
+                .text,
+            "welcome back!"
+        );
+        assert_eq!(dst_ooo.list_threads(FolderFilter::All).unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_cloud_delete_queue_respects_shared_blobs_relinks_and_remote_recall_upsert() {
+        let dir = std::env::temp_dir().join(format!(
+            "teza-store-cloud-del-queue-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = MessageStore::open(&dir.join("q.db")).unwrap();
+
+        let sha_shared = "e".repeat(64);
+        let sha_remote = "f".repeat(64);
+        for (sha, cid, rel) in [
+            (&sha_shared, "drv-shared", "blobs/ee/ee/shared.enc"),
+            (&sha_remote, "drv-remote", "blobs/ff/ff/remote.enc"),
+        ] {
+            store
+                .upsert_media_object(&MediaObjectRecord {
+                    sha256: sha.clone(),
+                    kind: "image".into(),
+                    mime: "image/png".into(),
+                    size_bytes: 12_345,
+                    thumb_sha256: None,
+                    width: None,
+                    height: None,
+                    duration_ms: None,
+                    local_state: MEDIA_LOCAL_STATE_LOCAL,
+                    local_rel_path: Some(rel.into()),
+                    is_encrypted: true,
+                    pin_count: 0,
+                    created_ts: 1_000,
+                    last_accessed_ts: 1_000,
+                    cloud_provider: Some("gdrive".into()),
+                    cloud_file_id: Some(cid.into()),
+                    cloud_encrypted: true,
+                    cloud_key_ver: 1,
+                    cloud_synced_ts: Some(2_000),
+                })
+                .unwrap();
+        }
+
+        let make_link = |mid: &str, sha: &str| MessageMediaRecord {
+            thread_id: "t1".into(),
+            msg_id: mid.into(),
+            variant: "primary".into(),
+            url_hash: format!("uh-{mid}"),
+            sha256: Some(sha.into()),
+            original_name: None,
+            saved_user_path: None,
+            cdn_status: MEDIA_CDN_STATUS_OK,
+            updated_ts: 2_000,
+        };
+        store.link_message_media(&make_link("m1", &sha_shared)).unwrap();
+        store.link_message_media(&make_link("m2", &sha_shared)).unwrap();
+        store.link_message_media(&make_link("m_rem", &sha_remote)).unwrap();
+
+        // Removing m1 keeps sha_shared referenced by m2 -> NOT queued
+        let _ = store.cleanup_orphaned_media_for_msg("t1", "m1").unwrap();
+        assert!(store.list_pending_cloud_deletes(10).unwrap().is_empty());
+
+        // Removing m2 orphans sha_shared -> queued!
+        let _ = store.cleanup_orphaned_media_for_msg("t1", "m2").unwrap();
+        let queued = store.list_pending_cloud_deletes(10).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].sha256, sha_shared);
+        assert!(store.is_media_unreferenced(&sha_shared).unwrap());
+
+        // Re-linking sha_shared to m3 cancels the queued cloud delete automatically!
+        store.link_message_media(&make_link("m3", &sha_shared)).unwrap();
+        assert!(store.list_pending_cloud_deletes(10).unwrap().is_empty());
+        assert!(!store.is_media_unreferenced(&sha_shared).unwrap());
+
+        // Remote recall via upsert_message_returning_orphans cleans local blob AND queues cloud delete!
+        let mut msg_rem = MessageDto {
+            msg_id: "m_rem".into(),
+            cli_msg_id: None,
+            thread_id: "t1".into(),
+            sender_id: "u2".into(),
+            sender_name: "Bob".into(),
+            text: "photo".into(),
+            msg_type: "chat.photo".into(),
+            ts: 1_500,
+            is_outgoing: false,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
+            reactions: Vec::new(),
+            attachment_url: Some("https://f10-zpc.zdn.vn/r.png".into()),
+            attachment_name: Some("r.png".into()),
+        };
+        store.upsert_message(&msg_rem).unwrap();
+        msg_rem.is_recalled = true;
+        msg_rem.text = "[Tin nhắn đã thu hồi]".into();
+        let orphans = store.upsert_message_returning_orphans(&msg_rem).unwrap();
+        assert_eq!(orphans, vec!["blobs/ff/ff/remote.enc"]);
+
+        let queued2 = store.list_pending_cloud_deletes(10).unwrap();
+        assert_eq!(queued2.len(), 1);
+        assert_eq!(queued2[0].sha256, sha_remote);
+        assert_eq!(queued2[0].cloud_file_id, "drv-remote");
+
+        // Completing pending cloud delete removes queue row & drops unreferenced evicted media_objects row
+        store.complete_pending_cloud_delete(&sha_remote).unwrap();
+        assert!(store.list_pending_cloud_deletes(10).unwrap().is_empty());
+        assert!(store.get_media_object(&sha_remote).unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cloud_media_uses_mutation_cursor_and_monotonic_mutation_seq_never_collides() {
+        let dir = std::env::temp_dir().join(format!(
+            "teza-store-cm-mut-cursor-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = MessageStore::open(&dir.join("cm_mut.db")).unwrap();
+
+        let make_msg = |mid: &str, ts: i64| MessageDto {
+            msg_id: mid.into(),
+            cli_msg_id: None,
+            thread_id: "t1".into(),
+            sender_id: "u1".into(),
+            sender_name: "Alice".into(),
+            text: format!("msg {mid}"),
+            msg_type: "chat.photo".into(),
+            ts,
+            is_outgoing: true,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
+            reactions: Vec::new(),
+            attachment_url: Some("https://f10-zpc.zdn.vn/a.jpg".into()),
+            attachment_name: Some("a.jpg".into()),
+        };
+        store.upsert_message(&make_msg("m1", 1_600_000_001_000)).unwrap();
+
+        let sha = "a".repeat(64);
+        store
+            .upsert_media_object(&MediaObjectRecord {
+                sha256: sha.clone(),
+                kind: "image".into(),
+                mime: "image/jpeg".into(),
+                size_bytes: 1234,
+                thumb_sha256: None,
+                width: None,
+                height: None,
+                duration_ms: None,
+                local_state: MEDIA_LOCAL_STATE_LOCAL,
+                local_rel_path: Some("blobs/aa/aa/a.enc".into()),
+                is_encrypted: true,
+                pin_count: 0,
+                created_ts: 1_500_000_000_000,
+                last_accessed_ts: 1_500_000_000_000,
+                cloud_provider: None,
+                cloud_file_id: None,
+                cloud_encrypted: true,
+                cloud_key_ver: 1,
+                cloud_synced_ts: None,
+            })
+            .unwrap();
+        store
+            .link_message_media(&MessageMediaRecord {
+                thread_id: "t1".into(),
+                msg_id: "m1".into(),
+                variant: "primary".into(),
+                url_hash: "uh-a".into(),
+                sha256: Some(sha.clone()),
+                original_name: Some("a.jpg".into()),
+                saved_user_path: None,
+                cdn_status: MEDIA_CDN_STATUS_OK,
+                updated_ts: 1_500_000_000_000,
+            })
+            .unwrap();
+
+        // Simulate PC clock behind server cursor (`since_ts` far ahead of `cloud_synced_ts`):
+        // `mark_media_cloud_synced` allocates monotonic ts >= now_ms and `cloud_media` filters by `since_mutation_ts`!
+        store
+            .mark_media_cloud_synced(&sha, "gdrive", "drv-a", 1, 1_500_000_000_500)
+            .unwrap();
+        let synced_ts = store
+            .get_media_object(&sha)
+            .unwrap()
+            .unwrap()
+            .cloud_synced_ts
+            .unwrap();
+        assert!(synced_ts > 1_500_000_000_500);
+
+        // Even when server `since_ts` is far ahead of `synced_ts`, `since_mutation_ts = 0` STILL exports cloud_media!
+        let batch = store
+            .export_history_delta_since_with_mutation_cursor(
+                "u1",
+                "dev-A",
+                synced_ts + 999_999_999,
+                0,
+                500,
+            )
+            .unwrap();
+        assert!(batch.messages.is_empty());
+        assert_eq!(batch.max_message_ts_cursor, None);
+        assert_eq!(batch.cloud_media.len(), 1);
+        assert_eq!(batch.max_cloud_media_cursor_ts, Some(synced_ts));
+
+        // Once mutation cursor advances past `synced_ts`, `cloud_media` is NOT re-exported;
+        // also `mark_media_cdn_status` must NOT bump `updated_ts`!
+        store
+            .mark_media_cdn_status("uh-a", MEDIA_CDN_STATUS_EXPIRED)
+            .unwrap();
+        let batch_after = store
+            .export_history_delta_since_with_mutation_cursor("u1", "dev-A", 0, synced_ts + 1, 500)
+            .unwrap();
+        assert!(batch_after.cloud_media.is_empty());
+
+        // Strictly monotonic `next_local_mutation_ts`: rapid calls in the same ms (and even when
+        // wall clock is behind `gdrive_last_mutation_sync_ts`) never collide!
+        store
+            .set_gdrive_last_mutation_sync_ts(synced_ts + 10_000_000)
+            .unwrap();
+        let m1 = store.next_local_mutation_ts().unwrap();
+        let m2 = store.next_local_mutation_ts().unwrap();
+        let m3 = store.next_local_mutation_ts().unwrap();
+        assert!(m1 >= synced_ts + 10_000_000);
+        assert_eq!(m2, m1 + 1);
+        assert_eq!(m3, m2 + 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upsert_message_prevents_unrecall_and_sets_insert_updated_ts_for_backfill_and_recall() {
+        let dir = std::env::temp_dir().join(format!(
+            "teza-store-upsert-recall-backfill-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut store = MessageStore::open(&dir.join("ur.db")).unwrap();
+
+        let orig = MessageDto {
+            msg_id: "m1".into(),
+            cli_msg_id: None,
+            thread_id: "t1".into(),
+            sender_id: "u1".into(),
+            sender_name: "Alice".into(),
+            text: "Top secret payload".into(),
+            msg_type: "chat.photo".into(),
+            ts: 1_600_000_010_000,
+            is_outgoing: true,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
+            reactions: Vec::new(),
+            attachment_url: Some("https://f10-zpc.zdn.vn/secret.jpg".into()),
+            attachment_name: Some("secret.jpg".into()),
+        };
+        store.upsert_message(&orig).unwrap();
+        store.mark_recalled("t1", "m1").unwrap();
+
+        let recalled_before = store.get_message("t1", "m1").unwrap().unwrap();
+        assert!(recalled_before.is_recalled);
+        let mut_cursor_after_recall = store
+            .export_history_delta_since_with_mutation_cursor("u1", "dev-A", 1_600_000_020_000, 0, 500)
+            .unwrap()
+            .max_mutation_ts_cursor
+            .unwrap();
+
+        // Stale non-recalled packet arrives -> MUST NOT un-recall, restore text/attachments, corrupt FTS, or bump updated_ts!
+        store.upsert_message(&orig).unwrap();
+        let after_stale = store.get_message("t1", "m1").unwrap().unwrap();
+        assert!(after_stale.is_recalled);
+        assert_eq!(after_stale.text, "[Tin nhắn đã thu hồi]");
+        assert!(after_stale.attachment_url.is_none());
+        assert!(after_stale.attachment_name.is_none());
+        assert!(store.search_messages("Top secret", 10).unwrap().is_empty());
+        let no_echo = store
+            .export_history_delta_since_with_mutation_cursor(
+                "u1",
+                "dev-A",
+                1_600_000_020_000,
+                mut_cursor_after_recall + 1,
+                500,
+            )
+            .unwrap();
+        assert!(no_echo.messages.is_empty());
+
+        // Set `gdrive_last_history_sync_ts` ahead, then insert a scrolled-back old message AND a brand-new recalled message:
+        // both MUST receive `updated_ts > 0` on INSERT so they export via `since_mutation_ts`!
+        store
+            .set_gdrive_last_history_sync_ts(1_600_000_050_000)
+            .unwrap();
+        let mut backfilled = orig.clone();
+        backfilled.msg_id = "m_old_backfill".into();
+        backfilled.text = "Scrolled back message".into();
+        backfilled.ts = 1_600_000_001_000;
+        store.upsert_message(&backfilled).unwrap();
+
+        let mut new_recalled = orig.clone();
+        new_recalled.msg_id = "m_new_recalled".into();
+        new_recalled.text = "[Tin nhắn đã thu hồi]".into();
+        new_recalled.ts = 1_600_000_002_000;
+        new_recalled.is_recalled = true;
+        store.upsert_message(&new_recalled).unwrap();
+
+        let exported = store
+            .export_history_delta_since_with_mutation_cursor(
+                "u1",
+                "dev-A",
+                1_600_000_050_000,
+                mut_cursor_after_recall + 1,
+                500,
+            )
+            .unwrap();
+        let ids: Vec<&str> = exported.messages.iter().map(|m| m.msg_id.as_str()).collect();
+        assert_eq!(ids, vec!["m_old_backfill", "m_new_recalled"]);
+        assert!(exported.messages[1].is_recalled);
+        assert!(exported.messages[1].attachment_url.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_thread_anchors_to_server_clock_and_step5_blocks_zombie_cloud_media() {
+        let dir = std::env::temp_dir().join(format!(
+            "teza-store-thread-tomb-skew-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut src = MessageStore::open(&dir.join("src.db")).unwrap();
+        let dst = MessageStore::open(&dir.join("dst.db")).unwrap();
+
+        // Thread with server timestamps far behind current PC wall-clock (simulating PC clock lead!)
+        src.upsert_thread(&ThreadDto {
+            id: "g1".into(),
+            title: "Team Chat".into(),
+            avatar: String::new(),
+            kind: ThreadKind::Group,
+            last_preview: "old".into(),
+            last_ts: 1_600_000_010_000,
+            unread_count: 0,
+            is_pinned: false,
+            is_muted: false,
+            last_read_in_ts: 0,
+            peer_read_ts: 0,
+            muted_until_ts: 0,
+            is_archived: false,
+        })
+        .unwrap();
+        src.upsert_message(&MessageDto {
+            msg_id: "m_old".into(),
+            cli_msg_id: None,
+            thread_id: "g1".into(),
+            sender_id: "u1".into(),
+            sender_name: "Alice".into(),
+            text: "old".into(),
+            msg_type: "chat.text".into(),
+            ts: 1_600_000_010_000,
+            is_outgoing: false,
+            is_recalled: false,
+            is_pinned: false,
+            quote: None,
+            reactions: Vec::new(),
+            attachment_url: None,
+            attachment_name: None,
+        })
+        .unwrap();
+
+        let _ = src.delete_thread("g1").unwrap();
+        let tomb_batch = src
+            .export_history_delta_since_with_mutation_cursor("u1", "dev-A", 1_600_000_020_000, 0, 500)
+            .unwrap();
+        assert_eq!(tomb_batch.deleted_threads.len(), 1);
+        // MUST anchor to server clock 1_600_000_010_000, NOT PC wall-clock (~1.79e12)!
+        assert_eq!(tomb_batch.deleted_threads[0].deleted_ts, 1_600_000_010_000);
+
+        dst.import_history_delta_idempotent_detailed(&tomb_batch)
+            .unwrap();
+
+        // Post-rejoin message at server_ts = 1_600_000_015_000 (still behind PC wall-clock!) MUST survive,
+        // while a late cloud_media record (with PC wall-clock cloud_synced_ts > del_ts!) for deleted `m_old`
+        // MUST be rejected (no zombie message_media/media_objects resurrection)!
+        let sha_zombie = "9".repeat(64);
+        let late_batch = HistoryDeltaBatch {
+            version: HistoryDeltaBatch::CURRENT_VERSION,
+            uid: "u1".into(),
+            device_id: "dev-B".into(),
+            exported_ts: 1_900_000_000_000,
+            threads: vec![ThreadDto {
+                id: "g1".into(),
+                title: "Team Chat".into(),
+                avatar: String::new(),
+                kind: ThreadKind::Group,
+                last_preview: "rejoined".into(),
+                last_ts: 1_600_000_015_000,
+                unread_count: 1,
+                is_pinned: false,
+                is_muted: false,
+                last_read_in_ts: 0,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
+            }],
+            messages: vec![MessageDto {
+                msg_id: "m_rejoin".into(),
+                cli_msg_id: None,
+                thread_id: "g1".into(),
+                sender_id: "u2".into(),
+                sender_name: "Bob".into(),
+                text: "rejoined".into(),
+                msg_type: "chat.text".into(),
+                ts: 1_600_000_015_000,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            }],
+            folders: Vec::new(),
+            thread_folders: Vec::new(),
+            translations: Vec::new(),
+            cloud_media: vec![HistoryCloudMediaRecord {
+                thread_id: "g1".into(),
+                msg_id: "m_old".into(),
+                variant: "primary".into(),
+                url_hash: "uh-zombie".into(),
+                sha256: sha_zombie.clone(),
+                kind: "image".into(),
+                mime: "image/jpeg".into(),
+                size_bytes: 4096,
+                original_name: Some("zombie.jpg".into()),
+                cloud_provider: "gdrive".into(),
+                cloud_file_id: "drv-zombie".into(),
+                cloud_key_ver: 1,
+                cloud_synced_ts: 1_900_000_000_000,
+            }],
+            deleted_messages: Vec::new(),
+            deleted_threads: Vec::new(),
+            messages_truncated: false,
+            cloud_media_truncated: false,
+            mutations_truncated: false,
+            max_message_ts_cursor: None,
+            max_cloud_media_cursor_ts: None,
+            max_mutation_ts_cursor: None,
+        };
+        dst.import_history_delta_idempotent_detailed(&late_batch)
+            .unwrap();
+        assert!(dst.get_message("g1", "m_rejoin").unwrap().is_some());
+        assert!(dst.get_message("g1", "m_old").unwrap().is_none());
+        assert!(dst
+            .get_message_media_record("g1", "m_old", "primary")
+            .unwrap()
+            .is_none());
+        assert!(dst.get_media_object(&sha_zombie).unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cloud_delete_backoff_poison_drop_qualified_complete_upload_backoff_and_vault_reset() {
+        let dir = std::env::temp_dir().join(format!(
+            "teza-store-queue-backoff-reset-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = MessageStore::open(&dir.join("qbr.db")).unwrap();
+
+        let sha_poison = "1".repeat(64);
+        let sha_ok = "2".repeat(64);
+        for (sha, cid, rel) in [
+            (&sha_poison, "drv-poison", "blobs/11/11/p.enc"),
+            (&sha_ok, "drv-ok", "blobs/22/22/o.enc"),
+        ] {
+            store
+                .upsert_media_object(&MediaObjectRecord {
+                    sha256: sha.clone(),
+                    kind: "image".into(),
+                    mime: "image/jpeg".into(),
+                    size_bytes: 1000,
+                    thumb_sha256: None,
+                    width: None,
+                    height: None,
+                    duration_ms: None,
+                    local_state: MEDIA_LOCAL_STATE_LOCAL,
+                    local_rel_path: Some(rel.into()),
+                    is_encrypted: true,
+                    pin_count: 0,
+                    created_ts: 1_000,
+                    last_accessed_ts: 1_000,
+                    cloud_provider: Some("gdrive".into()),
+                    cloud_file_id: Some(cid.into()),
+                    cloud_encrypted: true,
+                    cloud_key_ver: 1,
+                    cloud_synced_ts: Some(1_000),
+                })
+                .unwrap();
+            store
+                .link_message_media(&MessageMediaRecord {
+                    thread_id: "t1".into(),
+                    msg_id: format!("m-{cid}"),
+                    variant: "primary".into(),
+                    url_hash: format!("uh-{cid}"),
+                    sha256: Some(sha.clone()),
+                    original_name: None,
+                    saved_user_path: None,
+                    cdn_status: MEDIA_CDN_STATUS_OK,
+                    updated_ts: 1_000,
+                })
+                .unwrap();
+            let _ = store
+                .cleanup_orphaned_media_for_msg("t1", &format!("m-{cid}"))
+                .unwrap();
+        }
+
+        // Before any history pull, `require_history_pull = true` returns empty!
+        let now = chrono::Utc::now().timestamp_millis();
+        assert!(store
+            .list_ready_pending_cloud_deletes(10, true, 0, now)
+            .unwrap()
+            .is_empty());
+
+        // After history pull completes, both items become ready
+        store.record_gdrive_history_pull_completed(now).unwrap();
+        let ready = store
+            .list_ready_pending_cloud_deletes(10, true, 0, now)
+            .unwrap();
+        assert_eq!(ready.len(), 2);
+
+        // Recording 1st permanent 403 failure backs off `sha_poison`, unblocking `sha_ok` immediately!
+        assert!(!store
+            .record_pending_cloud_delete_failure(&sha_poison, "drv-poison", true, now)
+            .unwrap());
+        let ready_after_1 = store
+            .list_ready_pending_cloud_deletes(10, true, 0, now)
+            .unwrap();
+        assert_eq!(ready_after_1.len(), 1);
+        assert_eq!(ready_after_1[0].sha256, sha_ok);
+
+        // Attempts 2 and 3 drop permanent poison row completely
+        assert!(!store
+            .record_pending_cloud_delete_failure(&sha_poison, "drv-poison", true, now + 120_000)
+            .unwrap());
+        assert!(store
+            .record_pending_cloud_delete_failure(&sha_poison, "drv-poison", true, now + 500_000)
+            .unwrap());
+        assert!(store
+            .list_ready_pending_cloud_deletes(10, true, 0, now + 10_000_000)
+            .unwrap()
+            .iter()
+            .all(|r| r.sha256 != sha_poison));
+
+        // Qualified `complete_pending_cloud_delete_for_file` MUST NOT clobber a newer `cloud_file_id`!
+        store
+            .mark_media_cloud_synced(&sha_ok, "gdrive", "drv-ok-newer", 1, now)
+            .unwrap();
+        store
+            .complete_pending_cloud_delete_for_file(&sha_ok, "drv-ok")
+            .unwrap();
+        assert_eq!(
+            store
+                .get_media_object(&sha_ok)
+                .unwrap()
+                .unwrap()
+                .cloud_file_id
+                .as_deref(),
+            Some("drv-ok-newer")
+        );
+
+        // Pending upload backoff isolates failing local blob so healthy newer blob is returned first
+        let sha_bad_up = "3".repeat(64);
+        let sha_good_up = "4".repeat(64);
+        for (sha, created_ts) in [(&sha_bad_up, 1_000i64), (&sha_good_up, 2_000i64)] {
+            store
+                .upsert_media_object(&MediaObjectRecord {
+                    sha256: sha.clone(),
+                    kind: "image".into(),
+                    mime: "image/jpeg".into(),
+                    size_bytes: 512,
+                    thumb_sha256: None,
+                    width: None,
+                    height: None,
+                    duration_ms: None,
+                    local_state: MEDIA_LOCAL_STATE_LOCAL,
+                    local_rel_path: Some(format!("blobs/33/33/{sha}.enc")),
+                    is_encrypted: true,
+                    pin_count: 0,
+                    created_ts,
+                    last_accessed_ts: created_ts,
+                    cloud_provider: None,
+                    cloud_file_id: None,
+                    cloud_encrypted: true,
+                    cloud_key_ver: 1,
+                    cloud_synced_ts: None,
+                })
+                .unwrap();
+        }
+        store
+            .record_media_cloud_upload_failure(&sha_bad_up, now)
+            .unwrap();
+        let pending_up = store.list_pending_cloud_uploads(10).unwrap();
+        assert_eq!(pending_up.len(), 1);
+        assert_eq!(pending_up[0].sha256, sha_good_up);
+
+        // Vault recovery reset clears stale cloud links (preserving local blobs), drops orphan
+        // cloud-only rows, clears applied deltas, and resets sync cursors
+        store
+            .mark_media_cloud_synced(&sha_good_up, "gdrive", "drv-good-old", 1, now)
+            .unwrap();
+        store.set_gdrive_last_history_sync_ts(999).unwrap();
+        store.set_gdrive_last_mutation_sync_ts(888).unwrap();
+        store.mark_delta_applied("d1", now).unwrap();
+        store
+            .reset_gdrive_sync_state_for_vault_recovery(true, true)
+            .unwrap();
+        assert_eq!(store.get_gdrive_last_history_sync_ts().unwrap(), Some(0));
+        assert_eq!(store.get_gdrive_last_mutation_sync_ts().unwrap(), Some(0));
+        assert!(!store.is_delta_applied("d1").unwrap());
+        assert!(store.get_media_object(&sha_ok).unwrap().is_none());
+        let good_after = store.get_media_object(&sha_good_up).unwrap().unwrap();
+        assert_eq!(good_after.local_state, MEDIA_LOCAL_STATE_LOCAL);
+        assert!(good_after.cloud_file_id.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_recalled_backfill_and_ai_session_validation_trim_same_ms_title() {
+        let dir = std::env::temp_dir().join(format!(
+            "teza-store-backfill-ai-52-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("bf.db");
+
+        {
+            let mut store = MessageStore::open(&db_path).unwrap();
+            store
+                .upsert_message(&MessageDto {
+                    msg_id: "m_rec".into(),
+                    cli_msg_id: None,
+                    thread_id: "t1".into(),
+                    sender_id: "u1".into(),
+                    sender_name: "Alice".into(),
+                    text: "[Tin nhắn đã thu hồi]".into(),
+                    msg_type: "chat.text".into(),
+                    ts: 1_600_000_001_000,
+                    is_outgoing: true,
+                    is_recalled: true,
+                    is_pinned: false,
+                    quote: None,
+                    reactions: Vec::new(),
+                    attachment_url: None,
+                    attachment_name: None,
+                })
+                .unwrap();
+            // Simulate a crash between `ALTER TABLE messages ADD COLUMN updated_ts` and the backfill UPDATE:
+            store
+                .conn
+                .execute(
+                    "UPDATE messages SET updated_ts = 0 WHERE msg_id = 'm_rec'",
+                    [],
+                )
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "DELETE FROM store_meta WHERE k = 'backfilled_recalled_updated_ts_v1'",
+                    [],
+                )
+                .unwrap();
+        }
+
+        // Reopening MUST atomically detect missing sentinel and backfill `updated_ts > 0`!
+        let store = MessageStore::open(&db_path).unwrap();
+        let upd_ts: i64 = store
+            .conn
+            .query_row(
+                "SELECT updated_ts FROM messages WHERE msg_id = 'm_rec'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(upd_ts > 0);
+
+        // P3 #52: `insert_ai_message` rejects >64-char session_id; `list_ai_messages`/`clear_ai_messages` trim;
+        // same-ms model reply derives title from legacy un-backfilled user message at identical ms!
+        let too_long_sid = "s".repeat(65);
+        assert!(store
+            .insert_ai_message(&AiStoredMessageDto {
+                id: "ai-long".into(),
+                session_id: too_long_sid,
+                role: "user".into(),
+                content: "hello".into(),
+                model: "m".into(),
+                backend: "cloud".into(),
+                ts: 1_700_000_000_000,
+            })
+            .is_err());
+
+        // Seed an un-backfilled legacy user row in `ai_messages` without an `ai_sessions` row,
+        // then insert a `model` reply sharing the EXACT same millisecond.
+        let enc_legacy_user = store
+            .cipher
+            .encrypt_str(&ai_msg_aad("u-same-ms"), "Hỏi về lịch họp tuần sau")
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO ai_messages (id, session_id, role, content, model, backend, ts)
+                 VALUES ('u-same-ms', 'legacy-same', 'user', ?1, 'm', 'cloud', 1700000005000)",
+                params![enc_legacy_user],
+            )
+            .unwrap();
+        store
+            .insert_ai_message(&AiStoredMessageDto {
+                id: "m-same-ms".into(),
+                session_id: "  legacy-same  ".into(),
+                role: "model".into(),
+                content: "Lịch họp vào thứ Hai lúc 9h.".into(),
+                model: "m".into(),
+                backend: "cloud".into(),
+                ts: 1_700_000_005_000,
+            })
+            .unwrap();
+
+        let sessions = store.list_ai_sessions(10).unwrap();
+        let sess = sessions.iter().find(|s| s.id == "legacy-same").unwrap();
+        assert_eq!(sess.title, "Hỏi về lịch họp tuần sau");
+
+        let listed = store.list_ai_messages("  legacy-same  ", 10).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(store.clear_ai_messages("  legacy-same  ").unwrap(), 2);
+        assert!(store.list_ai_messages("legacy-same", 10).unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct MockUsEastern2026;
+
+    impl MockUsEastern2026 {
+        fn est() -> chrono::FixedOffset {
+            chrono::FixedOffset::west_opt(5 * 3600).unwrap()
+        }
+        fn edt() -> chrono::FixedOffset {
+            chrono::FixedOffset::west_opt(4 * 3600).unwrap()
+        }
+    }
+
+    impl TimeZone for MockUsEastern2026 {
+        type Offset = chrono::FixedOffset;
+
+        fn from_offset(_offset: &Self::Offset) -> Self {
+            MockUsEastern2026
+        }
+
+        fn offset_from_local_date(
+            &self,
+            local: &NaiveDate,
+        ) -> chrono::LocalResult<Self::Offset> {
+            let start = NaiveDate::from_ymd_opt(2026, 3, 8).unwrap();
+            let end = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+            if *local >= start && *local < end {
+                chrono::LocalResult::Single(Self::edt())
+            } else {
+                chrono::LocalResult::Single(Self::est())
+            }
+        }
+
+        fn offset_from_local_datetime(
+            &self,
+            local: &NaiveDateTime,
+        ) -> chrono::LocalResult<Self::Offset> {
+            let spring_start = NaiveDate::from_ymd_opt(2026, 3, 8)
+                .unwrap()
+                .and_hms_opt(2, 0, 0)
+                .unwrap();
+            let spring_end = NaiveDate::from_ymd_opt(2026, 3, 8)
+                .unwrap()
+                .and_hms_opt(3, 0, 0)
+                .unwrap();
+            let fall_start = NaiveDate::from_ymd_opt(2026, 11, 1)
+                .unwrap()
+                .and_hms_opt(1, 0, 0)
+                .unwrap();
+            let fall_end = NaiveDate::from_ymd_opt(2026, 11, 1)
+                .unwrap()
+                .and_hms_opt(2, 0, 0)
+                .unwrap();
+
+            if *local < spring_start {
+                chrono::LocalResult::Single(Self::est())
+            } else if *local < spring_end {
+                chrono::LocalResult::None
+            } else if *local < fall_start {
+                chrono::LocalResult::Single(Self::edt())
+            } else if *local < fall_end {
+                chrono::LocalResult::Ambiguous(Self::edt(), Self::est())
+            } else {
+                chrono::LocalResult::Single(Self::est())
+            }
+        }
+
+        fn offset_from_utc_date(&self, utc: &NaiveDate) -> Self::Offset {
+            let start = NaiveDate::from_ymd_opt(2026, 3, 8).unwrap();
+            let end = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+            if *utc >= start && *utc < end {
+                Self::edt()
+            } else {
+                Self::est()
+            }
+        }
+
+        fn offset_from_utc_datetime(&self, utc: &NaiveDateTime) -> Self::Offset {
+            let spring_utc = NaiveDate::from_ymd_opt(2026, 3, 8)
+                .unwrap()
+                .and_hms_opt(7, 0, 0)
+                .unwrap();
+            let fall_utc = NaiveDate::from_ymd_opt(2026, 11, 1)
+                .unwrap()
+                .and_hms_opt(6, 0, 0)
+                .unwrap();
+            if *utc >= spring_utc && *utc < fall_utc {
+                Self::edt()
+            } else {
+                Self::est()
+            }
+        }
+    }
+
+    #[test]
+    fn compute_next_occurrence_preserves_anchor_day_utc_plus_7_and_dst_wall_clock() {
+        let vn = chrono::FixedOffset::east_opt(7 * 3600).unwrap();
+
+        // Bug #8 (Vietnam UTC+7 1st-of-month): Mar 1 01:00 +07:00 (= Feb 28 18:00Z) MUST roll
+        // to Apr 1 01:00 +07:00, NEVER Mar 29!
+        let mar1_vn = DateTime::parse_from_rfc3339("2026-03-01T01:00:00+07:00")
+            .unwrap()
+            .timestamp_millis();
+        let apr1_vn = DateTime::parse_from_rfc3339("2026-04-01T01:00:00+07:00")
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            compute_next_occurrence_in_tz(&vn, mar1_vn, Some(1), "monthly", mar1_vn),
+            Some(apr1_vn)
+        );
+        // Even with anchor_day = None, derives day 1 in +07:00 (not Feb 28 in UTC!)
+        assert_eq!(
+            compute_next_occurrence_in_tz(&vn, mar1_vn, None, "monthly", mar1_vn),
+            Some(apr1_vn)
+        );
+
+        // May 1 06:00 +07:00 (= Apr 30 23:00Z) MUST roll to Jun 1 06:00 +07:00, NEVER May 31!
+        let may1_vn = DateTime::parse_from_rfc3339("2026-05-01T06:00:00+07:00")
+            .unwrap()
+            .timestamp_millis();
+        let jun1_vn = DateTime::parse_from_rfc3339("2026-06-01T06:00:00+07:00")
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            compute_next_occurrence_in_tz(&vn, may1_vn, Some(1), "monthly", may1_vn),
+            Some(jun1_vn)
+        );
+
+        // Bug #8 (anchor_day = 31): Jan 31 -> Feb 28 -> Mar 31 -> Apr 30 -> May 31 (no drift!)
+        let jan31_vn = DateTime::parse_from_rfc3339("2026-01-31T09:30:00+07:00")
+            .unwrap()
+            .timestamp_millis();
+        let feb28_vn = DateTime::parse_from_rfc3339("2026-02-28T09:30:00+07:00")
+            .unwrap()
+            .timestamp_millis();
+        let mar31_vn = DateTime::parse_from_rfc3339("2026-03-31T09:30:00+07:00")
+            .unwrap()
+            .timestamp_millis();
+        let apr30_vn = DateTime::parse_from_rfc3339("2026-04-30T09:30:00+07:00")
+            .unwrap()
+            .timestamp_millis();
+        let may31_vn = DateTime::parse_from_rfc3339("2026-05-31T09:30:00+07:00")
+            .unwrap()
+            .timestamp_millis();
+
+        assert_eq!(
+            compute_next_occurrence_in_tz(&vn, jan31_vn, Some(31), "monthly", jan31_vn),
+            Some(feb28_vn)
+        );
+        assert_eq!(
+            compute_next_occurrence_in_tz(&vn, feb28_vn, Some(31), "monthly", feb28_vn),
+            Some(mar31_vn)
+        );
+        assert_eq!(
+            compute_next_occurrence_in_tz(&vn, mar31_vn, Some(31), "monthly", mar31_vn),
+            Some(apr30_vn)
+        );
+        assert_eq!(
+            compute_next_occurrence_in_tz(&vn, apr30_vn, Some(31), "monthly", apr30_vn),
+            Some(may31_vn)
+        );
+
+        // Leap year 2028: Jan 31 -> Feb 29 -> Mar 31
+        let jan31_2028_vn = DateTime::parse_from_rfc3339("2028-01-31T08:00:00+07:00")
+            .unwrap()
+            .timestamp_millis();
+        let feb29_2028_vn = DateTime::parse_from_rfc3339("2028-02-29T08:00:00+07:00")
+            .unwrap()
+            .timestamp_millis();
+        let mar31_2028_vn = DateTime::parse_from_rfc3339("2028-03-31T08:00:00+07:00")
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            compute_next_occurrence_in_tz(&vn, jan31_2028_vn, Some(31), "monthly", jan31_2028_vn),
+            Some(feb29_2028_vn)
+        );
+        assert_eq!(
+            compute_next_occurrence_in_tz(&vn, feb29_2028_vn, Some(31), "monthly", feb29_2028_vn),
+            Some(mar31_2028_vn)
+        );
+
+        // Bug #8 (DST preservation): daily/weekly across spring-forward (23h) & fall-back (25h)
+        let tz = MockUsEastern2026;
+        let mar7_0900 = DateTime::parse_from_rfc3339("2026-03-07T09:00:00-05:00")
+            .unwrap()
+            .timestamp_millis();
+        let mar8_0900 = DateTime::parse_from_rfc3339("2026-03-08T09:00:00-04:00")
+            .unwrap()
+            .timestamp_millis();
+        let mar14_0900 = DateTime::parse_from_rfc3339("2026-03-14T09:00:00-04:00")
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(mar8_0900 - mar7_0900, 23 * 3600 * 1000);
+        assert_eq!(
+            compute_next_occurrence_in_tz(&tz, mar7_0900, None, "daily", mar7_0900),
+            Some(mar8_0900)
+        );
+        assert_eq!(
+            compute_next_occurrence_in_tz(&tz, mar7_0900, None, "weekly", mar7_0900),
+            Some(mar14_0900)
+        );
+
+        let oct31_0900 = DateTime::parse_from_rfc3339("2026-10-31T09:00:00-04:00")
+            .unwrap()
+            .timestamp_millis();
+        let nov1_0900 = DateTime::parse_from_rfc3339("2026-11-01T09:00:00-05:00")
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(nov1_0900 - oct31_0900, 25 * 3600 * 1000);
+        assert_eq!(
+            compute_next_occurrence_in_tz(&tz, oct31_0900, None, "daily", oct31_0900),
+            Some(nov1_0900)
+        );
+
+        // DST spring-forward non-existent gap (02:30 on Mar 8) resolves to 03:00 EDT, NOT None!
+        let mar7_0230 = DateTime::parse_from_rfc3339("2026-03-07T02:30:00-05:00")
+            .unwrap()
+            .timestamp_millis();
+        let mar8_0300 = DateTime::parse_from_rfc3339("2026-03-08T03:00:00-04:00")
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            compute_next_occurrence_in_tz(&tz, mar7_0230, None, "daily", mar7_0230),
+            Some(mar8_0300)
+        );
+
+        // DST fall-back ambiguous hour (01:30 on Nov 1) resolves cleanly to earliest (01:30 EDT).
+        let oct31_0130 = DateTime::parse_from_rfc3339("2026-10-31T01:30:00-04:00")
+            .unwrap()
+            .timestamp_millis();
+        let nov1_0130_edt = DateTime::parse_from_rfc3339("2026-11-01T01:30:00-04:00")
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            compute_next_occurrence_in_tz(&tz, oct31_0130, None, "daily", oct31_0130),
+            Some(nov1_0130_edt)
+        );
+    }
+
+    #[test]
+    fn scheduled_messages_cadence_revert_edit_reset_delete_guard_filter_and_migration() {
+        let dir = std::env::temp_dir().join(format!(
+            "teza-store-sched-ux-fixes-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("sched_ux.db");
+        let store = MessageStore::open(&db_path).unwrap();
+
+        // 1. Monthly anchor_day = 31 survives Jan 31 -> Feb 28 -> Mar 31 via complete_scheduled_message,
+        //    even when retry backoff and reschedule_now occur!
+        let jan31_local = resolve_local_datetime_in_tz(
+            &Local,
+            NaiveDate::from_ymd_opt(2026, 1, 31)
+                .unwrap()
+                .and_hms_opt(9, 0, 0)
+                .unwrap(),
+        )
+        .unwrap()
+        .timestamp_millis();
+        let feb28_local = resolve_local_datetime_in_tz(
+            &Local,
+            NaiveDate::from_ymd_opt(2026, 2, 28)
+                .unwrap()
+                .and_hms_opt(9, 0, 0)
+                .unwrap(),
+        )
+        .unwrap()
+        .timestamp_millis();
+        let mar31_local = resolve_local_datetime_in_tz(
+            &Local,
+            NaiveDate::from_ymd_opt(2026, 3, 31)
+                .unwrap()
+                .and_hms_opt(9, 0, 0)
+                .unwrap(),
+        )
+        .unwrap()
+        .timestamp_millis();
+
+        let monthly = store
+            .create_scheduled_message(&NewScheduledMessageInput {
+                thread_id: "t-monthly".into(),
+                thread_title: "Kế toán".into(),
+                thread_kind: "group".into(),
+                text: "Chốt lương cuối tháng".into(),
+                attachment_path: String::new(),
+                send_at_ts: jan31_local,
+                recurrence: "monthly".into(),
+                misfire_policy: "ask".into(),
+                misfire_grace_secs: 600,
+            })
+            .unwrap();
+        assert_eq!(monthly.anchor_day, Some(31));
+        assert_eq!(monthly.next_attempt_ts, None);
+        assert!(!monthly.bypass_misfire);
+
+        // Claim at jan31_local, hit transient error -> retry sets next_attempt_ts (+30s) without mutating send_at_ts!
+        let claimed = store
+            .claim_due_scheduled_messages(jan31_local, 10)
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        // #67d: delete_scheduled_message MUST reject while status == 'sending'
+        assert!(!store.delete_scheduled_message(&monthly.id).unwrap());
+        assert!(store.get_scheduled_message(&monthly.id).unwrap().is_some());
+
+        // #5 helper: revert_scheduled_message_to_pending reverts 'sending' -> 'pending' WITHOUT incrementing retry_count
+        let reverted = store
+            .revert_scheduled_message_to_pending(&monthly.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reverted.status, "pending");
+        assert_eq!(reverted.retry_count, 0);
+        assert_eq!(reverted.next_attempt_ts, None);
+        assert!(!reverted.bypass_misfire);
+        // Re-calling revert when not 'sending' returns None
+        assert!(store
+            .revert_scheduled_message_to_pending(&monthly.id)
+            .unwrap()
+            .is_none());
+
+        // Claim again, fail with retry at +30s
+        assert_eq!(
+            store
+                .claim_due_scheduled_messages(jan31_local, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        let retried = store
+            .fail_or_retry_scheduled_message(
+                &monthly.id,
+                "network blip",
+                Some(jan31_local + 30_000),
+                jan31_local + 1_000,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.send_at_ts, jan31_local);
+        assert_eq!(retried.next_attempt_ts, Some(jan31_local + 30_000));
+        assert_eq!(retried.retry_count, 1);
+        // Scheduler next_pending_schedule_ts respects next_attempt_ts and claim skips before +30s!
+        assert_eq!(
+            store.next_pending_schedule_ts().unwrap(),
+            Some(jan31_local + 30_000)
+        );
+        assert!(store
+            .claim_due_scheduled_messages(jan31_local + 29_999, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .claim_due_scheduled_messages(jan31_local + 30_000, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Complete at +35s -> rolls to Feb 28 09:00 (NOT 09:00:30!) and keeps anchor_day = 31!
+        let after_jan = store
+            .complete_scheduled_message(&monthly.id, jan31_local + 35_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_jan.status, "pending");
+        assert_eq!(after_jan.send_at_ts, feb28_local);
+        assert_eq!(after_jan.anchor_day, Some(31));
+        assert_eq!(after_jan.next_attempt_ts, None);
+        assert!(!after_jan.bypass_misfire);
+
+        // Suppose Feb 28 misfires -> user clicks "Gửi ngay" at 14:37 -> send_at_ts stays Feb 28 09:00!
+        let feb28_late = feb28_local + 5 * 3600 * 1000 + 37 * 60 * 1000;
+        let _ = store
+            .mark_scheduled_message_missed(&monthly.id, "Quá giờ", feb28_late)
+            .unwrap();
+        let resched = store
+            .reschedule_now(&monthly.id, feb28_late + 1_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resched.status, "pending");
+        assert_eq!(resched.send_at_ts, feb28_local);
+        assert_eq!(resched.next_attempt_ts, Some(feb28_late + 1_000));
+        assert!(resched.bypass_misfire);
+        assert_eq!(resched.retry_count, 0);
+        assert!(resched.last_error.is_empty());
+
+        // Completing "Gửi ngay" rolls cleanly to Mar 31 09:00 using anchor_day = 31!
+        let after_feb = store
+            .complete_scheduled_message(&monthly.id, feb28_late + 2_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_feb.send_at_ts, mar31_local);
+        assert_eq!(after_feb.anchor_day, Some(31));
+        assert_eq!(after_feb.next_attempt_ts, None);
+        assert!(!after_feb.bypass_misfire);
+
+        // 2. #67c: Updating send_at_ts or recurrence on a pending retrying item resets retry state
+        //    and updates anchor_day; updating text alone leaves retry state untouched.
+        let _ = store
+            .fail_or_retry_scheduled_message(
+                &monthly.id,
+                "temp err",
+                Some(mar31_local + 60_000),
+                mar31_local + 1_000,
+            )
+            .unwrap();
+        let text_only = store
+            .update_scheduled_message(
+                &monthly.id,
+                &UpdateScheduledMessageInput {
+                    text: Some("Chốt lương (đã sửa nội dung)".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(text_only.retry_count, 1);
+        assert_eq!(text_only.last_error, "temp err");
+        assert_eq!(text_only.next_attempt_ts, Some(mar31_local + 60_000));
+
+        let apr15_local = resolve_local_datetime_in_tz(
+            &Local,
+            NaiveDate::from_ymd_opt(2026, 4, 15)
+                .unwrap()
+                .and_hms_opt(10, 0, 0)
+                .unwrap(),
+        )
+        .unwrap()
+        .timestamp_millis();
+        let ts_changed = store
+            .update_scheduled_message(
+                &monthly.id,
+                &UpdateScheduledMessageInput {
+                    send_at_ts: Some(apr15_local),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(ts_changed.retry_count, 0);
+        assert!(ts_changed.last_error.is_empty());
+        assert_eq!(ts_changed.next_attempt_ts, None);
+        assert!(!ts_changed.bypass_misfire);
+        assert_eq!(ts_changed.anchor_day, Some(15));
+
+        // Now set retry state again and change ONLY recurrence -> also resets retry state!
+        let _ = store
+            .fail_or_retry_scheduled_message(
+                &monthly.id,
+                "temp err 2",
+                Some(apr15_local + 60_000),
+                apr15_local + 1_000,
+            )
+            .unwrap();
+        let rec_changed = store
+            .update_scheduled_message(
+                &monthly.id,
+                &UpdateScheduledMessageInput {
+                    recurrence: Some("weekly".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec_changed.recurrence, "weekly");
+        assert_eq!(rec_changed.retry_count, 0);
+        assert!(rec_changed.last_error.is_empty());
+        assert_eq!(rec_changed.next_attempt_ts, None);
+        assert!(!rec_changed.bypass_misfire);
+
+        // 3. #37: list_scheduled_messages_filtered applies allowed_thread_ids BEFORE LIMIT
+        for i in 1..=3_i64 {
+            store
+                .create_scheduled_message(&NewScheduledMessageInput {
+                    thread_id: "t-other".into(),
+                    thread_title: "Other".into(),
+                    thread_kind: "direct".into(),
+                    text: format!("other {i}"),
+                    attachment_path: String::new(),
+                    send_at_ts: 1_750_000_000_000 + i * 1_000,
+                    recurrence: "once".into(),
+                    misfire_policy: "send_on_resume".into(),
+                    misfire_grace_secs: 600,
+                })
+                .unwrap();
+        }
+        for i in 1..=2_i64 {
+            store
+                .create_scheduled_message(&NewScheduledMessageInput {
+                    thread_id: "t-allowed".into(),
+                    thread_title: "Allowed".into(),
+                    thread_kind: "direct".into(),
+                    text: format!("allowed {i}"),
+                    attachment_path: String::new(),
+                    send_at_ts: 1_750_000_100_000 + i * 1_000,
+                    recurrence: "once".into(),
+                    misfire_policy: "send_on_resume".into(),
+                    misfire_grace_secs: 600,
+                })
+                .unwrap();
+        }
+        let filtered = store
+            .list_scheduled_messages_filtered(Some("pending"), Some(&["t-allowed".to_string()]), 2)
+            .unwrap();
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|s| s.thread_id == "t-allowed"));
+        // Empty allowed_thread_ids slice behaves as unrestricted (matches ApiClientDto semantics)
+        let unrestricted = store
+            .list_scheduled_messages_filtered(Some("pending"), Some(&[]), 2)
+            .unwrap();
+        assert_eq!(unrestricted.len(), 2);
+        assert!(unrestricted.iter().all(|s| s.thread_id == "t-other"));
+
+        // 4. Reopening with NULL anchor_day triggers safe backfill migration
+        store
+            .conn
+            .execute(
+                "UPDATE scheduled_messages SET anchor_day = NULL WHERE id = ?1",
+                params![&monthly.id],
+            )
+            .unwrap();
+        drop(store);
+        let reopened = MessageStore::open(&db_path).unwrap();
+        let reloaded = reopened
+            .get_scheduled_message(&monthly.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.anchor_day, Some(15));
+        assert!(reopened.delete_scheduled_message(&monthly.id).unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn api_idempotency_hash_load_around_has_newer_and_preview_fallback_kind() {
+        let dir = std::env::temp_dir().join(format!(
+            "teza-store-idem-around-kind-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db_path = dir.join("ux_meta.db");
+        let mut store = MessageStore::open(&db_path).unwrap();
+
+        // #13: ApiIdempotencyRecord stores & returns request_hash while legacy helpers keep working
+        let t0 = 1_760_000_000_000_i64;
+        store
+            .put_api_idempotency_with_hash(
+                "cli_1",
+                "send:key-1",
+                200,
+                r#"{"ok":true,"msg_id":"m1"}"#,
+                "a1b2c3d4",
+                t0,
+            )
+            .unwrap();
+        let rec = store
+            .get_api_idempotency_record("cli_1", "send:key-1", DAY_MS, t0 + 5_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rec,
+            ApiIdempotencyRecord {
+                status_code: 200,
+                response_json: r#"{"ok":true,"msg_id":"m1"}"#.to_string(),
+                request_hash: "a1b2c3d4".to_string(),
+            }
+        );
+        // Legacy wrapper returns (status, response_json)
+        assert_eq!(
+            store
+                .get_api_idempotency("cli_1", "send:key-1", DAY_MS, t0 + 5_000)
+                .unwrap(),
+            Some((200, r#"{"ok":true,"msg_id":"m1"}"#.to_string()))
+        );
+        // Legacy put stores empty request_hash
+        store
+            .put_api_idempotency("cli_1", "send:key-legacy", 201, r#"{"ok":true}"#, t0)
+            .unwrap();
+        let legacy_rec = store
+            .get_api_idempotency_record("cli_1", "send:key-legacy", DAY_MS, t0 + 1_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy_rec.request_hash, "");
+        assert_eq!(legacy_rec.status_code, 201);
+
+        // #21: load_messages_around_with_meta accurately computes has_newer
+        for i in 1..=10_i64 {
+            store
+                .upsert_message(&MessageDto {
+                    msg_id: format!("m-{i:02}"),
+                    cli_msg_id: None,
+                    thread_id: "t-hist".into(),
+                    sender_id: "u1".into(),
+                    sender_name: "Alice".into(),
+                    text: format!("message {i}"),
+                    msg_type: "chat.text".into(),
+                    ts: i * 1_000,
+                    is_outgoing: false,
+                    is_recalled: false,
+                    is_pinned: false,
+                    quote: None,
+                    reactions: Vec::new(),
+                    attachment_url: None,
+                    attachment_name: None,
+                })
+                .unwrap();
+        }
+        let (slice_mid, has_newer_mid) = store
+            .load_messages_around_with_meta("t-hist", 3_000, 2, 3)
+            .unwrap();
+        let mid_ids: Vec<&str> = slice_mid.iter().map(|m| m.msg_id.as_str()).collect();
+        assert_eq!(mid_ids, vec!["m-01", "m-02", "m-03", "m-04", "m-05"]);
+        assert!(has_newer_mid);
+
+        // Exact boundary (8, 9, 10 == 3 items -> no newer items remain!)
+        let (slice_end, has_newer_end) = store
+            .load_messages_around_with_meta("t-hist", 8_000, 2, 3)
+            .unwrap();
+        let end_ids: Vec<&str> = slice_end.iter().map(|m| m.msg_id.as_str()).collect();
+        assert_eq!(end_ids, vec!["m-06", "m-07", "m-08", "m-09", "m-10"]);
+        assert!(!has_newer_end);
+
+        // max_after == 0 still reports has_newer == true when messages exist at/after target_ts
+        let (slice_zero, has_newer_zero) = store
+            .load_messages_around_with_meta("t-hist", 3_000, 2, 0)
+            .unwrap();
+        let zero_ids: Vec<&str> = slice_zero.iter().map(|m| m.msg_id.as_str()).collect();
+        assert_eq!(zero_ids, vec!["m-01", "m-02"]);
+        assert!(has_newer_zero);
+
+        // #32: update_thread_preview_with_fallback_kind_and_meta creates Group/Cloud rows accurately
+        let created_grp = store
+            .update_thread_preview_with_fallback_kind_and_meta(
+                "g888123",
+                "Bạn: Báo cáo tuần",
+                t0,
+                false,
+                true,
+                Some(ThreadKind::Group),
+                Some("Nhóm Kỹ Thuật"),
+                None,
+            )
+            .unwrap();
+        assert!(created_grp);
+        let grp_row = store.get_thread_row("g888123").unwrap().unwrap();
+        assert_eq!(grp_row.kind, ThreadKind::Group);
+        assert_eq!(grp_row.title, "Nhóm Kỹ Thuật");
+
+        let created_cloud = store
+            .update_thread_preview_with_fallback_kind_and_meta(
+                "cloud_me",
+                "Bạn: Ghi chú nhanh",
+                t0,
+                false,
+                true,
+                Some(ThreadKind::Cloud),
+                Some("Cloud của tôi"),
+                None,
+            )
+            .unwrap();
+        assert!(created_cloud);
+        let cloud_row = store.get_thread_row("cloud_me").unwrap().unwrap();
+        assert_eq!(cloud_row.kind, ThreadKind::Cloud);
+        assert_eq!(cloud_row.title, "Cloud của tôi");
+
+        // Backward-compatible wrapper still creates Direct rows by default
+        let created_direct = store
+            .update_thread_preview_returning_created("u-direct-new", "Xin chào", t0, true, false)
+            .unwrap();
+        assert!(created_direct);
+        let direct_row = store.get_thread_row("u-direct-new").unwrap().unwrap();
+        assert_eq!(direct_row.kind, ThreadKind::Direct);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

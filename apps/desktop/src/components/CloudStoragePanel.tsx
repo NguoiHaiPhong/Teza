@@ -7,6 +7,7 @@ import {
   Clock,
   Cloud,
   Database,
+  ExternalLink,
   Eye,
   EyeOff,
   FileText,
@@ -39,6 +40,7 @@ import type {
 export interface CloudStoragePanelProps {
   relayEnabled: boolean;
   onOpenNetworkTab: () => void;
+  onLockVault?: () => Promise<void>;
 }
 
 type ManagerSubTab = "by_thread" | "largest_items" | "prune_age";
@@ -179,6 +181,7 @@ function CloudToggleRow({
 export function CloudStoragePanel({
   relayEnabled,
   onOpenNetworkTab,
+  onLockVault,
 }: CloudStoragePanelProps) {
   const { locale, t } = useI18n();
 
@@ -193,6 +196,8 @@ export function CloudStoragePanel({
   const [connecting, setConnecting] = useState(false);
   const [cancellingConnect, setCancellingConnect] = useState(false);
   const [disconnecting, setDisconnecting] = useState(false);
+  const [confirmDisconnect, setConfirmDisconnect] = useState(false);
+  const [lockingVault, setLockingVault] = useState(false);
   const [unlocking, setUnlocking] = useState(false);
   const [syncingNow, setSyncingNow] = useState(false);
   const [pruning, setPruning] = useState(false);
@@ -224,6 +229,8 @@ export function CloudStoragePanel({
   const overviewSeqRef = useRef(0);
   const oauthDrawerTouchedRef = useRef(false);
   const prevSyncingRef = useRef(false);
+  const confirmBoxRef = useRef<HTMLDivElement | null>(null);
+  const confirmDisconnectRef = useRef<HTMLDivElement | null>(null);
 
   const isRelayBlocked = relayEnabled || Boolean(status?.relay_blocked);
 
@@ -233,6 +240,24 @@ export function CloudStoragePanel({
       mountedRef.current = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (confirmAction) {
+      confirmBoxRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }, [confirmAction]);
+
+  useEffect(() => {
+    if (confirmDisconnect) {
+      confirmDisconnectRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }, [confirmDisconnect]);
+
+  useEffect(() => {
+    if (!status?.connected) {
+      setConfirmDisconnect(false);
+    }
+  }, [status?.connected]);
 
   const loadOverview = useCallback(async () => {
     if (relayEnabledRef.current) return;
@@ -275,6 +300,7 @@ export function CloudStoragePanel({
       setOverview(null);
       setSelectedShas(new Set());
       setConfirmAction(null);
+      setConfirmDisconnect(false);
       setPassphrase("");
       setPassphraseConfirm("");
       setPassphraseError(null);
@@ -537,10 +563,13 @@ export function CloudStoragePanel({
   };
 
   const handleDisconnect = async () => {
-    if (isRelayBlocked || disconnecting) return;
+    if (isRelayBlocked || disconnecting || pruning || lockingVault || syncingNow || status?.syncing) {
+      return;
+    }
     setDisconnecting(true);
     setFeedback(null);
     setConfirmAction(null);
+    setConfirmDisconnect(false);
     try {
       const nextStatus = await bridge.gdriveDisconnect();
       if (!mountedRef.current) return;
@@ -558,6 +587,44 @@ export function CloudStoragePanel({
       });
     } finally {
       if (mountedRef.current) setDisconnecting(false);
+    }
+  };
+
+  const handleLockVault = async () => {
+    if (
+      !onLockVault ||
+      isRelayBlocked ||
+      lockingVault ||
+      disconnecting ||
+      pruning ||
+      syncingNow ||
+      status?.syncing
+    ) {
+      return;
+    }
+    setLockingVault(true);
+    setFeedback(null);
+    setConfirmAction(null);
+    setConfirmDisconnect(false);
+    try {
+      await onLockVault();
+      if (!mountedRef.current) return;
+      const nextStatus = await bridge.gdriveGetStatus();
+      if (!mountedRef.current) return;
+      setStatus(nextStatus);
+      if (!nextStatus.vault_unlocked) {
+        setOverview(null);
+        setSelectedShas(new Set());
+        setFeedback({ tone: "ok", text: t("gdriveVaultLockedNotice") });
+      }
+    } catch (err) {
+      if (!mountedRef.current) return;
+      setFeedback({
+        tone: "error",
+        text: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      if (mountedRef.current) setLockingVault(false);
     }
   };
 
@@ -640,6 +707,27 @@ export function CloudStoragePanel({
       });
     } finally {
       if (mountedRef.current) setSyncingNow(false);
+    }
+  };
+
+  const validRootFolderId = useMemo(() => {
+    const raw = status?.root_folder_id?.trim() ?? "";
+    return /^[A-Za-z0-9_-]+$/.test(raw) ? raw : null;
+  }, [status?.root_folder_id]);
+
+  const handleOpenVaultFolder = async () => {
+    if (!validRootFolderId) return;
+    setFeedback(null);
+    try {
+      await bridge.openExternalUrl(
+        `https://drive.google.com/drive/folders/${encodeURIComponent(validRootFolderId)}`,
+      );
+    } catch (err) {
+      if (!mountedRef.current) return;
+      setFeedback({
+        tone: "error",
+        text: err instanceof Error ? err.message : String(err),
+      });
     }
   };
 
@@ -805,6 +893,7 @@ export function CloudStoragePanel({
 
     return (
       <div
+        ref={confirmBoxRef}
         className="space-y-2.5 rounded-xl p-3 text-xs"
         style={{
           background: "var(--danger-bg)",
@@ -987,25 +1076,64 @@ export function CloudStoragePanel({
             </div>
           </div>
 
-          <div className="flex shrink-0 items-center gap-2">
+          <div className="flex shrink-0 flex-wrap items-center gap-2">
             {status?.connected ? (
-              <button
-                type="button"
-                disabled={disconnecting || pruning}
-                onClick={() => void handleDisconnect()}
-                className="inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition hover:opacity-90 disabled:opacity-50"
-                style={{
-                  background: "var(--danger-bg)",
-                  color: "var(--danger-text)",
-                }}
-              >
-                {disconnecting ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <LogOut className="h-3.5 w-3.5" />
+              <>
+                {validRootFolderId && (
+                  <button
+                    type="button"
+                    onClick={() => void handleOpenVaultFolder()}
+                    className="hover-menu inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition"
+                    style={{
+                      background: "var(--bg-sidebar)",
+                      border: "1px solid var(--border-subtle)",
+                      color: "var(--text-primary)",
+                    }}
+                  >
+                    <ExternalLink className="h-3.5 w-3.5 shrink-0" />
+                    <span>{t("gdriveOpenVaultFolderBtn")}</span>
+                  </button>
                 )}
-                <span>{t("gdriveDisconnectBtn")}</span>
-              </button>
+                {status.vault_unlocked && onLockVault && (
+                  <button
+                    type="button"
+                    disabled={lockingVault || isBusySync || pruning || disconnecting}
+                    onClick={() => void handleLockVault()}
+                    title={t("gdriveLockVaultTitle")}
+                    className="hover-menu inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-50"
+                    style={{
+                      background: "var(--bg-sidebar)",
+                      border: "1px solid var(--border-subtle)",
+                      color: "var(--text-primary)",
+                    }}
+                  >
+                    {lockingVault ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Lock className="h-3.5 w-3.5" />
+                    )}
+                    <span>{t("gdriveLockVaultBtn")}</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  disabled={disconnecting || pruning || isBusySync || lockingVault}
+                  onClick={() => setConfirmDisconnect((prev) => !prev)}
+                  title={isBusySync ? t("gdriveDisconnectBusyHint") : undefined}
+                  className="inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+                  style={{
+                    background: "var(--danger-bg)",
+                    color: "var(--danger-text)",
+                  }}
+                >
+                  {disconnecting ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <LogOut className="h-3.5 w-3.5" />
+                  )}
+                  <span>{t("gdriveDisconnectBtn")}</span>
+                </button>
+              </>
             ) : isWaitingBrowser ? (
               <button
                 type="button"
@@ -1044,6 +1172,57 @@ export function CloudStoragePanel({
           </div>
         </div>
 
+        {/* Inline confirmation dialog before disconnecting Google Drive */}
+        {status?.connected && confirmDisconnect && (
+          <div
+            ref={confirmDisconnectRef}
+            role="alertdialog"
+            aria-label={t("gdriveDisconnectConfirmTitle")}
+            className="space-y-2.5 rounded-xl p-3 text-xs"
+            style={{
+              background: "var(--danger-bg)",
+              border: "1px solid var(--danger-text)",
+              color: "var(--danger-text)",
+            }}
+          >
+            <div className="flex items-start gap-2">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <div className="min-w-0 flex-1 space-y-1">
+                <div className="font-semibold">{t("gdriveDisconnectConfirmTitle")}</div>
+                <div className="leading-relaxed opacity-90">{t("gdriveDisconnectConfirmDesc")}</div>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              <button
+                type="button"
+                disabled={disconnecting}
+                onClick={() => setConfirmDisconnect(false)}
+                className="rounded-lg px-3 py-1.5 text-xs font-medium disabled:opacity-50"
+                style={{
+                  background: "var(--bg-sidebar)",
+                  border: "1px solid var(--border-subtle)",
+                  color: "var(--text-primary)",
+                }}
+              >
+                {t("cancel")}
+              </button>
+              <button
+                type="button"
+                disabled={disconnecting || pruning || isBusySync || lockingVault}
+                onClick={() => void handleDisconnect()}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-rose-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-rose-500 disabled:opacity-50"
+              >
+                {disconnecting ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <LogOut className="h-3.5 w-3.5" />
+                )}
+                <span>{t("gdriveDisconnectBtn")}</span>
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Active waiting-for-browser sign-in guidance */}
         {!status?.connected && isWaitingBrowser && (
           <div
@@ -1066,16 +1245,19 @@ export function CloudStoragePanel({
           </div>
         )}
 
-        {/* Scope & E2EE privacy note */}
+        {/* Scope, backup location & E2EE privacy note */}
         <div
-          className="flex items-start gap-2 rounded-lg px-2.5 py-2 text-[11.5px] leading-relaxed"
+          className="space-y-1.5 rounded-lg px-2.5 py-2 text-[11.5px] leading-relaxed"
           style={{
             background: "var(--bg-sidebar)",
             color: "var(--text-secondary)",
           }}
         >
-          <Shield className="mt-0.5 h-3.5 w-3.5 shrink-0" style={{ color: "var(--accent)" }} />
-          <span>{t("gdriveScopeNote")}</span>
+          <div className="flex items-start gap-2">
+            <Shield className="mt-0.5 h-3.5 w-3.5 shrink-0" style={{ color: "var(--accent)" }} />
+            <span>{t("gdriveScopeNote")}</span>
+          </div>
+          <div className="pl-[22px] text-[11px] opacity-90">{t("gdriveBackupLocationNote")}</div>
         </div>
 
         {/* Collapsible Developer / Advanced BYO OAuth drawer */}
@@ -1673,10 +1855,14 @@ export function CloudStoragePanel({
                 <div className="space-y-1.5">
                   {sortedThreads.length === 0 ? (
                     <div
-                      className="rounded-lg px-3 py-5 text-center text-xs"
+                      className="rounded-lg px-3 py-5 text-center text-xs leading-relaxed"
                       style={{ background: "var(--bg-sidebar)", color: "var(--text-secondary)" }}
                     >
-                      {t("gdriveNoCloudItems")}
+                      {(overview?.history_file_count ?? 0) > 0
+                        ? t("gdriveNoMediaItemsWithHistory", {
+                            count: overview?.history_file_count ?? 0,
+                          })
+                        : t("gdriveNoCloudItems")}
                     </div>
                   ) : (
                     <div className="max-h-60 space-y-1.5 overflow-y-auto pr-0.5">
@@ -1743,10 +1929,14 @@ export function CloudStoragePanel({
                 <div className="space-y-2">
                   {largestItems.length === 0 ? (
                     <div
-                      className="rounded-lg px-3 py-5 text-center text-xs"
+                      className="rounded-lg px-3 py-5 text-center text-xs leading-relaxed"
                       style={{ background: "var(--bg-sidebar)", color: "var(--text-secondary)" }}
                     >
-                      {t("gdriveNoCloudItems")}
+                      {(overview?.history_file_count ?? 0) > 0
+                        ? t("gdriveNoMediaItemsWithHistory", {
+                            count: overview?.history_file_count ?? 0,
+                          })
+                        : t("gdriveNoCloudItems")}
                     </div>
                   ) : (
                     <>

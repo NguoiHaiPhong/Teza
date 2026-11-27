@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ArrowLeft,
   ArrowRight,
@@ -65,6 +65,7 @@ interface PendingFillRequest {
 interface Props {
   app: WebAppItem;
   suspended: boolean;
+  topSlot?: ReactNode;
   allEmbeddedApps?: WebAppItem[];
   onSelectApp?: (item: WebAppItem) => void;
   onBackToHub: () => void;
@@ -76,6 +77,7 @@ interface Props {
 export function WebAppWorkspace({
   app,
   suspended,
+  topSlot,
   allEmbeddedApps = [],
   onSelectApp,
   onBackToHub,
@@ -670,6 +672,8 @@ export function WebAppWorkspace({
           </button>
         </div>
       </header>
+
+      {topSlot ? <div className="relative z-20 shrink-0">{topSlot}</div> : null}
 
       <div ref={hostRef} className="relative flex min-h-0 flex-1 items-center justify-center">
         {accountsOpen ? (

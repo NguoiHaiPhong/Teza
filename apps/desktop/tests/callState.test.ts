@@ -257,6 +257,8 @@ test("video call overlay and local capture guards behave cleanly across phases",
 
   assert.equal(shouldCaptureLocalVideo(baseSnap), false);
   assert.equal(shouldCaptureLocalVideo({ ...baseSnap, phase: "connected" }), true);
+  assert.equal(shouldCaptureLocalVideo({ ...baseSnap, phase: "connected" }, false), true);
+  assert.equal(shouldCaptureLocalVideo({ ...baseSnap, phase: "connected" }, true), false);
   assert.equal(
     shouldCaptureLocalVideo({ ...baseSnap, phase: "connected", cam_enabled: false }),
     false,

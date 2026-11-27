@@ -1,6 +1,7 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
+  Ban,
   BarChart3,
   CalendarClock,
   Check,
@@ -10,6 +11,8 @@ import {
   CornerUpLeft,
   Download,
   ExternalLink,
+  Eye,
+  EyeOff,
   FileText,
   Forward,
   Image as ImageIcon,
@@ -33,8 +36,14 @@ import {
   Zap,
 } from "lucide-react";
 import { bridge } from "../bridge";
-import type { MessageDto, ThreadKind } from "../types";
+import type { ConnectionStatus, MessageDto, PollDto, ThreadKind } from "../types";
 import { useI18n } from "../i18n";
+import {
+  extractStickerIdentity,
+  type BlockedStickerDisplayMode,
+  type BlockedStickerKind,
+  type BlockedStickerRule,
+} from "../utils/blockedStickers";
 import { isBuzzMessage } from "../utils/buzz";
 import { formatCallDuration, type CallStartDisabledReason } from "../utils/callState";
 import { copyImageReliable, copyTextReliable } from "../utils/clipboard";
@@ -113,19 +122,37 @@ interface Props {
   onOpenThread?: (msg: MessageDto) => void;
   onRetrySend?: (msg: MessageDto) => void;
   onDiscardFailed?: (msgId: string) => void;
+  discardDisabled?: boolean;
   onSaveFile?: (url: string, name: string, opts?: { threadId?: string; msgId?: string }) => void;
   onOpenExternal?: (url: string) => void;
   onCopyError?: (err: unknown) => void;
-  onVotePoll?: (msg: MessageDto, optionIds: number[]) => Promise<void> | void;
+  onVotePoll?: (
+    msg: MessageDto,
+    optionIds: number[],
+  ) => Promise<boolean | string | void> | boolean | string | void;
   onAddPollOption?: (
     msg: MessageDto,
     optionText: string,
     votedOptionIds: number[],
-  ) => Promise<boolean | void> | void;
-  onLockPoll?: (msg: MessageDto) => Promise<boolean | void> | void;
-  onRefreshPoll?: (msg: MessageDto) => Promise<void> | void;
+  ) => Promise<boolean | string | void> | boolean | string | void;
+  onLockPoll?: (
+    msg: MessageDto,
+  ) => Promise<boolean | string | void> | boolean | string | void;
+  onRefreshPoll?: (
+    msg: MessageDto,
+  ) => Promise<boolean | string | void> | boolean | string | void;
+  currentUserId?: string;
+  canManagePolls?: boolean;
+  connectionStatus?: ConnectionStatus;
   onStartVoiceCall?: (partnerId: string, partnerName?: string) => void;
   callDisabledReason?: CallStartDisabledReason | null;
+  blockedStickerRule?: BlockedStickerRule | null;
+  blockedStickerMode?: BlockedStickerDisplayMode;
+  onBlockSticker?: (
+    msg: MessageDto,
+    opts: { kind: BlockedStickerKind; global: boolean },
+  ) => void;
+  onUnblockSticker?: (ruleId: string) => void;
 }
 
 function formatClock(ts: number): string {
@@ -249,6 +276,35 @@ function renderPlainWithEmoticons(
   );
 }
 
+function formatPollErrorMessage(
+  err: unknown,
+  lang: "vi" | "en" | "ko",
+  fallbackKind: "action" | "load" = "action",
+): string {
+  const raw =
+    err instanceof Error
+      ? err.message
+      : typeof err === "string"
+        ? err
+        : err !== null && err !== undefined
+          ? String(err)
+          : "";
+  const trimmed = raw.trim();
+  if (trimmed) return trimmed;
+  if (fallbackKind === "load") {
+    return lang === "en"
+      ? "Unable to load poll options. Tap refresh to try again."
+      : lang === "ko"
+        ? "투표 항목을 불러오지 못했습니다. 새로고침을 눌러 다시 시도하세요."
+        : "Không thể tải lựa chọn bình chọn. Nhấn làm mới để thử lại.";
+  }
+  return lang === "en"
+    ? "Poll action failed. Please try again."
+    : lang === "ko"
+      ? "투표 작업을 완료하지 못했습니다. 다시 시도해 주세요."
+      : "Thao tác bình chọn thất bại. Vui lòng thử lại.";
+}
+
 function renderMentionsAndSearch(
   text: string,
   isOutgoing: boolean,
@@ -259,8 +315,9 @@ function renderMentionsAndSearch(
   viewProfileTitle: string,
   highlightQuery?: string,
   largeEmoticons = false,
+  allowAll = true,
 ) {
-  const tokens = tokenizeMentions(text, mentionMembers);
+  const tokens = tokenizeMentions(text, mentionMembers, { allowAll });
   return tokens.map((tok, idx) => {
     if (tok.kind === "mention") {
       const color = isOutgoing ? "var(--link-out)" : "var(--accent)";
@@ -306,6 +363,7 @@ function renderLinkedText(
   viewProfileTitle: string,
   highlightQuery?: string,
   largeEmoticons = false,
+  allowAll = true,
 ) {
   const parts = splitTextLinks(text);
   return parts.map((part, idx) =>
@@ -332,6 +390,7 @@ function renderLinkedText(
           viewProfileTitle,
           highlightQuery,
           largeEmoticons,
+          allowAll,
         )}
       </span>
     ),
@@ -388,6 +447,7 @@ export const MessageBubble = memo(function MessageBubble({
   onOpenThread,
   onRetrySend,
   onDiscardFailed,
+  discardDisabled = false,
   onSaveFile,
   onOpenExternal,
   onCopyError,
@@ -395,8 +455,15 @@ export const MessageBubble = memo(function MessageBubble({
   onAddPollOption,
   onLockPoll,
   onRefreshPoll,
+  currentUserId,
+  canManagePolls,
+  connectionStatus,
   onStartVoiceCall,
   callDisabledReason = null,
+  blockedStickerRule = null,
+  blockedStickerMode = "collapse",
+  onBlockSticker,
+  onUnblockSticker,
 }: Props) {
   const { lang, locale, t } = useI18n();
   const { emojiStyle } = useEmojiStyle();
@@ -405,10 +472,17 @@ export const MessageBubble = memo(function MessageBubble({
   const [mediaError, setMediaError] = useState(false);
   const [mediaRetryKey, setMediaRetryKey] = useState(0);
   const [showOriginal, setShowOriginal] = useState(false);
+  const [tempRevealed, setTempRevealed] = useState(false);
   const [pollBusy, setPollBusy] = useState(false);
+  const [pollError, setPollError] = useState<string | null>(null);
+  const [pollRetryTick, setPollRetryTick] = useState(0);
   const [newPollOption, setNewPollOption] = useState("");
   const [confirmLockPoll, setConfirmLockPoll] = useState(false);
   const hydratedPollIdsRef = useRef<Set<number>>(new Set());
+
+  useEffect(() => {
+    setTempRevealed(false);
+  }, [msg.msg_id, blockedStickerRule?.id]);
 
   useEffect(() => {
     setMediaError(false);
@@ -426,12 +500,54 @@ export const MessageBubble = memo(function MessageBubble({
   );
 
   useEffect(() => {
+    setPollError(null);
+  }, [pollData?.poll_id]);
+
+  useEffect(() => {
+    if (sparsePollId <= 0) return;
+    const onOnline = () => {
+      if (!hydratedPollIdsRef.current.has(sparsePollId)) {
+        setPollRetryTick((n) => n + 1);
+      }
+    };
+    window.addEventListener("online", onOnline);
+    return () => window.removeEventListener("online", onOnline);
+  }, [sparsePollId]);
+
+  useEffect(() => {
     if (sparsePollId <= 0 || !onRefreshPoll) return;
+    if (connectionStatus && connectionStatus !== "connected") return;
     if (hydratedPollIdsRef.current.has(sparsePollId)) return;
+    let cancelled = false;
     hydratedPollIdsRef.current.add(sparsePollId);
     setPollBusy(true);
-    void Promise.resolve(onRefreshPoll(msg)).finally(() => setPollBusy(false));
-  }, [sparsePollId, onRefreshPoll, msg]);
+    setPollError(null);
+    void Promise.resolve(onRefreshPoll(msg))
+      .then((res) => {
+        if (res === false || (typeof res === "string" && res.trim().length > 0)) {
+          hydratedPollIdsRef.current.delete(sparsePollId);
+          if (!cancelled) {
+            setPollError(
+              formatPollErrorMessage(typeof res === "string" ? res : "", lang, "load"),
+            );
+          }
+        }
+      })
+      .catch((err) => {
+        hydratedPollIdsRef.current.delete(sparsePollId);
+        if (!cancelled) {
+          setPollError(formatPollErrorMessage(err, lang, "load"));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setPollBusy(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sparsePollId, onRefreshPoll, msg, connectionStatus, pollRetryTick, lang]);
 
   useEffect(() => {
     if (pollClosedFlag) {
@@ -531,19 +647,24 @@ export const MessageBubble = memo(function MessageBubble({
       setPickerPos(null);
     };
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !e.defaultPrevented) {
+      if (e.key === "Escape" && !e.defaultPrevented && !isImeComposingEvent(e)) {
         e.preventDefault();
+        e.stopPropagation();
         close();
       }
     };
     window.addEventListener("click", close);
     window.addEventListener("contextmenu", close);
     window.addEventListener("scroll", close, true);
+    window.addEventListener("resize", close);
+    window.addEventListener("blur", close);
     window.addEventListener("keydown", onKeyDown);
     return () => {
       window.removeEventListener("click", close);
       window.removeEventListener("contextmenu", close);
       window.removeEventListener("scroll", close, true);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("blur", close);
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [menuPos, pickerPos]);
@@ -665,6 +786,86 @@ export const MessageBubble = memo(function MessageBubble({
       )}
     </span>
   );
+
+  const effectiveBlockedStickerRule =
+    !msg.is_outgoing && !msg.is_recalled ? blockedStickerRule : null;
+  const stickerIdentity = isStickerKind ? extractStickerIdentity(msg) : null;
+  const canBlockStickerSingle = Boolean(
+    !msg.is_outgoing &&
+      isStickerKind &&
+      !msg.is_recalled &&
+      !msg.send_status &&
+      onBlockSticker &&
+      stickerIdentity &&
+      (stickerIdentity.stickerId || stickerIdentity.fallbackUrl),
+  );
+  const canBlockStickerCategory = Boolean(
+    !msg.is_outgoing &&
+      isStickerKind &&
+      !msg.is_recalled &&
+      !msg.send_status &&
+      onBlockSticker &&
+      stickerIdentity?.cateId,
+  );
+  const hasBlockStickerActions = canBlockStickerSingle || canBlockStickerCategory;
+
+  if (effectiveBlockedStickerRule && !tempRevealed) {
+    if (blockedStickerMode === "hide") {
+      return null;
+    }
+    return (
+      <div
+        id={`msg-${msg.msg_id}`}
+        className="flex justify-start"
+        style={{
+          marginTop: groupedWithPrev ? "var(--msg-gap-grouped)" : "var(--msg-gap-group)",
+        }}
+      >
+        {!msg.is_outgoing && threadKind === "group" && (
+          <div className="mr-2 w-7 shrink-0" />
+        )}
+        <div
+          className={`inline-flex max-w-[78%] flex-wrap items-center gap-2 rounded-full px-3 py-1 text-[12px] ${
+            highlighted ? "ring-2 ring-sky-400" : ""
+          }`}
+          style={{
+            background: "var(--bg-surface)",
+            border: "1px solid var(--border-subtle)",
+            color: "var(--text-secondary)",
+          }}
+        >
+          <EyeOff className="h-3.5 w-3.5 shrink-0 opacity-75" />
+          <span className="truncate">{t("blockedStickerHiddenPill")}</span>
+          <button
+            type="button"
+            onClick={() => setTempRevealed(true)}
+            className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium transition hover:opacity-85"
+            style={{
+              background: "var(--chip-bg)",
+              color: "var(--text-primary)",
+            }}
+          >
+            <Eye className="h-3 w-3" />
+            <span>{t("blockedStickerShowOnce")}</span>
+          </button>
+          {onUnblockSticker && (
+            <button
+              type="button"
+              onClick={() => onUnblockSticker(effectiveBlockedStickerRule.id)}
+              className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium transition hover:opacity-85"
+              style={{
+                background: "var(--accent-soft)",
+                color: "var(--accent)",
+              }}
+            >
+              <span>{t("blockedStickerUnblock")}</span>
+            </button>
+          )}
+          <span className="text-[10.5px] tabular-nums opacity-70">{formatClock(msg.ts)}</span>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div
@@ -852,9 +1053,12 @@ export const MessageBubble = memo(function MessageBubble({
           e.preventDefault();
           e.stopPropagation();
           setPickerPos(null);
+          const menuW = hasBlockStickerActions ? 256 : 210;
+          const maxMenuH = Math.max(120, window.innerHeight - 16);
+          const menuH = Math.min(hasBlockStickerActions ? 470 : 390, maxMenuH);
           setMenuPos({
-            x: Math.max(8, Math.min(e.clientX, window.innerWidth - 210)),
-            y: Math.max(8, Math.min(e.clientY, window.innerHeight - 390)),
+            x: Math.max(8, Math.min(e.clientX, window.innerWidth - menuW - 8)),
+            y: Math.max(8, Math.min(e.clientY, window.innerHeight - menuH - 8)),
           });
         }}
         onDoubleClick={(e) => {
@@ -972,7 +1176,7 @@ export const MessageBubble = memo(function MessageBubble({
                 msgId: msg.msg_id,
               })
             }
-            className="mb-1 block overflow-hidden rounded-xl"
+            className="relative mb-1 block overflow-hidden rounded-xl"
           >
             <RelayImage
               key={mediaRetryKey}
@@ -985,7 +1189,35 @@ export const MessageBubble = memo(function MessageBubble({
               className="max-h-72 w-auto rounded-xl object-cover transition hover:brightness-95"
               loading="lazy"
             />
+            {msg.send_status === "sending" && (
+              <span className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/30">
+                <span className="inline-flex items-center gap-1.5 rounded-full bg-black/70 px-3 py-1 text-xs font-medium text-white shadow">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  <span>{t("sendingStatus")}</span>
+                </span>
+              </span>
+            )}
           </button>
+        )}
+
+        {msg.send_status === "sending" && !normalizedAttachmentUrl && msg.msg_type === "chat.photo" && (
+          <div
+            className="mb-1 flex items-center gap-2.5 rounded-xl px-3 py-2.5"
+            style={{ background: "var(--card-bg)" }}
+          >
+            <Loader2
+              className="h-4 w-4 shrink-0 animate-spin"
+              style={{ color: msg.is_outgoing ? "var(--link-out)" : "var(--accent)" }}
+            />
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-[13px] font-medium">
+                {msg.attachment_name || t("photoAlt")}
+              </div>
+              <div className="text-[11.5px] opacity-80" style={{ color: "var(--text-secondary)" }}>
+                {t("sendingStatus")}
+              </div>
+            </div>
+          </div>
         )}
 
         {isMediaFailed && (
@@ -1216,7 +1448,28 @@ export const MessageBubble = memo(function MessageBubble({
             const canAddOption = Boolean(
               !isPollClosed && pollData.allow_add_option && pollData.poll_id > 0 && onAddPollOption,
             );
-            const canLockPoll = Boolean(!isPollClosed && pollData.poll_id > 0 && onLockPoll);
+            const pollCreatorRaw = (pollData as PollDto & { creator_id?: string | number })
+              .creator_id;
+            const normalizedPollCreator =
+              pollCreatorRaw !== undefined && pollCreatorRaw !== null
+                ? String(pollCreatorRaw).trim()
+                : "";
+            const normalizedCurrentUser = (currentUserId ?? "").trim();
+            const isPollCreator = Boolean(
+              msg.is_outgoing ||
+                (normalizedCurrentUser &&
+                  ((normalizedPollCreator && normalizedPollCreator === normalizedCurrentUser) ||
+                    (msg.sender_id && msg.sender_id.trim() === normalizedCurrentUser))),
+            );
+            const hasPollManagePermission =
+              canManagePolls !== undefined
+                ? Boolean(canManagePolls || isPollCreator)
+                : normalizedCurrentUser || normalizedPollCreator
+                  ? isPollCreator
+                  : msg.is_outgoing;
+            const canLockPoll = Boolean(
+              !isPollClosed && pollData.poll_id > 0 && onLockPoll && hasPollManagePermission,
+            );
 
             const submitNewPollOption = async () => {
               if (!canAddOption || !onAddPollOption || pollBusy) return;
@@ -1225,12 +1478,17 @@ export const MessageBubble = memo(function MessageBubble({
               const votedIds = pollData.allow_multi
                 ? pollData.options.filter((o) => o.voted).map((o) => o.id)
                 : [];
+              setPollError(null);
               setPollBusy(true);
               try {
-                const ok = await onAddPollOption(msg, trimmed, votedIds);
-                if (ok !== false) {
+                const res = await onAddPollOption(msg, trimmed, votedIds);
+                if (res === false || (typeof res === "string" && res.trim().length > 0)) {
+                  setPollError(formatPollErrorMessage(typeof res === "string" ? res : "", lang));
+                } else {
                   setNewPollOption("");
                 }
+              } catch (err) {
+                setPollError(formatPollErrorMessage(err, lang));
               } finally {
                 setPollBusy(false);
               }
@@ -1259,8 +1517,33 @@ export const MessageBubble = memo(function MessageBubble({
                       onClick={(e) => {
                         e.stopPropagation();
                         if (pollBusy) return;
+                        setPollError(null);
                         setPollBusy(true);
-                        void Promise.resolve(onRefreshPoll(msg)).finally(() => setPollBusy(false));
+                        void Promise.resolve(onRefreshPoll(msg))
+                          .then((res) => {
+                            if (
+                              res === false ||
+                              (typeof res === "string" && res.trim().length > 0)
+                            ) {
+                              if (sparsePollId > 0) {
+                                hydratedPollIdsRef.current.delete(sparsePollId);
+                              }
+                              setPollError(
+                                formatPollErrorMessage(
+                                  typeof res === "string" ? res : "",
+                                  lang,
+                                  "load",
+                                ),
+                              );
+                            }
+                          })
+                          .catch((err) => {
+                            if (sparsePollId > 0) {
+                              hydratedPollIdsRef.current.delete(sparsePollId);
+                            }
+                            setPollError(formatPollErrorMessage(err, lang, "load"));
+                          })
+                          .finally(() => setPollBusy(false));
                       }}
                       title={t("pollRefreshTitle")}
                       className="hover-menu rounded p-1 opacity-75 hover:opacity-100 disabled:opacity-40"
@@ -1304,10 +1587,26 @@ export const MessageBubble = memo(function MessageBubble({
                               : opt.voted
                                 ? []
                                 : [opt.id];
+                            setPollError(null);
                             setPollBusy(true);
-                            void Promise.resolve(onVotePoll(msg, nextIds)).finally(() =>
-                              setPollBusy(false),
-                            );
+                            void Promise.resolve(onVotePoll(msg, nextIds))
+                              .then((res) => {
+                                if (
+                                  res === false ||
+                                  (typeof res === "string" && res.trim().length > 0)
+                                ) {
+                                  setPollError(
+                                    formatPollErrorMessage(
+                                      typeof res === "string" ? res : "",
+                                      lang,
+                                    ),
+                                  );
+                                }
+                              })
+                              .catch((err) => {
+                                setPollError(formatPollErrorMessage(err, lang));
+                              })
+                              .finally(() => setPollBusy(false));
                           }}
                           className={`relative block w-full overflow-hidden rounded-lg px-2.5 py-1.5 text-left text-xs transition hover:brightness-95 disabled:cursor-default ${
                             pollBusy ? "opacity-70" : ""
@@ -1405,6 +1704,30 @@ export const MessageBubble = memo(function MessageBubble({
                   </div>
                 )}
 
+                {pollError && (
+                  <div
+                    role="alert"
+                    onClick={(e) => e.stopPropagation()}
+                    className="mt-2 flex items-start justify-between gap-2 rounded-lg px-2.5 py-1.5 text-[11px] leading-snug"
+                    style={{
+                      background: "var(--danger-bg)",
+                      color: "var(--danger-text)",
+                      border: "1px solid rgba(244, 63, 94, 0.35)",
+                    }}
+                  >
+                    <span className="min-w-0 break-words">{pollError}</span>
+                    <button
+                      type="button"
+                      onClick={() => setPollError(null)}
+                      title={t("close")}
+                      aria-label={t("close")}
+                      className="shrink-0 rounded p-0.5 opacity-80 transition hover:opacity-100"
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  </div>
+                )}
+
                 {(totalVotes > 0 || canLockPoll) && (
                   <div
                     className="mt-2 flex flex-wrap items-center justify-between gap-2 border-t pt-1.5 text-[11px]"
@@ -1430,10 +1753,28 @@ export const MessageBubble = memo(function MessageBubble({
                             disabled={pollBusy}
                             onClick={() => {
                               if (!onLockPoll || pollBusy) return;
+                              setPollError(null);
                               setPollBusy(true);
                               void Promise.resolve(onLockPoll(msg))
-                                .then((ok) => {
-                                  if (ok !== false) setConfirmLockPoll(false);
+                                .then((res) => {
+                                  if (
+                                    res === false ||
+                                    (typeof res === "string" && res.trim().length > 0)
+                                  ) {
+                                    setConfirmLockPoll(false);
+                                    setPollError(
+                                      formatPollErrorMessage(
+                                        typeof res === "string" ? res : "",
+                                        lang,
+                                      ),
+                                    );
+                                  } else {
+                                    setConfirmLockPoll(false);
+                                  }
+                                })
+                                .catch((err) => {
+                                  setConfirmLockPoll(false);
+                                  setPollError(formatPollErrorMessage(err, lang));
                                 })
                                 .finally(() => setPollBusy(false));
                             }}
@@ -1584,6 +1925,7 @@ export const MessageBubble = memo(function MessageBubble({
                 t("viewMemberProfileTitle"),
                 highlightQuery,
                 isPureEmoticon,
+                threadKind === "group",
               )}
               {useInlineMeta && (
                 <span
@@ -1730,6 +2072,20 @@ export const MessageBubble = memo(function MessageBubble({
                 <span>{t("translatedOrigLabel")}</span>
               </button>
             )}
+            {effectiveBlockedStickerRule && tempRevealed && (
+              <button
+                type="button"
+                onClick={() => setTempRevealed(false)}
+                className="flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[11px] opacity-80 hover:opacity-100 hover:underline"
+                style={{
+                  background: isPlainSticker ? "var(--pill-bg)" : undefined,
+                  color: isPlainSticker ? "var(--pill-text)" : "var(--text-secondary)",
+                }}
+              >
+                <EyeOff className="h-3 w-3" />
+                <span>{t("blockedStickerHideAgain")}</span>
+              </button>
+            )}
             {timestampEl}
           </div>
         )}
@@ -1786,7 +2142,9 @@ export const MessageBubble = memo(function MessageBubble({
             <div
               data-teza-floating-popup="true"
               onClick={(e) => e.stopPropagation()}
-              className="fixed z-[80] w-52 rounded-xl py-1 shadow-2xl"
+              className={`fixed z-[80] max-h-[calc(100vh-16px)] overflow-y-auto rounded-xl py-1 shadow-2xl ${
+                hasBlockStickerActions ? "w-60" : "w-52"
+              }`}
               style={{
                 left: `${menuPos.x}px`,
                 top: `${menuPos.y}px`,
@@ -1900,6 +2258,70 @@ export const MessageBubble = memo(function MessageBubble({
             >
               <Copy className="h-3.5 w-3.5" /> {t("copyText")}
             </button>
+            {(hasBlockStickerActions || (effectiveBlockedStickerRule && tempRevealed)) && (
+              <div
+                className="my-1 border-t"
+                style={{ borderColor: "var(--border-subtle)" }}
+              />
+            )}
+            {effectiveBlockedStickerRule && tempRevealed && (
+              <>
+                <button
+                  onClick={() => {
+                    setTempRevealed(false);
+                    setMenuPos(null);
+                  }}
+                  className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
+                >
+                  <EyeOff className="h-3.5 w-3.5 shrink-0" /> {t("blockedStickerHideAgain")}
+                </button>
+                {onUnblockSticker && (
+                  <button
+                    onClick={() => {
+                      onUnblockSticker(effectiveBlockedStickerRule.id);
+                      setMenuPos(null);
+                    }}
+                    className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
+                    style={{ color: "var(--accent)" }}
+                  >
+                    <Eye className="h-3.5 w-3.5 shrink-0" /> {t("blockedStickerUnblock")}
+                  </button>
+                )}
+              </>
+            )}
+            {canBlockStickerSingle && onBlockSticker && (
+              <>
+                <button
+                  onClick={() => {
+                    onBlockSticker(msg, { kind: "sticker", global: false });
+                    setMenuPos(null);
+                  }}
+                  className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
+                >
+                  <EyeOff className="h-3.5 w-3.5 shrink-0" /> {t("blockedStickerHideInChat")}
+                </button>
+                <button
+                  onClick={() => {
+                    onBlockSticker(msg, { kind: "sticker", global: true });
+                    setMenuPos(null);
+                  }}
+                  className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
+                >
+                  <Ban className="h-3.5 w-3.5 shrink-0" /> {t("blockedStickerHideEverywhere")}
+                </button>
+              </>
+            )}
+            {canBlockStickerCategory && onBlockSticker && (
+              <button
+                onClick={() => {
+                  onBlockSticker(msg, { kind: "category", global: false });
+                  setMenuPos(null);
+                }}
+                className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px]"
+              >
+                <Ban className="h-3.5 w-3.5 shrink-0" /> {t("blockedStickerHidePackInChat")}
+              </button>
+            )}
             {msg.is_outgoing && !msg.is_recalled && !msg.send_status && (
               <button
                 onClick={() => {
@@ -1911,19 +2333,21 @@ export const MessageBubble = memo(function MessageBubble({
                 <RotateCcw className="h-3.5 w-3.5" /> {t("recallMessage")}
               </button>
             )}
-            <button
-              onClick={() => {
-                if (msg.send_status && onDiscardFailed) {
-                  onDiscardFailed(msg.msg_id);
-                } else {
-                  onDeleteLocal(msg);
-                }
-                setMenuPos(null);
-              }}
-              className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px] text-rose-500"
-            >
-              <Trash2 className="h-3.5 w-3.5" /> {t("deleteOnDevice")}
-            </button>
+            {(!msg.send_status || msg.send_status === "failed" || !discardDisabled) && (
+              <button
+                onClick={() => {
+                  if (msg.send_status && onDiscardFailed) {
+                    onDiscardFailed(msg.msg_id);
+                  } else {
+                    onDeleteLocal(msg);
+                  }
+                  setMenuPos(null);
+                }}
+                className="hover-menu flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13.5px] text-rose-500"
+              >
+                <Trash2 className="h-3.5 w-3.5" /> {t("deleteOnDevice")}
+              </button>
+            )}
           </div>,
             document.body,
           )}

@@ -14,12 +14,13 @@
 //!    (`4 * 1024 * 1024`, multiple of 256 KiB) chunks, and downloads stream chunk-by-chunk to disk
 //!    with no artificial per-file size cap or artificial cloud quota cap.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::{Read, Write};
 use std::num::NonZeroU32;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -45,6 +46,8 @@ use crate::store::MessageStore;
 
 pub use crate::store::{
     CloudMediaBreakdown, GDriveCloudItemDto, GDriveThreadUsageDto, HistoryDeltaBatch,
+    HistoryDeltaImportReport, HistoryDeletedMessageTombstone, HistoryDeletedThreadTombstone,
+    PendingCloudDeleteRecord,
 };
 
 pub const GDRIVE_OAUTH_SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
@@ -107,12 +110,16 @@ pub enum GDriveError {
     NotConnected,
     #[error("Google Drive E2EE vault is locked")]
     VaultLocked,
+    #[error("Kho sao lưu Google Drive bị thiếu tệp khóa manifest.enc.json sau khi khôi phục. Vui lòng mở khóa lại kho E2EE bằng mật khẩu trước khi đồng bộ để tránh dữ liệu không thể giải mã.")]
+    VaultManifestMissing,
     #[error("Invalid E2EE passphrase or corrupted vault manifest")]
     InvalidPassphrase,
     #[error("Google Drive sign-in was cancelled")]
     AuthCancelled,
     #[error("Google Drive sign-in timed out")]
     AuthTimeout,
+    #[error("Google Drive OAuth access token expired or revoked (HTTP 401)")]
+    Unauthorized,
     #[error("Google Drive API rate limit exceeded")]
     RateLimited,
     #[error("Google Drive đã hết dung lượng trống (storageQuotaExceeded). Hãy giải phóng dung lượng trên Google Drive hoặc dùng Trình quản lý dung lượng Cloud để xóa bớt tệp cũ.")]
@@ -279,6 +286,8 @@ pub struct GDriveStatusDto {
     pub connected: bool,
     pub account_email: Option<String>,
     pub account_name: Option<String>,
+    #[serde(default)]
+    pub root_folder_id: Option<String>,
     pub vault_unlocked: bool,
     pub has_remote_manifest: bool,
     pub sync_enabled: bool,
@@ -622,9 +631,62 @@ impl Drop for GDriveTokens {
     }
 }
 
+#[derive(Default)]
+struct GlobalManifestCache {
+    by_id: HashMap<String, Vec<u8>>,
+}
+
+fn global_manifest_cache() -> &'static StdMutex<GlobalManifestCache> {
+    static CACHE: OnceLock<StdMutex<GlobalManifestCache>> = OnceLock::new();
+    CACHE.get_or_init(|| StdMutex::new(GlobalManifestCache::default()))
+}
+
+fn manifest_sidecar_path(tokens_path: &Path) -> PathBuf {
+    let mut os = tokens_path.as_os_str().to_os_string();
+    os.push(".manifest.json");
+    PathBuf::from(os)
+}
+
+fn register_global_manifest_for_ids(
+    manifest_file_id: Option<&str>,
+    uid_folder_id: Option<&str>,
+    manifest_json: &[u8],
+) {
+    let mut guard = global_manifest_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(mid) = manifest_file_id.map(str::trim).filter(|s| !s.is_empty()) {
+        guard.by_id.insert(format!("m:{mid}"), manifest_json.to_vec());
+    }
+    if let Some(ufid) = uid_folder_id.map(str::trim).filter(|s| !s.is_empty()) {
+        guard.by_id.insert(format!("u:{ufid}"), manifest_json.to_vec());
+    }
+}
+
+fn lookup_global_manifest_for_ids(
+    manifest_file_id: Option<&str>,
+    uid_folder_id: Option<&str>,
+) -> Option<Vec<u8>> {
+    let guard = global_manifest_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(mid) = manifest_file_id.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(bytes) = guard.by_id.get(&format!("m:{mid}")) {
+            return Some(bytes.clone());
+        }
+    }
+    if let Some(ufid) = uid_folder_id.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(bytes) = guard.by_id.get(&format!("u:{ufid}")) {
+            return Some(bytes.clone());
+        }
+    }
+    None
+}
+
 impl GDriveTokens {
     pub fn is_access_token_fresh(&self, now_epoch_secs: i64) -> bool {
-        !self.access_token.is_empty() && now_epoch_secs.saturating_add(60) < self.expires_at_epoch_secs
+        !self.access_token.trim().is_empty()
+            && now_epoch_secs.saturating_add(60) < self.expires_at_epoch_secs
     }
 
     pub fn load_from_file(path: &Path) -> GDriveResult<Option<Self>> {
@@ -638,7 +700,20 @@ impl GDriveTokens {
         let parsed = serde_json::from_str::<Self>(&plain)
             .map_err(|e| GDriveError::Other(format!("Corrupted gdrive tokens payload: {e}")));
         zeroize_string(&mut plain);
-        parsed.map(Some)
+        let tokens = parsed?;
+        let sidecar = manifest_sidecar_path(path);
+        if sidecar.exists() {
+            if let Ok(raw) = std::fs::read(&sidecar) {
+                if serde_json::from_slice::<VaultManifest>(&raw).is_ok() {
+                    register_global_manifest_for_ids(
+                        tokens.manifest_file_id.as_deref(),
+                        tokens.uid_folder_id.as_deref(),
+                        &raw,
+                    );
+                }
+            }
+        }
+        Ok(Some(tokens))
     }
 
     pub fn save_to_file(&self, path: &Path) -> GDriveResult<()> {
@@ -649,11 +724,20 @@ impl GDriveTokens {
         let sealed = sealed_res
             .map_err(|e| GDriveError::Other(format!("Failed to seal gdrive tokens: {e}")))?;
         data_dir::write_private_atomic(path, sealed.as_bytes())
-            .map_err(|e| GDriveError::Other(format!("Failed to save gdrive tokens: {e}")))
+            .map_err(|e| GDriveError::Other(format!("Failed to save gdrive tokens: {e}")))?;
+        if let Some(manifest_bytes) = lookup_global_manifest_for_ids(
+            self.manifest_file_id.as_deref(),
+            self.uid_folder_id.as_deref(),
+        ) {
+            let sidecar = manifest_sidecar_path(path);
+            let _ = data_dir::write_private_atomic(&sidecar, &manifest_bytes);
+        }
+        Ok(())
     }
 
     pub fn delete_file(path: &Path) {
         let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(manifest_sidecar_path(path));
     }
 }
 
@@ -1363,12 +1447,51 @@ pub struct VaultFolderIds {
     pub manifest_file_id: Option<String>,
 }
 
+/// Builds a safe Google Drive web URL for a validated Drive folder ID (`[A-Za-z0-9_-]`).
+pub fn drive_folder_web_url(folder_id: &str) -> Option<String> {
+    let trimmed = folder_id.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 256
+        || !trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    Some(format!("https://drive.google.com/drive/folders/{trimmed}"))
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HistorySyncReport {
     pub downloaded_deltas: usize,
     pub applied_messages: usize,
+    pub deleted_messages: usize,
+    pub deleted_threads: usize,
+    pub orphaned_local_paths: Vec<String>,
     pub uploaded_delta_id: Option<String>,
     pub new_last_history_sync_ts: i64,
+    pub new_last_mutation_sync_ts: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResumableOffsetStatus {
+    Incomplete(u64),
+    Completed(String),
+    NotFound,
+}
+
+fn is_permanent_cloud_delete_error(err: &GDriveError) -> bool {
+    matches!(
+        err,
+        GDriveError::Api(msg) if msg.starts_with("HTTP 400:") || msg.starts_with("HTTP 403:")
+    )
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CloudOrphanPruneReport {
+    pub deleted_count: usize,
+    pub skipped_referenced: usize,
+    pub failed_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1388,11 +1511,81 @@ impl Default for GDriveEndpoints {
     }
 }
 
+#[derive(Clone)]
+struct OAuthRefreshContext {
+    client_id: String,
+    client_secret: Option<String>,
+    token_broker_url: Option<String>,
+    refresh_token: String,
+}
+
+impl fmt::Debug for OAuthRefreshContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuthRefreshContext")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("token_broker_url", &self.token_broker_url)
+            .field("refresh_token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for OAuthRefreshContext {
+    fn drop(&mut self) {
+        if let Some(ref mut sec) = self.client_secret {
+            zeroize_string(sec);
+        }
+        zeroize_string(&mut self.refresh_token);
+    }
+}
+
+#[derive(Clone)]
+struct RefreshedTokenSnapshot {
+    access_token: String,
+    refresh_token: String,
+    expires_at_epoch_secs: i64,
+}
+
+impl fmt::Debug for RefreshedTokenSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RefreshedTokenSnapshot")
+            .field("access_token", &"[REDACTED]")
+            .field("refresh_token", &"[REDACTED]")
+            .field("expires_at_epoch_secs", &self.expires_at_epoch_secs)
+            .finish()
+    }
+}
+
+impl Drop for RefreshedTokenSnapshot {
+    fn drop(&mut self) {
+        zeroize_string(&mut self.access_token);
+        zeroize_string(&mut self.refresh_token);
+    }
+}
+
+#[derive(Default, Debug)]
+struct GDriveClientState {
+    cached_manifests_by_uid: HashMap<String, Vec<u8>>,
+    manifest_missing_folders: HashSet<String>,
+    pending_store_recovery_reset: HashMap<String, (bool, bool)>,
+    oauth_contexts: HashMap<String, OAuthRefreshContext>,
+    refreshed_tokens: HashMap<String, RefreshedTokenSnapshot>,
+}
+
+fn token_fingerprint(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    encode_hex_lower(&digest)
+}
+
 /// Direct (`.no_proxy()`) Google Drive v3 + OAuth2 client with strict Relay exclusion.
 #[derive(Clone, Debug)]
 pub struct GDriveClient {
     http: Client,
     endpoints: GDriveEndpoints,
+    state: Arc<StdMutex<GDriveClientState>>,
 }
 
 impl GDriveClient {
@@ -1408,7 +1601,208 @@ impl GDriveClient {
             .user_agent("TezaDesktop/1.0")
             .build()
             .map_err(|e| GDriveError::Other(format!("Failed to build direct Drive HTTP client: {e}")))?;
-        Ok(Self { http, endpoints })
+        Ok(Self {
+            http,
+            endpoints,
+            state: Arc::new(StdMutex::new(GDriveClientState::default())),
+        })
+    }
+
+    /// Caches a wrapped `VaultManifest` locally on this client so `verify_or_recover_vault_folders`
+    /// can safely re-upload the exact same manifest if `Teza Vault` is deleted/recreated on Drive.
+    pub fn cache_vault_manifest(&self, uid: &str, manifest: &VaultManifest) -> GDriveResult<()> {
+        let raw = serde_json::to_vec_pretty(manifest)
+            .map_err(|e| GDriveError::Other(format!("Failed serializing vault manifest: {e}")))?;
+        self.cache_vault_manifest_bytes(uid, None, None, &raw);
+        Ok(())
+    }
+
+    fn cache_vault_manifest_bytes(
+        &self,
+        uid: &str,
+        manifest_file_id: Option<&str>,
+        uid_folder_id: Option<&str>,
+        manifest_json: &[u8],
+    ) {
+        let uid_seg = sanitize_uid_folder_name(uid);
+        {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .cached_manifests_by_uid
+                .insert(uid_seg, manifest_json.to_vec());
+        }
+        register_global_manifest_for_ids(manifest_file_id, uid_folder_id, manifest_json);
+    }
+
+    fn lookup_cached_manifest_bytes(
+        &self,
+        uid: &str,
+        prev_manifest_file_id: Option<&str>,
+        prev_uid_folder_id: Option<&str>,
+    ) -> Option<Vec<u8>> {
+        let uid_seg = sanitize_uid_folder_name(uid);
+        {
+            let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(bytes) = guard.cached_manifests_by_uid.get(&uid_seg) {
+                return Some(bytes.clone());
+            }
+        }
+        lookup_global_manifest_for_ids(prev_manifest_file_id, prev_uid_folder_id)
+    }
+
+    fn mark_folders_manifest_status(
+        &self,
+        blobs_folder_id: &str,
+        history_folder_id: &str,
+        has_manifest: bool,
+    ) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if has_manifest {
+            guard.manifest_missing_folders.remove(blobs_folder_id);
+            guard.manifest_missing_folders.remove(history_folder_id);
+        } else {
+            if !blobs_folder_id.trim().is_empty() {
+                guard
+                    .manifest_missing_folders
+                    .insert(blobs_folder_id.to_string());
+            }
+            if !history_folder_id.trim().is_empty() {
+                guard
+                    .manifest_missing_folders
+                    .insert(history_folder_id.to_string());
+            }
+        }
+    }
+
+    fn ensure_folder_has_manifest(&self, folder_id: &str) -> GDriveResult<()> {
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.manifest_missing_folders.contains(folder_id) {
+            return Err(GDriveError::VaultManifestMissing);
+        }
+        Ok(())
+    }
+
+    fn record_pending_store_recovery_reset(
+        &self,
+        uid: &str,
+        reset_blobs: bool,
+        reset_history: bool,
+    ) {
+        if !reset_blobs && !reset_history {
+            return;
+        }
+        let uid_seg = sanitize_uid_folder_name(uid);
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard
+            .pending_store_recovery_reset
+            .entry(uid_seg)
+            .or_insert((false, false));
+        entry.0 |= reset_blobs;
+        entry.1 |= reset_history;
+    }
+
+    /// Consumes any pending `(reset_blobs, reset_history)` store reset queued by
+    /// `verify_or_recover_vault_folders` when remote vault folders were newly recreated.
+    pub fn take_pending_store_recovery_reset(&self, uid: &str) -> Option<(bool, bool)> {
+        let uid_seg = sanitize_uid_folder_name(uid);
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.pending_store_recovery_reset.remove(&uid_seg)
+    }
+
+    fn record_oauth_context(
+        &self,
+        access_token: &str,
+        client_id: &str,
+        client_secret: Option<&str>,
+        token_broker_url: Option<&str>,
+        refresh_token: &str,
+    ) {
+        let trimmed_at = access_token.trim();
+        let trimmed_rt = refresh_token.trim();
+        if trimmed_at.is_empty() || trimmed_rt.is_empty() || client_id.trim().is_empty() {
+            return;
+        }
+        let fp = token_fingerprint(trimmed_at);
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.oauth_contexts.len() >= 16 {
+            guard.oauth_contexts.clear();
+        }
+        guard.oauth_contexts.insert(
+            fp,
+            OAuthRefreshContext {
+                client_id: client_id.to_string(),
+                client_secret: client_secret.map(str::to_string),
+                token_broker_url: token_broker_url.map(str::to_string),
+                refresh_token: trimmed_rt.to_string(),
+            },
+        );
+    }
+
+    fn resolve_effective_access_token(&self, access_token: &str) -> String {
+        let trimmed = access_token.trim();
+        if trimmed.is_empty() {
+            return access_token.to_string();
+        }
+        let fp = token_fingerprint(trimmed);
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .refreshed_tokens
+            .get(&fp)
+            .map(|snap| snap.access_token.clone())
+            .unwrap_or_else(|| access_token.to_string())
+    }
+
+    async fn try_force_refresh_on_401(
+        &self,
+        relay_enabled: bool,
+        failed_access_token: &str,
+    ) -> GDriveResult<Option<String>> {
+        ensure_relay_disabled(relay_enabled)?;
+        let fp = token_fingerprint(failed_access_token.trim());
+        let ctx_opt = {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.oauth_contexts.remove(&fp)
+        };
+        let Some(ctx) = ctx_opt else {
+            return Ok(None);
+        };
+        let mut tmp_tokens = GDriveTokens {
+            access_token: failed_access_token.to_string(),
+            refresh_token: ctx.refresh_token.clone(),
+            expires_at_epoch_secs: 0,
+            account_email: None,
+            account_name: None,
+            root_folder_id: None,
+            uid_folder_id: None,
+            blobs_folder_id: None,
+            history_folder_id: None,
+            manifest_file_id: None,
+        };
+        self.refresh_access_token_inner(
+            relay_enabled,
+            &ctx.client_id,
+            ctx.client_secret.as_deref(),
+            ctx.token_broker_url.as_deref(),
+            &mut tmp_tokens,
+            true,
+        )
+        .await?;
+        let new_access = tmp_tokens.access_token.clone();
+        {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.refreshed_tokens.len() >= 16 {
+                guard.refreshed_tokens.clear();
+            }
+            guard.refreshed_tokens.insert(
+                fp,
+                RefreshedTokenSnapshot {
+                    access_token: tmp_tokens.access_token.clone(),
+                    refresh_token: tmp_tokens.refresh_token.clone(),
+                    expires_at_epoch_secs: tmp_tokens.expires_at_epoch_secs,
+                },
+            );
+        }
+        Ok(Some(new_access))
     }
 
     /// Exchanges an OAuth 2.0 PKCE authorization code for access + refresh tokens.
@@ -1486,11 +1880,25 @@ impl GDriveClient {
         }
         let parsed: TokenResp = serde_json::from_str(&body)
             .map_err(|e| GDriveError::Api(format!("Invalid OAuth token JSON: {e}")))?;
+        let access_token = parsed.access_token.trim().to_string();
+        if access_token.is_empty() {
+            return Err(GDriveError::Api(
+                "OAuth token exchange returned empty access_token".into(),
+            ));
+        }
+        let refresh_token = parsed.refresh_token.unwrap_or_default();
         let now = chrono::Utc::now().timestamp();
         let ttl = parsed.expires_in.max(60);
+        self.record_oauth_context(
+            &access_token,
+            client_id,
+            client_secret,
+            token_broker_url,
+            &refresh_token,
+        );
         Ok(GDriveTokens {
-            access_token: parsed.access_token,
-            refresh_token: parsed.refresh_token.unwrap_or_default(),
+            access_token,
+            refresh_token,
             expires_at_epoch_secs: now.saturating_add(ttl),
             account_email: None,
             account_name: None,
@@ -1535,10 +1943,115 @@ impl GDriveClient {
         token_broker_url: Option<&str>,
         tokens: &mut GDriveTokens,
     ) -> GDriveResult<bool> {
+        self.refresh_access_token_inner(
+            relay_enabled,
+            client_id,
+            client_secret,
+            token_broker_url,
+            tokens,
+            false,
+        )
+        .await
+    }
+
+    /// Unconditionally forces an OAuth access token refresh regardless of local wall-clock
+    /// `expires_at_epoch_secs` (used after an HTTP 401 Unauthorized response).
+    pub async fn force_refresh_access_token_with_broker(
+        &self,
+        relay_enabled: bool,
+        client_id: &str,
+        client_secret: Option<&str>,
+        token_broker_url: Option<&str>,
+        tokens: &mut GDriveTokens,
+    ) -> GDriveResult<bool> {
+        self.refresh_access_token_inner(
+            relay_enabled,
+            client_id,
+            client_secret,
+            token_broker_url,
+            tokens,
+            true,
+        )
+        .await
+    }
+
+    /// Executes an async Drive API operation, forcing one OAuth refresh + retry on `GDriveError::Unauthorized`.
+    /// Returns `(output, token_was_refreshed)`.
+    pub async fn run_with_401_refresh<T, F, Fut>(
+        &self,
+        relay_enabled: bool,
+        client_id: &str,
+        client_secret: Option<&str>,
+        token_broker_url: Option<&str>,
+        tokens: &mut GDriveTokens,
+        mut op: F,
+    ) -> GDriveResult<(T, bool)>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: std::future::Future<Output = GDriveResult<T>>,
+    {
+        ensure_relay_disabled(relay_enabled)?;
+        match op(tokens.access_token.clone()).await {
+            Ok(v) => Ok((v, false)),
+            Err(GDriveError::Unauthorized) => {
+                self.force_refresh_access_token_with_broker(
+                    relay_enabled,
+                    client_id,
+                    client_secret,
+                    token_broker_url,
+                    tokens,
+                )
+                .await?;
+                let v = op(tokens.access_token.clone()).await?;
+                Ok((v, true))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn refresh_access_token_inner(
+        &self,
+        relay_enabled: bool,
+        client_id: &str,
+        client_secret: Option<&str>,
+        token_broker_url: Option<&str>,
+        tokens: &mut GDriveTokens,
+        force: bool,
+    ) -> GDriveResult<bool> {
         ensure_relay_disabled(relay_enabled)?;
 
+        if !force && !tokens.access_token.trim().is_empty() {
+            let fp = token_fingerprint(tokens.access_token.trim());
+            let cached_replacement = {
+                let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                guard.refreshed_tokens.remove(&fp)
+            };
+            if let Some(snap) = cached_replacement {
+                tokens.access_token = snap.access_token.clone();
+                tokens.expires_at_epoch_secs = snap.expires_at_epoch_secs;
+                if !snap.refresh_token.trim().is_empty() {
+                    tokens.refresh_token = snap.refresh_token.clone();
+                }
+                self.record_oauth_context(
+                    &tokens.access_token,
+                    client_id,
+                    client_secret,
+                    token_broker_url,
+                    &tokens.refresh_token,
+                );
+                return Ok(true);
+            }
+        }
+
         let now = chrono::Utc::now().timestamp();
-        if tokens.is_access_token_fresh(now) {
+        if !force && tokens.is_access_token_fresh(now) {
+            self.record_oauth_context(
+                &tokens.access_token,
+                client_id,
+                client_secret,
+                token_broker_url,
+                &tokens.refresh_token,
+            );
             return Ok(false);
         }
         if tokens.refresh_token.trim().is_empty() {
@@ -1600,12 +2113,25 @@ impl GDriveClient {
         }
         let parsed: RefreshResp = serde_json::from_str(&body)
             .map_err(|e| GDriveError::Api(format!("Invalid refresh token JSON: {e}")))?;
+        let new_access_token = parsed.access_token.trim().to_string();
+        if new_access_token.is_empty() {
+            return Err(GDriveError::Api(
+                "OAuth token refresh returned empty access_token".into(),
+            ));
+        }
         let ttl = parsed.expires_in.max(60);
-        tokens.access_token = parsed.access_token;
+        tokens.access_token = new_access_token;
         tokens.expires_at_epoch_secs = chrono::Utc::now().timestamp().saturating_add(ttl);
         if let Some(new_rt) = parsed.refresh_token.filter(|s| !s.trim().is_empty()) {
             tokens.refresh_token = new_rt;
         }
+        self.record_oauth_context(
+            &tokens.access_token,
+            client_id,
+            client_secret,
+            token_broker_url,
+            &tokens.refresh_token,
+        );
         Ok(true)
     }
 
@@ -1727,6 +2253,7 @@ impl GDriveClient {
         url.query_pairs_mut()
             .append_pair("q", &q)
             .append_pair("fields", "files(id,name,size,mimeType,modifiedTime)")
+            .append_pair("orderBy", "createdTime asc")
             .append_pair("pageSize", "1")
             .append_pair("spaces", "drive");
 
@@ -1803,12 +2330,15 @@ impl GDriveClient {
         let payload_bytes = serde_json::to_vec(&payload)
             .map_err(|e| GDriveError::Other(format!("Failed encoding folder metadata: {e}")))?;
 
-        for attempt in 0..=MAX_API_RETRIES {
+        let mut current_token = self.resolve_effective_access_token(access_token);
+        let mut refreshed_on_401 = false;
+        let mut attempt = 0usize;
+        loop {
             ensure_relay_disabled(relay_enabled)?;
             let resp = self
                 .http
                 .post(&url)
-                .header(AUTHORIZATION, format!("Bearer {access_token}"))
+                .header(AUTHORIZATION, format!("Bearer {current_token}"))
                 .header(CONTENT_TYPE, "application/json; charset=UTF-8")
                 .body(payload_bytes.clone())
                 .send()
@@ -1828,13 +2358,23 @@ impl GDriveClient {
             if status.is_success() {
                 return parse_file_id(&body);
             }
+            if status == StatusCode::UNAUTHORIZED && !refreshed_on_401 {
+                if let Some(new_tok) = self
+                    .try_force_refresh_on_401(relay_enabled, &current_token)
+                    .await?
+                {
+                    current_token = new_tok;
+                    refreshed_on_401 = true;
+                    continue;
+                }
+            }
             if is_retryable_drive_error(status, &body) && attempt < MAX_API_RETRIES {
                 tokio::time::sleep(compute_retry_delay(attempt, retry_after.as_deref())).await;
+                attempt += 1;
                 continue;
             }
             return Err(map_drive_http_error(status, &body));
         }
-        Err(GDriveError::RateLimited)
     }
 
     /// Idempotently finds or creates `Teza Vault/` -> `README.txt` + `<uid>/` -> `blobs/`, `history/`
@@ -1977,6 +2517,279 @@ impl GDriveClient {
         })
     }
 
+    /// Lightweight folder liveness probe (`GET /files/{id}?fields=id,trashed,mimeType`).
+    /// Returns `Ok(true)` only when the folder exists, is not trashed, and has Drive folder MIME.
+    /// Maps `404 NotFound` or `trashed == true` cleanly to `Ok(false)`.
+    pub async fn is_folder_alive(
+        &self,
+        relay_enabled: bool,
+        access_token: &str,
+        folder_id: &str,
+    ) -> GDriveResult<bool> {
+        ensure_relay_disabled(relay_enabled)?;
+        let id = folder_id.trim();
+        if id.is_empty() {
+            return Ok(false);
+        }
+        let url = format!(
+            "{}/files/{}?fields=id,trashed,mimeType",
+            self.endpoints.drive_api_base,
+            encode_path_segment(id)
+        );
+        let body = match self
+            .send_get_text_with_retry(relay_enabled, access_token, &url)
+            .await
+        {
+            Ok(b) => b,
+            Err(GDriveError::NotFound) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct FolderProbeResp {
+            #[serde(default)]
+            id: Option<String>,
+            #[serde(default)]
+            trashed: Option<bool>,
+            #[serde(default)]
+            mime_type: Option<String>,
+        }
+        let parsed: FolderProbeResp = serde_json::from_str(&body)
+            .map_err(|e| GDriveError::Api(format!("Invalid Drive folder probe JSON: {e}")))?;
+        let has_id = parsed.id.as_deref().is_some_and(|s| !s.trim().is_empty());
+        let trashed = parsed.trashed.unwrap_or(false);
+        let mime_ok = parsed
+            .mime_type
+            .as_deref()
+            .is_none_or(|mt| mt == DRIVE_FOLDER_MIME);
+        Ok(has_id && !trashed && mime_ok)
+    }
+
+    /// Lightweight file liveness probe (`GET /files/{id}?fields=id,trashed`).
+    /// Returns `Ok(true)` only when the file exists and is not trashed.
+    /// Maps `404 NotFound` or `trashed == true` cleanly to `Ok(false)`.
+    pub async fn is_file_alive(
+        &self,
+        relay_enabled: bool,
+        access_token: &str,
+        file_id: &str,
+    ) -> GDriveResult<bool> {
+        ensure_relay_disabled(relay_enabled)?;
+        let id = file_id.trim();
+        if id.is_empty() {
+            return Ok(false);
+        }
+        let url = format!(
+            "{}/files/{}?fields=id,trashed",
+            self.endpoints.drive_api_base,
+            encode_path_segment(id)
+        );
+        let body = match self
+            .send_get_text_with_retry(relay_enabled, access_token, &url)
+            .await
+        {
+            Ok(b) => b,
+            Err(GDriveError::NotFound) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct FileProbeResp {
+            #[serde(default)]
+            id: Option<String>,
+            #[serde(default)]
+            trashed: Option<bool>,
+        }
+        let parsed: FileProbeResp = serde_json::from_str(&body)
+            .map_err(|e| GDriveError::Api(format!("Invalid Drive file probe JSON: {e}")))?;
+        let has_id = parsed.id.as_deref().is_some_and(|s| !s.trim().is_empty());
+        let trashed = parsed.trashed.unwrap_or(false);
+        Ok(has_id && !trashed)
+    }
+
+    /// Verifies cached vault folder IDs (`root`, `uid_dir`, `blobs`, `history`) and `manifest.enc.json`
+    /// are still alive & non-trashed. If any cached folder is missing or trashed, invalidates the cache
+    /// and recreates/re-resolves `Teza Vault/<uid>/{blobs,history}` via `ensure_vault_folders`.
+    /// When `manifest.enc.json` is missing after recovery, automatically re-uploads the locally cached
+    /// wrapped `VaultManifest` (matching the cached `master_key`) if available; otherwise blocks
+    /// encrypted uploads to those recovered folders until re-unlock.
+    /// Returns `(folders, folders_updated_on_tokens)`.
+    pub async fn verify_or_recover_vault_folders(
+        &self,
+        relay_enabled: bool,
+        access_token: &str,
+        uid: &str,
+        tokens: &mut GDriveTokens,
+    ) -> GDriveResult<(VaultFolderIds, bool)> {
+        ensure_relay_disabled(relay_enabled)?;
+        let prev_uid_dir = tokens.uid_folder_id.clone();
+        let prev_blobs = tokens.blobs_folder_id.clone();
+        let prev_history = tokens.history_folder_id.clone();
+        let prev_manifest = tokens.manifest_file_id.clone();
+
+        if let (Some(root), Some(uid_dir), Some(blobs), Some(history)) = (
+            tokens.root_folder_id.clone(),
+            tokens.uid_folder_id.clone(),
+            tokens.blobs_folder_id.clone(),
+            tokens.history_folder_id.clone(),
+        ) {
+            let root_ok = self
+                .is_folder_alive(relay_enabled, access_token, &root)
+                .await?;
+            let uid_ok = if root_ok {
+                self.is_folder_alive(relay_enabled, access_token, &uid_dir)
+                    .await?
+            } else {
+                false
+            };
+            let blobs_ok = if root_ok && uid_ok {
+                self.is_folder_alive(relay_enabled, access_token, &blobs)
+                    .await?
+            } else {
+                false
+            };
+            let history_ok = if root_ok && uid_ok && blobs_ok {
+                self.is_folder_alive(relay_enabled, access_token, &history)
+                    .await?
+            } else {
+                false
+            };
+            if root_ok && uid_ok && blobs_ok && history_ok {
+                let manifest_ok = match tokens.manifest_file_id.as_deref() {
+                    Some(mid) => {
+                        self.is_file_alive(relay_enabled, access_token, mid)
+                            .await?
+                    }
+                    None => false,
+                };
+                if manifest_ok {
+                    self.mark_folders_manifest_status(&blobs, &history, true);
+                    return Ok((
+                        VaultFolderIds {
+                            root_folder_id: root,
+                            uid_folder_id: uid_dir,
+                            blobs_folder_id: blobs,
+                            history_folder_id: history,
+                            manifest_file_id: tokens.manifest_file_id.clone(),
+                        },
+                        false,
+                    ));
+                }
+
+                // All folders are alive, but `manifest_file_id` was missing or trashed/deleted:
+                // probe Drive for an existing `manifest.enc.json` first, then fall back to the
+                // locally cached wrapped manifest if available.
+                let found_manifest = self
+                    .find_file_in_folder(
+                        relay_enabled,
+                        access_token,
+                        &uid_dir,
+                        DRIVE_MANIFEST_FILE_NAME,
+                        None,
+                    )
+                    .await?
+                    .map(|f| f.id);
+                let restored_manifest = if let Some(fid) = found_manifest {
+                    Some(fid)
+                } else if let Some(cached_bytes) = self.lookup_cached_manifest_bytes(
+                    uid,
+                    prev_manifest.as_deref(),
+                    Some(uid_dir.as_str()),
+                ) {
+                    let new_id = self
+                        .upload_small_bytes(
+                            relay_enabled,
+                            access_token,
+                            &uid_dir,
+                            DRIVE_MANIFEST_FILE_NAME,
+                            "application/json",
+                            &cached_bytes,
+                        )
+                        .await?;
+                    self.cache_vault_manifest_bytes(
+                        uid,
+                        Some(&new_id),
+                        Some(&uid_dir),
+                        &cached_bytes,
+                    );
+                    Some(new_id)
+                } else {
+                    None
+                };
+                let changed = tokens.manifest_file_id != restored_manifest;
+                tokens.manifest_file_id = restored_manifest.clone();
+                self.mark_folders_manifest_status(&blobs, &history, restored_manifest.is_some());
+                return Ok((
+                    VaultFolderIds {
+                        root_folder_id: root,
+                        uid_folder_id: uid_dir,
+                        blobs_folder_id: blobs,
+                        history_folder_id: history,
+                        manifest_file_id: restored_manifest,
+                    },
+                    changed,
+                ));
+            }
+            // Cached folder was trashed or permanently deleted -> invalidate & recreate cleanly.
+            tokens.root_folder_id = None;
+            tokens.uid_folder_id = None;
+            tokens.blobs_folder_id = None;
+            tokens.history_folder_id = None;
+            tokens.manifest_file_id = None;
+        }
+
+        let mut folders = self
+            .ensure_vault_folders(relay_enabled, access_token, uid, tokens)
+            .await?;
+
+        if folders.manifest_file_id.is_none() {
+            if let Some(cached_bytes) = self.lookup_cached_manifest_bytes(
+                uid,
+                prev_manifest.as_deref(),
+                prev_uid_dir.as_deref(),
+            ) {
+                let new_id = self
+                    .upload_small_bytes(
+                        relay_enabled,
+                        access_token,
+                        &folders.uid_folder_id,
+                        DRIVE_MANIFEST_FILE_NAME,
+                        "application/json",
+                        &cached_bytes,
+                    )
+                    .await?;
+                self.cache_vault_manifest_bytes(
+                    uid,
+                    Some(&new_id),
+                    Some(&folders.uid_folder_id),
+                    &cached_bytes,
+                );
+                tokens.manifest_file_id = Some(new_id.clone());
+                folders.manifest_file_id = Some(new_id);
+            }
+        }
+
+        self.mark_folders_manifest_status(
+            &folders.blobs_folder_id,
+            &folders.history_folder_id,
+            folders.manifest_file_id.is_some(),
+        );
+
+        let blobs_recreated = prev_blobs
+            .as_deref()
+            .is_some_and(|old| old != folders.blobs_folder_id.as_str());
+        let history_recreated = prev_history
+            .as_deref()
+            .is_some_and(|old| old != folders.history_folder_id.as_str());
+        if blobs_recreated || history_recreated {
+            self.record_pending_store_recovery_reset(uid, blobs_recreated, history_recreated);
+        }
+
+        Ok((folders, true))
+    }
+
     /// Unlocks an existing remote `manifest.enc.json` or initializes & uploads a new vault manifest
     /// on first device. Returns `(CloudMasterKey, created_new)`.
     pub async fn unlock_or_init_vault(
@@ -2003,6 +2816,17 @@ impl GDriveClient {
             let manifest: VaultManifest =
                 serde_json::from_slice(&raw).map_err(|_| GDriveError::InvalidPassphrase)?;
             let master_key = unwrap_master_key_manifest(uid, passphrase, &manifest).await?;
+            self.cache_vault_manifest_bytes(
+                uid,
+                Some(&manifest_id),
+                Some(&folders.uid_folder_id),
+                &raw,
+            );
+            self.mark_folders_manifest_status(
+                &folders.blobs_folder_id,
+                &folders.history_folder_id,
+                true,
+            );
             return Ok((master_key, false));
         }
 
@@ -2019,7 +2843,18 @@ impl GDriveClient {
                 &manifest_json,
             )
             .await?;
-        tokens.manifest_file_id = Some(file_id);
+        tokens.manifest_file_id = Some(file_id.clone());
+        self.cache_vault_manifest_bytes(
+            uid,
+            Some(&file_id),
+            Some(&folders.uid_folder_id),
+            &manifest_json,
+        );
+        self.mark_folders_manifest_status(
+            &folders.blobs_folder_id,
+            &folders.history_folder_id,
+            true,
+        );
         Ok((master_key, true))
     }
 
@@ -2036,6 +2871,9 @@ impl GDriveClient {
         data: &[u8],
     ) -> GDriveResult<String> {
         ensure_relay_disabled(relay_enabled)?;
+        if name != DRIVE_README_FILE_NAME && name != DRIVE_MANIFEST_FILE_NAME {
+            self.ensure_folder_has_manifest(parent_id)?;
+        }
 
         if data.len() > SMALL_UPLOAD_LIMIT {
             return self
@@ -2069,12 +2907,15 @@ impl GDriveClient {
         );
         let ct_hdr = format!("multipart/related; boundary={boundary}");
 
-        for attempt in 0..=MAX_API_RETRIES {
+        let mut current_token = self.resolve_effective_access_token(access_token);
+        let mut refreshed_on_401 = false;
+        let mut attempt = 0usize;
+        loop {
             ensure_relay_disabled(relay_enabled)?;
             let resp = self
                 .http
                 .post(&url)
-                .header(AUTHORIZATION, format!("Bearer {access_token}"))
+                .header(AUTHORIZATION, format!("Bearer {current_token}"))
                 .header(CONTENT_TYPE, &ct_hdr)
                 .body(body.clone())
                 .send()
@@ -2093,13 +2934,23 @@ impl GDriveClient {
             if status.is_success() {
                 return parse_file_id(&resp_text);
             }
+            if status == StatusCode::UNAUTHORIZED && !refreshed_on_401 {
+                if let Some(new_tok) = self
+                    .try_force_refresh_on_401(relay_enabled, &current_token)
+                    .await?
+                {
+                    current_token = new_tok;
+                    refreshed_on_401 = true;
+                    continue;
+                }
+            }
             if is_retryable_drive_error(status, &resp_text) && attempt < MAX_API_RETRIES {
                 tokio::time::sleep(compute_retry_delay(attempt, retry_after.as_deref())).await;
+                attempt += 1;
                 continue;
             }
             return Err(map_drive_http_error(status, &resp_text));
         }
-        Err(GDriveError::RateLimited)
     }
 
     async fn initiate_resumable_session(
@@ -2121,12 +2972,15 @@ impl GDriveClient {
         }))
         .map_err(|e| GDriveError::Other(format!("Failed encoding upload metadata: {e}")))?;
 
-        for attempt in 0..=MAX_API_RETRIES {
+        let mut current_token = self.resolve_effective_access_token(access_token);
+        let mut refreshed_on_401 = false;
+        let mut attempt = 0usize;
+        loop {
             ensure_relay_disabled(relay_enabled)?;
             let resp = self
                 .http
                 .post(&init_url)
-                .header(AUTHORIZATION, format!("Bearer {access_token}"))
+                .header(AUTHORIZATION, format!("Bearer {current_token}"))
                 .header(CONTENT_TYPE, "application/json; charset=UTF-8")
                 .header("X-Upload-Content-Type", mime)
                 .header("X-Upload-Content-Length", total_len.to_string())
@@ -2157,13 +3011,23 @@ impl GDriveClient {
                     "Drive resumable init response missing Location header".into(),
                 ));
             }
+            if status == StatusCode::UNAUTHORIZED && !refreshed_on_401 {
+                if let Some(new_tok) = self
+                    .try_force_refresh_on_401(relay_enabled, &current_token)
+                    .await?
+                {
+                    current_token = new_tok;
+                    refreshed_on_401 = true;
+                    continue;
+                }
+            }
             if is_retryable_drive_error(status, &body) && attempt < MAX_API_RETRIES {
                 tokio::time::sleep(compute_retry_delay(attempt, retry_after.as_deref())).await;
+                attempt += 1;
                 continue;
             }
             return Err(map_drive_http_error(status, &body));
         }
-        Err(GDriveError::RateLimited)
     }
 
     async fn upload_bytes_resumable(
@@ -2175,6 +3039,10 @@ impl GDriveClient {
         mime: &str,
         data: &[u8],
     ) -> GDriveResult<String> {
+        ensure_relay_disabled(relay_enabled)?;
+        if name != DRIVE_README_FILE_NAME && name != DRIVE_MANIFEST_FILE_NAME {
+            self.ensure_folder_has_manifest(parent_id)?;
+        }
         let total_len = data.len() as u64;
         let session_uri = self
             .initiate_resumable_session(
@@ -2196,7 +3064,7 @@ impl GDriveClient {
             let end_incl = end_excl - 1;
             let content_range = format!("bytes {offset}-{end_incl}/{total_len}");
 
-            let resp = self
+            let resp = match self
                 .http
                 .put(&session_uri)
                 .header(CONTENT_TYPE, mime)
@@ -2204,7 +3072,37 @@ impl GDriveClient {
                 .body(chunk)
                 .send()
                 .await
-                .map_err(|e| GDriveError::Api(format!("Drive chunk PUT failed: {e}")))?;
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    if retries < MAX_API_RETRIES {
+                        tokio::time::sleep(compute_retry_delay(retries, None)).await;
+                        retries += 1;
+                        match self
+                            .query_resumable_offset(relay_enabled, &session_uri, total_len)
+                            .await
+                        {
+                            Ok(ResumableOffsetStatus::Completed(fid)) => return Ok(fid),
+                            Ok(ResumableOffsetStatus::Incomplete(acked)) => {
+                                let next = (acked as usize).min(data.len());
+                                if next > offset {
+                                    retries = 0;
+                                }
+                                offset = next;
+                            }
+                            Ok(ResumableOffsetStatus::NotFound) => {
+                                return Err(GDriveError::NotFound);
+                            }
+                            Err(GDriveError::RelayBlocked) => {
+                                return Err(GDriveError::RelayBlocked);
+                            }
+                            Err(_) => {}
+                        }
+                        continue;
+                    }
+                    return Err(GDriveError::Api(format!("Drive chunk PUT failed: {e}")));
+                }
+            };
             let status = resp.status();
             let range_hdr = resp
                 .headers()
@@ -2226,17 +3124,52 @@ impl GDriveClient {
                     .as_deref()
                     .and_then(parse_drive_range_next_offset)
                     .map(|v| v as usize)
-                    .unwrap_or(end_excl);
-                offset = next.min(data.len());
-                retries = 0;
-                continue;
+                    .unwrap_or(0)
+                    .min(data.len());
+                if next > offset {
+                    offset = next;
+                    retries = 0;
+                    continue;
+                }
+                offset = next;
+                if retries < MAX_API_RETRIES {
+                    tokio::time::sleep(compute_retry_delay(retries, retry_after.as_deref())).await;
+                    retries += 1;
+                    continue;
+                }
+                return Err(GDriveError::Api(format!(
+                    "Drive resumable upload stalled at byte offset {offset}/{total_len} (HTTP 308 did not advance)"
+                )));
             }
             if is_retryable_drive_error(status, &body) && retries < MAX_API_RETRIES {
                 tokio::time::sleep(compute_retry_delay(retries, retry_after.as_deref())).await;
                 retries += 1;
+                match self
+                    .query_resumable_offset(relay_enabled, &session_uri, total_len)
+                    .await
+                {
+                    Ok(ResumableOffsetStatus::Completed(fid)) => return Ok(fid),
+                    Ok(ResumableOffsetStatus::Incomplete(acked)) => {
+                        let next = (acked as usize).min(data.len());
+                        if next > offset {
+                            retries = 0;
+                        }
+                        offset = next;
+                    }
+                    Ok(ResumableOffsetStatus::NotFound) => return Err(GDriveError::NotFound),
+                    Err(GDriveError::RelayBlocked) => return Err(GDriveError::RelayBlocked),
+                    Err(_) => {}
+                }
                 continue;
             }
             return Err(map_drive_http_error(status, &body));
+        }
+
+        if let Ok(ResumableOffsetStatus::Completed(fid)) = self
+            .query_resumable_offset(relay_enabled, &session_uri, total_len)
+            .await
+        {
+            return Ok(fid);
         }
 
         Err(GDriveError::Api(
@@ -2280,6 +3213,9 @@ impl GDriveClient {
         chunk_size: usize,
     ) -> GDriveResult<String> {
         ensure_relay_disabled(relay_enabled)?;
+        if name != DRIVE_README_FILE_NAME && name != DRIVE_MANIFEST_FILE_NAME {
+            self.ensure_folder_has_manifest(parent_id)?;
+        }
 
         let meta = tokio::fs::metadata(file_path).await.map_err(|e| {
             GDriveError::Other(format!(
@@ -2303,7 +3239,7 @@ impl GDriveClient {
         if total_len == 0 {
             for attempt in 0..=MAX_API_RETRIES {
                 ensure_relay_disabled(relay_enabled)?;
-                let resp = self
+                let resp = match self
                     .http
                     .put(&session_uri)
                     .header(CONTENT_TYPE, mime)
@@ -2311,7 +3247,24 @@ impl GDriveClient {
                     .body(Vec::new())
                     .send()
                     .await
-                    .map_err(|e| GDriveError::Api(format!("Drive empty upload PUT failed: {e}")))?;
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if attempt < MAX_API_RETRIES {
+                            tokio::time::sleep(compute_retry_delay(attempt, None)).await;
+                            if let Ok(ResumableOffsetStatus::Completed(fid)) = self
+                                .query_resumable_offset(relay_enabled, &session_uri, 0)
+                                .await
+                            {
+                                return Ok(fid);
+                            }
+                            continue;
+                        }
+                        return Err(GDriveError::Api(format!(
+                            "Drive empty upload PUT failed: {e}"
+                        )));
+                    }
+                };
                 let status = resp.status();
                 let retry_after = resp
                     .headers()
@@ -2324,6 +3277,12 @@ impl GDriveClient {
                 }
                 if is_retryable_drive_error(status, &body) && attempt < MAX_API_RETRIES {
                     tokio::time::sleep(compute_retry_delay(attempt, retry_after.as_deref())).await;
+                    if let Ok(ResumableOffsetStatus::Completed(fid)) = self
+                        .query_resumable_offset(relay_enabled, &session_uri, 0)
+                        .await
+                    {
+                        return Ok(fid);
+                    }
                     continue;
                 }
                 return Err(map_drive_http_error(status, &body));
@@ -2359,7 +3318,7 @@ impl GDriveClient {
             let end_incl = offset + (n as u64) - 1;
             let content_range = format!("bytes {offset}-{end_incl}/{total_len}");
 
-            let resp = self
+            let resp = match self
                 .http
                 .put(&session_uri)
                 .header(CONTENT_TYPE, mime)
@@ -2367,7 +3326,39 @@ impl GDriveClient {
                 .body(buf[..n].to_vec())
                 .send()
                 .await
-                .map_err(|e| GDriveError::Api(format!("Drive resumable chunk PUT failed: {e}")))?;
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    if retries < MAX_API_RETRIES {
+                        tokio::time::sleep(compute_retry_delay(retries, None)).await;
+                        retries += 1;
+                        match self
+                            .query_resumable_offset(relay_enabled, &session_uri, total_len)
+                            .await
+                        {
+                            Ok(ResumableOffsetStatus::Completed(fid)) => return Ok(fid),
+                            Ok(ResumableOffsetStatus::Incomplete(acked)) => {
+                                let next = acked.min(total_len);
+                                if next > offset {
+                                    retries = 0;
+                                }
+                                offset = next;
+                            }
+                            Ok(ResumableOffsetStatus::NotFound) => {
+                                return Err(GDriveError::NotFound);
+                            }
+                            Err(GDriveError::RelayBlocked) => {
+                                return Err(GDriveError::RelayBlocked);
+                            }
+                            Err(_) => {}
+                        }
+                        continue;
+                    }
+                    return Err(GDriveError::Api(format!(
+                        "Drive resumable chunk PUT failed: {e}"
+                    )));
+                }
+            };
             let status = resp.status();
             let range_hdr = resp
                 .headers()
@@ -2388,24 +3379,54 @@ impl GDriveClient {
                 let next = range_hdr
                     .as_deref()
                     .and_then(parse_drive_range_next_offset)
-                    .unwrap_or(end_incl + 1);
-                offset = next.min(total_len);
-                retries = 0;
-                continue;
+                    .unwrap_or(0)
+                    .min(total_len);
+                if next > offset {
+                    offset = next;
+                    retries = 0;
+                    continue;
+                }
+                offset = next;
+                if retries < MAX_API_RETRIES {
+                    tokio::time::sleep(compute_retry_delay(retries, retry_after.as_deref())).await;
+                    retries += 1;
+                    continue;
+                }
+                return Err(GDriveError::Api(format!(
+                    "Drive resumable upload stalled at byte offset {offset}/{total_len} (HTTP 308 did not advance)"
+                )));
             }
             if is_retryable_drive_error(status, &body) && retries < MAX_API_RETRIES {
                 tokio::time::sleep(compute_retry_delay(retries, retry_after.as_deref())).await;
                 retries += 1;
-                // Query server upload progress so we resume at the exact committed byte offset.
-                if let Ok(Some(acked_next)) = self
+                // Query server upload progress so we resume at the exact committed byte offset
+                // (or detect that the final chunk actually completed with 200/201).
+                match self
                     .query_resumable_offset(relay_enabled, &session_uri, total_len)
                     .await
                 {
-                    offset = acked_next.min(total_len);
+                    Ok(ResumableOffsetStatus::Completed(fid)) => return Ok(fid),
+                    Ok(ResumableOffsetStatus::Incomplete(acked)) => {
+                        let next = acked.min(total_len);
+                        if next > offset {
+                            retries = 0;
+                        }
+                        offset = next;
+                    }
+                    Ok(ResumableOffsetStatus::NotFound) => return Err(GDriveError::NotFound),
+                    Err(GDriveError::RelayBlocked) => return Err(GDriveError::RelayBlocked),
+                    Err(_) => {}
                 }
                 continue;
             }
             return Err(map_drive_http_error(status, &body));
+        }
+
+        if let Ok(ResumableOffsetStatus::Completed(fid)) = self
+            .query_resumable_offset(relay_enabled, &session_uri, total_len)
+            .await
+        {
+            return Ok(fid);
         }
 
         Err(GDriveError::Api(
@@ -2418,7 +3439,7 @@ impl GDriveClient {
         relay_enabled: bool,
         session_uri: &str,
         total_len: u64,
-    ) -> GDriveResult<Option<u64>> {
+    ) -> GDriveResult<ResumableOffsetStatus> {
         ensure_relay_disabled(relay_enabled)?;
         let resp = self
             .http
@@ -2429,16 +3450,25 @@ impl GDriveClient {
             .send()
             .await
             .map_err(|e| GDriveError::Api(format!("Drive resumable offset query failed: {e}")))?;
-        if resp.status() == StatusCode::PERMANENT_REDIRECT {
+        let status = resp.status();
+        if status == StatusCode::OK || status == StatusCode::CREATED {
+            let body = resp.text().await.unwrap_or_default();
+            return Ok(ResumableOffsetStatus::Completed(parse_file_id(&body)?));
+        }
+        if status == StatusCode::PERMANENT_REDIRECT {
             let next = resp
                 .headers()
                 .get(RANGE)
                 .and_then(|v| v.to_str().ok())
                 .and_then(parse_drive_range_next_offset)
                 .unwrap_or(0);
-            return Ok(Some(next));
+            return Ok(ResumableOffsetStatus::Incomplete(next));
         }
-        Ok(None)
+        if status == StatusCode::NOT_FOUND || status == StatusCode::GONE {
+            return Ok(ResumableOffsetStatus::NotFound);
+        }
+        let body = resp.text().await.unwrap_or_default();
+        Err(map_drive_http_error(status, &body))
     }
 
     /// Streams a Google Drive file directly to `dst_path` in O(1) RAM.
@@ -2463,12 +3493,15 @@ impl GDriveClient {
             })?;
         }
 
-        for attempt in 0..=MAX_API_RETRIES {
+        let mut current_token = self.resolve_effective_access_token(access_token);
+        let mut refreshed_on_401 = false;
+        let mut attempt = 0usize;
+        loop {
             ensure_relay_disabled(relay_enabled)?;
             let mut resp = self
                 .http
                 .get(&url)
-                .header(AUTHORIZATION, format!("Bearer {access_token}"))
+                .header(AUTHORIZATION, format!("Bearer {current_token}"))
                 .send()
                 .await
                 .map_err(|e| GDriveError::Api(format!("Drive download request failed: {e}")))?;
@@ -2483,8 +3516,19 @@ impl GDriveClient {
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
                 let body = resp.text().await.unwrap_or_default();
+                if status == StatusCode::UNAUTHORIZED && !refreshed_on_401 {
+                    if let Some(new_tok) = self
+                        .try_force_refresh_on_401(relay_enabled, &current_token)
+                        .await?
+                    {
+                        current_token = new_tok;
+                        refreshed_on_401 = true;
+                        continue;
+                    }
+                }
                 if is_retryable_drive_error(status, &body) && attempt < MAX_API_RETRIES {
                     tokio::time::sleep(compute_retry_delay(attempt, retry_after.as_deref())).await;
+                    attempt += 1;
                     continue;
                 }
                 return Err(map_drive_http_error(status, &body));
@@ -2518,13 +3562,16 @@ impl GDriveClient {
             }
             .await;
 
+            // Ensure the OS file handle is closed before deleting partial files on Windows.
+            let std_file = file.into_std().await;
+            drop(std_file);
+
             if let Err(err) = stream_res {
                 let _ = tokio::fs::remove_file(dst_path).await;
                 return Err(err);
             }
             return Ok(total);
         }
-        Err(GDriveError::RateLimited)
     }
 
     /// Downloads a small Drive file (e.g., `manifest.enc.json` or `.delta.enc`) into memory.
@@ -2541,12 +3588,15 @@ impl GDriveClient {
             self.endpoints.drive_api_base,
             encode_path_segment(file_id)
         );
-        for attempt in 0..=MAX_API_RETRIES {
+        let mut current_token = self.resolve_effective_access_token(access_token);
+        let mut refreshed_on_401 = false;
+        let mut attempt = 0usize;
+        loop {
             ensure_relay_disabled(relay_enabled)?;
             let resp = self
                 .http
                 .get(&url)
-                .header(AUTHORIZATION, format!("Bearer {access_token}"))
+                .header(AUTHORIZATION, format!("Bearer {current_token}"))
                 .send()
                 .await
                 .map_err(|e| GDriveError::Api(format!("Drive download failed: {e}")))?;
@@ -2567,13 +3617,23 @@ impl GDriveClient {
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
             let body = resp.text().await.unwrap_or_default();
+            if status == StatusCode::UNAUTHORIZED && !refreshed_on_401 {
+                if let Some(new_tok) = self
+                    .try_force_refresh_on_401(relay_enabled, &current_token)
+                    .await?
+                {
+                    current_token = new_tok;
+                    refreshed_on_401 = true;
+                    continue;
+                }
+            }
             if is_retryable_drive_error(status, &body) && attempt < MAX_API_RETRIES {
                 tokio::time::sleep(compute_retry_delay(attempt, retry_after.as_deref())).await;
+                attempt += 1;
                 continue;
             }
             return Err(map_drive_http_error(status, &body));
         }
-        Err(GDriveError::RateLimited)
     }
 
     /// Permanently deletes a Google Drive file. Treats `404 Not Found` as already deleted (`Ok(())`).
@@ -2590,12 +3650,15 @@ impl GDriveClient {
             self.endpoints.drive_api_base,
             encode_path_segment(file_id)
         );
-        for attempt in 0..=MAX_API_RETRIES {
+        let mut current_token = self.resolve_effective_access_token(access_token);
+        let mut refreshed_on_401 = false;
+        let mut attempt = 0usize;
+        loop {
             ensure_relay_disabled(relay_enabled)?;
             let resp = self
                 .http
                 .delete(&url)
-                .header(AUTHORIZATION, format!("Bearer {access_token}"))
+                .header(AUTHORIZATION, format!("Bearer {current_token}"))
                 .send()
                 .await
                 .map_err(|e| GDriveError::Api(format!("Drive delete request failed: {e}")))?;
@@ -2609,17 +3672,123 @@ impl GDriveClient {
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
             let body = resp.text().await.unwrap_or_default();
+            if status == StatusCode::UNAUTHORIZED && !refreshed_on_401 {
+                if let Some(new_tok) = self
+                    .try_force_refresh_on_401(relay_enabled, &current_token)
+                    .await?
+                {
+                    current_token = new_tok;
+                    refreshed_on_401 = true;
+                    continue;
+                }
+            }
             if is_retryable_drive_error(status, &body) && attempt < MAX_API_RETRIES {
                 tokio::time::sleep(compute_retry_delay(attempt, retry_after.as_deref())).await;
+                attempt += 1;
                 continue;
             }
             return Err(map_drive_http_error(status, &body));
         }
-        Err(GDriveError::RateLimited)
+    }
+
+    /// Drains queued unreferenced cloud media deletions (`gdrive_pending_cloud_deletes`),
+    /// skipping pruning unless remote history sync has completed since the item was queued
+    /// (preventing cross-device shared-blob deletion when `sync_history` is disabled),
+    /// re-verifying `store.is_media_unreferenced(sha256)` immediately before deleting each file,
+    /// qualifying `complete_pending_cloud_delete_for_file` with `cloud_file_id`, and applying
+    /// per-row retry backoff (dropping permanent 400/403 poison rows after 3 attempts).
+    pub async fn drain_pending_cloud_deletes(
+        &self,
+        relay_enabled: bool,
+        access_token: &str,
+        store: &Arc<AsyncMutex<MessageStore>>,
+        limit: usize,
+    ) -> GDriveResult<CloudOrphanPruneReport> {
+        self.drain_pending_cloud_deletes_with_policy(
+            relay_enabled,
+            access_token,
+            store,
+            limit,
+            true,
+            0,
+        )
+        .await
+    }
+
+    pub async fn drain_pending_cloud_deletes_with_policy(
+        &self,
+        relay_enabled: bool,
+        access_token: &str,
+        store: &Arc<AsyncMutex<MessageStore>>,
+        limit: usize,
+        require_history_pull: bool,
+        min_grace_ms: i64,
+    ) -> GDriveResult<CloudOrphanPruneReport> {
+        ensure_relay_disabled(relay_enabled)?;
+        if limit == 0 {
+            return Ok(CloudOrphanPruneReport::default());
+        }
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let pending = {
+            let guard = store.lock().await;
+            guard
+                .list_ready_pending_cloud_deletes(limit, require_history_pull, min_grace_ms, now_ms)
+                .map_err(|e| GDriveError::Other(format!("SQLite pending cloud deletes: {e}")))?
+        };
+        let mut report = CloudOrphanPruneReport::default();
+
+        for item in pending {
+            ensure_relay_disabled(relay_enabled)?;
+            let still_unreferenced = {
+                let guard = store.lock().await;
+                guard
+                    .is_media_unreferenced(&item.sha256)
+                    .map_err(|e| GDriveError::Other(format!("SQLite media ref check: {e}")))?
+            };
+            if !still_unreferenced {
+                let guard = store.lock().await;
+                let _ = guard.cancel_pending_cloud_delete(&item.sha256);
+                report.skipped_referenced += 1;
+                continue;
+            }
+
+            match self
+                .delete_drive_file(relay_enabled, access_token, &item.cloud_file_id)
+                .await
+            {
+                Ok(()) => {
+                    let guard = store.lock().await;
+                    guard
+                        .complete_pending_cloud_delete_for_file(&item.sha256, &item.cloud_file_id)
+                        .map_err(|e| {
+                            GDriveError::Other(format!("SQLite complete cloud delete: {e}"))
+                        })?;
+                    report.deleted_count += 1;
+                }
+                Err(GDriveError::RelayBlocked) => return Err(GDriveError::RelayBlocked),
+                Err(GDriveError::Unauthorized) => return Err(GDriveError::Unauthorized),
+                Err(err) => {
+                    let fail_now = chrono::Utc::now().timestamp_millis();
+                    let permanent = is_permanent_cloud_delete_error(&err);
+                    let guard = store.lock().await;
+                    let _ = guard.record_pending_cloud_delete_failure(
+                        &item.sha256,
+                        &item.cloud_file_id,
+                        permanent,
+                        fail_now,
+                    );
+                    report.failed_count += 1;
+                }
+            }
+        }
+
+        Ok(report)
     }
 
     /// Pulls unseen `.delta.enc` history files from Drive `history/`, decrypts & merges them
-    /// idempotently into `store`, then exports & uploads any local deltas since `last_history_sync_ts`
+    /// idempotently into `store`, then exports & uploads any local deltas (new messages,
+    /// recalls/mutations via `updated_ts`, and message/thread deletion tombstones)
     /// in bounded pages without ever jumping past truncated rows or local wall-clock skew.
     /// Never holds the `MessageStore` mutex across network or crypto I/O.
     #[allow(clippy::too_many_arguments)]
@@ -2662,16 +3831,41 @@ impl GDriveClient {
         limit_msgs: usize,
     ) -> GDriveResult<HistorySyncReport> {
         ensure_relay_disabled(relay_enabled)?;
+        self.ensure_folder_has_manifest(history_folder_id)?;
+
+        let mut effective_last_history_sync_ts = last_history_sync_ts;
+        if let Some((reset_blobs, reset_history)) = self.take_pending_store_recovery_reset(uid) {
+            let guard = store.lock().await;
+            guard
+                .reset_gdrive_sync_state_for_vault_recovery(reset_blobs, reset_history)
+                .map_err(|e| GDriveError::Other(format!("SQLite vault recovery reset: {e}")))?;
+            if reset_history {
+                effective_last_history_sync_ts = 0;
+            }
+        }
 
         let remote_files = self
             .list_folder_files(relay_enabled, access_token, history_folder_id)
             .await?;
 
+        let initial_mutation_cursor = {
+            let guard = store.lock().await;
+            guard
+                .get_gdrive_last_mutation_sync_ts()
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+        };
+
         let mut report = HistorySyncReport {
             downloaded_deltas: 0,
             applied_messages: 0,
+            deleted_messages: 0,
+            deleted_threads: 0,
+            orphaned_local_paths: Vec::new(),
             uploaded_delta_id: None,
-            new_last_history_sync_ts: last_history_sync_ts,
+            new_last_history_sync_ts: effective_last_history_sync_ts,
+            new_last_mutation_sync_ts: initial_mutation_cursor,
         };
 
         for file in remote_files {
@@ -2697,30 +3891,60 @@ impl GDriveClient {
             }
 
             let now_ms = chrono::Utc::now().timestamp_millis();
-            let applied = {
+            let import_rep = {
                 let guard = store.lock().await;
-                let count = guard.import_history_delta_idempotent(&batch).map_err(|e| {
-                    GDriveError::Other(format!("Failed importing history delta into SQLite: {e}"))
-                })?;
+                let rep = guard
+                    .import_history_delta_idempotent_detailed(&batch)
+                    .map_err(|e| {
+                        GDriveError::Other(format!(
+                            "Failed importing history delta into SQLite: {e}"
+                        ))
+                    })?;
                 guard.mark_delta_applied(&file.id, now_ms).map_err(|e| {
                     GDriveError::Other(format!("Failed marking delta applied in SQLite: {e}"))
                 })?;
-                count
+                rep
             };
             report.downloaded_deltas += 1;
-            report.applied_messages += applied;
+            report.applied_messages += import_rep.applied_messages;
+            report.deleted_messages += import_rep.deleted_messages;
+            report.deleted_threads += import_rep.deleted_threads;
+            report
+                .orphaned_local_paths
+                .extend(import_rep.orphaned_local_paths);
         }
 
-        // Export local changes since `cursor_ts` in bounded pages so DBs with >2,000 messages
-        // or PC clock skew ahead of server timestamps never drop rows.
-        let mut cursor_ts = last_history_sync_ts;
+        // Record that all remote deltas currently on Drive have been pulled & merged into `store`,
+        // unblocking safe cloud orphan pruning for deletions queued before or during this pull.
+        {
+            let pull_now_ms = chrono::Utc::now().timestamp_millis();
+            let guard = store.lock().await;
+            let _ = guard.record_gdrive_history_pull_completed(pull_now_ms);
+        }
+
+        if !report.orphaned_local_paths.is_empty() {
+            report.orphaned_local_paths.sort();
+            report.orphaned_local_paths.dedup();
+        }
+
+        // Export local changes since `(cursor_ts, mutation_cursor_ts)` in bounded pages so DBs with
+        // >2,000 messages, PC clock skew ahead of server timestamps, recalls, and deletion tombstones
+        // never drop rows or contaminate the server-clock cursor.
+        let mut cursor_ts = effective_last_history_sync_ts;
+        let mut mutation_cursor_ts = initial_mutation_cursor;
         let safe_dev = sanitize_uid_folder_name(device_id);
         for _page in 0..MAX_HISTORY_UPLOAD_PAGES_PER_CYCLE {
             ensure_relay_disabled(relay_enabled)?;
             let local_batch = {
                 let guard = store.lock().await;
                 guard
-                    .export_history_delta_since(uid, device_id, cursor_ts, limit_msgs)
+                    .export_history_delta_since_with_mutation_cursor(
+                        uid,
+                        device_id,
+                        cursor_ts,
+                        mutation_cursor_ts,
+                        limit_msgs,
+                    )
                     .map_err(|e| {
                         GDriveError::Other(format!("Failed exporting history delta: {e}"))
                     })?
@@ -2728,6 +3952,8 @@ impl GDriveClient {
             let has_changes = !local_batch.messages.is_empty()
                 || !local_batch.threads.is_empty()
                 || !local_batch.cloud_media.is_empty()
+                || !local_batch.deleted_messages.is_empty()
+                || !local_batch.deleted_threads.is_empty()
                 || (cursor_ts <= 0 && !local_batch.folders.is_empty());
             if !has_changes {
                 break;
@@ -2737,9 +3963,12 @@ impl GDriveClient {
                 .messages
                 .first()
                 .map(|m| m.ts)
+                .or_else(|| local_batch.deleted_messages.first().map(|d| d.deleted_ts))
+                .or_else(|| local_batch.deleted_threads.first().map(|d| d.deleted_ts))
+                .or_else(|| local_batch.cloud_media.first().map(|c| c.cloud_synced_ts))
                 .unwrap_or(cursor_ts.max(0));
-            let (to_ts, next_watermark) =
-                compute_history_batch_watermark(cursor_ts, &local_batch);
+            let (to_ts, next_ts_watermark, next_mut_watermark) =
+                compute_history_batch_watermarks(cursor_ts, mutation_cursor_ts, &local_batch);
 
             let encrypted = encrypt_history_delta(&local_batch, master_key, uid)?;
             let file_name = format!("{safe_dev}-{from_ts}-{to_ts}.delta.enc");
@@ -2760,15 +3989,31 @@ impl GDriveClient {
                 guard
                     .mark_delta_applied(&uploaded_id, now_ms)
                     .map_err(|e| GDriveError::Other(format!("SQLite mark_delta_applied: {e}")))?;
-                guard
-                    .set_gdrive_last_history_sync_ts(next_watermark)
-                    .map_err(|e| GDriveError::Other(format!("SQLite history watermark: {e}")))?;
+                if next_ts_watermark != cursor_ts || next_ts_watermark > 0 {
+                    guard
+                        .set_gdrive_last_history_sync_ts(next_ts_watermark)
+                        .map_err(|e| {
+                            GDriveError::Other(format!("SQLite history watermark: {e}"))
+                        })?;
+                }
+                if next_mut_watermark > mutation_cursor_ts {
+                    guard
+                        .set_gdrive_last_mutation_sync_ts(next_mut_watermark)
+                        .map_err(|e| {
+                            GDriveError::Other(format!("SQLite mutation watermark: {e}"))
+                        })?;
+                }
             }
             report.uploaded_delta_id = Some(uploaded_id);
-            report.new_last_history_sync_ts = next_watermark;
-            cursor_ts = next_watermark;
+            report.new_last_history_sync_ts = next_ts_watermark;
+            report.new_last_mutation_sync_ts = next_mut_watermark;
+            cursor_ts = next_ts_watermark;
+            mutation_cursor_ts = next_mut_watermark;
 
-            if !local_batch.messages_truncated && !local_batch.cloud_media_truncated {
+            if !local_batch.messages_truncated
+                && !local_batch.cloud_media_truncated
+                && !local_batch.mutations_truncated
+            {
                 break;
             }
         }
@@ -2782,12 +4027,15 @@ impl GDriveClient {
         access_token: &str,
         url: &str,
     ) -> GDriveResult<String> {
-        for attempt in 0..=MAX_API_RETRIES {
+        let mut current_token = self.resolve_effective_access_token(access_token);
+        let mut refreshed_on_401 = false;
+        let mut attempt = 0usize;
+        loop {
             ensure_relay_disabled(relay_enabled)?;
             let resp = self
                 .http
                 .get(url)
-                .header(AUTHORIZATION, format!("Bearer {access_token}"))
+                .header(AUTHORIZATION, format!("Bearer {current_token}"))
                 .send()
                 .await
                 .map_err(|e| GDriveError::Api(format!("Drive GET request failed: {e}")))?;
@@ -2805,19 +4053,73 @@ impl GDriveClient {
             if status.is_success() {
                 return Ok(body);
             }
+            if status == StatusCode::UNAUTHORIZED && !refreshed_on_401 {
+                if let Some(new_tok) = self
+                    .try_force_refresh_on_401(relay_enabled, &current_token)
+                    .await?
+                {
+                    current_token = new_tok;
+                    refreshed_on_401 = true;
+                    continue;
+                }
+            }
             if is_retryable_drive_error(status, &body) && attempt < MAX_API_RETRIES {
                 tokio::time::sleep(compute_retry_delay(attempt, retry_after.as_deref())).await;
+                attempt += 1;
                 continue;
             }
             return Err(map_drive_http_error(status, &body));
         }
-        Err(GDriveError::RateLimited)
     }
 }
 
-fn compute_history_batch_watermark(cursor_ts: i64, batch: &HistoryDeltaBatch) -> (i64, i64) {
-    let msg_cap = if batch.messages_truncated {
-        batch.max_message_ts()
+fn compute_history_batch_watermarks(
+    cursor_ts: i64,
+    mutation_cursor_ts: i64,
+    batch: &HistoryDeltaBatch,
+) -> (i64, i64, i64) {
+    // 1. Server-clock history watermark (`gdrive_last_history_sync_ts`):
+    //    Strictly derived from server-clock messages & threads, NEVER contaminated by local PC
+    //    wall-clock `cloud_media` or mutation timestamps.
+    let (ts_to, next_ts_watermark) = if batch.messages_truncated {
+        if let Some(cap_ts) = batch.max_message_ts_cursor {
+            let next = cap_ts.saturating_add(1).max(cursor_ts.saturating_add(1));
+            (cap_ts, next)
+        } else {
+            (cursor_ts, cursor_ts)
+        }
+    } else {
+        let max_msg_ts = batch.max_message_ts_cursor.unwrap_or(0);
+        let max_thread_ts = batch
+            .threads
+            .iter()
+            .map(|t| t.last_ts.max(t.last_read_in_ts).max(t.peer_read_ts))
+            .filter(|&ts| ts >= cursor_ts)
+            .max()
+            .unwrap_or(0);
+        let max_db_ts = max_msg_ts.max(max_thread_ts);
+
+        if max_db_ts > 0 {
+            let next = max_db_ts.saturating_add(1).max(cursor_ts);
+            (max_db_ts, next)
+        } else if cursor_ts <= 0
+            && (!batch.folders.is_empty()
+                || !batch.threads.is_empty()
+                || !batch.messages.is_empty())
+        {
+            // Initial batch containing only 0-timestamp rows (e.g. stub threads from
+            // `ensure_direct_thread` or folders-only): advance 0 -> 1 without touching PC clock.
+            (1, 1)
+        } else {
+            // Mutation/tombstone/cloud_media-only batch: keep server-clock cursor unchanged.
+            (cursor_ts, cursor_ts)
+        }
+    };
+
+    // 2. Local monotonic mutation watermark (`gdrive_last_mutation_sync_ts`):
+    //    Tracks mutated messages, deletion tombstones, AND `cloud_media` links together.
+    let mut_cap = if batch.mutations_truncated {
+        batch.max_mutation_ts_cursor
     } else {
         None
     };
@@ -2826,39 +4128,43 @@ fn compute_history_batch_watermark(cursor_ts: i64, batch: &HistoryDeltaBatch) ->
     } else {
         None
     };
-
-    if msg_cap.is_some() || cm_cap.is_some() {
-        let cap_ts = match (msg_cap, cm_cap) {
+    let (mut_to, next_mut_watermark) = if mut_cap.is_some() || cm_cap.is_some() {
+        let cap_mut = match (mut_cap, cm_cap) {
             (Some(a), Some(b)) => a.min(b),
             (Some(a), None) => a,
             (None, Some(b)) => b,
             (None, None) => unreachable!(),
         };
-        let next = cap_ts.saturating_add(1).max(cursor_ts.saturating_add(1));
-        return (cap_ts, next);
-    }
-
-    let max_msg_ts = batch.max_message_ts().unwrap_or(0);
-    let max_thread_ts = batch
-        .threads
-        .iter()
-        .map(|t| t.last_ts.max(t.last_read_in_ts).max(t.peer_read_ts))
-        .max()
-        .unwrap_or(0);
-    let max_media_ts = batch
-        .max_cloud_media_cursor_ts
-        .or_else(|| batch.cloud_media.iter().map(|c| c.cloud_synced_ts).max())
-        .unwrap_or(0);
-    let max_db_ts = max_msg_ts.max(max_thread_ts).max(max_media_ts);
-
-    if max_db_ts > 0 {
-        let next = max_db_ts.saturating_add(1).max(cursor_ts);
-        (max_db_ts, next)
+        let next = cap_mut
+            .saturating_add(1)
+            .max(mutation_cursor_ts.saturating_add(1));
+        (cap_mut, next)
     } else {
-        // Folders-only initial batch (0 non-zero DB timestamps): never advance to PC wall-clock.
-        let next = cursor_ts.max(1);
-        (next, next)
-    }
+        let max_mut_db = batch.max_mutation_ts_cursor.unwrap_or(0);
+        let max_cm_db = batch
+            .max_cloud_media_cursor_ts
+            .or_else(|| batch.cloud_media.iter().map(|c| c.cloud_synced_ts).max())
+            .unwrap_or(0);
+        let max_mut = max_mut_db.max(max_cm_db);
+        if max_mut > 0 {
+            let next = max_mut.saturating_add(1).max(mutation_cursor_ts);
+            (max_mut, next)
+        } else if mutation_cursor_ts <= 0 && !batch.cloud_media.is_empty() {
+            (1, 1)
+        } else {
+            (0, mutation_cursor_ts)
+        }
+    };
+
+    let file_to_ts = if ts_to > cursor_ts || (cursor_ts <= 0 && ts_to > 0) {
+        ts_to.max(mut_to)
+    } else if mut_to > 0 {
+        mut_to
+    } else {
+        ts_to.max(1)
+    };
+
+    (file_to_ts, next_ts_watermark, next_mut_watermark)
 }
 
 fn truncate_error_body(body: &str) -> String {
@@ -2875,6 +4181,9 @@ fn truncate_error_body(body: &str) -> String {
 }
 
 fn map_drive_http_error(status: StatusCode, body: &str) -> GDriveError {
+    if status == StatusCode::UNAUTHORIZED {
+        return GDriveError::Unauthorized;
+    }
     if status == StatusCode::NOT_FOUND {
         return GDriveError::NotFound;
     }
@@ -3938,5 +5247,1585 @@ mod tests {
         assert_eq!(captured[1].0, "/refresh");
         assert!(captured[1].1.contains("\"refresh_token\":\"1//broker_refresh\""));
         assert!(!captured[1].1.contains("SHOULD_NOT_BE_SENT"));
+    }
+
+    #[tokio::test]
+    async fn is_folder_alive_and_verify_or_recover_recreates_trashed_or_missing_vault_folders() {
+        use tokio::sync::Mutex;
+
+        // Validate drive_folder_web_url helper & injection rejection
+        assert_eq!(
+            drive_folder_web_url("1aBcD_ef-90"),
+            Some("https://drive.google.com/drive/folders/1aBcD_ef-90".to_string())
+        );
+        assert_eq!(drive_folder_web_url(""), None);
+        assert_eq!(drive_folder_web_url("   "), None);
+        assert_eq!(drive_folder_web_url("abc/../evil"), None);
+        assert_eq!(drive_folder_web_url("abc?x=1"), None);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // State map: file_or_folder_id -> Option<bool> (None = 404, Some(false) = alive, Some(true) = trashed)
+        let folder_states: Arc<Mutex<std::collections::HashMap<String, Option<bool>>>> =
+            Arc::new(Mutex::new(std::collections::HashMap::from([
+                ("root-old".to_string(), Some(false)),
+                ("uid-old".to_string(), Some(false)),
+                ("blobs-old".to_string(), Some(false)),
+                ("hist-old".to_string(), Some(false)),
+                ("manifest-old".to_string(), Some(false)),
+            ])));
+        let created_names: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_queries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let states_srv = folder_states.clone();
+        let created_srv = created_names.clone();
+        let queries_srv = seen_queries.clone();
+        let stop_srv = Arc::new(Notify::new());
+        let stop_clone = stop_srv.clone();
+
+        let srv = tokio::spawn(async move {
+            let mut next_id = 1usize;
+            loop {
+                let accepted = tokio::select! {
+                    _ = stop_clone.notified() => break,
+                    res = listener.accept() => res,
+                };
+                let Ok((mut sock, _)) = accepted else {
+                    break;
+                };
+                let mut raw = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let header_end = loop {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break 0;
+                    }
+                    raw.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                if header_end == 0 {
+                    continue;
+                }
+                let head_str = String::from_utf8_lossy(&raw[..header_end]).to_string();
+                let first_line = head_str.lines().next().unwrap_or("");
+                let content_len: usize = head_str
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                let mut body = raw[header_end..].to_vec();
+                while body.len() < content_len {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&tmp[..n]);
+                }
+                body.truncate(content_len);
+
+                if first_line.starts_with("GET /api/files?") {
+                    queries_srv.lock().await.push(first_line.to_string());
+                    let json = r#"{"files":[]}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                        json.len()
+                    );
+                    sock.write_all(resp.as_bytes()).await.unwrap();
+                } else if let Some(rest) = first_line.strip_prefix("GET /api/files/") {
+                    let fid = rest.split('?').next().unwrap_or("");
+                    let state = states_srv.lock().await.get(fid).copied().flatten();
+                    match state {
+                        Some(trashed) => {
+                            let mime = if fid.contains("manifest") {
+                                "application/json"
+                            } else {
+                                DRIVE_FOLDER_MIME
+                            };
+                            let json = serde_json::json!({
+                                "id": fid,
+                                "trashed": trashed,
+                                "mimeType": mime
+                            })
+                            .to_string();
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                                json.len()
+                            );
+                            sock.write_all(resp.as_bytes()).await.unwrap();
+                        }
+                        None => {
+                            sock.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                .await
+                                .unwrap();
+                        }
+                    }
+                } else if first_line.starts_with("POST /api/files") {
+                    let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let name = val["name"].as_str().unwrap_or("").to_string();
+                    created_srv.lock().await.push(name);
+                    let fid = format!("new-folder-{next_id}");
+                    next_id += 1;
+                    states_srv.lock().await.insert(fid.clone(), Some(false));
+                    let json = format!("{{\"id\":\"{fid}\"}}");
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                        json.len()
+                    );
+                    sock.write_all(resp.as_bytes()).await.unwrap();
+                } else if first_line.starts_with("POST /upload/files") {
+                    let json = r#"{"id":"readme-id","size":"10"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                        json.len()
+                    );
+                    sock.write_all(resp.as_bytes()).await.unwrap();
+                }
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let client = GDriveClient::with_endpoints(GDriveEndpoints {
+            token_url: format!("http://{addr}/token"),
+            drive_api_base: format!("http://{addr}/api"),
+            drive_upload_base: format!("http://{addr}/upload"),
+        })
+        .unwrap();
+
+        let mut tokens = GDriveTokens {
+            access_token: "tok".into(),
+            refresh_token: "ref".into(),
+            expires_at_epoch_secs: 1_900_000_000,
+            account_email: None,
+            account_name: None,
+            root_folder_id: Some("root-old".into()),
+            uid_folder_id: Some("uid-old".into()),
+            blobs_folder_id: Some("blobs-old".into()),
+            history_folder_id: Some("hist-old".into()),
+            manifest_file_id: Some("manifest-old".into()),
+        };
+
+        // Strict relay exclusion
+        assert!(matches!(
+            client.is_folder_alive(true, "tok", "root-old").await,
+            Err(GDriveError::RelayBlocked)
+        ));
+        assert!(matches!(
+            client
+                .verify_or_recover_vault_folders(true, "tok", "u1", &mut tokens)
+                .await,
+            Err(GDriveError::RelayBlocked)
+        ));
+
+        // 1) All cached folders alive -> fast hit, 0 recreations
+        let (f1, updated1) = client
+            .verify_or_recover_vault_folders(false, "tok", "u1", &mut tokens)
+            .await
+            .unwrap();
+        assert!(!updated1);
+        assert_eq!(f1.root_folder_id, "root-old");
+        assert!(created_names.lock().await.is_empty());
+
+        // 2) User trashes Teza Vault -> is_folder_alive returns false & auto-recovers new folders!
+        folder_states
+            .lock()
+            .await
+            .insert("root-old".to_string(), Some(true));
+        assert!(!client.is_folder_alive(false, "tok", "root-old").await.unwrap());
+        let (f2, updated2) = client
+            .verify_or_recover_vault_folders(false, "tok", "u1", &mut tokens)
+            .await
+            .unwrap();
+        assert!(updated2);
+        assert_ne!(f2.root_folder_id, "root-old");
+        assert_eq!(tokens.root_folder_id.as_deref(), Some(f2.root_folder_id.as_str()));
+        assert_eq!(
+            *created_names.lock().await,
+            vec!["Teza Vault", "u1", "blobs", "history"]
+        );
+
+        // 3) Permanently deleted (404) blobs folder -> is_folder_alive returns false & auto-recovers!
+        folder_states.lock().await.remove(&f2.blobs_folder_id);
+        assert!(!client
+            .is_folder_alive(false, "tok", &f2.blobs_folder_id)
+            .await
+            .unwrap());
+        let (f3, updated3) = client
+            .verify_or_recover_vault_folders(false, "tok", "u1", &mut tokens)
+            .await
+            .unwrap();
+        assert!(updated3);
+        assert_ne!(f3.blobs_folder_id, f2.blobs_folder_id);
+
+        // 4) Trashed uid_folder_id is also detected & recovered; find_file_in_folder uses deterministic orderBy!
+        folder_states
+            .lock()
+            .await
+            .insert(f3.uid_folder_id.clone(), Some(true));
+        let (f4, updated4) = client
+            .verify_or_recover_vault_folders(false, "tok", "u1", &mut tokens)
+            .await
+            .unwrap();
+        assert!(updated4);
+        assert_ne!(f4.uid_folder_id, f3.uid_folder_id);
+        let queries = seen_queries.lock().await;
+        assert!(!queries.is_empty());
+        assert!(
+            queries.iter().all(|q| q.contains("orderBy=createdTime+asc")),
+            "find_file_in_folder must pass orderBy=createdTime asc: {queries:?}"
+        );
+
+        stop_srv.notify_one();
+        let _ = srv.await;
+    }
+
+    #[tokio::test]
+    async fn sync_history_deltas_syncs_old_recall_and_tombstones_under_clock_skew_and_prunes_cloud_orphans() {
+        use crate::store::{MediaObjectRecord, MessageMediaRecord, MEDIA_CDN_STATUS_OK, MEDIA_LOCAL_STATE_LOCAL};
+        use tokio::sync::Mutex;
+
+        let dir = temp_test_dir("recall-tombstone-e2e");
+        let store_a = Arc::new(AsyncMutex::new(
+            MessageStore::open(&dir.join("dev_a.db")).unwrap(),
+        ));
+        let store_b = Arc::new(AsyncMutex::new(
+            MessageStore::open(&dir.join("dev_b.db")).unwrap(),
+        ));
+        let master = CloudMasterKey::generate().unwrap();
+
+        let sha_rec = "1".repeat(64);
+        let sha_shared = "2".repeat(64);
+        {
+            let mut a = store_a.lock().await;
+            a.upsert_thread(&ThreadDto {
+                id: "t1".into(),
+                title: "Main Chat".into(),
+                avatar: String::new(),
+                kind: ThreadKind::Direct,
+                last_preview: "hi".into(),
+                last_ts: 1_600_000_003_000,
+                unread_count: 0,
+                is_pinned: false,
+                is_muted: false,
+                last_read_in_ts: 0,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
+            })
+            .unwrap();
+            a.upsert_thread(&ThreadDto {
+                id: "t_gone".into(),
+                title: "Group Left".into(),
+                avatar: String::new(),
+                kind: ThreadKind::Group,
+                last_preview: "bye".into(),
+                last_ts: 1_600_000_002_500,
+                unread_count: 0,
+                is_pinned: false,
+                is_muted: false,
+                last_read_in_ts: 0,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
+            })
+            .unwrap();
+            for (tid, mid, text, ts) in [
+                ("t1", "m1", "secret photo", 1_600_000_001_000i64),
+                ("t1", "m2", "delete locally", 1_600_000_002_000),
+                ("t1", "m3", "keep shared", 1_600_000_003_000),
+                ("t_gone", "mg1", "group msg", 1_600_000_002_500),
+            ] {
+                a.upsert_message(&MessageDto {
+                    msg_id: mid.into(),
+                    cli_msg_id: None,
+                    thread_id: tid.into(),
+                    sender_id: "u1".into(),
+                    sender_name: "Alice".into(),
+                    text: text.into(),
+                    msg_type: "chat.text".into(),
+                    ts,
+                    is_outgoing: true,
+                    is_recalled: false,
+                    is_pinned: false,
+                    quote: None,
+                    reactions: Vec::new(),
+                    attachment_url: None,
+                    attachment_name: None,
+                })
+                .unwrap();
+            }
+            for (sha, cid) in [(&sha_rec, "drv-blob-rec"), (&sha_shared, "drv-blob-shared")] {
+                a.upsert_media_object(&MediaObjectRecord {
+                    sha256: sha.clone(),
+                    kind: "image".into(),
+                    mime: "image/jpeg".into(),
+                    size_bytes: 2048,
+                    thumb_sha256: None,
+                    width: None,
+                    height: None,
+                    duration_ms: None,
+                    local_state: MEDIA_LOCAL_STATE_LOCAL,
+                    local_rel_path: Some(format!("blobs/{sha}.enc")),
+                    is_encrypted: true,
+                    pin_count: 0,
+                    created_ts: 1_600_000_001_000,
+                    last_accessed_ts: 1_600_000_001_000,
+                    cloud_provider: Some("gdrive".into()),
+                    cloud_file_id: Some(cid.into()),
+                    cloud_encrypted: true,
+                    cloud_key_ver: 1,
+                    cloud_synced_ts: Some(1_600_000_001_500),
+                })
+                .unwrap();
+            }
+            let mk_link = |tid: &str, mid: &str, sha: &str| MessageMediaRecord {
+                thread_id: tid.into(),
+                msg_id: mid.into(),
+                variant: "primary".into(),
+                url_hash: format!("uh-{mid}"),
+                sha256: Some(sha.into()),
+                original_name: None,
+                saved_user_path: None,
+                cdn_status: MEDIA_CDN_STATUS_OK,
+                updated_ts: 1_600_000_001_500,
+            };
+            a.link_message_media(&mk_link("t1", "m1", &sha_rec)).unwrap();
+            a.link_message_media(&mk_link("t1", "m2", &sha_shared)).unwrap();
+            a.link_message_media(&mk_link("t1", "m3", &sha_shared)).unwrap();
+        }
+
+        // Mock Drive server supporting list, multipart upload, alt=media download, and DELETE
+        type MockFiles = Arc<Mutex<Vec<(String, String, Vec<u8>)>>>;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let files_store: MockFiles = Arc::new(Mutex::new(Vec::new()));
+        let deleted_file_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let srv_files = files_store.clone();
+        let srv_deleted = deleted_file_ids.clone();
+        let stop_srv = Arc::new(Notify::new());
+        let stop_clone = stop_srv.clone();
+
+        let server = tokio::spawn(async move {
+            let mut next_id = 1usize;
+            loop {
+                let accepted = tokio::select! {
+                    _ = stop_clone.notified() => break,
+                    res = listener.accept() => res,
+                };
+                let Ok((mut sock, _)) = accepted else {
+                    break;
+                };
+                let mut raw = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let header_end = loop {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break 0;
+                    }
+                    raw.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                if header_end == 0 {
+                    continue;
+                }
+                let head_str = String::from_utf8_lossy(&raw[..header_end]).to_string();
+                let first_line = head_str.lines().next().unwrap_or("");
+                let content_len: usize = head_str
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                let mut body = raw[header_end..].to_vec();
+                while body.len() < content_len {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&tmp[..n]);
+                }
+                body.truncate(content_len);
+
+                if first_line.starts_with("GET /api/files?") {
+                    let files = srv_files.lock().await;
+                    let arr: Vec<serde_json::Value> = files
+                        .iter()
+                        .map(|(id, name, data)| {
+                            serde_json::json!({
+                                "id": id,
+                                "name": name,
+                                "size": data.len().to_string(),
+                                "mimeType": "application/octet-stream"
+                            })
+                        })
+                        .collect();
+                    let json = serde_json::json!({ "files": arr }).to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                        json.len()
+                    );
+                    sock.write_all(resp.as_bytes()).await.unwrap();
+                } else if first_line.starts_with("POST /upload/files") {
+                    let boundary = head_str
+                        .lines()
+                        .find_map(|l| l.split("boundary=").nth(1))
+                        .unwrap()
+                        .trim()
+                        .to_string();
+                    let delim = format!("--{boundary}").into_bytes();
+                    let mut parts: Vec<&[u8]> = Vec::new();
+                    let mut pos = 0;
+                    while let Some(rel) = body[pos..].windows(delim.len()).position(|w| w == delim) {
+                        let start = pos + rel + delim.len();
+                        if body[start..].starts_with(b"--") {
+                            break;
+                        }
+                        let part_start = if body[start..].starts_with(b"\r\n") {
+                            start + 2
+                        } else {
+                            start
+                        };
+                        if let Some(next_rel) = body[part_start..]
+                            .windows(delim.len())
+                            .position(|w| w == delim)
+                        {
+                            let end = (part_start + next_rel).saturating_sub(2);
+                            parts.push(&body[part_start..end]);
+                            pos = part_start + next_rel;
+                        } else {
+                            break;
+                        }
+                    }
+                    let meta_part = parts[0];
+                    let meta_split = meta_part.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                    let meta_json: serde_json::Value =
+                        serde_json::from_slice(&meta_part[meta_split + 4..]).unwrap();
+                    let name = meta_json["name"].as_str().unwrap().to_string();
+                    let data_part = parts[1];
+                    let data_split = data_part.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                    let data = data_part[data_split + 4..].to_vec();
+
+                    let fid = format!("drv-delta-{next_id}");
+                    next_id += 1;
+                    let sz = data.len();
+                    srv_files.lock().await.push((fid.clone(), name, data));
+                    let resp_body = format!("{{\"id\":\"{fid}\",\"size\":\"{sz}\"}}");
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                        resp_body.len()
+                    );
+                    sock.write_all(resp.as_bytes()).await.unwrap();
+                } else if let Some(rest) = first_line.strip_prefix("GET /api/files/") {
+                    let fid = rest.split('?').next().unwrap_or("");
+                    let maybe_data = srv_files
+                        .lock()
+                        .await
+                        .iter()
+                        .find(|(id, _, _)| id == fid)
+                        .map(|(_, _, d)| d.clone());
+                    if let Some(data) = maybe_data {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            data.len()
+                        );
+                        sock.write_all(head.as_bytes()).await.unwrap();
+                        sock.write_all(&data).await.unwrap();
+                    } else {
+                        sock.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await
+                            .unwrap();
+                    }
+                } else if let Some(rest) = first_line.strip_prefix("DELETE /api/files/") {
+                    let fid = rest.split_whitespace().next().unwrap_or("").to_string();
+                    srv_deleted.lock().await.push(fid);
+                    sock.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await
+                        .unwrap();
+                }
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let client = GDriveClient::with_endpoints(GDriveEndpoints {
+            token_url: format!("http://{addr}/token"),
+            drive_api_base: format!("http://{addr}/api"),
+            drive_upload_base: format!("http://{addr}/upload"),
+        })
+        .unwrap();
+
+        // Cycle 1: Device A uploads initial state; Device B pulls it
+        let rep_a1 = client
+            .sync_history_deltas(false, "tok", "hist-f", &store_a, &master, "u1", "dev-A", 0)
+            .await
+            .unwrap();
+        assert_eq!(rep_a1.new_last_history_sync_ts, 1_600_000_003_001);
+        assert_eq!(rep_a1.new_last_mutation_sync_ts, 1_600_000_001_501);
+
+        let rep_b1 = client
+            .sync_history_deltas(false, "tok", "hist-f", &store_b, &master, "u1", "dev-B", 0)
+            .await
+            .unwrap();
+        assert_eq!(rep_b1.applied_messages, 4);
+
+        // Device A recalls OLD m1, deletes OLD m2 locally, and deletes OLD thread t_gone
+        {
+            let mut a = store_a.lock().await;
+            a.mark_recalled("t1", "m1").unwrap();
+            assert!(a.delete_message("t1", "m2").unwrap());
+            let _ = a.delete_thread("t_gone").unwrap();
+        }
+
+        // Cycle 2 on Device A: exports recall & tombstones WITHOUT jumping server-clock history watermark!
+        let rep_a2 = client
+            .sync_history_deltas(
+                false,
+                "tok",
+                "hist-f",
+                &store_a,
+                &master,
+                "u1",
+                "dev-A",
+                rep_a1.new_last_history_sync_ts,
+            )
+            .await
+            .unwrap();
+        assert!(rep_a2.uploaded_delta_id.is_some());
+        assert_eq!(
+            rep_a2.new_last_history_sync_ts, 1_600_000_003_001,
+            "PC wall-clock mutation must NOT advance server-clock history watermark"
+        );
+        assert!(rep_a2.new_last_mutation_sync_ts > 0);
+
+        // Drain cloud deletes on Device A: drv-blob-rec deleted, drv-blob-shared preserved (m3 still refs it)!
+        let prune_rep = client
+            .drain_pending_cloud_deletes(false, "tok", &store_a, 50)
+            .await
+            .unwrap();
+        assert_eq!(prune_rep.deleted_count, 1);
+        assert_eq!(prune_rep.failed_count, 0);
+        assert_eq!(*deleted_file_ids.lock().await, vec!["drv-blob-rec"]);
+
+        // New message arrives under severe PC clock skew (ts STILL < PC clock) -> MUST still sync!
+        {
+            let mut a = store_a.lock().await;
+            a.upsert_message(&MessageDto {
+                msg_id: "m4".into(),
+                cli_msg_id: None,
+                thread_id: "t1".into(),
+                sender_id: "u2".into(),
+                sender_name: "Bob".into(),
+                text: "arrived after recall".into(),
+                msg_type: "chat.text".into(),
+                ts: 1_600_000_004_000,
+                is_outgoing: false,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+        }
+        let rep_a3 = client
+            .sync_history_deltas(
+                false,
+                "tok",
+                "hist-f",
+                &store_a,
+                &master,
+                "u1",
+                "dev-A",
+                rep_a2.new_last_history_sync_ts,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rep_a3.new_last_history_sync_ts, 1_600_000_004_001);
+        assert!(rep_a3.uploaded_delta_id.is_some());
+
+        // Device B syncs -> m1 recalled, m2 deleted, t_gone deleted, m3 & m4 intact!
+        let rep_b2 = client
+            .sync_history_deltas(
+                false,
+                "tok",
+                "hist-f",
+                &store_b,
+                &master,
+                "u1",
+                "dev-B",
+                rep_b1.new_last_history_sync_ts,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rep_b2.deleted_messages, 1);
+        assert_eq!(rep_b2.deleted_threads, 1);
+        {
+            let b = store_b.lock().await;
+            assert!(b.get_message("t1", "m1").unwrap().unwrap().is_recalled);
+            assert!(b.get_message("t1", "m2").unwrap().is_none());
+            assert!(b.get_message("t1", "m3").unwrap().is_some());
+            assert_eq!(
+                b.get_message("t1", "m4").unwrap().unwrap().text,
+                "arrived after recall"
+            );
+            assert!(b.get_message("t_gone", "mg1").unwrap().is_none());
+            assert_eq!(b.list_threads(FolderFilter::All).unwrap().len(), 1);
+        }
+
+        stop_srv.notify_one();
+        let _ = server.await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cloud_media_wall_clock_never_contaminates_history_watermark_and_stub_threads_advance_to_one()
+    {
+        use crate::store::HistoryCloudMediaRecord;
+
+        // 1) PC wall-clock cloud_media far ahead of server messages must NOT jump next_ts_watermark!
+        let batch_skew = HistoryDeltaBatch {
+            version: HistoryDeltaBatch::CURRENT_VERSION,
+            uid: "u1".into(),
+            device_id: "dev-A".into(),
+            exported_ts: 1_900_000_000_000,
+            threads: Vec::new(),
+            messages: vec![MessageDto {
+                msg_id: "m1".into(),
+                cli_msg_id: None,
+                thread_id: "t1".into(),
+                sender_id: "u1".into(),
+                sender_name: "Alice".into(),
+                text: "hello".into(),
+                msg_type: "chat.text".into(),
+                ts: 1_600_000_005_000,
+                is_outgoing: true,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            }],
+            folders: Vec::new(),
+            thread_folders: Vec::new(),
+            translations: Vec::new(),
+            cloud_media: vec![HistoryCloudMediaRecord {
+                thread_id: "t1".into(),
+                msg_id: "m1".into(),
+                variant: "primary".into(),
+                url_hash: "uh1".into(),
+                sha256: "a".repeat(64),
+                kind: "image".into(),
+                mime: "image/jpeg".into(),
+                size_bytes: 100,
+                original_name: None,
+                cloud_provider: "gdrive".into(),
+                cloud_file_id: "drv-1".into(),
+                cloud_key_ver: 1,
+                cloud_synced_ts: 1_900_000_000_000,
+            }],
+            deleted_messages: Vec::new(),
+            deleted_threads: Vec::new(),
+            messages_truncated: false,
+            cloud_media_truncated: false,
+            mutations_truncated: false,
+            max_message_ts_cursor: Some(1_600_000_005_000),
+            max_cloud_media_cursor_ts: Some(1_900_000_000_000),
+            max_mutation_ts_cursor: None,
+        };
+        let (_to_ts, next_ts, next_mut) = compute_history_batch_watermarks(0, 0, &batch_skew);
+        assert_eq!(next_ts, 1_600_000_005_001);
+        assert_eq!(next_mut, 1_900_000_000_001);
+
+        // 2) Stub thread with last_ts == 0 at initial cursor_ts == 0 advances 0 -> 1 so it won't loop!
+        let stub_batch = HistoryDeltaBatch {
+            version: HistoryDeltaBatch::CURRENT_VERSION,
+            uid: "u1".into(),
+            device_id: "dev-A".into(),
+            exported_ts: 1_700_000_000_000,
+            threads: vec![ThreadDto {
+                id: "stub-1".into(),
+                title: "Stub".into(),
+                avatar: String::new(),
+                kind: ThreadKind::Direct,
+                last_preview: String::new(),
+                last_ts: 0,
+                unread_count: 0,
+                is_pinned: false,
+                is_muted: false,
+                last_read_in_ts: 0,
+                peer_read_ts: 0,
+                muted_until_ts: 0,
+                is_archived: false,
+            }],
+            messages: Vec::new(),
+            folders: Vec::new(),
+            thread_folders: Vec::new(),
+            translations: Vec::new(),
+            cloud_media: Vec::new(),
+            deleted_messages: Vec::new(),
+            deleted_threads: Vec::new(),
+            messages_truncated: false,
+            cloud_media_truncated: false,
+            mutations_truncated: false,
+            max_message_ts_cursor: None,
+            max_cloud_media_cursor_ts: None,
+            max_mutation_ts_cursor: None,
+        };
+        let (_to2, next_ts2, next_mut2) = compute_history_batch_watermarks(0, 0, &stub_batch);
+        assert_eq!(next_ts2, 1);
+        assert_eq!(next_mut2, 0);
+    }
+
+    #[tokio::test]
+    async fn vault_recovery_reuploads_cached_manifest_resets_store_and_blocks_uploads_without_manifest()
+    {
+        use crate::store::{MediaObjectRecord, MEDIA_LOCAL_STATE_LOCAL};
+        use tokio::sync::Mutex;
+
+        let dir = temp_test_dir("vault-recovery-manifest");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        type MockUploadedFiles = Arc<Mutex<Vec<(String, String, String, Vec<u8>)>>>;
+        let files: MockUploadedFiles = Arc::new(Mutex::new(Vec::new()));
+        let alive_ids: Arc<Mutex<HashMap<String, bool>>> = Arc::new(Mutex::new(HashMap::new()));
+        let files_srv = files.clone();
+        let alive_srv = alive_ids.clone();
+        let stop_srv = Arc::new(Notify::new());
+        let stop_clone = stop_srv.clone();
+
+        let srv = tokio::spawn(async move {
+            let mut next_id = 1usize;
+            loop {
+                let accepted = tokio::select! {
+                    _ = stop_clone.notified() => break,
+                    res = listener.accept() => res,
+                };
+                let Ok((mut sock, _)) = accepted else {
+                    break;
+                };
+                let mut raw = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let header_end = loop {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break 0;
+                    }
+                    raw.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                if header_end == 0 {
+                    continue;
+                }
+                let head_str = String::from_utf8_lossy(&raw[..header_end]).to_string();
+                let first_line = head_str.lines().next().unwrap_or("");
+                let content_len: usize = head_str
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                let mut body = raw[header_end..].to_vec();
+                while body.len() < content_len {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&tmp[..n]);
+                }
+                body.truncate(content_len);
+
+                if first_line.starts_with("GET /api/files?") {
+                    let json = r#"{"files":[]}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                        json.len()
+                    );
+                    sock.write_all(resp.as_bytes()).await.unwrap();
+                } else if let Some(rest) = first_line.strip_prefix("GET /api/files/") {
+                    let fid = rest.split('?').next().unwrap_or("");
+                    let is_alive = alive_srv.lock().await.get(fid).copied().unwrap_or(false);
+                    if is_alive {
+                        let mime = if fid.starts_with("file-") {
+                            "application/json"
+                        } else {
+                            DRIVE_FOLDER_MIME
+                        };
+                        let json = serde_json::json!({
+                            "id": fid,
+                            "trashed": false,
+                            "mimeType": mime
+                        })
+                        .to_string();
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                            json.len()
+                        );
+                        sock.write_all(resp.as_bytes()).await.unwrap();
+                    } else {
+                        sock.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await
+                            .unwrap();
+                    }
+                } else if first_line.starts_with("POST /api/files") {
+                    let fid = format!("folder-{next_id}");
+                    next_id += 1;
+                    alive_srv.lock().await.insert(fid.clone(), true);
+                    let json = format!("{{\"id\":\"{fid}\"}}");
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                        json.len()
+                    );
+                    sock.write_all(resp.as_bytes()).await.unwrap();
+                } else if first_line.starts_with("POST /upload/files") {
+                    let boundary = head_str
+                        .lines()
+                        .find_map(|l| l.split("boundary=").nth(1))
+                        .unwrap()
+                        .trim()
+                        .to_string();
+                    let delim = format!("--{boundary}").into_bytes();
+                    let mut parts: Vec<&[u8]> = Vec::new();
+                    let mut pos = 0;
+                    while let Some(rel) = body[pos..].windows(delim.len()).position(|w| w == delim) {
+                        let start = pos + rel + delim.len();
+                        if body[start..].starts_with(b"--") {
+                            break;
+                        }
+                        let part_start = if body[start..].starts_with(b"\r\n") {
+                            start + 2
+                        } else {
+                            start
+                        };
+                        if let Some(next_rel) = body[part_start..]
+                            .windows(delim.len())
+                            .position(|w| w == delim)
+                        {
+                            let end = (part_start + next_rel).saturating_sub(2);
+                            parts.push(&body[part_start..end]);
+                            pos = part_start + next_rel;
+                        } else {
+                            break;
+                        }
+                    }
+                    let meta_part = parts[0];
+                    let meta_split = meta_part.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                    let meta_json: serde_json::Value =
+                        serde_json::from_slice(&meta_part[meta_split + 4..]).unwrap();
+                    let name = meta_json["name"].as_str().unwrap_or("").to_string();
+                    let parent = meta_json["parents"][0].as_str().unwrap_or("").to_string();
+                    let data_part = parts[1];
+                    let data_split = data_part.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                    let data = data_part[data_split + 4..].to_vec();
+
+                    let fid = format!("file-{next_id}");
+                    next_id += 1;
+                    alive_srv.lock().await.insert(fid.clone(), true);
+                    let sz = data.len();
+                    files_srv.lock().await.push((fid.clone(), parent, name, data));
+                    let json = format!("{{\"id\":\"{fid}\",\"size\":\"{sz}\"}}");
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                        json.len()
+                    );
+                    sock.write_all(resp.as_bytes()).await.unwrap();
+                }
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let endpoints = GDriveEndpoints {
+            token_url: format!("http://{addr}/token"),
+            drive_api_base: format!("http://{addr}/api"),
+            drive_upload_base: format!("http://{addr}/upload"),
+        };
+        let client1 = GDriveClient::with_endpoints(endpoints.clone()).unwrap();
+        let mut tokens = GDriveTokens {
+            access_token: "tok".into(),
+            refresh_token: "ref".into(),
+            expires_at_epoch_secs: 1_900_000_000,
+            account_email: None,
+            account_name: None,
+            root_folder_id: None,
+            uid_folder_id: None,
+            blobs_folder_id: None,
+            history_folder_id: None,
+            manifest_file_id: None,
+        };
+
+        // 1) Initial unlock creates manifest.enc.json and caches it locally + sidecar on save_to_file!
+        let (mk1, created_new) = client1
+            .unlock_or_init_vault(false, "tok", "u_rec", "strong-passphrase-1", &mut tokens)
+            .await
+            .unwrap();
+        assert!(created_new);
+        let tok_path = dir.join("gdrive_tokens_u_rec.dpapi");
+        tokens.save_to_file(&tok_path).unwrap();
+
+        // Simulate app restart with a brand-new GDriveClient loading tokens + sidecar manifest
+        let mut reloaded_tokens = GDriveTokens::load_from_file(&tok_path).unwrap().unwrap();
+        let client2 = GDriveClient::with_endpoints(endpoints.clone()).unwrap();
+
+        // Trash everything on Drive -> recovery MUST recreate folders AND re-upload the SAME wrapped manifest!
+        alive_ids.lock().await.clear();
+        let (recovered, updated) = client2
+            .verify_or_recover_vault_folders(false, "tok", "u_rec", &mut reloaded_tokens)
+            .await
+            .unwrap();
+        assert!(updated);
+        let new_manifest_id = recovered
+            .manifest_file_id
+            .clone()
+            .expect("cached manifest must be automatically re-uploaded after recovery");
+
+        // Unwrap the re-uploaded manifest bytes -> MUST match original CloudMasterKey `mk1`!
+        let reuploaded_bytes = files
+            .lock()
+            .await
+            .iter()
+            .find(|(id, _, name, _)| id == &new_manifest_id && name == DRIVE_MANIFEST_FILE_NAME)
+            .map(|(_, _, _, d)| d.clone())
+            .expect("re-uploaded manifest.enc.json must exist on mock Drive");
+        let parsed_manifest: VaultManifest = serde_json::from_slice(&reuploaded_bytes).unwrap();
+        let mk_unwrapped = unwrap_master_key_manifest("u_rec", "strong-passphrase-1", &parsed_manifest)
+            .await
+            .unwrap();
+        assert_eq!(mk_unwrapped.as_bytes(), mk1.as_bytes());
+
+        // Next sync_history_deltas MUST reset stale store cloud links & cursors cleanly!
+        let store = Arc::new(AsyncMutex::new(
+            MessageStore::open(&dir.join("rec.db")).unwrap(),
+        ));
+        let sha_local = "7".repeat(64);
+        {
+            let mut s = store.lock().await;
+            s.upsert_message(&MessageDto {
+                msg_id: "m_old_sync".into(),
+                cli_msg_id: None,
+                thread_id: "t1".into(),
+                sender_id: "u_rec".into(),
+                sender_name: "Alice".into(),
+                text: "must resync after recovery".into(),
+                msg_type: "chat.text".into(),
+                ts: 1_600_000_001_000,
+                is_outgoing: true,
+                is_recalled: false,
+                is_pinned: false,
+                quote: None,
+                reactions: Vec::new(),
+                attachment_url: None,
+                attachment_name: None,
+            })
+            .unwrap();
+            s.upsert_media_object(&MediaObjectRecord {
+                sha256: sha_local.clone(),
+                kind: "image".into(),
+                mime: "image/jpeg".into(),
+                size_bytes: 500,
+                thumb_sha256: None,
+                width: None,
+                height: None,
+                duration_ms: None,
+                local_state: MEDIA_LOCAL_STATE_LOCAL,
+                local_rel_path: Some("blobs/77/77/s.enc".into()),
+                is_encrypted: true,
+                pin_count: 0,
+                created_ts: 1_000,
+                last_accessed_ts: 1_000,
+                cloud_provider: Some("gdrive".into()),
+                cloud_file_id: Some("stale-old-blob-id".into()),
+                cloud_encrypted: true,
+                cloud_key_ver: 1,
+                cloud_synced_ts: Some(1_000),
+            })
+            .unwrap();
+            s.set_gdrive_last_history_sync_ts(1_600_000_999_000).unwrap();
+        }
+        let rep = client2
+            .sync_history_deltas(
+                false,
+                "tok",
+                &recovered.history_folder_id,
+                &store,
+                &mk1,
+                "u_rec",
+                "dev-1",
+                1_600_000_999_000,
+            )
+            .await
+            .unwrap();
+        assert!(
+            rep.uploaded_delta_id.is_some(),
+            "recovered history folder must reset stale watermark and re-upload existing messages"
+        );
+        {
+            let s = store.lock().await;
+            assert!(s
+                .get_media_object(&sha_local)
+                .unwrap()
+                .unwrap()
+                .cloud_file_id
+                .is_none());
+        }
+
+        // 2) Fresh client WITHOUT cached manifest recovering a trashed vault MUST refuse encrypted uploads!
+        let client_no_cache = GDriveClient::with_endpoints(endpoints).unwrap();
+        let mut uncached_tokens = GDriveTokens {
+            access_token: "tok".into(),
+            refresh_token: "ref".into(),
+            expires_at_epoch_secs: 1_900_000_000,
+            account_email: None,
+            account_name: None,
+            root_folder_id: Some("dead-root-nocache".into()),
+            uid_folder_id: Some("dead-uid-nocache".into()),
+            blobs_folder_id: Some("dead-blobs-nocache".into()),
+            history_folder_id: Some("dead-hist-nocache".into()),
+            manifest_file_id: Some("dead-manifest-nocache".into()),
+        };
+        let (rec_no_manifest, _) = client_no_cache
+            .verify_or_recover_vault_folders(false, "tok", "u_nocache", &mut uncached_tokens)
+            .await
+            .unwrap();
+        assert!(rec_no_manifest.manifest_file_id.is_none());
+
+        let dummy_blob = dir.join("blob.tzmb");
+        std::fs::write(&dummy_blob, b"encrypted-bytes").unwrap();
+        assert!(matches!(
+            client_no_cache
+                .upload_file_resumable(
+                    false,
+                    "tok",
+                    &rec_no_manifest.blobs_folder_id,
+                    "abc.tzmb",
+                    "application/octet-stream",
+                    &dummy_blob,
+                )
+                .await,
+            Err(GDriveError::VaultManifestMissing)
+        ));
+        assert!(matches!(
+            client_no_cache
+                .sync_history_deltas(
+                    false,
+                    "tok",
+                    &rec_no_manifest.history_folder_id,
+                    &store,
+                    &mk1,
+                    "u_nocache",
+                    "dev-1",
+                    0,
+                )
+                .await,
+            Err(GDriveError::VaultManifestMissing)
+        ));
+
+        stop_srv.notify_one();
+        let _ = srv.await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn drain_pending_cloud_deletes_requires_history_pull_and_backs_off_403_poison_rows() {
+        use crate::store::{
+            MediaObjectRecord, MessageMediaRecord, MEDIA_CDN_STATUS_OK, MEDIA_LOCAL_STATE_LOCAL,
+        };
+        use tokio::sync::Mutex;
+
+        let dir = temp_test_dir("drain-poison-guard");
+        let store = Arc::new(AsyncMutex::new(
+            MessageStore::open(&dir.join("dp.db")).unwrap(),
+        ));
+        let sha_poison = "a".repeat(64);
+        let sha_ok = "b".repeat(64);
+        {
+            let s = store.lock().await;
+            for (sha, cid) in [(&sha_poison, "drv-403"), (&sha_ok, "drv-204")] {
+                s.upsert_media_object(&MediaObjectRecord {
+                    sha256: sha.clone(),
+                    kind: "image".into(),
+                    mime: "image/jpeg".into(),
+                    size_bytes: 100,
+                    thumb_sha256: None,
+                    width: None,
+                    height: None,
+                    duration_ms: None,
+                    local_state: MEDIA_LOCAL_STATE_LOCAL,
+                    local_rel_path: Some(format!("blobs/aa/aa/{cid}.enc")),
+                    is_encrypted: true,
+                    pin_count: 0,
+                    created_ts: 1_000,
+                    last_accessed_ts: 1_000,
+                    cloud_provider: Some("gdrive".into()),
+                    cloud_file_id: Some(cid.into()),
+                    cloud_encrypted: true,
+                    cloud_key_ver: 1,
+                    cloud_synced_ts: Some(1_000),
+                })
+                .unwrap();
+                s.link_message_media(&MessageMediaRecord {
+                    thread_id: "t1".into(),
+                    msg_id: format!("m-{cid}"),
+                    variant: "primary".into(),
+                    url_hash: format!("uh-{cid}"),
+                    sha256: Some(sha.clone()),
+                    original_name: None,
+                    saved_user_path: None,
+                    cdn_status: MEDIA_CDN_STATUS_OK,
+                    updated_ts: 1_000,
+                })
+                .unwrap();
+                let _ = s
+                    .cleanup_orphaned_media_for_msg("t1", &format!("m-{cid}"))
+                    .unwrap();
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let deleted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let deleted_srv = deleted.clone();
+        let stop_srv = Arc::new(Notify::new());
+        let stop_clone = stop_srv.clone();
+        let srv = tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    _ = stop_clone.notified() => break,
+                    res = listener.accept() => res,
+                };
+                let Ok((mut sock, _)) = accepted else {
+                    break;
+                };
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]);
+                let first = head.lines().next().unwrap_or("");
+                if first.contains("/drv-403") {
+                    let body = r#"{"error":{"code":403,"message":"insufficientFilePermissions"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    sock.write_all(resp.as_bytes()).await.unwrap();
+                } else if first.contains("/drv-204") {
+                    deleted_srv.lock().await.push("drv-204".to_string());
+                    sock.write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                }
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let client = GDriveClient::with_endpoints(GDriveEndpoints {
+            token_url: format!("http://{addr}/token"),
+            drive_api_base: format!("http://{addr}/api"),
+            drive_upload_base: format!("http://{addr}/upload"),
+        })
+        .unwrap();
+
+        // Without prior history sync pull, drain_pending_cloud_deletes MUST NOT delete anything!
+        let rep0 = client
+            .drain_pending_cloud_deletes(false, "tok", &store, 10)
+            .await
+            .unwrap();
+        assert_eq!(rep0.deleted_count, 0);
+        assert!(deleted.lock().await.is_empty());
+
+        // Mark remote history pull completed -> with limit=1, 1st call hits drv-403 and backs it off;
+        // 2nd call MUST NOT starve on drv-403 and immediately deletes drv-204!
+        {
+            let s = store.lock().await;
+            s.record_gdrive_history_pull_completed(chrono::Utc::now().timestamp_millis())
+                .unwrap();
+        }
+        let rep1 = client
+            .drain_pending_cloud_deletes(false, "tok", &store, 1)
+            .await
+            .unwrap();
+        assert_eq!(rep1.failed_count, 1);
+        assert_eq!(rep1.deleted_count, 0);
+
+        let rep2 = client
+            .drain_pending_cloud_deletes(false, "tok", &store, 1)
+            .await
+            .unwrap();
+        assert_eq!(rep2.deleted_count, 1);
+        assert_eq!(*deleted.lock().await, vec!["drv-204"]);
+
+        stop_srv.notify_one();
+        let _ = srv.await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn resumable_upload_handles_200_on_offset_probe_and_missing_or_stalled_308_without_looping(
+    ) {
+        let dir = temp_test_dir("resumable-proto");
+        let file_path = dir.join("chunked.bin");
+        let payload = vec![0x5Au8; 300 * 1024];
+        std::fs::write(&file_path, &payload).unwrap();
+
+        // Scenario A: Final chunk PUT returns 503, offset probe `bytes */N` returns 200 OK with file id!
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let srv = tokio::spawn(async move {
+                // 1) POST init
+                let (mut s1, _) = listener.accept().await.unwrap();
+                let mut b = vec![0u8; 4096];
+                let _ = s1.read(&mut b).await;
+                let loc = format!("http://{addr}/session/a");
+                let r1 = format!(
+                    "HTTP/1.1 200 OK\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                s1.write_all(r1.as_bytes()).await.unwrap();
+                let _ = s1.shutdown().await;
+
+                // 2) Chunk 1 (0..262143) -> 308 Range: bytes=0-262143
+                let (mut s2, _) = listener.accept().await.unwrap();
+                let mut raw = Vec::new();
+                let mut tmp = [0u8; 8192];
+                loop {
+                    let n = s2.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        if raw.len() >= pos + 4 + 262_144 {
+                            break;
+                        }
+                    }
+                }
+                s2.write_all(b"HTTP/1.1 308 Permanent Redirect\r\nRange: bytes=0-262143\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                let _ = s2.shutdown().await;
+
+                // 3) Final chunk PUT -> server commits but returns 503
+                let (mut s3, _) = listener.accept().await.unwrap();
+                let mut raw3 = Vec::new();
+                let remaining = 300 * 1024 - 262_144;
+                loop {
+                    let n = s3.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    raw3.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = raw3.windows(4).position(|w| w == b"\r\n\r\n") {
+                        if raw3.len() >= pos + 4 + remaining {
+                            break;
+                        }
+                    }
+                }
+                s3.write_all(b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                let _ = s3.shutdown().await;
+
+                // 4) Offset probe PUT Content-Range: bytes */307200 -> 200 OK with final file ID!
+                let (mut s4, _) = listener.accept().await.unwrap();
+                let n4 = s4.read(&mut b).await.unwrap();
+                let req4 = String::from_utf8_lossy(&b[..n4]);
+                assert!(req4.to_ascii_lowercase().contains("bytes */307200"));
+                let ok_json = r#"{"id":"drv-completed-after-503"}"#;
+                let r4 = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{ok_json}",
+                    ok_json.len()
+                );
+                s4.write_all(r4.as_bytes()).await.unwrap();
+                let _ = s4.shutdown().await;
+            });
+
+            let client = GDriveClient::with_endpoints(GDriveEndpoints {
+                token_url: format!("http://{addr}/token"),
+                drive_api_base: format!("http://{addr}/api"),
+                drive_upload_base: format!("http://{addr}/upload"),
+            })
+            .unwrap();
+            let fid = client
+                .upload_file_resumable_chunked(
+                    false,
+                    "tok",
+                    "p1",
+                    "a.tzmb",
+                    "application/octet-stream",
+                    &file_path,
+                    256 * 1024,
+                )
+                .await
+                .unwrap();
+            assert_eq!(fid, "drv-completed-after-503");
+            srv.await.unwrap();
+        }
+
+        // Scenario B: Repeated 308 without Range header MUST NOT skip bytes or loop infinitely!
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let put_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let put_count_srv = put_count.clone();
+            let stop_srv = Arc::new(Notify::new());
+            let stop_clone = stop_srv.clone();
+            let srv = tokio::spawn(async move {
+                loop {
+                    let accepted = tokio::select! {
+                        _ = stop_clone.notified() => break,
+                        res = listener.accept() => res,
+                    };
+                    let Ok((mut sock, _)) = accepted else {
+                        break;
+                    };
+                    let mut raw = Vec::new();
+                    let mut tmp = [0u8; 8192];
+                    let header_end = loop {
+                        let n = sock.read(&mut tmp).await.unwrap_or(0);
+                        if n == 0 {
+                            break 0;
+                        }
+                        raw.extend_from_slice(&tmp[..n]);
+                        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break pos + 4;
+                        }
+                    };
+                    if header_end == 0 {
+                        continue;
+                    }
+                    let head = String::from_utf8_lossy(&raw[..header_end]).to_string();
+                    let cl: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    let mut body_len = raw.len() - header_end;
+                    while body_len < cl {
+                        let n = sock.read(&mut tmp).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        body_len += n;
+                    }
+                    if head.starts_with("POST ") {
+                        let loc = format!("http://{addr}/session/b");
+                        let r = format!(
+                            "HTTP/1.1 200 OK\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        sock.write_all(r.as_bytes()).await.unwrap();
+                    } else {
+                        put_count_srv.fetch_add(1, Ordering::Relaxed);
+                        // 308 with NO Range header! Must stay at offset 0 and terminate after MAX_API_RETRIES!
+                        assert!(head.to_ascii_lowercase().contains("bytes 0-"));
+                        sock.write_all(
+                            b"HTTP/1.1 308 Permanent Redirect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    let _ = sock.shutdown().await;
+                }
+            });
+
+            let client = GDriveClient::with_endpoints(GDriveEndpoints {
+                token_url: format!("http://{addr}/token"),
+                drive_api_base: format!("http://{addr}/api"),
+                drive_upload_base: format!("http://{addr}/upload"),
+            })
+            .unwrap();
+            let err = client
+                .upload_file_resumable_chunked(
+                    false,
+                    "tok",
+                    "p1",
+                    "b.tzmb",
+                    "application/octet-stream",
+                    &file_path,
+                    256 * 1024,
+                )
+                .await;
+            assert!(err.is_err());
+            assert_eq!(put_count.load(Ordering::Relaxed), MAX_API_RETRIES + 1);
+            stop_srv.notify_one();
+            let _ = srv.await;
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn oauth_401_forces_refresh_retry_once_and_rejects_empty_access_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop_srv = Arc::new(Notify::new());
+        let stop_clone = stop_srv.clone();
+        let refresh_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refresh_srv = refresh_calls.clone();
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    _ = stop_clone.notified() => break,
+                    res = listener.accept() => res,
+                };
+                let Ok((mut sock, _)) = accepted else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let first = req.lines().next().unwrap_or("");
+
+                if first.starts_with("POST /token") {
+                    if req.contains("code=empty_code") {
+                        let body = r#"{"access_token":"   ","refresh_token":"r1","expires_in":3600}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        sock.write_all(resp.as_bytes()).await.unwrap();
+                    } else {
+                        refresh_srv.fetch_add(1, Ordering::Relaxed);
+                        let body = r#"{"access_token":"ya29.fresh_after_401","expires_in":3600}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        sock.write_all(resp.as_bytes()).await.unwrap();
+                    }
+                } else if first.starts_with("GET /api/about") {
+                    if req.contains("Bearer ya29.fresh_after_401") {
+                        let body = r#"{"storageQuota":{"usage":"123"},"user":{"emailAddress":"ok@example.com"}}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        sock.write_all(resp.as_bytes()).await.unwrap();
+                    } else {
+                        let body = r#"{"error":{"code":401,"message":"Invalid Credentials"}}"#;
+                        let resp = format!(
+                            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        sock.write_all(resp.as_bytes()).await.unwrap();
+                    }
+                }
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        let client = GDriveClient::with_endpoints(GDriveEndpoints {
+            token_url: format!("http://{addr}/token"),
+            drive_api_base: format!("http://{addr}/api"),
+            drive_upload_base: format!("http://{addr}/upload"),
+        })
+        .unwrap();
+
+        // 1) Empty access_token from OAuth endpoint is rejected!
+        assert!(client
+            .exchange_oauth_code(false, "cid", None, "empty_code", "ver", "http://127.0.0.1/cb")
+            .await
+            .is_err());
+
+        // 2) Raw 401 without cached refresh context maps to GDriveError::Unauthorized
+        assert!(matches!(
+            client.fetch_drive_quota(false, "ya29.unknown_stale").await,
+            Err(GDriveError::Unauthorized)
+        ));
+
+        // 3) Wall-clock-fresh tokens (simulating backward clock skew) that get HTTP 401 automatically
+        //    force-refresh once, succeed, and report refreshed=true on next refresh_access_token_with_broker!
+        let mut tokens = GDriveTokens {
+            access_token: "ya29.revoked_early".into(),
+            refresh_token: "1//valid-refresh".into(),
+            expires_at_epoch_secs: chrono::Utc::now().timestamp() + 3600,
+            account_email: None,
+            account_name: None,
+            root_folder_id: None,
+            uid_folder_id: None,
+            blobs_folder_id: None,
+            history_folder_id: None,
+            manifest_file_id: None,
+        };
+        assert!(!client
+            .refresh_access_token_with_broker(false, "cid", None, None, &mut tokens)
+            .await
+            .unwrap());
+        let (quota, email, _) = client
+            .fetch_drive_quota(false, &tokens.access_token)
+            .await
+            .unwrap();
+        assert_eq!(quota.drive_usage_bytes, 123);
+        assert_eq!(email.as_deref(), Some("ok@example.com"));
+        assert_eq!(refresh_calls.load(Ordering::Relaxed), 1);
+
+        // Next call updates `tokens` in-place so caller persists the refreshed token!
+        assert!(client
+            .refresh_access_token_with_broker(false, "cid", None, None, &mut tokens)
+            .await
+            .unwrap());
+        assert_eq!(tokens.access_token, "ya29.fresh_after_401");
+
+        stop_srv.notify_one();
+        let _ = srv.await;
+    }
+
+    #[tokio::test]
+    async fn download_file_to_path_closes_handle_and_removes_partial_file_on_stream_error() {
+        let dir = temp_test_dir("dl-partial-cleanup");
+        let dst = dir.join("partial.bin");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf).await;
+            // Advertise Content-Length: 4096 but abruptly close after 10 bytes -> stream error!
+            sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n0123456789",
+            )
+            .await
+            .unwrap();
+            let _ = sock.shutdown().await;
+        });
+
+        let client = GDriveClient::with_endpoints(GDriveEndpoints {
+            token_url: format!("http://{addr}/token"),
+            drive_api_base: format!("http://{addr}/api"),
+            drive_upload_base: format!("http://{addr}/upload"),
+        })
+        .unwrap();
+
+        let res = client
+            .download_file_to_path(false, "tok", "f-trunc", &dst)
+            .await;
+        assert!(res.is_err());
+        assert!(
+            !dst.exists(),
+            "partial download file must be removed cleanly on Windows after closing file handle"
+        );
+
+        srv.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

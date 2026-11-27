@@ -1,6 +1,6 @@
 export type ThemeMode = "triforce" | "night-blue" | "dark" | "light";
 
-export type TranslateProvider = "deepl" | "gemini" | "azure";
+export type TranslateProvider = "deepl";
 
 export type TranslateDetectMode = "api_cache" | "local_smart_skip";
 
@@ -8,14 +8,8 @@ export interface TranslateConfigSummary {
   provider: TranslateProvider;
   detect_mode: TranslateDetectMode;
   target_lang: string;
-  gemini_model: string;
-  azure_region: string;
   has_deepl_key: boolean;
-  has_gemini_key: boolean;
-  has_azure_key: boolean;
   deepl_preview: string;
-  gemini_preview: string;
-  azure_preview: string;
 }
 
 export interface TranslateConfigUpdate {
@@ -23,10 +17,7 @@ export interface TranslateConfigUpdate {
   target_lang: string;
   detect_mode?: TranslateDetectMode;
   deepl_key?: string;
-  gemini_key?: string;
-  gemini_model?: string;
-  azure_key?: string;
-  azure_region?: string;
+  clear_deepl_key?: boolean;
 }
 
 export interface TranslationResult {
@@ -164,6 +155,8 @@ export interface PasscodeConfig {
   salt: string;
   hash: string;
   autoLockMinutes: number;
+  failedAttempts?: number;
+  lockoutUntilMs?: number;
 }
 
 export interface MutualGroupDto {
@@ -219,8 +212,15 @@ export interface MessageDto {
   reactions: ReactionSummary[];
   attachment_url: string | null;
   attachment_name: string | null;
+  is_live?: boolean;
   send_status?: "sending" | "failed";
   send_error?: string;
+}
+
+export interface MessagesAroundResult {
+  messages: MessageDto[];
+  has_more?: boolean;
+  has_newer: boolean;
 }
 
 export interface AccountProfile {
@@ -282,6 +282,7 @@ export interface AttachmentMeta {
 
 export type PendingAttachment =
   | {
+      id?: string;
       kind: "path";
       path: string;
       fileName: string;
@@ -289,6 +290,7 @@ export type PendingAttachment =
       isImage: boolean;
     }
   | {
+      id?: string;
       kind: "raw";
       file: File;
       fileName: string;
@@ -558,6 +560,7 @@ export interface GDriveStatusDto {
   connected: boolean;
   account_email: string | null;
   account_name: string | null;
+  root_folder_id?: string | null;
   vault_unlocked: boolean;
   has_remote_manifest: boolean;
   sync_enabled: boolean;
@@ -673,6 +676,7 @@ export type {
   AiCliProbeDto,
   AiConfigDto,
   AiConfigUpdateDto,
+  AiInstallZeroClawResponseDto,
   AiStoredMessageDto,
   AiSummaryDto,
   ApiAuditLogDto,
@@ -689,6 +693,8 @@ export type {
   ScheduledMessageDto,
   UpdateApiClientInput,
   UpdateScheduledMessageInput,
+  ZeroClawInstallProgressDto,
+  ZeroClawInstallResultDto,
 } from "./utils/automationHelpers";
 
 export interface AiStreamDeltaEvent {

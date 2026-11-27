@@ -1,9 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { CalendarClock, Loader2, X } from "lucide-react";
 import { useI18n } from "../i18n";
+import { isImeComposingEvent } from "../utils/searchNormalize";
 
 interface Props {
   open: boolean;
+  isLocked?: boolean;
   threadTitle: string;
   onClose: () => void;
   onSubmit: (title: string, startTimeMs: number, repeat: number) => Promise<void>;
@@ -15,7 +17,13 @@ function toLocalDatetimeInputValue(ms: number): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-export function CreateReminderModal({ open, threadTitle, onClose, onSubmit }: Props) {
+export function CreateReminderModal({
+  open,
+  isLocked = false,
+  threadTitle,
+  onClose,
+  onSubmit,
+}: Props) {
   const { t } = useI18n();
   const [title, setTitle] = useState("");
   const [dateTimeStr, setDateTimeStr] = useState(() =>
@@ -24,9 +32,24 @@ export function CreateReminderModal({ open, threadTitle, onClose, onSubmit }: Pr
   const [repeat, setRepeat] = useState<number>(0);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const savingRef = useRef(false);
+  const mountedRef = useRef(true);
 
   useEffect(() => {
-    if (!open) return;
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!open) {
+      savingRef.current = false;
+      setSaving(false);
+      return;
+    }
+    savingRef.current = false;
+    setSaving(false);
     setTitle("");
     setDateTimeStr(toLocalDatetimeInputValue(Date.now() + 30 * 60_000));
     setRepeat(0);
@@ -34,15 +57,27 @@ export function CreateReminderModal({ open, threadTitle, onClose, onSubmit }: Pr
   }, [open]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || isLocked) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (isLocked || isImeComposingEvent(e)) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!saving && !savingRef.current) {
+          onClose();
+        }
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, onClose]);
+  }, [open, isLocked, saving, onClose]);
 
   if (!open) return null;
+
+  const handleRequestClose = () => {
+    if (saving || savingRef.current) return;
+    onClose();
+  };
 
   const setPreset = (offsetMs?: number, tomorrow9Am = false) => {
     if (tomorrow9Am) {
@@ -57,35 +92,53 @@ export function CreateReminderModal({ open, threadTitle, onClose, onSubmit }: Pr
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (saving || savingRef.current) return;
     const clean = title.trim();
     if (!clean) {
-      setError("Vui lòng nhập nội dung nhắc hẹn");
+      setError(t("reminderErrorEmptyContent"));
       return;
     }
     const parsedMs = new Date(dateTimeStr).getTime();
     if (!Number.isFinite(parsedMs) || parsedMs <= 0) {
-      setError("Thời gian nhắc hẹn không hợp lệ");
+      setError(t("reminderErrorInvalidTime"));
       return;
     }
+    if (parsedMs <= Date.now() + 30_000) {
+      setError(t("reminderErrorPastTime"));
+      return;
+    }
+    savingRef.current = true;
     setSaving(true);
     setError(null);
     try {
       await onSubmit(clean, parsedMs, repeat);
-      onClose();
+      if (mountedRef.current) {
+        onClose();
+      }
     } catch (err) {
-      setError(String(err));
+      if (mountedRef.current) {
+        setError(String(err).replace(/^Error:\s*/i, ""));
+      }
     } finally {
-      setSaving(false);
+      savingRef.current = false;
+      if (mountedRef.current) {
+        setSaving(false);
+      }
     }
   };
 
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-xs"
-      onClick={onClose}
+      onClick={handleRequestClose}
     >
       <form
         onSubmit={(e) => void handleSave(e)}
+        onKeyDown={(e) => {
+          if (isImeComposingEvent(e) && e.key === "Enter") {
+            e.preventDefault();
+          }
+        }}
         className="w-full max-w-md overflow-hidden rounded-2xl shadow-2xl"
         style={{
           background: "var(--bg-sidebar)",
@@ -102,7 +155,12 @@ export function CreateReminderModal({ open, threadTitle, onClose, onSubmit }: Pr
             <CalendarClock className="h-5 w-5 shrink-0" style={{ color: "var(--accent)" }} />
             <span className="truncate text-[15.5px]">{t("createReminderModalTitle", { title: threadTitle })}</span>
           </div>
-          <button type="button" onClick={onClose} className="hover-menu rounded-lg p-1.5">
+          <button
+            type="button"
+            disabled={saving}
+            onClick={handleRequestClose}
+            className="hover-menu rounded-lg p-1.5 disabled:cursor-not-allowed disabled:opacity-40"
+          >
             <X className="h-4 w-4" style={{ color: "var(--text-secondary)" }} />
           </button>
         </div>
@@ -209,8 +267,9 @@ export function CreateReminderModal({ open, threadTitle, onClose, onSubmit }: Pr
         >
           <button
             type="button"
-            onClick={onClose}
-            className="hover-menu rounded-xl px-4 py-2 text-xs font-medium"
+            disabled={saving}
+            onClick={handleRequestClose}
+            className="hover-menu rounded-xl px-4 py-2 text-xs font-medium disabled:cursor-not-allowed disabled:opacity-50"
             style={{ background: "var(--bg-surface)" }}
           >
             {t("cancel")}

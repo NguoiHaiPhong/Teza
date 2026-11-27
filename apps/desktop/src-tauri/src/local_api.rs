@@ -13,7 +13,7 @@
 //!   per-client sliding-window rate limiting + global anti-spam send spacing (`429 Retry-After`),
 //!   24h `Idempotency-Key` replay cache, and persistent audit logging.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,11 +28,13 @@ use tokio::task::JoinHandle;
 
 use crate::scheduler::{is_expired_err, SchedulerHandle};
 use zalo_core::chat::messaging;
-use zalo_core::chat::parser::format_thread_preview;
+use zalo_core::chat::parser::{format_thread_preview, normalize_ts_ms};
 use zalo_core::chat::{strip_vi_accents, FolderFilter, ThreadKind};
 use zalo_core::data_dir::{write_private_atomic, StoragePaths};
 use zalo_core::session::Session;
-use zalo_core::store::{ApiClientDto, MessageStore, NewScheduledMessageInput};
+use zalo_core::store::{
+    ApiClientDto, MessageStore, NewScheduledMessageInput, ScheduledMessageDto,
+};
 
 pub const DEFAULT_LOCAL_API_PORT: u16 = 17_820;
 pub const MIN_LOCAL_API_PORT: u16 = 1_024;
@@ -56,6 +58,21 @@ const MAX_IDEMPOTENCY_KEY_BYTES: usize = 118;
 const MAX_BEARER_TOKEN_BYTES: usize = 512;
 const IDEMPOTENCY_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+/// Maximum schedule horizon (5 years in milliseconds) accepted by `POST /v1/messages/schedule`.
+const MAX_SCHEDULE_FUTURE_MS: i64 = 5 * 365 * 24 * 3_600 * 1_000;
+/// Cap unauthenticated 401/403 audit log writes per minute so floods cannot evict valid history.
+const MAX_UNAUTH_AUDIT_PER_MIN: usize = 20;
+/// Cap logged HTTP request paths in audit entries to 256 UTF-8 characters.
+const MAX_AUDIT_PATH_CHARS: usize = 256;
+/// Security-sensitive HTTP headers that MUST NOT appear more than once in a request.
+const SINGLE_VALUE_SECURITY_HEADERS: [&str; 6] = [
+    "host",
+    "content-length",
+    "sec-fetch-site",
+    "origin",
+    "authorization",
+    "idempotency-key",
+];
 
 fn default_local_api_port() -> u16 {
     DEFAULT_LOCAL_API_PORT
@@ -137,21 +154,203 @@ pub struct LocalApiStatusDto {
     pub bind_addr: String,
     pub port: u16,
     pub active_clients: usize,
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+/// Sanitized schedule payload returned by Local API endpoints (redacts local filesystem
+/// `attachment_path` and exposes boolean `has_attachment` instead).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ApiScheduledMessageDto {
+    id: String,
+    thread_id: String,
+    thread_title: String,
+    thread_kind: String,
+    text: String,
+    has_attachment: bool,
+    send_at_ts: i64,
+    next_attempt_ts: Option<i64>,
+    recurrence: String,
+    misfire_policy: String,
+    misfire_grace_secs: i64,
+    status: String,
+    retry_count: u32,
+    last_error: String,
+    created_at: i64,
+    updated_at: i64,
+    sent_at_ts: i64,
+}
+
+impl From<ScheduledMessageDto> for ApiScheduledMessageDto {
+    fn from(item: ScheduledMessageDto) -> Self {
+        Self {
+            id: item.id,
+            thread_id: item.thread_id,
+            thread_title: item.thread_title,
+            thread_kind: item.thread_kind,
+            text: item.text,
+            has_attachment: !item.attachment_path.trim().is_empty(),
+            send_at_ts: item.send_at_ts,
+            next_attempt_ts: item.next_attempt_ts,
+            recurrence: item.recurrence,
+            misfire_policy: item.misfire_policy,
+            misfire_grace_secs: item.misfire_grace_secs,
+            status: item.status,
+            retry_count: item.retry_count,
+            last_error: item.last_error,
+            created_at: item.created_at,
+            updated_at: item.updated_at,
+            sent_at_ts: item.sent_at_ts,
+        }
+    }
+}
+
+/// Standard FIPS 180-4 SHA-256 hex digest used for canonical idempotency payload hashing.
+fn sha256_hex(data: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut padded = Vec::with_capacity(data.len() + 72);
+    padded.extend_from_slice(data);
+    padded.push(0x80);
+    while (padded.len() % 64) != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    let mut w = [0u32; 64];
+    for chunk in padded.as_chunks::<64>().0 {
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+
+    let mut out = String::with_capacity(64);
+    for word in h {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{word:08x}");
+    }
+    out
+}
+
+/// RAII guard preventing concurrent requests with the same `(client_id, scoped_key)`
+/// from racing past idempotency replay checks.
+struct InFlightIdempotencyGuard {
+    set: Arc<std::sync::Mutex<HashSet<(String, String)>>>,
+    key: (String, String),
+}
+
+impl InFlightIdempotencyGuard {
+    fn try_acquire(
+        set: &Arc<std::sync::Mutex<HashSet<(String, String)>>>,
+        client_id: &str,
+        scoped_key: &str,
+    ) -> Option<Self> {
+        let key = (client_id.to_string(), scoped_key.to_string());
+        let mut guard = set.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.insert(key.clone()) {
+            Some(Self {
+                set: set.clone(),
+                key,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for InFlightIdempotencyGuard {
+    fn drop(&mut self) {
+        let mut guard = self.set.lock().unwrap_or_else(|e| e.into_inner());
+        guard.remove(&self.key);
+    }
 }
 
 type EventEmitFn = dyn Fn(&str, serde_json::Value) + Send + Sync;
+type SessionExpiredFn = dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    + Send
+    + Sync;
 
 #[derive(Clone)]
 struct EventSink {
     emit_fn: Arc<EventEmitFn>,
+    expire_session_fn: Option<Arc<SessionExpiredFn>>,
 }
 
 impl EventSink {
     fn from_app(app: AppHandle) -> Self {
+        let app_for_emit = app.clone();
+        let app_for_expire = app;
         Self {
             emit_fn: Arc::new(move |event, payload| {
-                let _ = app.emit(event, payload);
+                let _ = app_for_emit.emit(event, payload);
             }),
+            expire_session_fn: Some(Arc::new(move |reason| {
+                let app_handle = app_for_expire.clone();
+                Box::pin(async move {
+                    crate::clear_expired_session_for_app(&app_handle, reason, true).await;
+                })
+            })),
         }
     }
 
@@ -163,12 +362,19 @@ impl EventSink {
                     guard.push((event.to_string(), payload));
                 }
             }),
+            expire_session_fn: None,
         }
     }
 
     fn emit_json<T: Serialize>(&self, event: &str, payload: &T) {
         if let Ok(val) = serde_json::to_value(payload) {
             (self.emit_fn)(event, val);
+        }
+    }
+
+    async fn clear_expired_session(&self, reason: String) {
+        if let Some(ref handler) = self.expire_session_fn {
+            (handler)(reason).await;
         }
     }
 }
@@ -183,9 +389,25 @@ struct RunningServer {
 struct RateLimiterState {
     per_client: HashMap<String, VecDeque<Instant>>,
     last_send_at: Option<Instant>,
+    unauth_audit_timestamps: VecDeque<Instant>,
 }
 
 impl RateLimiterState {
+    fn allow_unauth_audit(&mut self, now: Instant) -> bool {
+        while let Some(&front) = self.unauth_audit_timestamps.front() {
+            if now.saturating_duration_since(front) >= RATE_LIMIT_WINDOW {
+                self.unauth_audit_timestamps.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.unauth_audit_timestamps.len() >= MAX_UNAUTH_AUDIT_PER_MIN {
+            return false;
+        }
+        self.unauth_audit_timestamps.push_back(now);
+        true
+    }
+
     fn check_client_rate_limit(
         &mut self,
         client_id: &str,
@@ -249,7 +471,10 @@ pub struct LocalApiManager {
     config_path: PathBuf,
     config: Arc<Mutex<LocalApiConfig>>,
     runtime: Arc<Mutex<Option<RunningServer>>>,
+    last_error: Arc<Mutex<Option<String>>>,
+    lifecycle_lock: Arc<Mutex<()>>,
     rate_limiter: Arc<Mutex<RateLimiterState>>,
+    in_flight_idempotency: Arc<std::sync::Mutex<HashSet<(String, String)>>>,
 }
 
 impl LocalApiManager {
@@ -265,7 +490,10 @@ impl LocalApiManager {
             config_path,
             config: Arc::new(Mutex::new(loaded)),
             runtime: Arc::new(Mutex::new(None)),
+            last_error: Arc::new(Mutex::new(None)),
+            lifecycle_lock: Arc::new(Mutex::new(())),
             rate_limiter: Arc::new(Mutex::new(RateLimiterState::default())),
+            in_flight_idempotency: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -273,7 +501,7 @@ impl LocalApiManager {
         self.config.lock().await.clone()
     }
 
-    /// Return current status including live bound address and count of enabled API clients.
+    /// Return current status including live bound address, last error, and count of enabled API clients.
     pub async fn status(&self, store_arc: &Arc<Mutex<MessageStore>>) -> LocalApiStatusDto {
         let cfg = self.config.lock().await.clone();
         let (running, bound_addr, port) = {
@@ -296,12 +524,14 @@ impl LocalApiManager {
                 .map(|clients| clients.into_iter().filter(|c| c.enabled).count())
                 .unwrap_or(0)
         };
+        let last_error = self.last_error.lock().await.clone();
         LocalApiStatusDto {
             enabled: cfg.enabled,
             running,
             bind_addr: bound_addr,
             port,
             active_clients,
+            last_error,
         }
     }
 
@@ -313,15 +543,40 @@ impl LocalApiManager {
         store_arc: Arc<Mutex<MessageStore>>,
         scheduler: SchedulerHandle,
     ) -> Result<LocalApiStatusDto, String> {
-        let enabled = self.config.lock().await.enabled;
-        if !enabled {
+        let _lc = self.lifecycle_lock.lock().await;
+        let cfg = self.config.lock().await.clone();
+        if !cfg.enabled {
             return Ok(self.status(&store_arc).await);
         }
-        self.start(app, sess_arc, store_arc, scheduler).await
+        if let Err(err) = cfg.validate() {
+            *self.last_error.lock().await = Some(err.clone());
+            return Err(err);
+        }
+        let sink = EventSink::from_app(app);
+        match self
+            .start_internal_locked(
+                cfg.port,
+                sink,
+                sess_arc,
+                store_arc.clone(),
+                scheduler,
+            )
+            .await
+        {
+            Ok(_) => {
+                *self.last_error.lock().await = None;
+                Ok(self.status(&store_arc).await)
+            }
+            Err(err) => {
+                *self.last_error.lock().await = Some(err.clone());
+                Err(err)
+            }
+        }
     }
 
     /// Bind strictly on `127.0.0.1:<cfg.port>` and start accepting Local API requests.
     /// Stops any existing listener first.
+    #[allow(dead_code)]
     pub async fn start(
         &self,
         app: AppHandle,
@@ -329,22 +584,44 @@ impl LocalApiManager {
         store_arc: Arc<Mutex<MessageStore>>,
         scheduler: SchedulerHandle,
     ) -> Result<LocalApiStatusDto, String> {
+        let _lc = self.lifecycle_lock.lock().await;
         let cfg = self.config.lock().await.clone();
-        cfg.validate()?;
-        self.start_internal(
-            cfg.port,
-            EventSink::from_app(app),
-            sess_arc,
-            store_arc.clone(),
-            scheduler,
-        )
-        .await?;
-        Ok(self.status(&store_arc).await)
+        if let Err(err) = cfg.validate() {
+            *self.last_error.lock().await = Some(err.clone());
+            return Err(err);
+        }
+        let sink = EventSink::from_app(app);
+        match self
+            .start_internal_locked(
+                cfg.port,
+                sink,
+                sess_arc,
+                store_arc.clone(),
+                scheduler,
+            )
+            .await
+        {
+            Ok(_) => {
+                *self.last_error.lock().await = None;
+                Ok(self.status(&store_arc).await)
+            }
+            Err(err) => {
+                *self.last_error.lock().await = Some(err.clone());
+                Err(err)
+            }
+        }
     }
 
     /// Immediately stop the running HTTP server via the watch shutdown channel and await
     /// listener drop so the port is released cleanly. Returns `true` if a server was stopped.
     pub async fn stop(&self) -> bool {
+        let _lc = self.lifecycle_lock.lock().await;
+        let stopped = self.stop_locked().await;
+        *self.last_error.lock().await = None;
+        stopped
+    }
+
+    async fn stop_locked(&self) -> bool {
         let running = { self.runtime.lock().await.take() };
         let Some(mut srv) = running else {
             return false;
@@ -362,6 +639,10 @@ impl LocalApiManager {
 
     /// Update configuration atomically, persisting to `local_api.json`, and apply the
     /// live start / restart / Kill Switch stop transition.
+    ///
+    /// When changing ports while running, binds the NEW listener and saves config BEFORE
+    /// stopping the old listener so an occupied port or disk write failure never disrupts
+    /// a working listener (#35).
     pub async fn apply_config(
         &self,
         new_cfg: LocalApiConfig,
@@ -370,69 +651,97 @@ impl LocalApiManager {
         store_arc: Arc<Mutex<MessageStore>>,
         scheduler: SchedulerHandle,
     ) -> Result<LocalApiStatusDto, String> {
+        let sink = EventSink::from_app(app);
+        self.apply_config_with_sink(new_cfg, sink, sess_arc, store_arc, scheduler)
+            .await
+    }
+
+    async fn apply_config_with_sink(
+        &self,
+        new_cfg: LocalApiConfig,
+        sink: EventSink,
+        sess_arc: Arc<Mutex<Session>>,
+        store_arc: Arc<Mutex<MessageStore>>,
+        scheduler: SchedulerHandle,
+    ) -> Result<LocalApiStatusDto, String> {
+        let _lc = self.lifecycle_lock.lock().await;
         new_cfg.validate()?;
-        let prev_cfg = self.config.lock().await.clone();
 
         if !new_cfg.enabled {
-            self.stop().await;
             new_cfg
                 .save_to_file(&self.config_path)
                 .map_err(|e| format!("Không lưu được cấu hình Local API: {e}"))?;
             *self.config.lock().await = new_cfg;
+            self.stop_locked().await;
+            *self.last_error.lock().await = None;
             return Ok(self.status(&store_arc).await);
         }
 
-        let need_rebind = {
-            let rt = self.runtime.lock().await;
+        let running_port = {
+            let mut rt = self.runtime.lock().await;
             match rt.as_ref() {
-                Some(srv) if !srv.join_handle.is_finished() => {
-                    srv.bound_addr.port() != new_cfg.port
+                Some(srv) if !srv.join_handle.is_finished() => Some(srv.bound_addr.port()),
+                Some(_) => {
+                    rt.take();
+                    None
                 }
-                _ => true,
+                None => None,
             }
         };
 
-        // Update in-memory config first so any newly spawned server sees `min_send_interval_ms`.
-        *self.config.lock().await = new_cfg.clone();
+        // Already running on the exact target port (only e.g. `min_send_interval_ms` changed).
+        if running_port == Some(new_cfg.port) {
+            new_cfg
+                .save_to_file(&self.config_path)
+                .map_err(|e| format!("Không lưu được cấu hình Local API: {e}"))?;
+            *self.config.lock().await = new_cfg;
+            *self.last_error.lock().await = None;
+            return Ok(self.status(&store_arc).await);
+        }
 
-        if need_rebind {
-            if let Err(bind_err) = self
-                .start_internal(
-                    new_cfg.port,
-                    EventSink::from_app(app.clone()),
-                    sess_arc.clone(),
-                    store_arc.clone(),
-                    scheduler.clone(),
-                )
-                .await
-            {
-                // Roll back in-memory config and attempt to restore previous listener if it was active.
-                *self.config.lock().await = prev_cfg.clone();
-                if prev_cfg.enabled {
-                    let _ = self
-                        .start_internal(prev_cfg.port, EventSink::from_app(app), sess_arc, store_arc, scheduler)
-                        .await;
+        // Bind the NEW loopback listener BEFORE stopping any currently running listener (#35).
+        let (new_listener, actual_addr) = match Self::bind_loopback_listener(new_cfg.port).await {
+            Ok(pair) => pair,
+            Err(bind_err) => {
+                if running_port.is_none() {
+                    *self.last_error.lock().await = Some(bind_err.clone());
                 }
                 return Err(bind_err);
             }
-        }
+        };
 
+        // Persist config BEFORE tearing down the old listener: if saving fails, dropping
+        // `new_listener` cleanly restores the previous working listener and config with zero downtime.
         if let Err(save_err) = new_cfg.save_to_file(&self.config_path) {
-            self.stop().await;
-            *self.config.lock().await = prev_cfg;
+            drop(new_listener);
             return Err(format!("Không lưu được cấu hình Local API: {save_err}"));
         }
+
+        *self.config.lock().await = new_cfg;
+        self.stop_locked().await;
+        self.spawn_bound_listener_locked(
+            new_listener,
+            actual_addr,
+            sink,
+            sess_arc,
+            store_arc.clone(),
+            scheduler,
+        )
+        .await;
+        *self.last_error.lock().await = None;
 
         Ok(self.status(&store_arc).await)
     }
 
-    /// Kill Switch: immediately disables `enabled = false`, persists config, and closes listener.
-    #[allow(dead_code)]
+    /// Kill Switch: immediately disables `enabled = false`, clears `last_error`, closes listener,
+    /// and persists config.
     pub async fn kill_switch(
         &self,
         store_arc: &Arc<Mutex<MessageStore>>,
     ) -> Result<LocalApiStatusDto, String> {
-        self.stop().await;
+        let _lc = self.lifecycle_lock.lock().await;
+        self.stop_locked().await;
+        *self.last_error.lock().await = None;
         let updated = {
             let mut cfg = self.config.lock().await;
             cfg.enabled = false;
@@ -444,31 +753,35 @@ impl LocalApiManager {
         Ok(self.status(store_arc).await)
     }
 
-    async fn start_internal(
+    async fn bind_loopback_listener(port: u16) -> Result<(TcpListener, SocketAddr), String> {
+        // STRICT loopback-only bind: 127.0.0.1 ONLY, NEVER 0.0.0.0!
+        let bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let listener = TcpListener::bind(bind_addr)
+            .await
+            .map_err(|e| format!("Không thể mở Local API trên {bind_addr}: {e}"))?;
+        let actual_addr = listener
+            .local_addr()
+            .map_err(|e| format!("Không đọc được địa chỉ cục bộ của Local API: {e}"))?;
+        debug_assert!(actual_addr.ip().is_loopback());
+        Ok((listener, actual_addr))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_bound_listener_locked(
         &self,
-        port: u16,
+        listener: TcpListener,
+        actual_addr: SocketAddr,
         sink: EventSink,
         sess_arc: Arc<Mutex<Session>>,
         store_arc: Arc<Mutex<MessageStore>>,
         scheduler: SchedulerHandle,
-    ) -> Result<SocketAddr, String> {
-        self.stop().await;
-
-        // STRICT loopback-only bind: 127.0.0.1 ONLY, NEVER 0.0.0.0!
-        let bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-        let listener = TcpListener::bind(bind_addr).await.map_err(|e| {
-            format!("Không thể mở Local API trên {bind_addr}: {e}")
-        })?;
-        let actual_addr = listener.local_addr().map_err(|e| {
-            format!("Không đọc được địa chỉ cục bộ của Local API: {e}")
-        })?;
-        debug_assert!(actual_addr.ip().is_loopback());
-
+    ) {
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let ctx = Arc::new(ServerContext {
             bound_port: actual_addr.port(),
             config: self.config.clone(),
             rate_limiter: self.rate_limiter.clone(),
+            in_flight_idempotency: self.in_flight_idempotency.clone(),
             sess_arc,
             store_arc,
             scheduler,
@@ -523,8 +836,69 @@ impl LocalApiManager {
             join_handle,
             bound_addr: actual_addr,
         });
+    }
 
+    async fn start_internal_locked(
+        &self,
+        port: u16,
+        sink: EventSink,
+        sess_arc: Arc<Mutex<Session>>,
+        store_arc: Arc<Mutex<MessageStore>>,
+        scheduler: SchedulerHandle,
+    ) -> Result<SocketAddr, String> {
+        let running_same_port = {
+            let mut rt = self.runtime.lock().await;
+            match rt.as_ref() {
+                Some(srv) if !srv.join_handle.is_finished() => {
+                    port != 0 && srv.bound_addr.port() == port
+                }
+                Some(_) => {
+                    rt.take();
+                    false
+                }
+                None => false,
+            }
+        };
+        if running_same_port {
+            self.stop_locked().await;
+        }
+        let (listener, actual_addr) = Self::bind_loopback_listener(port).await?;
+        self.stop_locked().await;
+        self.spawn_bound_listener_locked(
+            listener,
+            actual_addr,
+            sink,
+            sess_arc,
+            store_arc,
+            scheduler,
+        )
+        .await;
         Ok(actual_addr)
+    }
+
+    #[cfg(test)]
+    async fn start_internal(
+        &self,
+        port: u16,
+        sink: EventSink,
+        sess_arc: Arc<Mutex<Session>>,
+        store_arc: Arc<Mutex<MessageStore>>,
+        scheduler: SchedulerHandle,
+    ) -> Result<SocketAddr, String> {
+        let _lc = self.lifecycle_lock.lock().await;
+        match self
+            .start_internal_locked(port, sink, sess_arc, store_arc, scheduler)
+            .await
+        {
+            Ok(addr) => {
+                *self.last_error.lock().await = None;
+                Ok(addr)
+            }
+            Err(err) => {
+                *self.last_error.lock().await = Some(err.clone());
+                Err(err)
+            }
+        }
     }
 }
 
@@ -532,6 +906,7 @@ struct ServerContext {
     bound_port: u16,
     config: Arc<Mutex<LocalApiConfig>>,
     rate_limiter: Arc<Mutex<RateLimiterState>>,
+    in_flight_idempotency: Arc<std::sync::Mutex<HashSet<(String, String)>>>,
     sess_arc: Arc<Mutex<Session>>,
     store_arc: Arc<Mutex<MessageStore>>,
     scheduler: SchedulerHandle,
@@ -599,6 +974,7 @@ fn status_reason(status: u16) -> &'static str {
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
+        409 => "Conflict",
         413 => "Payload Too Large",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
@@ -643,13 +1019,11 @@ pub fn has_forbidden_browser_headers(
 }
 
 /// Extract a Bearer token from an `Authorization` header value.
+/// Safe on arbitrary UTF-8 input (never slices at a non-character byte boundary).
 pub fn extract_bearer_token(auth_header: Option<&str>) -> Option<&str> {
     let raw = auth_header?.trim();
-    if raw.len() < 8 {
-        return None;
-    }
-    let (scheme, rest) = raw.split_at(7);
-    if !scheme.eq_ignore_ascii_case("bearer ") {
+    let (scheme, rest) = raw.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
         return None;
     }
     let token = rest.trim();
@@ -838,11 +1212,11 @@ async fn read_http_request(stream: &mut TcpStream) -> ReadRequestResult {
             ));
         }
 
-        if (name == "host" || name == "content-length") && headers.contains_key(&name) {
+        if SINGLE_VALUE_SECURITY_HEADERS.contains(&name.as_str()) && headers.contains_key(&name) {
             return ReadRequestResult::Error(HttpResponse::error(
                 400,
                 "duplicate_header",
-                "Duplicate Host or Content-Length header",
+                "Duplicate single-value security header",
             ));
         }
         headers.insert(name, val.to_string());
@@ -872,6 +1246,35 @@ async fn read_http_request(stream: &mut TcpStream) -> ReadRequestResult {
     let mut body = buf.split_off(header_end + 4);
     if body.len() > content_length {
         body.truncate(content_length);
+    }
+
+    // #14: Support `Expect: 100-continue` (sent by curl/.NET/Java for bodies > 1 KiB)
+    // after headers & Content-Length <= MAX_BODY_BYTES have passed validation.
+    if let Some(expect_val) = headers.get("expect") {
+        if expect_val.trim().eq_ignore_ascii_case("100-continue") && body.len() < content_length {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return ReadRequestResult::Error(HttpResponse::error(
+                    408,
+                    "request_timeout",
+                    "Request timed out before 100 Continue",
+                ));
+            };
+            let continue_fut = async {
+                stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+                stream.flush().await
+            };
+            match tokio::time::timeout(remaining, continue_fut).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return ReadRequestResult::EmptyClose,
+                Err(_) => {
+                    return ReadRequestResult::Error(HttpResponse::error(
+                        408,
+                        "request_timeout",
+                        "Timed out sending 100 Continue",
+                    ));
+                }
+            }
+        }
     }
 
     while body.len() < content_length {
@@ -1020,11 +1423,39 @@ async fn handle_connection(mut stream: TcpStream, ctx: Arc<ServerContext>) {
 }
 
 async fn route_and_handle_request(req: &HttpRequest, ctx: &ServerContext) -> HttpResponse {
+    let now_ms = now_epoch_ms();
+
     // 1. DNS Rebinding Protection (mandatory Host header validation)
     let Some(host) = req.headers.get("host").map(String::as_str) else {
+        record_unauth_audit(
+            ctx,
+            "",
+            "anonymous",
+            &req.method,
+            &req.path,
+            "",
+            403,
+            "forbidden_host",
+            "Missing Host header",
+            now_ms,
+        )
+        .await;
         return HttpResponse::error(403, "forbidden_host", "Missing Host header");
     };
     if !is_valid_local_host(host, ctx.bound_port) {
+        record_unauth_audit(
+            ctx,
+            "",
+            "anonymous",
+            &req.method,
+            &req.path,
+            "",
+            403,
+            "forbidden_host",
+            "Forbidden Host header (loopback only)",
+            now_ms,
+        )
+        .await;
         return HttpResponse::error(
             403,
             "forbidden_host",
@@ -1038,6 +1469,19 @@ async fn route_and_handle_request(req: &HttpRequest, ctx: &ServerContext) -> Htt
         req.headers.get("sec-fetch-site").map(String::as_str),
     ) || req.method == "OPTIONS"
     {
+        record_unauth_audit(
+            ctx,
+            "",
+            "anonymous",
+            &req.method,
+            &req.path,
+            "",
+            403,
+            "forbidden_origin",
+            "Browser cross-origin requests are blocked",
+            now_ms,
+        )
+        .await;
         return HttpResponse::error(
             403,
             "forbidden_origin",
@@ -1045,12 +1489,10 @@ async fn route_and_handle_request(req: &HttpRequest, ctx: &ServerContext) -> Htt
         );
     }
 
-    let now_ms = now_epoch_ms();
-
     // 3. Bearer Token Authentication (required on ALL endpoints including /v1/health)
     let Some(raw_token) = extract_bearer_token(req.headers.get("authorization").map(String::as_str))
     else {
-        record_audit(
+        record_unauth_audit(
             ctx,
             "",
             "anonymous",
@@ -1073,7 +1515,7 @@ async fn route_and_handle_request(req: &HttpRequest, ctx: &ServerContext) -> Htt
     };
 
     let Some(client) = verified_client else {
-        record_audit(
+        record_unauth_audit(
             ctx,
             "",
             "unknown",
@@ -1220,6 +1662,14 @@ fn thread_kind_str(kind: ThreadKind) -> &'static str {
     }
 }
 
+fn truncate_audit_path(path: &str) -> String {
+    if path.chars().count() <= MAX_AUDIT_PATH_CHARS {
+        path.to_string()
+    } else {
+        path.chars().take(MAX_AUDIT_PATH_CHARS).collect()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn record_audit(
     ctx: &ServerContext,
@@ -1233,6 +1683,7 @@ async fn record_audit(
     detail: &str,
     now_ms: i64,
 ) {
+    let safe_path = truncate_audit_path(path);
     let logged = {
         let store = ctx.store_arc.lock().await;
         store
@@ -1240,7 +1691,7 @@ async fn record_audit(
                 client_id,
                 client_name,
                 method,
-                path,
+                &safe_path,
                 target_thread_id,
                 status_code,
                 outcome,
@@ -1252,6 +1703,43 @@ async fn record_audit(
     if let Some(entry) = logged {
         ctx.sink.emit_json("core://local-api-audit", &entry);
     }
+}
+
+/// Rate-limited audit logger for unauthenticated 401/403 rejections (#38) so an
+/// unauthenticated flood cannot evict the 500-row authenticated audit history.
+#[allow(clippy::too_many_arguments)]
+async fn record_unauth_audit(
+    ctx: &ServerContext,
+    client_id: &str,
+    client_name: &str,
+    method: &str,
+    path: &str,
+    target_thread_id: &str,
+    status_code: u16,
+    outcome: &str,
+    detail: &str,
+    now_ms: i64,
+) {
+    let allowed = {
+        let mut limiter = ctx.rate_limiter.lock().await;
+        limiter.allow_unauth_audit(Instant::now())
+    };
+    if !allowed {
+        return;
+    }
+    record_audit(
+        ctx,
+        client_id,
+        client_name,
+        method,
+        path,
+        target_thread_id,
+        status_code,
+        outcome,
+        detail,
+        now_ms,
+    )
+    .await;
 }
 
 async fn handle_health(
@@ -1309,6 +1797,32 @@ async fn handle_list_threads(
         )
         .await;
         return HttpResponse::error(403, "forbidden_scope", "Missing required scope: read_threads");
+    }
+
+    // #4: Reject unauthenticated access consistently with /v1/messages/send.
+    let is_authed = {
+        let sess = ctx.sess_arc.lock().await;
+        sess.is_authenticated()
+    };
+    if !is_authed {
+        record_audit(
+            ctx,
+            &client.id,
+            &client.name,
+            &req.method,
+            &req.path,
+            "",
+            503,
+            "not_authenticated",
+            "Teza account is not authenticated",
+            now_ms,
+        )
+        .await;
+        return HttpResponse::error(
+            503,
+            "not_authenticated",
+            "Teza account is not signed in",
+        );
     }
 
     let params = parse_query_params(&req.query);
@@ -1448,7 +1962,8 @@ async fn handle_list_schedules(
     ctx: &ServerContext,
 ) -> HttpResponse {
     let now_ms = now_epoch_ms();
-    if !client_has_scope(client, "read_threads") {
+    // #37: Permit EITHER `read_threads` OR `schedule` scope.
+    if !client_has_scope(client, "read_threads") && !client_has_scope(client, "schedule") {
         record_audit(
             ctx,
             &client.id,
@@ -1458,11 +1973,41 @@ async fn handle_list_schedules(
             "",
             403,
             "forbidden_scope",
-            "Missing required scope: read_threads",
+            "Missing required scope: read_threads or schedule",
             now_ms,
         )
         .await;
-        return HttpResponse::error(403, "forbidden_scope", "Missing required scope: read_threads");
+        return HttpResponse::error(
+            403,
+            "forbidden_scope",
+            "Missing required scope: read_threads or schedule",
+        );
+    }
+
+    // #4: Reject unauthenticated access consistently with /v1/messages/send.
+    let is_authed = {
+        let sess = ctx.sess_arc.lock().await;
+        sess.is_authenticated()
+    };
+    if !is_authed {
+        record_audit(
+            ctx,
+            &client.id,
+            &client.name,
+            &req.method,
+            &req.path,
+            "",
+            503,
+            "not_authenticated",
+            "Teza account is not authenticated",
+            now_ms,
+        )
+        .await;
+        return HttpResponse::error(
+            503,
+            "not_authenticated",
+            "Teza account is not signed in",
+        );
     }
 
     let params = parse_query_params(&req.query);
@@ -1528,9 +2073,16 @@ async fn handle_list_schedules(
         },
     };
 
+    // #37: Filter `allowed_thread_ids` BEFORE SQL `LIMIT` and redact local `attachment_path`.
+    let allowed_slice = (!client.allowed_thread_ids.is_empty())
+        .then_some(client.allowed_thread_ids.as_slice());
     let schedules = {
         let store = ctx.store_arc.lock().await;
-        match store.list_scheduled_messages(status_filter.as_deref(), limit) {
+        match store.list_scheduled_messages_filtered(
+            status_filter.as_deref(),
+            allowed_slice,
+            limit,
+        ) {
             Ok(list) => list,
             Err(err) => {
                 drop(store);
@@ -1552,9 +2104,9 @@ async fn handle_list_schedules(
         }
     };
 
-    let filtered: Vec<_> = schedules
+    let sanitized: Vec<ApiScheduledMessageDto> = schedules
         .into_iter()
-        .filter(|s| is_thread_allowed(client, &s.thread_id))
+        .map(ApiScheduledMessageDto::from)
         .collect();
 
     record_audit(
@@ -1566,7 +2118,7 @@ async fn handle_list_schedules(
         "",
         200,
         "ok",
-        &format!("returned {} schedules", filtered.len()),
+        &format!("returned {} schedules", sanitized.len()),
         now_ms,
     )
     .await;
@@ -1575,7 +2127,7 @@ async fn handle_list_schedules(
         200,
         &serde_json::json!({
             "ok": true,
-            "schedules": filtered,
+            "schedules": sanitized,
         }),
     )
 }
@@ -1699,6 +2251,29 @@ async fn handle_send_message(
         );
     }
 
+    let explicit_kind = match body.kind.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => match parse_explicit_thread_kind(raw) {
+            Ok(k) => Some(k),
+            Err(msg) => {
+                record_audit(
+                    ctx,
+                    &client.id,
+                    &client.name,
+                    &req.method,
+                    &req.path,
+                    thread_id,
+                    400,
+                    "invalid_kind",
+                    msg,
+                    now_ms,
+                )
+                .await;
+                return HttpResponse::error(400, "invalid_kind", msg);
+            }
+        },
+        None => None,
+    };
+
     let idem_key = match resolve_idempotency_key(
         req.headers.get("idempotency-key").map(String::as_str),
         body.idempotency_key.as_deref(),
@@ -1722,16 +2297,23 @@ async fn handle_send_message(
         }
     };
 
-    // Check 24h idempotency cache BEFORE anti-spam send throttling so safe retries succeed.
-    if let Some(ref scoped_key) = idem_key {
-        let cached = {
-            let store = ctx.store_arc.lock().await;
-            store
-                .get_api_idempotency(&client.id, scoped_key, IDEMPOTENCY_TTL_MS, now_ms)
-                .ok()
-                .flatten()
-        };
-        if let Some((cached_status, cached_json)) = cached {
+    let request_hash = sha256_hex(
+        serde_json::json!({
+            "op": "send",
+            "thread_id": thread_id,
+            "kind": explicit_kind.map(thread_kind_str),
+            "text": trimmed_text,
+        })
+        .to_string()
+        .as_bytes(),
+    );
+
+    // #13: Prevent concurrent duplicate execution for the same (client_id, scoped_key)
+    // and check 24h idempotency cache with canonical payload hash BEFORE send throttling.
+    let _in_flight_guard = if let Some(ref scoped_key) = idem_key {
+        let Some(guard) =
+            InFlightIdempotencyGuard::try_acquire(&ctx.in_flight_idempotency, &client.id, scoped_key)
+        else {
             record_audit(
                 ctx,
                 &client.id,
@@ -1739,21 +2321,27 @@ async fn handle_send_message(
                 &req.method,
                 &req.path,
                 thread_id,
-                cached_status,
-                "idempotent_replay",
-                "Returned cached idempotent response",
+                409,
+                "idempotency_in_flight",
+                "Concurrent request with same Idempotency-Key already in flight",
                 now_ms,
             )
             .await;
-            return HttpResponse::raw_json(cached_status, cached_json)
-                .with_header("Idempotency-Replayed", "true");
-        }
-    }
-
-    let kind = match body.kind.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(raw) => match parse_explicit_thread_kind(raw) {
-            Ok(k) => k,
-            Err(msg) => {
+            return HttpResponse::error(
+                409,
+                "idempotency_in_flight",
+                "A request with this Idempotency-Key is already in progress",
+            );
+        };
+        let cached = {
+            let store = ctx.store_arc.lock().await;
+            store
+                .get_api_idempotency_record(&client.id, scoped_key, IDEMPOTENCY_TTL_MS, now_ms)
+                .ok()
+                .flatten()
+        };
+        if let Some(rec) = cached {
+            if !rec.request_hash.is_empty() && rec.request_hash != request_hash {
                 record_audit(
                     ctx,
                     &client.id,
@@ -1761,23 +2349,37 @@ async fn handle_send_message(
                     &req.method,
                     &req.path,
                     thread_id,
-                    400,
-                    "invalid_kind",
-                    msg,
+                    409,
+                    "idempotency_payload_mismatch",
+                    "Idempotency-Key reused with different request payload",
                     now_ms,
                 )
                 .await;
-                return HttpResponse::error(400, "invalid_kind", msg);
+                return HttpResponse::error(
+                    409,
+                    "idempotency_payload_mismatch",
+                    "Idempotency-Key was already used with a different request payload",
+                );
             }
-        },
-        None => {
-            let store = ctx.store_arc.lock().await;
-            store
-                .get_thread_kind(thread_id)
-                .ok()
-                .flatten()
-                .unwrap_or(ThreadKind::Direct)
+            record_audit(
+                ctx,
+                &client.id,
+                &client.name,
+                &req.method,
+                &req.path,
+                thread_id,
+                rec.status_code,
+                "idempotent_replay",
+                "Returned cached idempotent response",
+                now_ms,
+            )
+            .await;
+            return HttpResponse::raw_json(rec.status_code, rec.response_json)
+                .with_header("Idempotency-Replayed", "true");
         }
+        Some(guard)
+    } else {
+        None
     };
 
     let sess_snapshot = {
@@ -1804,6 +2406,20 @@ async fn handle_send_message(
             "Teza account is not signed in",
         );
     }
+
+    let expected_uid = sess_snapshot.profile.uid.clone();
+
+    let kind = match explicit_kind {
+        Some(k) => k,
+        None => {
+            let store = ctx.store_arc.lock().await;
+            store
+                .get_thread_kind(thread_id)
+                .ok()
+                .flatten()
+                .unwrap_or(ThreadKind::Direct)
+        }
+    };
 
     // Global anti-spam minimum send spacing check & atomic reservation.
     let min_interval_ms = ctx.config.lock().await.min_send_interval_ms;
@@ -1842,6 +2458,20 @@ async fn handle_send_message(
 
     match messaging::send_text(&sess_snapshot, thread_id, kind, trimmed_text).await {
         Ok(msg) => {
+            // #6: Re-check that the active account UID has not changed mid-send before
+            // mutating `store_arc` or emitting `core://message-new`.
+            let same_account = {
+                let sess = ctx.sess_arc.lock().await;
+                sess.is_authenticated() && sess.profile.uid == expected_uid
+            };
+            if !same_account {
+                return HttpResponse::error(
+                    409,
+                    "account_switched",
+                    "Teza account changed while sending message",
+                );
+            }
+
             let finish_ms = now_epoch_ms();
             let resp_val = serde_json::json!({
                 "ok": true,
@@ -1855,19 +2485,24 @@ async fn handle_send_message(
                 let mut store = ctx.store_arc.lock().await;
                 let _ = store.upsert_message(&msg);
                 let preview = format_thread_preview(&msg.text, true, "", false);
-                let _ = store.update_thread_preview_returning_created(
+                // #32: Preserve Group/Cloud thread kind when creating uncached thread preview rows.
+                let _ = store.update_thread_preview_with_fallback_kind_and_meta(
                     &msg.thread_id,
                     &preview,
                     msg.ts,
                     false,
                     true,
+                    Some(kind),
+                    None,
+                    None,
                 );
                 if let Some(ref scoped_key) = idem_key {
-                    if let Err(err) = store.put_api_idempotency(
+                    if let Err(err) = store.put_api_idempotency_with_hash(
                         &client.id,
                         scoped_key,
                         200,
                         &resp_body,
+                        &request_hash,
                         finish_ms,
                     ) {
                         eprintln!("[teza][local-api] failed to persist send idempotency: {err}");
@@ -1895,7 +2530,12 @@ async fn handle_send_message(
         }
         Err(err) => {
             let finish_ms = now_epoch_ms();
-            let (status, code, detail) = if is_expired_err(&err) {
+            let expired = is_expired_err(&err);
+            let same_account = {
+                let sess = ctx.sess_arc.lock().await;
+                sess.is_authenticated() && sess.profile.uid == expected_uid
+            };
+            let (status, code, detail) = if expired {
                 (
                     503,
                     "session_expired",
@@ -1904,19 +2544,29 @@ async fn handle_send_message(
             } else {
                 (502, "send_failed", format!("Upstream send failed: {err}"))
             };
-            record_audit(
-                ctx,
-                &client.id,
-                &client.name,
-                &req.method,
-                &req.path,
-                thread_id,
-                status,
-                code,
-                &detail,
-                finish_ms,
-            )
-            .await;
+            if same_account {
+                record_audit(
+                    ctx,
+                    &client.id,
+                    &client.name,
+                    &req.method,
+                    &req.path,
+                    thread_id,
+                    status,
+                    code,
+                    &detail,
+                    finish_ms,
+                )
+                .await;
+                // #5: Clear expired session, swap store to anonymous DB, and emit `core://auth-expired`.
+                if expired {
+                    ctx.sink
+                        .clear_expired_session(
+                            "Phiên đăng nhập đã hết hạn. Vui lòng quét lại mã QR.".to_string(),
+                        )
+                        .await;
+                }
+            }
             HttpResponse::error(status, code, &detail)
         }
     }
@@ -1962,6 +2612,32 @@ async fn handle_schedule_message(
         )
         .await;
         return HttpResponse::error(403, "forbidden_scope", "Missing required scope: schedule");
+    }
+
+    // #4: Reject unauthenticated access consistently with /v1/messages/send.
+    let is_authed = {
+        let sess = ctx.sess_arc.lock().await;
+        sess.is_authenticated()
+    };
+    if !is_authed {
+        record_audit(
+            ctx,
+            &client.id,
+            &client.name,
+            &req.method,
+            &req.path,
+            "",
+            503,
+            "not_authenticated",
+            "Teza account is not authenticated",
+            now_ms,
+        )
+        .await;
+        return HttpResponse::error(
+            503,
+            "not_authenticated",
+            "Teza account is not signed in",
+        );
     }
 
     let body: ScheduleMessageRequestBody = match serde_json::from_slice(&req.body) {
@@ -2049,7 +2725,10 @@ async fn handle_schedule_message(
         );
     }
 
-    if body.send_at_ts <= 0 {
+    // #10: Reject past timestamps (<= now_ms) and timestamps > 5 years in the future.
+    let normalized_send_at_ts = normalize_ts_ms(body.send_at_ts);
+    let max_allowed_ts = now_ms.saturating_add(MAX_SCHEDULE_FUTURE_MS);
+    if normalized_send_at_ts <= now_ms || normalized_send_at_ts > max_allowed_ts {
         record_audit(
             ctx,
             &client.id,
@@ -2059,14 +2738,14 @@ async fn handle_schedule_message(
             thread_id,
             400,
             "invalid_send_at_ts",
-            "send_at_ts must be positive epoch milliseconds",
+            "send_at_ts must be in the future and within 5 years",
             now_ms,
         )
         .await;
         return HttpResponse::error(
             400,
             "invalid_send_at_ts",
-            "send_at_ts must be positive epoch milliseconds",
+            "send_at_ts must be a future timestamp within 5 years",
         );
     }
 
@@ -2130,57 +2809,6 @@ async fn handle_schedule_message(
         }
     };
 
-    let idem_key = match resolve_idempotency_key(
-        req.headers.get("idempotency-key").map(String::as_str),
-        body.idempotency_key.as_deref(),
-    ) {
-        Ok(k) => k.map(|raw| format!("schedule:{raw}")),
-        Err(msg) => {
-            record_audit(
-                ctx,
-                &client.id,
-                &client.name,
-                &req.method,
-                &req.path,
-                thread_id,
-                400,
-                "invalid_idempotency_key",
-                msg,
-                now_ms,
-            )
-            .await;
-            return HttpResponse::error(400, "invalid_idempotency_key", msg);
-        }
-    };
-
-    // Check 24h idempotency cache first
-    if let Some(ref scoped_key) = idem_key {
-        let cached = {
-            let store = ctx.store_arc.lock().await;
-            store
-                .get_api_idempotency(&client.id, scoped_key, IDEMPOTENCY_TTL_MS, now_ms)
-                .ok()
-                .flatten()
-        };
-        if let Some((cached_status, cached_json)) = cached {
-            record_audit(
-                ctx,
-                &client.id,
-                &client.name,
-                &req.method,
-                &req.path,
-                thread_id,
-                cached_status,
-                "idempotent_replay",
-                "Returned cached idempotent response",
-                now_ms,
-            )
-            .await;
-            return HttpResponse::raw_json(cached_status, cached_json)
-                .with_header("Idempotency-Replayed", "true");
-        }
-    }
-
     let explicit_kind = match body.kind.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(raw) => match parse_explicit_thread_kind(raw) {
             Ok(k) => Some(k),
@@ -2204,54 +2832,159 @@ async fn handle_schedule_message(
         None => None,
     };
 
-    let created = {
-        let store = ctx.store_arc.lock().await;
-        let resolved_kind = explicit_kind.unwrap_or_else(|| {
+    let idem_key = match resolve_idempotency_key(
+        req.headers.get("idempotency-key").map(String::as_str),
+        body.idempotency_key.as_deref(),
+    ) {
+        Ok(k) => k.map(|raw| format!("schedule:{raw}")),
+        Err(msg) => {
+            record_audit(
+                ctx,
+                &client.id,
+                &client.name,
+                &req.method,
+                &req.path,
+                thread_id,
+                400,
+                "invalid_idempotency_key",
+                msg,
+                now_ms,
+            )
+            .await;
+            return HttpResponse::error(400, "invalid_idempotency_key", msg);
+        }
+    };
+
+    let explicit_title = body
+        .thread_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    let effective_grace_secs = body.misfire_grace_secs.unwrap_or(600).max(0);
+
+    let request_hash = sha256_hex(
+        serde_json::json!({
+            "op": "schedule",
+            "thread_id": thread_id,
+            "kind": explicit_kind.map(thread_kind_str),
+            "thread_title": explicit_title.as_deref(),
+            "text": trimmed_text,
+            "send_at_ts": normalized_send_at_ts,
+            "recurrence": &recurrence,
+            "misfire_policy": &misfire_policy,
+            "misfire_grace_secs": effective_grace_secs,
+        })
+        .to_string()
+        .as_bytes(),
+    );
+
+    // #13: In-flight concurrency guard + 24h idempotency replay with payload hash check.
+    let _in_flight_guard = if let Some(ref scoped_key) = idem_key {
+        let Some(guard) =
+            InFlightIdempotencyGuard::try_acquire(&ctx.in_flight_idempotency, &client.id, scoped_key)
+        else {
+            record_audit(
+                ctx,
+                &client.id,
+                &client.name,
+                &req.method,
+                &req.path,
+                thread_id,
+                409,
+                "idempotency_in_flight",
+                "Concurrent request with same Idempotency-Key already in flight",
+                now_ms,
+            )
+            .await;
+            return HttpResponse::error(
+                409,
+                "idempotency_in_flight",
+                "A request with this Idempotency-Key is already in progress",
+            );
+        };
+        let cached = {
+            let store = ctx.store_arc.lock().await;
             store
-                .get_thread_kind(thread_id)
+                .get_api_idempotency_record(&client.id, scoped_key, IDEMPOTENCY_TTL_MS, now_ms)
                 .ok()
                 .flatten()
-                .unwrap_or(ThreadKind::Direct)
-        });
-        let resolved_title = body
-            .thread_title
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(ToString::to_string)
-            .or_else(|| {
-                store
-                    .list_threads(FolderFilter::All)
-                    .ok()
-                    .and_then(|list| list.into_iter().find(|t| t.id == thread_id).map(|t| t.title))
-            })
-            .unwrap_or_else(|| thread_id.to_string());
+        };
+        if let Some(rec) = cached {
+            if !rec.request_hash.is_empty() && rec.request_hash != request_hash {
+                record_audit(
+                    ctx,
+                    &client.id,
+                    &client.name,
+                    &req.method,
+                    &req.path,
+                    thread_id,
+                    409,
+                    "idempotency_payload_mismatch",
+                    "Idempotency-Key reused with different request payload",
+                    now_ms,
+                )
+                .await;
+                return HttpResponse::error(
+                    409,
+                    "idempotency_payload_mismatch",
+                    "Idempotency-Key was already used with a different request payload",
+                );
+            }
+            record_audit(
+                ctx,
+                &client.id,
+                &client.name,
+                &req.method,
+                &req.path,
+                thread_id,
+                rec.status_code,
+                "idempotent_replay",
+                "Returned cached idempotent response",
+                now_ms,
+            )
+            .await;
+            return HttpResponse::raw_json(rec.status_code, rec.response_json)
+                .with_header("Idempotency-Replayed", "true");
+        }
+        Some(guard)
+    } else {
+        None
+    };
 
+    let created = {
+        let store = ctx.store_arc.lock().await;
+        // #67b: Rely on `create_scheduled_message`'s built-in `lookup_thread_title_and_kind`
+        // instead of scanning and decrypting the entire `threads` table.
         let input = NewScheduledMessageInput {
             thread_id: thread_id.to_string(),
-            thread_title: resolved_title,
-            thread_kind: thread_kind_str(resolved_kind).to_string(),
+            thread_title: explicit_title.unwrap_or_default(),
+            thread_kind: explicit_kind
+                .map(|k| thread_kind_str(k).to_string())
+                .unwrap_or_default(),
             text: trimmed_text.to_string(),
             attachment_path: String::new(),
-            send_at_ts: body.send_at_ts,
+            send_at_ts: normalized_send_at_ts,
             recurrence,
             misfire_policy,
-            misfire_grace_secs: body.misfire_grace_secs.unwrap_or(600).max(0),
+            misfire_grace_secs: effective_grace_secs,
         };
         let res = store.create_scheduled_message(&input);
         match res {
             Ok(sched) => {
+                let api_sched = ApiScheduledMessageDto::from(sched.clone());
                 let resp_body = serde_json::json!({
                     "ok": true,
-                    "schedule": sched,
+                    "schedule": api_sched,
                 })
                 .to_string();
                 if let Some(ref scoped_key) = idem_key {
-                    if let Err(err) = store.put_api_idempotency(
+                    if let Err(err) = store.put_api_idempotency_with_hash(
                         &client.id,
                         scoped_key,
                         200,
                         &resp_body,
+                        &request_hash,
                         now_ms,
                     ) {
                         eprintln!(
@@ -2323,6 +3056,7 @@ mod tests {
         dir: PathBuf,
         manager: LocalApiManager,
         bound_addr: SocketAddr,
+        sess_arc: Arc<Mutex<Session>>,
         store_arc: Arc<Mutex<MessageStore>>,
         scheduler: SchedulerHandle,
         events: Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
@@ -2331,6 +3065,19 @@ mod tests {
     impl Drop for TestEnv {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    async fn set_test_authenticated(sess_arc: &Arc<Mutex<Session>>, authed: bool) {
+        let mut sess = sess_arc.lock().await;
+        if authed {
+            sess.zpw_sek = Some("test_zpw_sek".to_string());
+            sess.secret_key = Some(vec![0x11u8; 32]);
+            sess.profile.uid = "test_uid_1001".to_string();
+        } else {
+            sess.zpw_sek = None;
+            sess.secret_key = None;
+            sess.profile.uid.clear();
         }
     }
 
@@ -2410,7 +3157,7 @@ mod tests {
             .start_internal(
                 0,
                 EventSink::capture(events.clone()),
-                sess_arc,
+                sess_arc.clone(),
                 store_arc.clone(),
                 scheduler.clone(),
             )
@@ -2422,6 +3169,7 @@ mod tests {
             dir,
             manager,
             bound_addr,
+            sess_arc,
             store_arc,
             scheduler,
             events,
@@ -2620,7 +3368,8 @@ mod tests {
             .await;
             assert_eq!(st, 401);
 
-            // 4. GET /v1/health with valid token (200)
+            // 4. GET /v1/health with valid token (200) while unauthenticated,
+            //    and verify #4: threads / schedules / send / schedule all reject with 503 when unauthenticated.
             let (st, _, body) = send_raw_http(
                 env.bound_addr,
                 &format!("GET /v1/health HTTP/1.1\r\nHost: localhost:{port}\r\nAuthorization: Bearer {full_token}\r\n\r\n"),
@@ -2631,6 +3380,53 @@ mod tests {
             assert_eq!(health["ok"], true);
             assert_eq!(health["authenticated"], false);
             assert!(health["server_time_ms"].as_i64().unwrap() > 0);
+
+            let (st_unauth_threads, _, body_unauth_threads) = send_raw_http(
+                env.bound_addr,
+                &format!("GET /v1/threads HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {restricted_token}\r\n\r\n"),
+            )
+            .await;
+            assert_eq!(st_unauth_threads, 503);
+            assert!(body_unauth_threads.contains("not_authenticated"));
+
+            let (st_unauth_scheds, _, body_unauth_scheds) = send_raw_http(
+                env.bound_addr,
+                &format!("GET /v1/schedules HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {restricted_token}\r\n\r\n"),
+            )
+            .await;
+            assert_eq!(st_unauth_scheds, 503);
+            assert!(body_unauth_scheds.contains("not_authenticated"));
+
+            let future_ts_unauth = now_epoch_ms() + 300_000;
+            let unauth_sched_body = format!(
+                r#"{{"thread_id":"g_ops","text":"Blocked unauth","send_at_ts":{future_ts_unauth}}}"#
+            );
+            let (st_unauth_create, _, body_unauth_create) = send_raw_http(
+                env.bound_addr,
+                &format!(
+                    "POST /v1/messages/schedule HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {restricted_token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{unauth_sched_body}",
+                    unauth_sched_body.len()
+                ),
+            )
+            .await;
+            assert_eq!(st_unauth_create, 503);
+            assert!(body_unauth_create.contains("not_authenticated"));
+
+            // Valid text when Teza account is unauthenticated -> 503
+            let send_payload = r#"{"thread_id":"u_allowed","text":"Hello"}"#;
+            let (st, _, body_unauth) = send_raw_http(
+                env.bound_addr,
+                &format!(
+                    "POST /v1/messages/send HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {full_token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{send_payload}",
+                    send_payload.len()
+                ),
+            )
+            .await;
+            assert_eq!(st, 503);
+            assert!(body_unauth.contains("not_authenticated"));
+
+            // Now authenticate session to test authenticated endpoints
+            set_test_authenticated(&env.sess_arc, true).await;
 
             // 5. GET /v1/threads respects allowed_thread_ids & query filters
             let (st, _, body) = send_raw_http(
@@ -2662,7 +3458,6 @@ mod tests {
             assert_eq!(filtered["threads"][0]["id"], "g_ops");
 
             // 6. Scope enforcement (restricted client lacks `send`) & send validation
-            let send_payload = r#"{"thread_id":"u_allowed","text":"Hello"}"#;
             let (st, _, _) = send_raw_http(
                 env.bound_addr,
                 &format!(
@@ -2697,18 +3492,6 @@ mod tests {
             )
             .await;
             assert_eq!(st, 400);
-
-            // Valid text when Teza account is unauthenticated -> 503
-            let (st, _, body_unauth) = send_raw_http(
-                env.bound_addr,
-                &format!(
-                    "POST /v1/messages/send HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {full_token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{send_payload}",
-                    send_payload.len()
-                ),
-            )
-            .await;
-            assert_eq!(st, 503);
-            assert!(body_unauth.contains("not_authenticated"));
 
             // 7. allowed_thread_ids enforcement on POST /v1/messages/schedule (403)
             let future_ts = now_epoch_ms() + 300_000;
@@ -2864,6 +3647,468 @@ mod tests {
             );
             let persisted = LocalApiConfig::load_from_file(&env.dir.join("local_api.json"));
             assert!(!persisted.enabled);
+        });
+    }
+
+    #[test]
+    fn sha256_hex_matches_nist_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+    }
+
+    #[test]
+    fn non_ascii_bearer_header_never_panics_and_returns_401() {
+        // #11: Byte offset 7 lands inside multi-byte UTF-8 char 'ê' — must never panic!
+        assert_eq!(extract_bearer_token(Some("Bearerê1")), None);
+        assert_eq!(extract_bearer_token(Some("Bearêr token")), None);
+        assert_eq!(extract_bearer_token(Some("Bearer   valid_tok")), Some("valid_tok"));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let env = setup_test_env().await;
+            let port = env.bound_addr.port();
+            let (st, _, body) = send_raw_http(
+                env.bound_addr,
+                &format!(
+                    "GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearerê1\r\n\r\n"
+                ),
+            )
+            .await;
+            assert_eq!(st, 401);
+            assert!(body.contains("unauthorized"));
+        });
+    }
+
+    #[test]
+    fn expect_100_continue_writes_continue_and_reads_body_cleanly() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let env = setup_test_env().await;
+            set_test_authenticated(&env.sess_arc, true).await;
+            let port = env.bound_addr.port();
+            let token = {
+                let store = env.store_arc.lock().await;
+                store
+                    .create_api_client("Curl Client", &["schedule".into()], &[], 30)
+                    .unwrap()
+                    .raw_token
+            };
+
+            let future_ts = now_epoch_ms() + 600_000;
+            let long_msg = "Xin chào ".repeat(150);
+            let payload = format!(
+                r#"{{"thread_id":"u_allowed","text":"{long_msg}","send_at_ts":{future_ts}}}"#
+            );
+            assert!(payload.len() > 1024);
+
+            let mut stream = TcpStream::connect(env.bound_addr).await.unwrap();
+            let headers = format!(
+                "POST /v1/messages/schedule HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nExpect: 100-continue\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                payload.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+
+            // Server MUST reply `HTTP/1.1 100 Continue\r\n\r\n` promptly before client sends body.
+            let mut cont_buf = [0u8; 64];
+            let n = tokio::time::timeout(Duration::from_millis(500), stream.read(&mut cont_buf))
+                .await
+                .expect("timed out waiting for 100 Continue")
+                .unwrap();
+            let cont_str = std::str::from_utf8(&cont_buf[..n]).unwrap();
+            assert_eq!(cont_str, "HTTP/1.1 100 Continue\r\n\r\n");
+
+            // Now send body and verify final 200 OK response.
+            stream.write_all(payload.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+            let mut resp_buf = Vec::new();
+            stream.read_to_end(&mut resp_buf).await.unwrap();
+            let resp_text = String::from_utf8(resp_buf).unwrap();
+            assert!(resp_text.starts_with("HTTP/1.1 200 OK\r\n"), "got: {resp_text}");
+            let (_, body) = resp_text.split_once("\r\n\r\n").unwrap();
+            let j: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(j["ok"], true);
+            assert_eq!(j["schedule"]["thread_id"], "u_allowed");
+        });
+    }
+
+    #[test]
+    fn duplicate_security_headers_rejected_with_400() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let env = setup_test_env().await;
+            let port = env.bound_addr.port();
+
+            let cases = [
+                format!("GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nHost: evil.test\r\n\r\n"),
+                format!("POST /v1/messages/send HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n{{}}"),
+                format!("GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nSec-Fetch-Site: cross-site\r\nSec-Fetch-Site: none\r\n\r\n"),
+                format!("GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://evil.test\r\nOrigin: https://other.test\r\n\r\n"),
+                format!("GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer a\r\nAuthorization: Bearer b\r\n\r\n"),
+                format!("POST /v1/messages/schedule HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nIdempotency-Key: k1\r\nIdempotency-Key: k2\r\n\r\n"),
+            ];
+
+            for raw in cases {
+                let (st, _, body) = send_raw_http(env.bound_addr, &raw).await;
+                assert_eq!(st, 400, "expected 400 for duplicate header, got {st}: {body}");
+                assert!(body.contains("duplicate_header"), "body={body}");
+            }
+        });
+    }
+
+    #[test]
+    fn schedule_rejects_past_and_too_far_future_timestamps() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let env = setup_test_env().await;
+            set_test_authenticated(&env.sess_arc, true).await;
+            let port = env.bound_addr.port();
+            let token = {
+                let store = env.store_arc.lock().await;
+                store
+                    .create_api_client("Sched Only", &["schedule".into()], &[], 30)
+                    .unwrap()
+                    .raw_token
+            };
+
+            let now = now_epoch_ms();
+            let invalid_timestamps = [
+                1_i64,
+                now - 10_000,
+                now.saturating_add(MAX_SCHEDULE_FUTURE_MS + 60_000),
+            ];
+            for bad_ts in invalid_timestamps {
+                let payload = format!(
+                    r#"{{"thread_id":"u_allowed","text":"Past or too far","send_at_ts":{bad_ts}}}"#
+                );
+                let (st, _, body) = send_raw_http(
+                    env.bound_addr,
+                    &format!(
+                        "POST /v1/messages/schedule HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                        payload.len()
+                    ),
+                )
+                .await;
+                assert_eq!(st, 400, "ts={bad_ts} should be rejected with 400");
+                assert!(body.contains("invalid_send_at_ts"), "body={body}");
+            }
+        });
+    }
+
+    #[test]
+    fn idempotency_payload_mismatch_and_in_flight_return_409() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let env = setup_test_env().await;
+            set_test_authenticated(&env.sess_arc, true).await;
+            let port = env.bound_addr.port();
+            let created = {
+                let store = env.store_arc.lock().await;
+                store
+                    .create_api_client("Idem Bot", &["schedule".into()], &[], 30)
+                    .unwrap()
+            };
+            let token = created.raw_token;
+            let client_id = created.client.id;
+
+            let future_ts = now_epoch_ms() + 600_000;
+            let payload_a = format!(
+                r#"{{"thread_id":"u_allowed","text":"Payload A","send_at_ts":{future_ts}}}"#
+            );
+            let payload_b = format!(
+                r#"{{"thread_id":"u_allowed","text":"Payload B DIFFERENT","send_at_ts":{future_ts}}}"#
+            );
+
+            // First request succeeds
+            let (st1, _, body1) = send_raw_http(
+                env.bound_addr,
+                &format!(
+                    "POST /v1/messages/schedule HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nIdempotency-Key: teza-job-001\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload_a}",
+                    payload_a.len()
+                ),
+            )
+            .await;
+            assert_eq!(st1, 200, "body={body1}");
+
+            // Same key + DIFFERENT payload -> 409 idempotency_payload_mismatch
+            let (st2, _, body2) = send_raw_http(
+                env.bound_addr,
+                &format!(
+                    "POST /v1/messages/schedule HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nIdempotency-Key: teza-job-001\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload_b}",
+                    payload_b.len()
+                ),
+            )
+            .await;
+            assert_eq!(st2, 409, "body={body2}");
+            assert!(body2.contains("idempotency_payload_mismatch"), "body={body2}");
+
+            // Simulate concurrent in-flight key held -> 409 idempotency_in_flight
+            let _held = InFlightIdempotencyGuard::try_acquire(
+                &env.manager.in_flight_idempotency,
+                &client_id,
+                "schedule:in-flight-key",
+            )
+            .expect("guard should acquire");
+
+            let (st3, _, body3) = send_raw_http(
+                env.bound_addr,
+                &format!(
+                    "POST /v1/messages/schedule HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nIdempotency-Key: in-flight-key\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload_a}",
+                    payload_a.len()
+                ),
+            )
+            .await;
+            assert_eq!(st3, 409, "body={body3}");
+            assert!(body3.contains("idempotency_in_flight"), "body={body3}");
+        });
+    }
+
+    #[test]
+    fn list_schedules_redacts_attachment_path_allows_schedule_scope_and_filters_before_limit() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let env = setup_test_env().await;
+            set_test_authenticated(&env.sess_arc, true).await;
+            let port = env.bound_addr.port();
+
+            let sched_only_token = {
+                let store = env.store_arc.lock().await;
+                let client = store
+                    .create_api_client(
+                        "Schedule Scope Only",
+                        &["schedule".into()],
+                        &["u_allowed".into()],
+                        30,
+                    )
+                    .unwrap();
+
+                // Seed 3 earlier schedules on `u_secret` and 1 later schedule on `u_allowed`
+                // with a sensitive Windows local attachment path.
+                let base = now_epoch_ms() + 100_000;
+                for i in 0..3 {
+                    store
+                        .create_scheduled_message(&NewScheduledMessageInput {
+                            thread_id: "u_secret".into(),
+                            thread_title: "Riêng Tư".into(),
+                            thread_kind: "direct".into(),
+                            text: format!("Secret {i}"),
+                            attachment_path: String::new(),
+                            send_at_ts: base + (i * 1_000),
+                            recurrence: "once".into(),
+                            misfire_policy: "send_on_resume".into(),
+                            misfire_grace_secs: 600,
+                        })
+                        .unwrap();
+                }
+                store
+                    .create_scheduled_message(&NewScheduledMessageInput {
+                        thread_id: "u_allowed".into(),
+                        thread_title: "Nguyễn Văn An".into(),
+                        thread_kind: "direct".into(),
+                        text: "Allowed with attachment".into(),
+                        attachment_path: r"C:\Users\Alice\Private\invoice.pdf".into(),
+                        send_at_ts: base + 50_000,
+                        recurrence: "once".into(),
+                        misfire_policy: "send_on_resume".into(),
+                        misfire_grace_secs: 600,
+                    })
+                    .unwrap();
+
+                client.raw_token
+            };
+
+            // Client with ONLY `schedule` scope (no `read_threads`) + `limit=1` MUST get `u_allowed`
+            // (proving allowed_thread_ids is filtered BEFORE SQL LIMIT) with `attachment_path` redacted.
+            let (st, _, body) = send_raw_http(
+                env.bound_addr,
+                &format!(
+                    "GET /v1/schedules?status=pending&limit=1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {sched_only_token}\r\n\r\n"
+                ),
+            )
+            .await;
+            assert_eq!(st, 200, "body={body}");
+            assert!(!body.contains("attachment_path"), "must not leak attachment_path: {body}");
+            assert!(!body.contains("invoice.pdf"), "must not leak local file path: {body}");
+
+            let j: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let list = j["schedules"].as_array().unwrap();
+            assert_eq!(list.len(), 1);
+            assert_eq!(list[0]["thread_id"], "u_allowed");
+            assert_eq!(list[0]["has_attachment"], true);
+            assert!(list[0].get("attachment_path").is_none());
+        });
+    }
+
+    #[test]
+    fn status_exposes_last_error_and_occupied_port_preserves_working_listener() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let env = setup_test_env().await;
+            let working_port = env.bound_addr.port();
+
+            // Initially no error
+            let st0 = env.manager.status(&env.store_arc).await;
+            assert!(st0.running);
+            assert_eq!(st0.last_error, None);
+
+            // Occupy another ephemeral port so binding it MUST fail
+            let blocker = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .unwrap();
+            let occupied_port = blocker.local_addr().unwrap().port();
+
+            // #35: Attempting to switch running listener to an occupied port MUST fail
+            // WITHOUT killing the already working listener on `working_port`!
+            let bad_cfg = LocalApiConfig {
+                enabled: true,
+                port: occupied_port,
+                min_send_interval_ms: 1_500,
+            };
+            let switch_res = env
+                .manager
+                .apply_config_with_sink(
+                    bad_cfg,
+                    EventSink::capture(env.events.clone()),
+                    env.sess_arc.clone(),
+                    env.store_arc.clone(),
+                    env.scheduler.clone(),
+                )
+                .await;
+            assert!(switch_res.is_err(), "switching to occupied port must fail");
+
+            let st_still_running = env.manager.status(&env.store_arc).await;
+            assert!(st_still_running.running, "old working listener must stay running");
+            assert_eq!(st_still_running.port, working_port);
+            assert!(
+                TcpStream::connect(env.bound_addr).await.is_ok(),
+                "old working listener must still accept connections"
+            );
+
+            // #15: Stopping then failing to start on occupied port exposes `last_error` in status DTO!
+            assert!(env.manager.stop().await);
+            let fail_start = env
+                .manager
+                .start_internal(
+                    occupied_port,
+                    EventSink::capture(env.events.clone()),
+                    env.sess_arc.clone(),
+                    env.store_arc.clone(),
+                    env.scheduler.clone(),
+                )
+                .await;
+            assert!(fail_start.is_err());
+
+            let st_err = env.manager.status(&env.store_arc).await;
+            assert!(!st_err.running);
+            assert!(
+                st_err
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|e| e.contains(&occupied_port.to_string())),
+                "status.last_error must expose bind failure: {:?}",
+                st_err.last_error
+            );
+
+            // Clearing via stop/kill_switch clears `last_error`
+            let st_cleared = env.manager.kill_switch(&env.store_arc).await.unwrap();
+            assert_eq!(st_cleared.last_error, None);
+            drop(blocker);
+        });
+    }
+
+    #[test]
+    fn unauth_audit_rate_limit_path_truncation_and_403_auditing() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let env = setup_test_env().await;
+            let port = env.bound_addr.port();
+
+            // 1. 403 forbidden_host and 403 forbidden_origin are audited, and long UTF-8 paths truncated to 256 chars.
+            let long_path = format!("/v1/{}", "ê".repeat(300));
+            let (st_host, _, _) = send_raw_http(
+                env.bound_addr,
+                &format!("GET {long_path} HTTP/1.1\r\nHost: evil.attacker.test:{port}\r\n\r\n"),
+            )
+            .await;
+            assert_eq!(st_host, 403);
+
+            let (st_origin, _, _) = send_raw_http(
+                env.bound_addr,
+                &format!("GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: https://evil.test\r\n\r\n"),
+            )
+            .await;
+            assert_eq!(st_origin, 403);
+
+            // 2. Flood 30 unauthenticated 401 requests -> total unauth audit rows MUST be capped at MAX_UNAUTH_AUDIT_PER_MIN (20).
+            for _ in 0..30 {
+                let (st_401, _, _) = send_raw_http(
+                    env.bound_addr,
+                    &format!("GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+                )
+                .await;
+                assert_eq!(st_401, 401);
+            }
+
+            let logs = {
+                let store = env.store_arc.lock().await;
+                store.list_api_audit_logs(100).unwrap()
+            };
+            assert_eq!(
+                logs.len(),
+                MAX_UNAUTH_AUDIT_PER_MIN,
+                "unauthenticated audit writes must be capped at {MAX_UNAUTH_AUDIT_PER_MIN}/min"
+            );
+            assert!(
+                logs.iter().any(|l| l.outcome == "forbidden_host" && l.status_code == 403),
+                "403 forbidden_host must be audited"
+            );
+            assert!(
+                logs.iter().any(|l| l.outcome == "forbidden_origin" && l.status_code == 403),
+                "403 forbidden_origin must be audited"
+            );
+            let truncated = logs
+                .iter()
+                .find(|l| l.outcome == "forbidden_host")
+                .expect("host audit entry");
+            assert_eq!(
+                truncated.path.chars().count(),
+                MAX_AUDIT_PATH_CHARS,
+                "logged audit path must be truncated to {MAX_AUDIT_PATH_CHARS} chars"
+            );
         });
     }
 }

@@ -2,36 +2,148 @@ import type { ThreadKind } from "../types.ts";
 
 // ==================== Item #1: Optional AI Assistant DTOs ====================
 
-export type AiBackendKind = "gemini_api" | "gemini_cli";
+export type AiBackendKind = "zeroclaw" | "cloud_api";
+
+export const DEFAULT_ZEROCLAW_PATH = "zeroclaw";
+export const DEFAULT_ZEROCLAW_MODEL = "default";
+export const DEFAULT_CLOUD_API_BASE_URL = "https://api.groq.com/openai/v1";
+export const DEFAULT_CLOUD_API_MODEL = "llama-3.3-70b-versatile";
+
+export type AiCloudProviderId = "groq" | "openrouter" | "xai" | "custom";
+
+export interface AiCloudModelPreset {
+  id: string;
+  label: string;
+  isFree?: boolean;
+}
+
+export interface AiCloudProviderPreset {
+  id: Exclude<AiCloudProviderId, "custom">;
+  name: string;
+  baseUrl: string;
+  defaultModel: string;
+  keyPlaceholder: string;
+  hint: string;
+  recommendedModels: readonly AiCloudModelPreset[];
+}
+
+export const AI_CLOUD_PROVIDERS: readonly AiCloudProviderPreset[] = [
+  {
+    id: "groq",
+    name: "Groq",
+    baseUrl: "https://api.groq.com/openai/v1",
+    defaultModel: "llama-3.3-70b-versatile",
+    keyPlaceholder: "gsk_...",
+    hint: "Tốc độ phản hồi rất nhanh, có gói dùng miễn phí tại console.groq.com.",
+    recommendedModels: [
+      { id: "llama-3.3-70b-versatile", label: "Llama 3.3 70B (Khuyên dùng)", isFree: true },
+      { id: "llama-3.1-8b-instant", label: "Llama 3.1 8B (Nhanh)", isFree: true },
+      { id: "qwen/qwen3-32b", label: "Qwen3 32B", isFree: true },
+      { id: "meta-llama/llama-4-scout-17b-16e-instruct", label: "Llama 4 Scout", isFree: true },
+    ],
+  },
+  {
+    id: "openrouter",
+    name: "OpenRouter",
+    baseUrl: "https://openrouter.ai/api/v1",
+    defaultModel: "meta-llama/llama-3.3-70b-instruct:free",
+    keyPlaceholder: "sk-or-v1-...",
+    hint: "Nhiều mẫu AI miễn phí và trả phí trên cùng một khóa tại openrouter.ai.",
+    recommendedModels: [
+      {
+        id: "meta-llama/llama-3.3-70b-instruct:free",
+        label: "Llama 3.3 70B",
+        isFree: true,
+      },
+      {
+        id: "deepseek/deepseek-r1-0528:free",
+        label: "DeepSeek R1",
+        isFree: true,
+      },
+      {
+        id: "qwen/qwen3-235b-a22b:free",
+        label: "Qwen3 235B",
+        isFree: true,
+      },
+      {
+        id: "mistralai/mistral-small-3.1-24b-instruct:free",
+        label: "Mistral Small 3.1",
+        isFree: true,
+      },
+    ],
+  },
+  {
+    id: "xai",
+    name: "xAI Grok",
+    baseUrl: "https://api.x.ai/v1",
+    defaultModel: "grok-3-mini",
+    keyPlaceholder: "xai-...",
+    hint: "Dùng trực tiếp các mẫu Grok chính thức từ console.x.ai.",
+    recommendedModels: [
+      { id: "grok-3-mini", label: "Grok 3 Mini (Khuyên dùng)" },
+      { id: "grok-3", label: "Grok 3" },
+      { id: "grok-3-fast", label: "Grok 3 Fast" },
+    ],
+  },
+] as const;
+
+export interface AiModelInfoDto {
+  id: string;
+  is_free: boolean;
+  owned_by?: string | null;
+}
 
 export interface AiConfigDto {
   enabled: boolean;
   backend: AiBackendKind;
-  gemini_model: string;
-  cli_path: string;
-  cli_model: string;
+  model: string;
+  api_base_url: string;
+  has_api_key: boolean;
+  api_key_preview: string;
+  zeroclaw_path: string;
+  zeroclaw_gateway_url: string;
+  has_zeroclaw_token: boolean;
+  zeroclaw_token_preview: string;
+  zeroclaw_safe_tools?: boolean;
   system_prompt: string;
   summary_language: string;
   max_summary_messages: number;
-  has_api_key: boolean;
-  api_key_preview: string;
-  has_translate_fallback_key?: boolean;
-  translate_fallback_preview?: string;
-  uses_translate_fallback_key?: boolean;
-  has_effective_api_key?: boolean;
 }
 
 export interface AiConfigUpdateDto {
   enabled?: boolean;
   backend?: AiBackendKind;
-  gemini_model?: string;
+  model?: string;
+  api_base_url?: string;
   api_key?: string;
   clear_api_key?: boolean;
-  cli_path?: string;
-  cli_model?: string;
+  zeroclaw_path?: string;
+  zeroclaw_gateway_url?: string;
+  zeroclaw_token?: string;
+  clear_zeroclaw_token?: boolean;
+  zeroclaw_safe_tools?: boolean;
   system_prompt?: string;
   summary_language?: string;
   max_summary_messages?: number;
+}
+
+export interface ZeroClawInstallProgressDto {
+  stage: "checking" | "downloading" | "verifying" | "extracting" | "ready" | string;
+  downloaded_bytes: number;
+  total_bytes: number | null;
+  tag: string | null;
+}
+
+export interface ZeroClawInstallResultDto {
+  installed_path: string;
+  tag: string;
+  version: string | null;
+  sha256_verified: boolean;
+}
+
+export interface AiInstallZeroClawResponseDto {
+  install: ZeroClawInstallResultDto;
+  config: AiConfigDto;
 }
 
 export interface AiStoredMessageDto {
@@ -48,6 +160,7 @@ export interface AiCliProbeDto {
   available: boolean;
   resolved_path: string | null;
   version: string | null;
+  mode?: string | null;
   error: string | null;
 }
 
@@ -60,23 +173,267 @@ export interface AiSummaryDto {
   model: string;
 }
 
-export const AI_GEMINI_MODELS = [
+export interface AiSessionDto {
+  id: string;
+  title: string;
+  created_ts: number;
+  updated_ts: number;
+  message_count: number;
+  last_preview: string;
+}
+
+export interface AiCommandResultDto {
+  command: string;
+  title: string;
+  output: string;
+  ok: boolean;
+}
+
+export type AiSlashCommandAction =
+  | { kind: "new" }
+  | { kind: "clear" }
+  | { kind: "model" }
+  | { kind: "help" }
+  | { kind: "zeroclaw"; command: "memory" | "memory_clear" | "skills" | "status" };
+
+export interface AiSlashCommandDef {
+  cmd: string;
+  label: string;
+  description: string;
+  zeroclawOnly?: boolean;
+  action: AiSlashCommandAction;
+}
+
+export const AI_SLASH_COMMANDS: readonly AiSlashCommandDef[] = [
   {
-    id: "gemini-2.5-flash",
-    label: "Gemini 2.5 Flash",
-    hint: "Nhanh · Cân bằng (Khuyên dùng)",
+    cmd: "/new",
+    label: "Phiên mới",
+    description: "Tạo cuộc trò chuyện AI mới",
+    action: { kind: "new" },
   },
   {
-    id: "gemini-2.5-pro",
-    label: "Gemini 2.5 Pro",
-    hint: "Thông minh · Suy luận sâu",
+    cmd: "/clear",
+    label: "Xóa phiên",
+    description: "Xóa tin nhắn và bộ nhớ phiên hiện tại",
+    action: { kind: "clear" },
   },
   {
-    id: "gemini-2.0-flash",
-    label: "Gemini 2.0 Flash",
-    hint: "Nhẹ · Phản hồi tức thì",
+    cmd: "/model",
+    label: "Chọn mẫu AI",
+    description: "Mở nhanh bảng chọn mẫu AI",
+    action: { kind: "model" },
   },
-] as const;
+  {
+    cmd: "/memory",
+    label: "Trí nhớ",
+    description: "Xem trí nhớ ZeroClaw đang lưu cho phiên này",
+    zeroclawOnly: true,
+    action: { kind: "zeroclaw", command: "memory" },
+  },
+  {
+    cmd: "/memory clear",
+    label: "Xóa trí nhớ",
+    description: "Xóa trí nhớ ZeroClaw của phiên này",
+    zeroclawOnly: true,
+    action: { kind: "zeroclaw", command: "memory_clear" },
+  },
+  {
+    cmd: "/skills",
+    label: "Kỹ năng",
+    description: "Xem danh sách kỹ năng ZeroClaw đã cài",
+    zeroclawOnly: true,
+    action: { kind: "zeroclaw", command: "skills" },
+  },
+  {
+    cmd: "/status",
+    label: "Trạng thái",
+    description: "Xem trạng thái và cấu hình ZeroClaw",
+    zeroclawOnly: true,
+    action: { kind: "zeroclaw", command: "status" },
+  },
+  {
+    cmd: "/help",
+    label: "Trợ giúp",
+    description: "Xem danh sách lệnh nhanh",
+    action: { kind: "help" },
+  },
+];
+
+export function parseAiSlashCommand(input: string): AiSlashCommandAction | null {
+  if (!input || typeof input !== "string") return null;
+  if (input.includes("\n") || input.includes("\r")) return null;
+  const trimmed = input.trim();
+  if (!trimmed.startsWith("/")) return null;
+  const normalized = trimmed.replace(/\s+/g, " ").toLowerCase();
+
+  switch (normalized) {
+    case "/new":
+      return { kind: "new" };
+    case "/clear":
+    case "/reset":
+      return { kind: "clear" };
+    case "/model":
+      return { kind: "model" };
+    case "/help":
+      return { kind: "help" };
+    case "/memory":
+    case "/memory list":
+    case "/memory stats":
+      return { kind: "zeroclaw", command: "memory" };
+    case "/memory clear":
+      return { kind: "zeroclaw", command: "memory_clear" };
+    case "/skills":
+      return { kind: "zeroclaw", command: "skills" };
+    case "/status":
+      return { kind: "zeroclaw", command: "status" };
+    default:
+      return null;
+  }
+}
+
+export function filterAiSlashCommands(
+  draft: string,
+  isZeroClaw = true,
+): AiSlashCommandDef[] {
+  if (!draft || typeof draft !== "string") return [];
+  if (draft.includes("\n") || draft.includes("\r")) return [];
+  if (!draft.startsWith("/")) return [];
+  const query = draft.replace(/[ \t]+/g, " ").toLowerCase();
+
+  return AI_SLASH_COMMANDS.filter((item) => {
+    if (!isZeroClaw && item.zeroclawOnly) return false;
+    return item.cmd.toLowerCase().startsWith(query);
+  });
+}
+
+export function formatAiHelpMarkdown(isZeroClaw: boolean): string {
+  const generalCommands = AI_SLASH_COMMANDS.filter((item) => !item.zeroclawOnly);
+  const lines: string[] = [
+    "### Lệnh nhanh Teza AI",
+    "",
+    ...generalCommands.map((item) => `- \`${item.cmd}\` — ${item.description}`),
+  ];
+
+  if (isZeroClaw) {
+    const zcCommands = AI_SLASH_COMMANDS.filter((item) => item.zeroclawOnly);
+    lines.push(
+      "",
+      "### Lệnh riêng cho ZeroClaw",
+      "",
+      ...zcCommands.map((item) => `- \`${item.cmd}\` — ${item.description}`),
+    );
+  } else {
+    lines.push(
+      "",
+      "*Chuyển sang chế độ ZeroClaw trong phần chọn mẫu AI để dùng thêm các lệnh xem trí nhớ, kỹ năng và trạng thái.*",
+    );
+  }
+
+  return lines.join("\n");
+}
+
+export function isValidAiModelName(raw: string): boolean {
+  const clean = raw.trim();
+  if (!clean || clean.length > 128) return false;
+  if (clean.includes("..") || clean.startsWith("/") || clean.endsWith("/")) return false;
+  return /^[A-Za-z0-9._:/-]+$/.test(clean);
+}
+
+export function formatInstallSizeMb(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 MB";
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+export function detectAiCloudProvider(baseUrl: string): AiCloudProviderId {
+  const clean = (baseUrl || "").trim().toLowerCase().replace(/\/+$/, "");
+  if (!clean) return "groq";
+  try {
+    const parsed = new URL(clean);
+    const host = parsed.hostname.toLowerCase();
+    if (host === "api.groq.com" || host.endsWith(".groq.com")) return "groq";
+    if (host === "openrouter.ai" || host.endsWith(".openrouter.ai")) return "openrouter";
+    if (host === "api.x.ai" || host === "x.ai") return "xai";
+    return "custom";
+  } catch {
+    if (clean.includes("groq.com")) return "groq";
+    if (clean.includes("openrouter.ai")) return "openrouter";
+    if (clean.includes("api.x.ai")) return "xai";
+    return "custom";
+  }
+}
+
+export function getAiCloudProviderPreset(id: AiCloudProviderId): AiCloudProviderPreset | null {
+  return AI_CLOUD_PROVIDERS.find((p) => p.id === id) ?? null;
+}
+
+export function getAiBackendBadgeLabel(
+  config: Pick<AiConfigDto, "backend" | "api_base_url"> | null | undefined,
+): string {
+  if (!config || config.backend !== "cloud_api") {
+    return "ZeroClaw";
+  }
+  const provider = detectAiCloudProvider(config.api_base_url);
+  const preset = getAiCloudProviderPreset(provider);
+  return preset ? preset.name : "Khóa API";
+}
+
+export function formatShortAiModelLabel(modelId: string | null | undefined): string {
+  const clean = (modelId || "").trim();
+  if (!clean || clean === DEFAULT_ZEROCLAW_MODEL) return "";
+  const afterSlash = clean.includes("/") ? clean.slice(clean.lastIndexOf("/") + 1) : clean;
+  return afterSlash.length > 28 ? `${afterSlash.slice(0, 27)}…` : afterSlash;
+}
+
+export function resolveQuickSwitchModelBackend(
+  currentBackend: AiBackendKind | null | undefined,
+  relayEnabled = false,
+): AiBackendKind {
+  return currentBackend === "zeroclaw" && !relayEnabled ? "zeroclaw" : "cloud_api";
+}
+
+export function needsZeroClawApiKeyLink(
+  config:
+    | Pick<AiConfigDto, "enabled" | "backend" | "has_api_key" | "zeroclaw_gateway_url">
+    | null
+    | undefined,
+  relayEnabled = false,
+): boolean {
+  if (!config || !config.enabled || config.backend !== "zeroclaw") return false;
+  if (relayEnabled) return false;
+  if (config.has_api_key) return false;
+  if ((config.zeroclaw_gateway_url || "").trim().length > 0) return false;
+  return true;
+}
+
+export function isValidHttpsApiBaseUrl(raw: string): boolean {
+  const trimmed = (raw || "").trim();
+  if (!trimmed || trimmed.length > 256) return false;
+  if (/[\x00-\x1f\x7f]/.test(trimmed)) return false;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "https:") return false;
+    if (parsed.username || parsed.password) return false;
+    if (parsed.search || parsed.hash) return false;
+    if (!parsed.hostname) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function isPublicCloudModelsProvider(baseUrl: string): boolean {
+  return detectAiCloudProvider(baseUrl) === "openrouter";
+}
+
+export function isSameCloudApiHost(urlA: string, urlB: string): boolean {
+  try {
+    const a = new URL((urlA || "").trim());
+    const b = new URL((urlB || "").trim());
+    return a.hostname.toLowerCase() === b.hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+}
 
 export const AI_SUMMARY_LANGUAGES = [
   { code: "vi", label: "Tiếng Việt" },
@@ -212,6 +569,11 @@ export const DEFAULT_LOCAL_API_PORT = 17820;
 export const DEFAULT_LOCAL_API_MIN_INTERVAL_MS = 1500;
 export const MIN_LOCAL_API_INTERVAL_MS = 200;
 export const MAX_LOCAL_API_INTERVAL_MS = 60_000;
+export const MIN_LOCAL_API_RATE_LIMIT = 1;
+export const MAX_LOCAL_API_RATE_LIMIT = 600;
+export const DEFAULT_LOCAL_API_AUDIT_LIMIT = 100;
+export const MAX_LOCAL_API_AUDIT_LIMIT = 500;
+export const LOCAL_API_AUDIT_LIMIT_STEPS = [100, 250, 500] as const;
 export const MAX_SCHEDULE_HORIZON_MS = 5 * 365 * 24 * 60 * 60 * 1000;
 
 export type BadgeTone = "neutral" | "info" | "success" | "warn" | "danger";
@@ -223,9 +585,55 @@ export function normalizeEpochMs(ts: number): number {
   return ts < 1_000_000_000_000 ? ts * 1000 : ts;
 }
 
-export function toLocalDatetimeInputValue(ms: number): string {
+export function extractAttachmentBasename(filePath: string | null | undefined): string {
+  const clean = (filePath || "").trim().replace(/[\\/]+$/, "");
+  if (!clean) return "";
+  const lastSep = Math.max(clean.lastIndexOf("/"), clean.lastIndexOf("\\"));
+  return lastSep >= 0 ? clean.slice(lastSep + 1) : clean;
+}
+
+export function isImageAttachmentPath(filePath: string | null | undefined): boolean {
+  const base = extractAttachmentBasename(filePath);
+  return /\.(png|jpe?g|webp|gif|bmp)$/i.test(base);
+}
+
+/**
+ * Formats an epoch timestamp for `<input type="datetime-local">` (`YYYY-MM-DDTHH:mm`).
+ *
+ * When `nowMsForFutureFloor` is provided and `ms` is in the future relative to it,
+ * truncating seconds could turn a schedule due within <60s into a past timestamp;
+ * in that case we round up to the next whole local minute so it stays valid.
+ */
+export function toLocalDatetimeInputValue(ms: number, nowMsForFutureFloor?: number): string {
   const safe = normalizeEpochMs(ms);
-  const d = new Date(safe > 0 ? safe : Date.now() + 10 * 60_000);
+  const safeNow =
+    nowMsForFutureFloor !== undefined && Number.isFinite(nowMsForFutureFloor)
+      ? normalizeEpochMs(nowMsForFutureFloor)
+      : null;
+  const fallbackBase = safeNow && safeNow > 0 ? safeNow : Date.now();
+  let d = new Date(safe > 0 ? safe : fallbackBase + 10 * 60_000);
+  if (safeNow !== null && safeNow > 0 && safe > safeNow) {
+    const truncatedMs = new Date(
+      d.getFullYear(),
+      d.getMonth(),
+      d.getDate(),
+      d.getHours(),
+      d.getMinutes(),
+      0,
+      0,
+    ).getTime();
+    if (truncatedMs <= safeNow) {
+      d = new Date(
+        d.getFullYear(),
+        d.getMonth(),
+        d.getDate(),
+        d.getHours(),
+        d.getMinutes() + 1,
+        0,
+        0,
+      );
+    }
+  }
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
@@ -389,14 +797,30 @@ export function validateLocalApiMinIntervalMs(
   return { valid: true, error: null };
 }
 
+export function validateLocalApiRateLimit(
+  rateLimit: number,
+): { valid: boolean; error: string | null } {
+  if (
+    !Number.isInteger(rateLimit) ||
+    rateLimit < MIN_LOCAL_API_RATE_LIMIT ||
+    rateLimit > MAX_LOCAL_API_RATE_LIMIT
+  ) {
+    return {
+      valid: false,
+      error: `Giới hạn tần suất (req/phút) phải là số nguyên từ ${MIN_LOCAL_API_RATE_LIMIT} đến ${MAX_LOCAL_API_RATE_LIMIT}.`,
+    };
+  }
+  return { valid: true, error: null };
+}
+
 export function sanitizeLocalApiPort(port: number): number {
   return Number.isInteger(port) && port >= 1024 && port <= 65535
     ? port
     : DEFAULT_LOCAL_API_PORT;
 }
 
-function escapeSingleQuotedShell(value: string): string {
-  return value.replace(/'/g, "'\\''");
+function escapeCmdDoubleQuoted(value: string): string {
+  return value.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, "$1$1");
 }
 
 function escapePowerShellSingleQuoted(value: string): string {
@@ -416,11 +840,12 @@ export function buildLocalApiCurlExample(
     text: "Xin chào từ Teza Local API!",
   });
   return [
-    `curl -X POST http://127.0.0.1:${safePort}/v1/messages/send \\`,
-    `  -H 'Authorization: Bearer ${escapeSingleQuotedShell(safeToken)}' \\`,
-    `  -H 'Content-Type: application/json' \\`,
-    `  -H 'Idempotency-Key: teza-job-001' \\`,
-    `  -d '${escapeSingleQuotedShell(payload)}'`,
+    `REM Dùng Idempotency-Key duy nhất cho mỗi nội dung tin nhắn khác nhau`,
+    `curl.exe -X POST "http://127.0.0.1:${safePort}/v1/messages/send" ^`,
+    `  -H "Authorization: Bearer ${escapeCmdDoubleQuoted(safeToken)}" ^`,
+    `  -H "Content-Type: application/json; charset=utf-8" ^`,
+    `  -H "Idempotency-Key: teza-job-001" ^`,
+    `  -d "${escapeCmdDoubleQuoted(payload)}"`,
   ].join("\n");
 }
 
@@ -433,6 +858,7 @@ export function buildLocalApiPowerShellExample(
   const safeToken = (tokenPlaceholder.trim() || "teza_YOUR_TOKEN").replace(/[\r\n]/g, "");
   const safeThreadId = (threadId.trim() || "123456789").replace(/[\r\n]/g, "");
   return [
+    `# Dùng Idempotency-Key duy nhất cho mỗi nội dung tin nhắn khác nhau`,
     `$headers = @{`,
     `  Authorization = 'Bearer ${escapePowerShellSingleQuoted(safeToken)}'`,
     `  'Idempotency-Key' = 'teza-job-001'`,
@@ -441,7 +867,8 @@ export function buildLocalApiPowerShellExample(
     `  thread_id = '${escapePowerShellSingleQuoted(safeThreadId)}'`,
     `  text = 'Xin chào từ Teza Local API!'`,
     `} | ConvertTo-Json -Compress`,
-    `Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:${safePort}/v1/messages/send' -Headers $headers -ContentType 'application/json; charset=utf-8' -Body $body`,
+    `$bodyBytes = [Text.Encoding]::UTF8.GetBytes($body)`,
+    `Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:${safePort}/v1/messages/send' -Headers $headers -ContentType 'application/json; charset=utf-8' -Body $bodyBytes`,
   ].join("\n");
 }
 
@@ -467,8 +894,9 @@ export function buildLocalApiPythonExample(
     `    data=payload,`,
     `    method="POST",`,
     `    headers={`,
-    `        "Authorization": f"Bearer {${JSON.stringify(safeToken)}}",`,
+    `        "Authorization": "Bearer " + ${JSON.stringify(safeToken)},`,
     `        "Content-Type": "application/json",`,
+    `        # Dùng Idempotency-Key duy nhất cho mỗi nội dung tin nhắn khác nhau`,
     `        "Idempotency-Key": "teza-job-001",`,
     `    },`,
     `)`,
@@ -481,6 +909,13 @@ export function formatAuditOutcome(statusCode: number, outcome: string): string 
   const norm = (outcome || "").trim().toLowerCase();
   if (norm === "idempotent_replay" || norm === "idempotency_replay" || norm === "replayed") {
     return "Trả về kết quả đã lưu (Idempotent)";
+  }
+  if (
+    norm === "idempotency_conflict" ||
+    norm === "idempotency_in_flight" ||
+    statusCode === 409
+  ) {
+    return "Trùng Idempotency-Key (khác nội dung hoặc đang xử lý)";
   }
   if (norm === "forbidden_scope" || norm === "missing_scope") {
     return "Thiếu quyền (Scope)";
@@ -499,6 +934,12 @@ export function formatAuditOutcome(statusCode: number, outcome: string): string 
   }
   if (norm === "unauthorized" || norm === "invalid_token" || statusCode === 401) {
     return "Token không hợp lệ hoặc bị khóa";
+  }
+  if (norm === "not_authenticated" || statusCode === 503) {
+    return "Chưa đăng nhập tài khoản";
+  }
+  if (statusCode === 408) {
+    return "Hết thời gian chờ kết nối";
   }
   if (statusCode === 403) {
     return "Bị từ chối quyền truy cập";

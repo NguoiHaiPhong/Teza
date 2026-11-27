@@ -6,8 +6,14 @@ import type { AddGroupMembersResultDto, ThreadDto } from "../types";
 import { isImeComposingEvent, matchesSearchQuery } from "../utils/searchNormalize";
 import { ThreadAvatar } from "./ThreadAvatar";
 
+const COUNTRY_CODE_OPTIONS = [
+  { code: "84", label: "+84 VN" },
+  { code: "82", label: "+82 KR" },
+] as const;
+
 interface Props {
   open: boolean;
+  isLocked?: boolean;
   threadId: string;
   groupTitle: string;
   threads: ThreadDto[];
@@ -18,6 +24,7 @@ interface Props {
 
 export function AddGroupMembersModal({
   open,
+  isLocked = false,
   threadId,
   groupTitle,
   threads,
@@ -26,8 +33,10 @@ export function AddGroupMembersModal({
   onAdded,
 }: Props) {
   const { lang, t } = useI18n();
+  const defaultCountryCode = lang === "ko" ? "82" : "84";
   const [query, setQuery] = useState("");
   const [phoneQuery, setPhoneQuery] = useState("");
+  const [countryCode, setCountryCode] = useState<string>(defaultCountryCode);
   const [pickedIds, setPickedIds] = useState<string[]>([]);
   const [extraUsers, setExtraUsers] = useState<
     { id: string; title: string; avatar: string }[]
@@ -37,9 +46,16 @@ export function AddGroupMembersModal({
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<AddGroupMembersResultDto | null>(null);
   const closeTimerRef = useRef<number | null>(null);
+  const mountedRef = useRef(true);
+  const activeThreadIdRef = useRef<string>(open ? threadId : "");
+  const phoneSearchSeqRef = useRef(0);
+
+  activeThreadIdRef.current = open ? threadId : "";
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
       if (closeTimerRef.current !== null) {
         window.clearTimeout(closeTimerRef.current);
         closeTimerRef.current = null;
@@ -52,24 +68,32 @@ export function AddGroupMembersModal({
       window.clearTimeout(closeTimerRef.current);
       closeTimerRef.current = null;
     }
+    phoneSearchSeqRef.current += 1;
+    setSearchingPhone(false);
+    setSubmitting(false);
     if (!open) return;
     setQuery("");
     setPhoneQuery("");
+    setCountryCode(defaultCountryCode);
     setPickedIds([]);
     setExtraUsers([]);
     setError(null);
     setResult(null);
-  }, [open, threadId]);
+  }, [open, threadId, defaultCountryCode]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || isLocked) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (isImeComposingEvent(e)) return;
-      if (e.key === "Escape") onClose();
+      if (isLocked || isImeComposingEvent(e)) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        onClose();
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, onClose]);
+  }, [open, isLocked, onClose]);
 
   const existingSet = useMemo(() => {
     const s = new Set<string>();
@@ -85,11 +109,11 @@ export function AddGroupMembersModal({
     for (const ex of extraUsers) {
       if (!existingSet.has(ex.id)) merged.set(ex.id, ex);
     }
-    for (const t of threads) {
-      if (t.kind !== "direct") continue;
-      if (existingSet.has(t.id)) continue;
-      if (!merged.has(t.id)) {
-        merged.set(t.id, { id: t.id, title: t.title, avatar: t.avatar });
+    for (const th of threads) {
+      if (th.kind !== "direct") continue;
+      if (existingSet.has(th.id)) continue;
+      if (!merged.has(th.id)) {
+        merged.set(th.id, { id: th.id, title: th.title, avatar: th.avatar });
       }
     }
     const q = query.trim();
@@ -111,13 +135,26 @@ export function AddGroupMembersModal({
   const handleFindPhone = async () => {
     const trimmed = phoneQuery.trim();
     if (!trimmed || searchingPhone) return;
+    const targetThreadId = threadId;
+    const seq = ++phoneSearchSeqRef.current;
     setSearchingPhone(true);
     setError(null);
     try {
-      const countryCode = trimmed.startsWith("+") ? undefined : lang === "ko" ? "82" : "84";
-      const profile = await bridge.findUserByPhone(trimmed, countryCode);
+      const effectiveCountry = trimmed.startsWith("+") ? undefined : countryCode;
+      const profile = await bridge.findUserByPhone(trimmed, effectiveCountry);
+      if (
+        !mountedRef.current ||
+        activeThreadIdRef.current !== targetThreadId ||
+        phoneSearchSeqRef.current !== seq
+      ) {
+        return;
+      }
       if (existingSet.has(profile.uid)) {
-        setError(`${profile.display_name} đã ở trong nhóm này.`);
+        setError(
+          t("addMemberAlreadyInGroup", {
+            name: profile.display_name || profile.account_name || profile.uid,
+          }),
+        );
       } else {
         setExtraUsers((prev) => {
           if (prev.some((x) => x.id === profile.uid)) return prev;
@@ -136,33 +173,59 @@ export function AddGroupMembersModal({
         setPhoneQuery("");
       }
     } catch (err) {
+      if (
+        !mountedRef.current ||
+        activeThreadIdRef.current !== targetThreadId ||
+        phoneSearchSeqRef.current !== seq
+      ) {
+        return;
+      }
       setError(String(err));
     } finally {
-      setSearchingPhone(false);
+      if (
+        mountedRef.current &&
+        activeThreadIdRef.current === targetThreadId &&
+        phoneSearchSeqRef.current === seq
+      ) {
+        setSearchingPhone(false);
+      }
     }
   };
 
   const handleSubmit = async () => {
     if (pickedIds.length === 0 || submitting) return;
+    const targetThreadId = threadId;
+    const idsToAdd = [...pickedIds];
     setSubmitting(true);
     setError(null);
     try {
-      const res = await bridge.addGroupMembers(threadId, pickedIds);
+      const res = await bridge.addGroupMembers(targetThreadId, idsToAdd);
+      if (!mountedRef.current || activeThreadIdRef.current !== targetThreadId) return;
       setResult(res);
+      const handledIds = new Set([...(res.added ?? []), ...(res.pending ?? [])]);
+      if (handledIds.size > 0) {
+        setPickedIds((prev) => prev.filter((id) => !handledIds.has(id)));
+      }
       onAdded(res);
       if (res.failed.length === 0) {
+        setPickedIds([]);
         if (closeTimerRef.current !== null) {
           window.clearTimeout(closeTimerRef.current);
         }
         closeTimerRef.current = window.setTimeout(() => {
           closeTimerRef.current = null;
-          onClose();
+          if (mountedRef.current && activeThreadIdRef.current === targetThreadId) {
+            onClose();
+          }
         }, 900);
       }
     } catch (err) {
+      if (!mountedRef.current || activeThreadIdRef.current !== targetThreadId) return;
       setError(String(err));
     } finally {
-      setSubmitting(false);
+      if (mountedRef.current && activeThreadIdRef.current === targetThreadId) {
+        setSubmitting(false);
+      }
     }
   };
 
@@ -210,6 +273,26 @@ export function AddGroupMembersModal({
           </div>
 
           <div className="flex items-center gap-2">
+            <select
+              value={countryCode}
+              onChange={(e) => setCountryCode(e.target.value)}
+              aria-label={t("findUserCountryCodeLabel")}
+              title={t("findUserCountryOverrideHint")}
+              className={`shrink-0 rounded-xl px-2 py-1.5 text-xs font-medium outline-none transition ${
+                phoneQuery.trim().startsWith("+") ? "opacity-60" : ""
+              }`}
+              style={{
+                background: "var(--bg-surface)",
+                border: "1px solid var(--border-subtle)",
+                color: "var(--text-primary)",
+              }}
+            >
+              {COUNTRY_CODE_OPTIONS.map((opt) => (
+                <option key={opt.code} value={opt.code}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
             <input
               value={phoneQuery}
               onChange={(e) => setPhoneQuery(e.target.value)}

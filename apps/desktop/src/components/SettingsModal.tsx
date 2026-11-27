@@ -10,6 +10,7 @@ import {
   Cloud,
   ExternalLink,
   Eye,
+  EyeOff,
   FileText,
   Film,
   FolderKanban,
@@ -74,8 +75,14 @@ import type {
   ThreadDto,
   TranslateConfigSummary,
 } from "../types";
+import { DEFAULT_LOCAL_API_AUDIT_LIMIT } from "../utils/automationHelpers";
 import { resolveEffectiveCallDevices } from "../utils/callState";
+import type {
+  BlockedStickerDisplayMode,
+  BlockedStickersConfig,
+} from "../utils/blockedStickers";
 import { hashPasscode, validatePasscodeCandidate, verifyPasscode } from "../utils/passcode";
+import { isImeComposingEvent } from "../utils/searchNormalize";
 import {
   extractWebAppDomain,
   normalizeWebUrl,
@@ -83,6 +90,7 @@ import {
   type WebAppOpenMode,
   type WebAppsConfig,
 } from "../utils/webApps";
+import { RelayImage } from "./RelayImage";
 import { ThreadAvatar } from "./ThreadAvatar";
 import { WEBAPP_ICON_OPTIONS, renderWebAppIcon } from "./WebAppWorkspace";
 
@@ -108,6 +116,8 @@ export type SettingsTab =
 
 interface Props {
   open: boolean;
+  authed?: boolean;
+  isLocked?: boolean;
   initialTab?: SettingsTab;
   myProfile: AccountProfile | null;
   connStatus: ConnectionStatus;
@@ -123,6 +133,12 @@ interface Props {
   onFxChange: (v: boolean) => void;
   sendOnEnter: boolean;
   onSendOnEnterChange: (v: boolean) => void;
+  stickerSuggestEnabled: boolean;
+  onStickerSuggestEnabledChange: (v: boolean) => void;
+  blockedStickersConfig?: BlockedStickersConfig;
+  onBlockedStickerModeChange?: (mode: BlockedStickerDisplayMode) => void;
+  onUnblockStickerRule?: (ruleId: string) => void;
+  onClearBlockedStickers?: () => void;
   notifyPrefs: NotificationPrefs;
   onNotifyPrefsChange: (next: NotificationPrefs) => void;
   onTestNotification: () => void;
@@ -147,6 +163,8 @@ interface Props {
   aiConfig?: AiConfigDto | null;
   onAiConfigChange?: (cfg: AiConfigDto) => void;
   onOpenAiChat?: () => void;
+  showTezaAiCard?: boolean;
+  onToggleShowTezaAiCard?: (show: boolean) => void;
   relayCfg: RelayConfigSummary | null;
   onRelaySaved: (cfg: RelayConfigSummary) => void;
   focusRelay?: boolean;
@@ -258,6 +276,8 @@ function ToggleRow({
 
 export function SettingsModal({
   open,
+  authed = true,
+  isLocked = false,
   initialTab = "notifications",
   myProfile,
   connStatus,
@@ -273,6 +293,12 @@ export function SettingsModal({
   onFxChange,
   sendOnEnter,
   onSendOnEnterChange,
+  stickerSuggestEnabled,
+  onStickerSuggestEnabledChange,
+  blockedStickersConfig,
+  onBlockedStickerModeChange,
+  onUnblockStickerRule,
+  onClearBlockedStickers,
   notifyPrefs,
   onNotifyPrefsChange,
   onTestNotification,
@@ -297,6 +323,8 @@ export function SettingsModal({
   aiConfig = null,
   onAiConfigChange,
   onOpenAiChat,
+  showTezaAiCard,
+  onToggleShowTezaAiCard,
   relayCfg,
   onRelaySaved,
   focusRelay = false,
@@ -358,7 +386,11 @@ export function SettingsModal({
   const [localApiStatus, setLocalApiStatus] = useState<LocalApiStatusDto | null>(null);
   const [localApiClients, setLocalApiClients] = useState<ApiClientDto[]>([]);
   const [localApiAuditLogs, setLocalApiAuditLogs] = useState<ApiAuditLogDto[]>([]);
+  const [localApiAuditLimit, setLocalApiAuditLimit] = useState<number>(DEFAULT_LOCAL_API_AUDIT_LIMIT);
   const [localApiLoading, setLocalApiLoading] = useState(false);
+  const localApiAuditLimitRef = useRef<number>(DEFAULT_LOCAL_API_AUDIT_LIMIT);
+  localApiAuditLimitRef.current = localApiAuditLimit;
+  const localApiHasUnsavedSecretRef = useRef(false);
   const mountedRef = useRef(true);
   const onAiConfigChangeRef = useRef(onAiConfigChange);
   onAiConfigChangeRef.current = onAiConfigChange;
@@ -376,6 +408,7 @@ export function SettingsModal({
   useEffect(() => {
     if (!open) {
       storageReqSeqRef.current += 1;
+      localApiHasUnsavedSecretRef.current = false;
       setStorageLoading(false);
       return;
     }
@@ -475,15 +508,18 @@ export function SettingsModal({
   }, [open, activeTab]);
 
   useEffect(() => {
-    if (!open || activeTab !== "local-api") return;
+    if (!open || activeTab !== "local-api") {
+      localApiHasUnsavedSecretRef.current = false;
+      return;
+    }
     let cancelled = false;
     let unlistenAudit: (() => void) | null = null;
     setLocalApiLoading(true);
     void Promise.all([
       bridge.localApiGetConfig(),
       bridge.localApiGetStatus(),
-      bridge.localApiListClients(),
-      bridge.localApiListAuditLogs(100),
+      authed ? bridge.localApiListClients() : Promise.resolve([] as ApiClientDto[]),
+      bridge.localApiListAuditLogs(localApiAuditLimitRef.current),
     ])
       .then(([cfg, st, clients, logs]) => {
         if (cancelled || !mountedRef.current) return;
@@ -500,16 +536,19 @@ export function SettingsModal({
     void bridge
       .onLocalApiAudit((entry) => {
         if (cancelled || !mountedRef.current) return;
+        const limit = localApiAuditLimitRef.current;
         setLocalApiAuditLogs((prev) => {
           if (prev.some((row) => row.id === entry.id)) return prev;
-          return [entry, ...prev].slice(0, 100);
+          return [entry, ...prev].slice(0, limit);
         });
-        void bridge
-          .localApiListClients()
-          .then((clients) => {
-            if (!cancelled && mountedRef.current) setLocalApiClients(clients);
-          })
-          .catch(() => undefined);
+        if (authed && entry.client_id && entry.client_id.trim()) {
+          void bridge
+            .localApiListClients()
+            .then((clients) => {
+              if (!cancelled && mountedRef.current) setLocalApiClients(clients);
+            })
+            .catch(() => undefined);
+        }
       })
       .then((fn) => {
         if (cancelled) {
@@ -525,18 +564,40 @@ export function SettingsModal({
       setLocalApiLoading(false);
       unlistenAudit?.();
     };
-  }, [open, activeTab]);
+  }, [open, activeTab, authed]);
+
+  const confirmLeaveUnsavedLocalApiToken = (): boolean => {
+    if (!localApiHasUnsavedSecretRef.current) return true;
+    const confirmed = window.confirm(t("localApiUnsavedTokenConfirm"));
+    if (confirmed) {
+      localApiHasUnsavedSecretRef.current = false;
+    }
+    return confirmed;
+  };
+
+  const requestClose = () => {
+    if (!confirmLeaveUnsavedLocalApiToken()) return;
+    onClose();
+  };
+
+  const requestTabChange = (nextTab: SettingsTab) => {
+    if (nextTab === activeTab) return;
+    if (activeTab === "local-api" && !confirmLeaveUnsavedLocalApiToken()) return;
+    setActiveTab(nextTab);
+  };
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || isLocked) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.defaultPrevented || e.key !== "Escape") return;
+      if (e.defaultPrevented || isImeComposingEvent(e) || e.key !== "Escape") return;
       e.preventDefault();
+      e.stopPropagation();
+      if (!confirmLeaveUnsavedLocalApiToken()) return;
       onClose();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, onClose]);
+  }, [open, isLocked, onClose, t]);
 
   if (!open) return null;
 
@@ -714,7 +775,7 @@ export function SettingsModal({
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-xs"
-      onClick={onClose}
+      onClick={requestClose}
     >
       <div
         className="flex h-[82vh] max-h-[680px] w-full max-w-3xl flex-col overflow-hidden rounded-2xl shadow-2xl"
@@ -739,7 +800,7 @@ export function SettingsModal({
           </div>
           <button
             type="button"
-            onClick={onClose}
+            onClick={requestClose}
             className="hover-menu rounded-lg p-1.5"
             title={`${t("close")} (Esc)`}
           >
@@ -765,7 +826,7 @@ export function SettingsModal({
                 <button
                   key={tab.id}
                   type="button"
-                  onClick={() => setActiveTab(tab.id)}
+                  onClick={() => requestTabChange(tab.id)}
                   className="flex shrink-0 items-center gap-2.5 rounded-xl px-3 py-2 text-left text-[13px] font-medium transition"
                   style={{
                     background: active ? "var(--accent-soft)" : "transparent",
@@ -1282,8 +1343,207 @@ export function SettingsModal({
                         onChange={onSendOnEnterChange}
                       />
                     </div>
+                    <div
+                      className="border-t pt-1.5"
+                      style={{ borderColor: "var(--border-subtle)" }}
+                    >
+                      <ToggleRow
+                        icon={<Sparkles className="h-4 w-4" />}
+                        label={t("stickerSuggestLabel")}
+                        desc={t("stickerSuggestDesc")}
+                        checked={stickerSuggestEnabled}
+                        onChange={onStickerSuggestEnabledChange}
+                      />
+                    </div>
                   </div>
                 </section>
+
+                {blockedStickersConfig && (
+                  <section className="space-y-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <h4
+                          className="text-xs font-semibold uppercase tracking-wider"
+                          style={{ color: "var(--text-secondary)" }}
+                        >
+                          {t("blockedStickersSectionTitle")}
+                        </h4>
+                        {blockedStickersConfig.rules.length > 0 && (
+                          <span
+                            className="rounded-full px-2 py-0.5 text-[11px] font-semibold"
+                            style={{
+                              background: "var(--accent-soft)",
+                              color: "var(--accent)",
+                            }}
+                          >
+                            {blockedStickersConfig.rules.length}
+                          </span>
+                        )}
+                      </div>
+                      {blockedStickersConfig.rules.length > 1 && onClearBlockedStickers && (
+                        <button
+                          type="button"
+                          onClick={onClearBlockedStickers}
+                          className="rounded-lg px-2.5 py-1 text-xs font-medium text-rose-400 transition hover:bg-rose-500/10"
+                        >
+                          {t("blockedStickersClearAll")}
+                        </button>
+                      )}
+                    </div>
+
+                    <div
+                      className="space-y-3 rounded-xl px-4 py-3"
+                      style={{ background: "var(--bg-surface)" }}
+                    >
+                      <p className="text-xs" style={{ color: "var(--text-secondary)" }}>
+                        {t("blockedStickersSectionDesc")}
+                      </p>
+
+                      {onBlockedStickerModeChange && (
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="text-[13px] font-medium">
+                            {t("blockedStickersModeLabel")}
+                          </span>
+                          <div
+                            className="inline-flex rounded-xl p-1"
+                            style={{
+                              background: "var(--bg-stage)",
+                              border: "1px solid var(--border-subtle)",
+                            }}
+                          >
+                            {(
+                              [
+                                { id: "collapse" as const, label: t("blockedStickersModeCollapse") },
+                                { id: "hide" as const, label: t("blockedStickersModeHide") },
+                              ] as const
+                            ).map((opt) => {
+                              const active = blockedStickersConfig.mode === opt.id;
+                              return (
+                                <button
+                                  key={opt.id}
+                                  type="button"
+                                  onClick={() => onBlockedStickerModeChange(opt.id)}
+                                  className="rounded-lg px-2.5 py-1 text-xs font-medium transition"
+                                  style={{
+                                    background: active ? "var(--accent)" : "transparent",
+                                    color: active
+                                      ? "var(--text-on-accent)"
+                                      : "var(--text-secondary)",
+                                  }}
+                                >
+                                  {opt.label}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+
+                      <div
+                        className="border-t pt-2.5"
+                        style={{ borderColor: "var(--border-subtle)" }}
+                      >
+                        {blockedStickersConfig.rules.length === 0 ? (
+                          <div
+                            className="flex items-center gap-2 py-2 text-xs"
+                            style={{ color: "var(--text-secondary)" }}
+                          >
+                            <EyeOff className="h-4 w-4 shrink-0 opacity-70" />
+                            <span>{t("blockedStickersEmpty")}</span>
+                          </div>
+                        ) : (
+                          <div className="max-h-60 space-y-1.5 overflow-y-auto pr-0.5">
+                            {blockedStickersConfig.rules.map((rule) => {
+                              const liveThreadTitle = rule.scopeThreadId
+                                ? threads.find((th) => th.id === rule.scopeThreadId)?.title ||
+                                  rule.scopeThreadTitle ||
+                                  rule.scopeThreadId
+                                : null;
+                              const kindLabel =
+                                rule.kind === "category"
+                                  ? t("blockedStickersKindPack")
+                                  : t("blockedStickersKindSticker");
+                              const displayTag =
+                                rule.label ||
+                                (/^\d+$/.test(rule.value) ? `#${rule.value}` : "");
+                              return (
+                                <div
+                                  key={rule.id}
+                                  className="flex items-center justify-between gap-2.5 rounded-xl px-2.5 py-2"
+                                  style={{
+                                    background: "var(--bg-stage)",
+                                    border: "1px solid var(--border-subtle)",
+                                  }}
+                                >
+                                  <div className="flex min-w-0 items-center gap-2.5">
+                                    {rule.previewUrl ? (
+                                      <RelayImage
+                                        src={rule.previewUrl}
+                                        alt=""
+                                        className="h-9 w-9 shrink-0 rounded-lg object-contain p-0.5"
+                                        style={{ background: "var(--bg-surface)" }}
+                                      />
+                                    ) : (
+                                      <div
+                                        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg"
+                                        style={{
+                                          background: "var(--bg-surface)",
+                                          color: "var(--text-secondary)",
+                                        }}
+                                      >
+                                        <EyeOff className="h-4 w-4" />
+                                      </div>
+                                    )}
+                                    <div className="min-w-0">
+                                      <div className="flex flex-wrap items-center gap-1.5">
+                                        <span
+                                          className="rounded-full px-2 py-0.5 text-[10.5px] font-semibold"
+                                          style={{
+                                            background: "var(--chip-bg)",
+                                            color: "var(--text-primary)",
+                                          }}
+                                        >
+                                          {kindLabel}
+                                        </span>
+                                        {displayTag && (
+                                          <span
+                                            className="truncate font-mono text-[11px]"
+                                            style={{ color: "var(--text-secondary)" }}
+                                          >
+                                            {displayTag}
+                                          </span>
+                                        )}
+                                      </div>
+                                      <div
+                                        className="mt-0.5 truncate text-[11.5px]"
+                                        style={{ color: "var(--text-secondary)" }}
+                                      >
+                                        {liveThreadTitle ?? t("blockedStickersScopeGlobal")}
+                                      </div>
+                                    </div>
+                                  </div>
+                                  {onUnblockStickerRule && (
+                                    <button
+                                      type="button"
+                                      onClick={() => onUnblockStickerRule(rule.id)}
+                                      className="hover-menu shrink-0 rounded-lg px-2.5 py-1 text-xs font-medium"
+                                      style={{
+                                        background: "var(--accent-soft)",
+                                        color: "var(--accent)",
+                                      }}
+                                    >
+                                      {t("blockedStickerUnblock")}
+                                    </button>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </section>
+                )}
               </>
             )}
 
@@ -1950,7 +2210,7 @@ export function SettingsModal({
                       <div className="text-[14px] font-semibold">{t("translateConfigTitle")}</div>
                       <div className="text-xs" style={{ color: "var(--text-secondary)" }}>
                         {t("translateConfigSummary", {
-                          provider: (translateCfg?.provider || "deepl").toUpperCase(),
+                          provider: "DeepL",
                           lang: translateCfg?.target_lang || "VI",
                           uiLang: translateCode,
                         })}
@@ -1977,40 +2237,81 @@ export function SettingsModal({
             )}
 
             {activeTab === "ai" && (
-              <Suspense
-                fallback={
+              <div className="space-y-4">
+                {onToggleShowTezaAiCard && (
                   <div
-                    className="flex items-center justify-center gap-2 rounded-xl p-6 text-xs"
-                    style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
+                    className="rounded-xl px-4 py-1"
+                    style={{ background: "var(--bg-surface)" }}
                   >
-                    <Loader2 className="h-4 w-4 animate-spin" style={{ color: "var(--accent)" }} />
-                    <span>{t("loadingPanelLabel")}</span>
+                    <ToggleRow
+                      icon={<Sparkles className="h-4 w-4" />}
+                      label={
+                        lang === "en"
+                          ? "Show Teza AI card in main list"
+                          : lang === "ko"
+                            ? "기본 목록에 Teza AI 카드 표시"
+                            : "Hiển thị thẻ Teza AI trên danh sách chính"
+                      }
+                      desc={
+                        lang === "en"
+                          ? "Keep the Teza AI shortcut visible for quick access anytime."
+                          : lang === "ko"
+                            ? "언제든 빠르게 열 수 있도록 Teza AI 바로가기를 표시합니다."
+                            : "Ghim lối tắt Trợ lý AI Teza để mở trò chuyện nhanh bất cứ lúc nào."
+                      }
+                      checked={showTezaAiCard ?? true}
+                      onChange={onToggleShowTezaAiCard}
+                    />
                   </div>
-                }
-              >
-                <AiSettingsSection
-                  config={aiLocalConfig}
-                  loading={aiLoading}
-                  translateHasGeminiKey={Boolean(translateCfg?.has_gemini_key)}
-                  translateGeminiPreview={translateCfg?.gemini_preview || ""}
-                  onSave={async (update) => {
-                    const saved = await bridge.aiUpdateConfig(update);
-                    setAiLocalConfig(saved);
-                    onAiConfigChange?.(saved);
-                    return saved;
-                  }}
-                  onProbeCli={(cliPath) => bridge.aiProbeCli(cliPath)}
-                  onOpenAiChat={
-                    onOpenAiChat
-                      ? () => {
-                          onClose();
-                          onOpenAiChat();
-                        }
-                      : undefined
+                )}
+                <Suspense
+                  fallback={
+                    <div
+                      className="flex items-center justify-center gap-2 rounded-xl p-6 text-xs"
+                      style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
+                    >
+                      <Loader2 className="h-4 w-4 animate-spin" style={{ color: "var(--accent)" }} />
+                      <span>{t("loadingPanelLabel")}</span>
+                    </div>
                   }
-                  onOpenTranslateSettings={() => setActiveTab("translate")}
-                />
-              </Suspense>
+                >
+                  <AiSettingsSection
+                    config={aiLocalConfig}
+                    loading={aiLoading}
+                    relayEnabled={Boolean(relayCfg?.enabled)}
+                    onSave={async (update) => {
+                      const saved = await bridge.aiUpdateConfig(update);
+                      try {
+                        localStorage.setItem("teza.aiAutoProbeCompleted", "1");
+                      } catch {
+                        // Ignore storage quota errors
+                      }
+                      setAiLocalConfig(saved);
+                      onAiConfigChange?.(saved);
+                      return saved;
+                    }}
+                    onProbeCli={(cliPath, gatewayUrl) => bridge.aiProbeCli(cliPath, gatewayUrl)}
+                    onListModels={(baseUrl, apiKey) => bridge.aiListModels(baseUrl, apiKey)}
+                    onInstallZeroClaw={async () => {
+                      const res = await bridge.aiInstallZeroClaw();
+                      setAiLocalConfig(res.config);
+                      onAiConfigChange?.(res.config);
+                      return res;
+                    }}
+                    onSubscribeInstallProgress={(handler) =>
+                      bridge.onZeroClawInstallProgress(handler)
+                    }
+                    onOpenAiChat={
+                      onOpenAiChat
+                        ? () => {
+                            onClose();
+                            onOpenAiChat();
+                          }
+                        : undefined
+                    }
+                  />
+                </Suspense>
+              </div>
             )}
 
             {activeTab === "local-api" && (
@@ -2032,11 +2333,42 @@ export function SettingsModal({
                   auditLogs={localApiAuditLogs}
                   threads={threads}
                   loading={localApiLoading}
-                  onSaveConfig={async (nextCfg) => {
-                    const st = await bridge.localApiUpdateConfig(nextCfg);
-                    setLocalApiConfig(nextCfg);
-                    setLocalApiStatus(st);
+                  unauthenticated={!authed}
+                  auditLimit={localApiAuditLimit}
+                  onAuditLimitChange={async (nextLimit) => {
+                    localApiAuditLimitRef.current = nextLimit;
+                    setLocalApiAuditLimit(nextLimit);
+                    const logs = await bridge.localApiListAuditLogs(nextLimit);
+                    if (mountedRef.current) setLocalApiAuditLogs(logs);
+                  }}
+                  onHasUnsavedSecretChange={(hasSecret) => {
+                    localApiHasUnsavedSecretRef.current = hasSecret;
+                  }}
+                  onKillSwitch={async () => {
+                    const st = await bridge.localApiKillSwitch();
+                    if (mountedRef.current) {
+                      setLocalApiStatus(st);
+                      setLocalApiConfig((prev) => (prev ? { ...prev, enabled: false } : prev));
+                    }
                     return st;
+                  }}
+                  onSaveConfig={async (nextCfg) => {
+                    try {
+                      const st = await bridge.localApiUpdateConfig(nextCfg);
+                      if (mountedRef.current) {
+                        setLocalApiConfig(nextCfg);
+                        setLocalApiStatus(st);
+                      }
+                      return st;
+                    } catch (err) {
+                      void bridge
+                        .localApiGetStatus()
+                        .then((st) => {
+                          if (mountedRef.current) setLocalApiStatus(st);
+                        })
+                        .catch(() => undefined);
+                      throw err;
+                    }
                   }}
                   onCreateClient={async (input) => {
                     const created = await bridge.localApiCreateClient(input);
@@ -2076,13 +2408,15 @@ export function SettingsModal({
                   }}
                   onRefreshAudit={async () => {
                     const [logs, st, clients] = await Promise.all([
-                      bridge.localApiListAuditLogs(100),
+                      bridge.localApiListAuditLogs(localApiAuditLimitRef.current),
                       bridge.localApiGetStatus(),
-                      bridge.localApiListClients(),
+                      authed ? bridge.localApiListClients() : Promise.resolve([] as ApiClientDto[]),
                     ]);
-                    setLocalApiAuditLogs(logs);
-                    setLocalApiStatus(st);
-                    setLocalApiClients(clients);
+                    if (mountedRef.current) {
+                      setLocalApiAuditLogs(logs);
+                      setLocalApiStatus(st);
+                      setLocalApiClients(clients);
+                    }
                   }}
                   onClearAudit={async () => {
                     await bridge.localApiClearAuditLogs();
@@ -2529,7 +2863,10 @@ export function SettingsModal({
                       >
                         <CloudStoragePanel
                           relayEnabled={Boolean(relayCfg?.enabled)}
-                          onOpenNetworkTab={() => setActiveTab("network")}
+                          onOpenNetworkTab={() => requestTabChange("network")}
+                          onLockVault={async () => {
+                            await bridge.gdriveLockVault();
+                          }}
                         />
                       </Suspense>
                     </section>
@@ -2854,7 +3191,39 @@ export function SettingsModal({
                     </p>
 
                     {!passcodeCfg.enabled ? (
-                      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                      <form
+                        className="grid grid-cols-1 gap-2 sm:grid-cols-2"
+                        onSubmit={(e) => {
+                          e.preventDefault();
+                          if (pinBusy) return;
+                          const err = validatePasscodeCandidate(newPin, confirmPin, t);
+                          if (err) {
+                            setPinFeedback({ ok: false, text: err });
+                            return;
+                          }
+                          setPinBusy(true);
+                          setPinFeedback(null);
+                          void hashPasscode(newPin)
+                            .then(({ salt, hash }) => {
+                              onUpdatePasscode({
+                                ...passcodeCfg,
+                                enabled: true,
+                                salt,
+                                hash,
+                                failedAttempts: 0,
+                                lockoutUntilMs: 0,
+                              });
+                              setNewPin("");
+                              setConfirmPin("");
+                              setPinFeedback({
+                                ok: true,
+                                text: t("passcodeEnabledMsg"),
+                              });
+                            })
+                            .catch((err2) => setPinFeedback({ ok: false, text: String(err2) }))
+                            .finally(() => setPinBusy(false));
+                        }}
+                      >
                         <input
                           type="password"
                           value={newPin}
@@ -2881,40 +3250,14 @@ export function SettingsModal({
                         />
                         <div className="sm:col-span-2">
                           <button
-                            type="button"
+                            type="submit"
                             disabled={pinBusy}
-                            onClick={() => {
-                              const err = validatePasscodeCandidate(newPin, confirmPin);
-                              if (err) {
-                                setPinFeedback({ ok: false, text: err });
-                                return;
-                              }
-                              setPinBusy(true);
-                              setPinFeedback(null);
-                              void hashPasscode(newPin)
-                                .then(({ salt, hash }) => {
-                                  onUpdatePasscode({
-                                    ...passcodeCfg,
-                                    enabled: true,
-                                    salt,
-                                    hash,
-                                  });
-                                  setNewPin("");
-                                  setConfirmPin("");
-                                  setPinFeedback({
-                                    ok: true,
-                                    text: t("passcodeEnabledMsg"),
-                                  });
-                                })
-                                .catch((e) => setPinFeedback({ ok: false, text: String(e) }))
-                                .finally(() => setPinBusy(false));
-                            }}
                             className="tf-btn rounded-lg px-3.5 py-1.5 text-xs font-semibold disabled:opacity-50"
                           >
                             {t("passcodeEnableBtn")}
                           </button>
                         </div>
-                      </div>
+                      </form>
                     ) : (
                       <div className="space-y-2.5">
                         <div className="flex flex-wrap items-center justify-between gap-2">
@@ -2946,7 +3289,7 @@ export function SettingsModal({
                           <button
                             type="button"
                             onClick={() => {
-                              onClose();
+                              requestClose();
                               onLockNow();
                             }}
                             className="inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition"
@@ -2957,86 +3300,12 @@ export function SettingsModal({
                           </button>
                         </div>
 
-                        <div
-                          className="grid grid-cols-1 gap-2 border-t pt-2.5 sm:grid-cols-3"
-                          style={{ borderColor: "var(--border-subtle)" }}
-                        >
-                          <input
-                            type="password"
-                            value={currentPin}
-                            onChange={(e) => setCurrentPin(e.target.value)}
-                            placeholder={t("passcodeCurrentPlaceholder")}
-                            autoComplete="off"
-                            className="rounded-lg px-3 py-1.5 text-xs outline-none"
-                            style={{
-                              background: "var(--bg-sidebar)",
-                              border: "1px solid var(--border-subtle)",
-                            }}
-                          />
-                          <input
-                            type="password"
-                            value={newPin}
-                            onChange={(e) => setNewPin(e.target.value)}
-                            placeholder={t("passcodeChangePlaceholder")}
-                            autoComplete="off"
-                            className="rounded-lg px-3 py-1.5 text-xs outline-none"
-                            style={{
-                              background: "var(--bg-sidebar)",
-                              border: "1px solid var(--border-subtle)",
-                            }}
-                          />
-                          <input
-                            type="password"
-                            value={confirmPin}
-                            onChange={(e) => setConfirmPin(e.target.value)}
-                            placeholder={t("passcodeConfirmNewPlaceholder")}
-                            autoComplete="off"
-                            className="rounded-lg px-3 py-1.5 text-xs outline-none"
-                            style={{
-                              background: "var(--bg-sidebar)",
-                              border: "1px solid var(--border-subtle)",
-                            }}
-                          />
-                        </div>
-                        <div className="flex flex-wrap items-center gap-2">
-                          <button
-                            type="button"
-                            disabled={pinBusy || !currentPin || !newPin}
-                            onClick={() => {
-                              const err = validatePasscodeCandidate(newPin, confirmPin);
-                              if (err) {
-                                setPinFeedback({ ok: false, text: err });
-                                return;
-                              }
-                              setPinBusy(true);
-                              setPinFeedback(null);
-                              void verifyPasscode(currentPin, passcodeCfg)
-                                .then(async (ok) => {
-                                  if (!ok) {
-                                    setPinFeedback({
-                                      ok: false,
-                                      text: t("passcodeWrongCurrent"),
-                                    });
-                                    return;
-                                  }
-                                  const { salt, hash } = await hashPasscode(newPin);
-                                  onUpdatePasscode({ ...passcodeCfg, enabled: true, salt, hash });
-                                  setCurrentPin("");
-                                  setNewPin("");
-                                  setConfirmPin("");
-                                  setPinFeedback({ ok: true, text: t("passcodeChangedMsg") });
-                                })
-                                .catch((e) => setPinFeedback({ ok: false, text: String(e) }))
-                                .finally(() => setPinBusy(false));
-                            }}
-                            className="tf-btn rounded-lg px-3 py-1.5 text-xs font-semibold disabled:opacity-50"
-                          >
-                            {t("passcodeChangeBtn")}
-                          </button>
-                          <button
-                            type="button"
-                            disabled={pinBusy || !currentPin}
-                            onClick={() => {
+                        <form
+                          className="space-y-2.5"
+                          onSubmit={(e) => {
+                            e.preventDefault();
+                            if (pinBusy || !currentPin) return;
+                            if (!newPin && !confirmPin) {
                               setPinBusy(true);
                               setPinFeedback(null);
                               void verifyPasscode(currentPin, passcodeCfg)
@@ -3053,20 +3322,139 @@ export function SettingsModal({
                                     enabled: false,
                                     salt: "",
                                     hash: "",
+                                    failedAttempts: 0,
+                                    lockoutUntilMs: 0,
                                   });
                                   setCurrentPin("");
                                   setNewPin("");
                                   setConfirmPin("");
                                   setPinFeedback({ ok: true, text: t("passcodeDisabledMsg") });
                                 })
-                                .catch((e) => setPinFeedback({ ok: false, text: String(e) }))
+                                .catch((err2) => setPinFeedback({ ok: false, text: String(err2) }))
                                 .finally(() => setPinBusy(false));
-                            }}
-                            className="rounded-lg bg-rose-500/15 px-3 py-1.5 text-xs font-medium text-rose-300 hover:bg-rose-500/25 disabled:opacity-50"
+                              return;
+                            }
+                            const err = validatePasscodeCandidate(newPin, confirmPin, t);
+                            if (err) {
+                              setPinFeedback({ ok: false, text: err });
+                              return;
+                            }
+                            setPinBusy(true);
+                            setPinFeedback(null);
+                            void verifyPasscode(currentPin, passcodeCfg)
+                              .then(async (ok) => {
+                                if (!ok) {
+                                  setPinFeedback({
+                                    ok: false,
+                                    text: t("passcodeWrongCurrent"),
+                                  });
+                                  return;
+                                }
+                                const { salt, hash } = await hashPasscode(newPin);
+                                onUpdatePasscode({
+                                  ...passcodeCfg,
+                                  enabled: true,
+                                  salt,
+                                  hash,
+                                  failedAttempts: 0,
+                                  lockoutUntilMs: 0,
+                                });
+                                setCurrentPin("");
+                                setNewPin("");
+                                setConfirmPin("");
+                                setPinFeedback({ ok: true, text: t("passcodeChangedMsg") });
+                              })
+                              .catch((err2) => setPinFeedback({ ok: false, text: String(err2) }))
+                              .finally(() => setPinBusy(false));
+                          }}
+                        >
+                          <div
+                            className="grid grid-cols-1 gap-2 border-t pt-2.5 sm:grid-cols-3"
+                            style={{ borderColor: "var(--border-subtle)" }}
                           >
-                            {t("passcodeDisableBtn")}
-                          </button>
-                        </div>
+                            <input
+                              type="password"
+                              value={currentPin}
+                              onChange={(e) => setCurrentPin(e.target.value)}
+                              placeholder={t("passcodeCurrentPlaceholder")}
+                              autoComplete="off"
+                              className="rounded-lg px-3 py-1.5 text-xs outline-none"
+                              style={{
+                                background: "var(--bg-sidebar)",
+                                border: "1px solid var(--border-subtle)",
+                              }}
+                            />
+                            <input
+                              type="password"
+                              value={newPin}
+                              onChange={(e) => setNewPin(e.target.value)}
+                              placeholder={t("passcodeChangePlaceholder")}
+                              autoComplete="off"
+                              className="rounded-lg px-3 py-1.5 text-xs outline-none"
+                              style={{
+                                background: "var(--bg-sidebar)",
+                                border: "1px solid var(--border-subtle)",
+                              }}
+                            />
+                            <input
+                              type="password"
+                              value={confirmPin}
+                              onChange={(e) => setConfirmPin(e.target.value)}
+                              placeholder={t("passcodeConfirmNewPlaceholder")}
+                              autoComplete="off"
+                              className="rounded-lg px-3 py-1.5 text-xs outline-none"
+                              style={{
+                                background: "var(--bg-sidebar)",
+                                border: "1px solid var(--border-subtle)",
+                              }}
+                            />
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <button
+                              type="submit"
+                              disabled={pinBusy || !currentPin || !newPin}
+                              className="tf-btn rounded-lg px-3 py-1.5 text-xs font-semibold disabled:opacity-50"
+                            >
+                              {t("passcodeChangeBtn")}
+                            </button>
+                            <button
+                              type="button"
+                              disabled={pinBusy || !currentPin}
+                              onClick={() => {
+                                if (pinBusy || !currentPin) return;
+                                setPinBusy(true);
+                                setPinFeedback(null);
+                                void verifyPasscode(currentPin, passcodeCfg)
+                                  .then((ok) => {
+                                    if (!ok) {
+                                      setPinFeedback({
+                                        ok: false,
+                                        text: t("passcodeWrongCurrent"),
+                                      });
+                                      return;
+                                    }
+                                    onUpdatePasscode({
+                                      ...passcodeCfg,
+                                      enabled: false,
+                                      salt: "",
+                                      hash: "",
+                                      failedAttempts: 0,
+                                      lockoutUntilMs: 0,
+                                    });
+                                    setCurrentPin("");
+                                    setNewPin("");
+                                    setConfirmPin("");
+                                    setPinFeedback({ ok: true, text: t("passcodeDisabledMsg") });
+                                  })
+                                  .catch((err2) => setPinFeedback({ ok: false, text: String(err2) }))
+                                  .finally(() => setPinBusy(false));
+                              }}
+                              className="rounded-lg bg-rose-500/15 px-3 py-1.5 text-xs font-medium text-rose-300 hover:bg-rose-500/25 disabled:opacity-50"
+                            >
+                              {t("passcodeDisableBtn")}
+                            </button>
+                          </div>
+                        </form>
                       </div>
                     )}
 

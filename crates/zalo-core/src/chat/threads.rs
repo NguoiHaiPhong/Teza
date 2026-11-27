@@ -1969,11 +1969,17 @@ pub fn normalize_phone_number(raw: &str, default_country: &str) -> Result<String
         .chars()
         .filter(|c| !matches!(c, ' ' | '-' | '.' | '(' | ')' | '\t' | '\u{00A0}'))
         .collect();
-    let (has_plus, digits) = match cleaned.strip_prefix('+') {
-        Some(rest) => (true, rest),
-        None => (false, cleaned.as_str()),
+    let (is_international, digits) = if let Some(rest) = cleaned.strip_prefix('+') {
+        (true, rest)
+    } else if let Some(rest) = cleaned.strip_prefix("00") {
+        (true, rest)
+    } else {
+        (false, cleaned.as_str())
     };
-    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+    if digits.is_empty()
+        || !digits.chars().all(|c| c.is_ascii_digit())
+        || (is_international && digits.starts_with('0'))
+    {
         return Err(anyhow::anyhow!("Số điện thoại không hợp lệ"));
     }
 
@@ -1989,7 +1995,7 @@ pub fn normalize_phone_number(raw: &str, default_country: &str) -> Result<String
         cc_clean.as_str()
     };
 
-    let normalized = if has_plus {
+    let normalized = if is_international {
         const TRUNK_ZERO_CODES: &[&str] = &[
             "886", "84", "82", "81", "44", "61", "66", "60", "62", "63", "49", "33",
         ];
@@ -2025,7 +2031,7 @@ pub fn normalize_phone_number(raw: &str, default_country: &str) -> Result<String
         digits.to_string()
     };
 
-    let min_len = if has_plus { 8 } else { 10 };
+    let min_len = if is_international { 8 } else { 10 };
     if !(min_len..=15).contains(&normalized.len()) {
         return Err(anyhow::anyhow!(
             "Số điện thoại không hợp lệ (cần 10-15 chữ số kèm mã quốc gia)"
@@ -4803,6 +4809,33 @@ pub async fn kick_group_members(
     parse_kick_group_members_response(&resp, clean_gid, &clean_members)
 }
 
+/// Minimum recommended lead time (ms) enforced at the Tauri IPC boundary for new reminders.
+pub const REMINDER_MIN_LEAD_MS: i64 = 30_000;
+
+/// Normalizes and validates a reminder start timestamp, ensuring it is positive and strictly
+/// after `now_ms + min_lead_ms`.
+pub fn validate_reminder_start_time(
+    start_time_ms: i64,
+    now_ms: i64,
+    min_lead_ms: i64,
+) -> Result<i64> {
+    let normalized_start = normalize_ts_ms(start_time_ms);
+    if normalized_start <= 0 {
+        anyhow::bail!("Thời gian nhắc hẹn không hợp lệ");
+    }
+    let normalized_now = normalize_ts_ms(now_ms);
+    let lead = min_lead_ms.max(0);
+    let min_allowed = normalized_now.saturating_add(lead);
+    if normalized_start <= min_allowed {
+        if lead >= 1_000 {
+            let secs = lead / 1_000;
+            anyhow::bail!("Thời gian nhắc hẹn phải cách hiện tại ít nhất {secs} giây");
+        }
+        anyhow::bail!("Thời gian nhắc hẹn phải nằm trong tương lai");
+    }
+    Ok(normalized_start)
+}
+
 pub async fn create_reminder(
     session: &Session,
     thread_id: &str,
@@ -4818,7 +4851,8 @@ pub async fn create_reminder(
     if clean_title.is_empty() {
         anyhow::bail!("Nội dung nhắc hẹn không được để trống");
     }
-    let normalized_start = normalize_ts_ms(start_time_ms);
+    let req_now_ms = chrono::Utc::now().timestamp_millis();
+    let normalized_start = validate_reminder_start_time(start_time_ms, req_now_ms, 0)?;
     let inner_params = json!({ "title": clean_title }).to_string();
     let resp = if kind == ThreadKind::Group {
         let clean_gid = clean_group_id(thread_id);
@@ -6521,9 +6555,70 @@ mod tests {
             "821012345678"
         );
 
+        // International `00` prefix behaves identically to `+` (strips `00`, never prepends default cc)
+        assert_eq!(
+            normalize_phone_number("0084912345678", "84").unwrap(),
+            "84912345678"
+        );
+        assert_eq!(
+            normalize_phone_number("0084 0912 345 678", "84").unwrap(),
+            "84912345678"
+        );
+        assert_eq!(
+            normalize_phone_number("0082 10-1234-5678", "84").unwrap(),
+            "821012345678"
+        );
+        assert_eq!(
+            normalize_phone_number("0082-010-1234-5678", "84").unwrap(),
+            "821012345678"
+        );
+        assert_eq!(
+            normalize_phone_number("001 (415) 555-2671", "82").unwrap(),
+            "14155552671"
+        );
+
         // Invalid inputs rejected
         assert!(normalize_phone_number("abc123", "82").is_err());
         assert!(normalize_phone_number("0123", "82").is_err());
+        assert!(normalize_phone_number("00", "84").is_err());
+        assert!(normalize_phone_number("00084912345678", "84").is_err());
+        assert!(normalize_phone_number("+084912345678", "84").is_err());
+    }
+
+    #[test]
+    fn validate_reminder_start_time_rejects_past_and_enforces_lead_time() {
+        let now_ms = 1_760_000_000_000_i64;
+        assert!(validate_reminder_start_time(0, now_ms, 0).is_err());
+        assert!(validate_reminder_start_time(-1_000, now_ms, 0).is_err());
+        assert!(validate_reminder_start_time(now_ms - 1, now_ms, 0).is_err());
+        assert!(validate_reminder_start_time(now_ms, now_ms, 0).is_err());
+        assert_eq!(
+            validate_reminder_start_time(now_ms + 1, now_ms, 0).unwrap(),
+            now_ms + 1
+        );
+
+        // With standard 30s lead time
+        assert!(validate_reminder_start_time(now_ms + 15_000, now_ms, REMINDER_MIN_LEAD_MS).is_err());
+        assert!(
+            validate_reminder_start_time(now_ms + REMINDER_MIN_LEAD_MS, now_ms, REMINDER_MIN_LEAD_MS)
+                .is_err()
+        );
+        assert_eq!(
+            validate_reminder_start_time(
+                now_ms + REMINDER_MIN_LEAD_MS + 1,
+                now_ms,
+                REMINDER_MIN_LEAD_MS
+            )
+            .unwrap(),
+            now_ms + REMINDER_MIN_LEAD_MS + 1
+        );
+
+        // Normalizes 10-digit Unix seconds
+        let future_secs = (now_ms / 1_000) + 60;
+        assert_eq!(
+            validate_reminder_start_time(future_secs, now_ms, REMINDER_MIN_LEAD_MS).unwrap(),
+            future_secs * 1_000
+        );
     }
 
     #[test]

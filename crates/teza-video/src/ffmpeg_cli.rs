@@ -10,8 +10,117 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crate::framing::{find_aud_delimiter, strip_leading_aud, H264_AUD};
+
+const LIST_CAMERAS_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_LIST_CAMERAS_STDERR_BYTES: u64 = 256 * 1024;
+
+/// Drop guard that kills and reaps a spawned child stored in an `Arc<Mutex<Option<Child>>>`
+/// unless explicitly disarmed after full ownership transfer.
+struct ChildSlotKillGuard {
+    slot: Arc<Mutex<Option<Child>>>,
+    armed: bool,
+}
+
+impl ChildSlotKillGuard {
+    fn new(slot: Arc<Mutex<Option<Child>>>) -> Self {
+        Self { slot, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ChildSlotKillGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Ok(mut g) = self.slot.lock() {
+                if let Some(mut c) = g.take() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+            }
+        }
+    }
+}
+
+/// Spawn `cmd`, drain stderr concurrently up to `MAX_LIST_CAMERAS_STDERR_BYTES`, and wait up to
+/// `timeout`. If the child does not exit in time, kill & wait it and return `None`.
+fn run_command_stderr_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<Vec<u8>> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().ok()?;
+    let stderr_pipe = child.stderr.take();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+    let reader_thread = stderr_pipe.map(|pipe| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.take(MAX_LIST_CAMERAS_STDERR_BYTES).read_to_end(&mut buf);
+            let _ = tx.send(buf);
+        })
+    });
+
+    let deadline = Instant::now() + timeout;
+    let exited = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break true,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => break false,
+        }
+    };
+
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(h) = reader_thread {
+            let _ = rx.recv_timeout(Duration::from_millis(200));
+            drop(h);
+        }
+        return None;
+    }
+
+    if let Some(h) = reader_thread {
+        let _ = h.join();
+    }
+    rx.try_recv().ok()
+}
+
+fn run_command_success_with_timeout(cmd: &mut Command, timeout: Duration) -> bool {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let Ok(mut child) = cmd.spawn() else {
+        return false;
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
 
 /// Filter out IR / Windows Hello / virtual depth cameras that produce unusable video streams.
 pub fn is_ignored_camera_device(name: &str) -> bool {
@@ -35,7 +144,7 @@ pub fn is_ffmpeg_available() -> bool {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x0800_0000);
         }
-        cmd.status().map(|s| s.success()).unwrap_or(false)
+        run_command_success_with_timeout(&mut cmd, LIST_CAMERAS_TIMEOUT)
     });
     *FFMPEG_OK
 }
@@ -56,18 +165,16 @@ pub fn list_cameras() -> Vec<String> {
             "dshow",
             "-i",
             "dummy",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        ]);
         {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x0800_0000);
         }
-        let Ok(out) = cmd.output() else {
+        let Some(stderr_bytes) = run_command_stderr_with_timeout(&mut cmd, LIST_CAMERAS_TIMEOUT)
+        else {
             return Vec::new();
         };
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
         let mut cams = Vec::new();
         for tag in ["(video)", "(none)"] {
             for line in stderr.lines() {
@@ -104,8 +211,8 @@ pub fn list_cameras() -> Vec<String> {
             "-i",
             "",
         ]);
-        if let Ok(out) = cmd.output() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
+        if let Some(stderr_bytes) = run_command_stderr_with_timeout(&mut cmd, LIST_CAMERAS_TIMEOUT) {
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
             let mut cams = Vec::new();
             let mut in_video = false;
             for line in stderr.lines() {
@@ -229,50 +336,67 @@ impl FfmpegCameraCapture {
             cmd.creation_flags(0x0800_0000);
         }
 
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .map_err(|e| anyhow::anyhow!("Không khởi chạy được camera `{dev_name}`: {e}"))?;
-        let mut stdout = child
-            .stdout
-            .take()
+        Self::start_from_child_with_spawner(child, on_au, |f| {
+            thread::Builder::new()
+                .name("teza-video-cam".to_string())
+                .spawn(f)
+        })
+    }
+
+    fn start_from_child_with_spawner<F>(
+        child: Child,
+        on_au: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
+        spawn_worker: F,
+    ) -> anyhow::Result<Self>
+    where
+        F: FnOnce(Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<JoinHandle<()>>,
+    {
+        let child_slot = Arc::new(Mutex::new(Some(child)));
+        let mut child_guard = ChildSlotKillGuard::new(child_slot.clone());
+
+        let mut stdout = child_slot
+            .lock()
+            .ok()
+            .and_then(|mut g| g.as_mut().and_then(|c| c.stdout.take()))
             .ok_or_else(|| anyhow::anyhow!("Không mở được stdout của ffmpeg camera"))?;
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_w = stop.clone();
-        let child_slot = Arc::new(Mutex::new(Some(child)));
         let child_w = child_slot.clone();
 
-        let worker = thread::Builder::new()
-            .name("teza-video-cam".to_string())
-            .spawn(move || {
-                let mut buf = [0u8; 8192];
-                let mut acc = Vec::with_capacity(65_536);
-                while !stop_w.load(Ordering::Relaxed) {
-                    match stdout.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            acc.extend_from_slice(&buf[..n]);
-                            while let Some(pos) = find_aud_delimiter(&acc, 6) {
-                                let raw_chunk: Vec<u8> = acc.drain(..pos).collect();
-                                let clean = strip_leading_aud(&raw_chunk);
-                                if !clean.is_empty() {
-                                    on_au(clean);
-                                }
+        let worker = spawn_worker(Box::new(move || {
+            let mut buf = [0u8; 8192];
+            let mut acc = Vec::with_capacity(65_536);
+            while !stop_w.load(Ordering::Relaxed) {
+                match stdout.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        acc.extend_from_slice(&buf[..n]);
+                        while let Some(pos) = find_aud_delimiter(&acc, 6) {
+                            let raw_chunk: Vec<u8> = acc.drain(..pos).collect();
+                            let clean = strip_leading_aud(&raw_chunk);
+                            if !clean.is_empty() {
+                                on_au(clean);
                             }
-                            if acc.len() > 262_144 {
-                                acc.clear();
-                            }
+                        }
+                        if acc.len() > 262_144 {
+                            acc.clear();
                         }
                     }
                 }
-                if let Ok(mut g) = child_w.lock() {
-                    if let Some(mut c) = g.take() {
-                        let _ = c.kill();
-                        let _ = c.wait();
-                    }
+            }
+            if let Ok(mut g) = child_w.lock() {
+                if let Some(mut c) = g.take() {
+                    let _ = c.kill();
+                    let _ = c.wait();
                 }
-            })?;
+            }
+        }))?;
 
+        child_guard.disarm();
         Ok(Self {
             stop,
             child_pid: child_slot,
@@ -377,6 +501,108 @@ mod tests {
         assert_eq!(
             bytes,
             vec![0, 0, 0, 1, 0x09, 0xF0, 0, 0, 0, 1, 0x67, 0x42]
+        );
+    }
+
+    fn spawn_sleeping_dummy_child(pipe_stdout: bool) -> Child {
+        #[cfg(target_os = "windows")]
+        let mut cmd = {
+            use std::os::windows::process::CommandExt;
+            let mut c = Command::new("ping");
+            c.args(["-n", "30", "127.0.0.1"]);
+            c.creation_flags(0x0800_0000);
+            c
+        };
+        #[cfg(not(target_os = "windows"))]
+        let mut cmd = {
+            let mut c = Command::new("sleep");
+            c.arg("30");
+            c
+        };
+        cmd.stdin(Stdio::null())
+            .stdout(if pipe_stdout {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stderr(Stdio::null());
+        cmd.spawn().expect("spawn dummy sleeping child")
+    }
+
+    #[test]
+    fn start_from_child_kills_and_reaps_child_on_missing_stdout_or_spawn_error() {
+        let on_au: Arc<dyn Fn(Vec<u8>) + Send + Sync> = Arc::new(|_| {});
+
+        // 1. Missing stdout error kills & reaps child via ChildSlotKillGuard
+        let child_no_stdout = spawn_sleeping_dummy_child(false);
+        let res = FfmpegCameraCapture::start_from_child_with_spawner(
+            child_no_stdout,
+            on_au.clone(),
+            |f| thread::Builder::new().spawn(f),
+        );
+        assert!(res.is_err());
+
+        // 2. Worker thread spawn failure kills & reaps child via ChildSlotKillGuard
+        let child_spawn_fail = spawn_sleeping_dummy_child(true);
+        let started = Instant::now();
+        let res2 = FfmpegCameraCapture::start_from_child_with_spawner(
+            child_spawn_fail,
+            on_au,
+            |_f| Err(std::io::Error::other("injected worker spawn failure")),
+        );
+        assert!(res2.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "ChildSlotKillGuard must kill & wait child immediately rather than letting it sleep 30s"
+        );
+    }
+
+    #[test]
+    fn run_command_stderr_with_timeout_captures_output_and_kills_hung_child() {
+        // 1. Fast stderr output is captured cleanly
+        #[cfg(target_os = "windows")]
+        let mut fast = {
+            use std::os::windows::process::CommandExt;
+            let mut c = Command::new("cmd");
+            c.args(["/C", "echo cam-probe-ok 1>&2"]);
+            c.creation_flags(0x0800_0000);
+            c
+        };
+        #[cfg(not(target_os = "windows"))]
+        let mut fast = {
+            let mut c = Command::new("sh");
+            c.args(["-c", "echo cam-probe-ok 1>&2"]);
+            c
+        };
+        let out = run_command_stderr_with_timeout(&mut fast, Duration::from_secs(3))
+            .expect("fast command stderr");
+        assert!(
+            String::from_utf8_lossy(&out).contains("cam-probe-ok"),
+            "unexpected stderr: {}",
+            String::from_utf8_lossy(&out)
+        );
+
+        // 2. Hung command is killed promptly once timeout elapses
+        #[cfg(target_os = "windows")]
+        let mut slow = {
+            use std::os::windows::process::CommandExt;
+            let mut c = Command::new("ping");
+            c.args(["-n", "20", "127.0.0.1"]);
+            c.creation_flags(0x0800_0000);
+            c
+        };
+        #[cfg(not(target_os = "windows"))]
+        let mut slow = {
+            let mut c = Command::new("sleep");
+            c.arg("20");
+            c
+        };
+        let started = Instant::now();
+        let res = run_command_stderr_with_timeout(&mut slow, Duration::from_millis(150));
+        assert!(res.is_none(), "hung command must time out and return None");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "timeout kill must return promptly"
         );
     }
 }

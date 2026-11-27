@@ -1,6 +1,7 @@
 import type { ChatFolderDto, MessageDto, PollDto, ReactionSummary, ThreadDto } from "../types.ts";
 import type { UiLanguage } from "../i18n/types.ts";
 import { uiLanguageToLocale } from "../i18n/types.ts";
+import { isThreadCurrentlyMuted } from "./notifyPrefs.ts";
 import { POLL_PREFIX, parsePollPayload } from "./richMessage.ts";
 import { looksLikeInternationalPhoneQuery } from "./searchNormalize.ts";
 
@@ -540,6 +541,7 @@ export function filterThreadsByFolder(
   threads: ThreadDto[],
   selection: string,
   customFolders: ChatFolderDto[],
+  nowMs = Date.now(),
 ): ThreadDto[] {
   if (selection === "archived") {
     return threads.filter((t) => Boolean(t.is_archived));
@@ -565,7 +567,7 @@ export function filterThreadsByFolder(
 
   return active.filter((t) => {
     if (excludedSet?.has(t.id)) return false;
-    if (folder.exclude_muted && t.is_muted) return false;
+    if (folder.exclude_muted && isThreadCurrentlyMuted(t, nowMs)) return false;
     if (folder.only_unread && t.unread_count <= 0) return false;
     if (hasExplicitSet || hasKindRule) {
       const inIds = idSet ? idSet.has(t.id) : false;
@@ -596,13 +598,14 @@ export function countFolderUnread(
   threads: ThreadDto[],
   selection: string,
   customFolders: ChatFolderDto[],
+  nowMs = Date.now(),
 ): number {
-  const matched = filterThreadsByFolder(threads, selection, customFolders);
+  const matched = filterThreadsByFolder(threads, selection, customFolders, nowMs);
   return matched.reduce((acc, t) => {
     if (selection === "unread") {
       return acc + t.unread_count;
     }
-    return acc + (t.is_muted ? 0 : t.unread_count);
+    return acc + (isThreadCurrentlyMuted(t, nowMs) ? 0 : t.unread_count);
   }, 0);
 }
 
@@ -749,8 +752,9 @@ export function resolveFolderForOpenedThread(
   targetThreadId: string,
   currentFolder: string,
   customFolders: ChatFolderDto[],
+  nowMs = Date.now(),
 ): string {
-  const currentlyVisible = filterThreadsByFolder(threads, currentFolder, customFolders);
+  const currentlyVisible = filterThreadsByFolder(threads, currentFolder, customFolders, nowMs);
   if (currentlyVisible.some((t) => t.id === targetThreadId)) {
     return currentFolder;
   }

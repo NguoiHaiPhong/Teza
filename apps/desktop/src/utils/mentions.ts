@@ -569,6 +569,111 @@ function pushText(out: MentionToken[], s: string) {
   }
 }
 
+export interface TokenizeMentionsOptions {
+  allowAll?: boolean;
+}
+
+/**
+ * Scans a restored draft for already-complete known `@Name ` tokens (followed by a space)
+ * so focusing the end of a restored draft does not spuriously re-open the mention popup.
+ */
+export function extractCompletedMentionSpans(
+  draft: string,
+  members: ReadonlyArray<Pick<MentionCandidate, "id" | "name">>,
+): CompletedMentionSpan[] {
+  if (!draft || !Array.isArray(members) || members.length === 0) return [];
+
+  const exactLowerSet = new Set<string>();
+  const foldedSet = new Set<string>();
+  let maxWords = 1;
+
+  const registerName = (raw: string) => {
+    const clean = raw.normalize("NFC").trim().replace(/\s+/g, " ");
+    if (!clean) return;
+    exactLowerSet.add(clean.toLowerCase());
+    foldedSet.add(foldVietnameseText(clean));
+    const wc = clean.split(" ").length;
+    if (wc > maxWords) maxWords = wc;
+  };
+
+  for (const m of members) {
+    if (!m?.name) continue;
+    if (isMentionAllMember(m)) {
+      registerName(m.name);
+      for (const alias of MENTION_ALL_ALIASES) {
+        registerName(alias);
+      }
+    } else {
+      registerName(m.name);
+    }
+  }
+
+  if (exactLowerSet.size === 0) return [];
+
+  const spans: CompletedMentionSpan[] = [];
+  let cursor = 0;
+
+  while (cursor < draft.length) {
+    const atPos = draft.indexOf("@", cursor);
+    if (atPos < 0) break;
+    if (atPos > 0 && !isAllowedBeforeAt(draft[atPos - 1])) {
+      cursor = atPos + 1;
+      continue;
+    }
+
+    const spaceAfterWordPositions: number[] = [];
+    let pos = atPos + 1;
+    let words = 0;
+    while (pos < draft.length && words < maxWords) {
+      const ch = draft[pos];
+      if (ch === " " || ch === "\t" || ch === "\r" || ch === "\n") {
+        break;
+      }
+      let wordEnd = pos;
+      while (
+        wordEnd < draft.length &&
+        draft[wordEnd] !== " " &&
+        draft[wordEnd] !== "\t" &&
+        draft[wordEnd] !== "\r" &&
+        draft[wordEnd] !== "\n"
+      ) {
+        wordEnd += 1;
+      }
+      if (wordEnd < draft.length && draft[wordEnd] === " ") {
+        spaceAfterWordPositions.push(wordEnd);
+        words += 1;
+        pos = wordEnd + 1;
+      } else {
+        break;
+      }
+    }
+
+    let matchedEndSpace = -1;
+    for (let i = spaceAfterWordPositions.length - 1; i >= 0; i -= 1) {
+      const spaceIdx = spaceAfterWordPositions[i];
+      const rawCandidate = draft.slice(atPos + 1, spaceIdx);
+      const normLower = rawCandidate.normalize("NFC").toLowerCase();
+      if (exactLowerSet.has(normLower) || foldedSet.has(foldVietnameseText(rawCandidate))) {
+        matchedEndSpace = spaceIdx;
+        break;
+      }
+    }
+
+    if (matchedEndSpace >= 0) {
+      const endExclusive = matchedEndSpace + 1;
+      spans.push({
+        start: atPos,
+        text: draft.slice(atPos, endExclusive),
+      });
+      cursor = endExclusive;
+    } else {
+      cursor = atPos + 1;
+    }
+  }
+
+  return spans;
+}
+
 /**
  * Splits a message into plain text and `@mention` tokens, matching multi-word
  * member names (longest-first, accent-insensitive fallback) before falling back
@@ -577,8 +682,10 @@ function pushText(out: MentionToken[], s: string) {
 export function tokenizeMentions(
   input: string,
   candidates: MentionCandidate[] = [],
+  options?: TokenizeMentionsOptions,
 ): MentionToken[] {
   if (!input) return [];
+  const allowAll = options?.allowAll ?? true;
   const text = input.normalize("NFC");
 
   const prepared = candidates
@@ -628,12 +735,16 @@ export function tokenizeMentions(
     );
     if (allMatch) {
       const endPos = atPos + 1 + allMatch[0].length;
-      out.push({
-        kind: "mention",
-        text: text.slice(atPos, endPos),
-        userId: null,
-        isAll: true,
-      });
+      if (allowAll) {
+        out.push({
+          kind: "mention",
+          text: text.slice(atPos, endPos),
+          userId: null,
+          isAll: true,
+        });
+      } else {
+        pushText(out, text.slice(atPos, endPos));
+      }
       cursor = endPos;
       continue;
     }

@@ -6,8 +6,11 @@ import {
   CheckCircle2,
   Clock,
   Cloud,
+  FileText,
   Hash,
+  Image as ImageIcon,
   Loader2,
+  Paperclip,
   Pencil,
   RefreshCw,
   Repeat,
@@ -18,14 +21,19 @@ import {
   Users,
   X,
 } from "lucide-react";
-import type { ThreadDto, ThreadKind } from "../types";
+import { bridge, isTauri, MAX_ATTACHMENT_BYTES } from "../bridge";
+import { useI18n } from "../i18n";
+import type { AttachmentMeta, ThreadDto, ThreadKind } from "../types";
+import { filterThreadsBySearchQuery, isImeComposingEvent } from "../utils/searchNormalize";
 import {
+  extractAttachmentBasename,
   formatLocalDateTime,
   formatScheduleMisfirePolicy,
   formatScheduleRecurrence,
   formatScheduleStatus,
   formatThreadKindLabel,
   getScheduleStatusTone,
+  isImageAttachmentPath,
   toLocalDatetimeInputValue,
   validateScheduleTimestamp,
   type BadgeTone,
@@ -42,13 +50,24 @@ export interface ScheduledMessagesModalProps {
   schedules: ScheduledMessageDto[];
   loading?: boolean;
   initialThreadId?: string | null;
+  isLocked?: boolean;
   onClose: () => void;
   onRefresh?: () => Promise<void> | void;
+  onPickAttachment?: () => Promise<AttachmentMeta | null>;
   onCreate: (input: CreateScheduledMessageInput) => Promise<ScheduledMessageDto | void>;
-  onUpdate: (id: string, input: UpdateScheduledMessageInput) => Promise<ScheduledMessageDto | void>;
-  onCancel: (id: string) => Promise<void>;
-  onDelete: (id: string) => Promise<void>;
-  onSendNow: (id: string) => Promise<ScheduledMessageDto | void>;
+  onUpdate: (
+    id: string,
+    input: UpdateScheduledMessageInput,
+  ) => Promise<ScheduledMessageDto | null | void>;
+  onCancel: (id: string) => Promise<boolean | void>;
+  onDelete: (id: string) => Promise<boolean | void>;
+  onSendNow: (id: string) => Promise<ScheduledMessageDto | null | void>;
+}
+
+function formatAttachmentBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 type RecipientMode = "thread" | "manual";
@@ -122,14 +141,17 @@ export function ScheduledMessagesModal({
   schedules,
   loading = false,
   initialThreadId = null,
+  isLocked = false,
   onClose,
   onRefresh,
+  onPickAttachment,
   onCreate,
   onUpdate,
   onCancel,
   onDelete,
   onSendNow,
 }: ScheduledMessagesModalProps) {
+  const { t } = useI18n();
   const [recipientMode, setRecipientMode] = useState<RecipientMode>("thread");
   const [threadSearch, setThreadSearch] = useState("");
   const [selectedThreadId, setSelectedThreadId] = useState("");
@@ -138,6 +160,9 @@ export function ScheduledMessagesModal({
   const [manualKind, setManualKind] = useState<ThreadKind>("direct");
 
   const [text, setText] = useState("");
+  const [attachmentPath, setAttachmentPath] = useState("");
+  const [attachmentSizeBytes, setAttachmentSizeBytes] = useState<number | null>(null);
+  const [pickingAttachment, setPickingAttachment] = useState(false);
   const [dateTimeStr, setDateTimeStr] = useState(() =>
     toLocalDatetimeInputValue(Date.now() + 10 * 60_000),
   );
@@ -150,8 +175,15 @@ export function ScheduledMessagesModal({
   const [submitting, setSubmitting] = useState(false);
   const [busyRowId, setBusyRowId] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
-  const [feedback, setFeedback] = useState<{ tone: "ok" | "error"; text: string } | null>(null);
+  const [feedback, setFeedback] = useState<{
+    tone: "ok" | "warn" | "error";
+    text: string;
+  } | null>(null);
 
+  const submittingRef = useRef(false);
+  const busyRowRef = useRef(false);
+  const pickingAttachmentRef = useRef(false);
+  const fallbackFileInputRef = useRef<HTMLInputElement | null>(null);
   const threadsRef = useRef(threads);
   threadsRef.current = threads;
 
@@ -160,6 +192,8 @@ export function ScheduledMessagesModal({
     if (!open) return;
     setEditingItem(null);
     setText("");
+    setAttachmentPath("");
+    setAttachmentSizeBytes(null);
     setDateTimeStr(toLocalDatetimeInputValue(Date.now() + 10 * 60_000));
     setRecurrence("once");
     setMisfirePolicy("send_on_resume");
@@ -168,7 +202,7 @@ export function ScheduledMessagesModal({
 
     const currentThreads = threadsRef.current;
     if (initialThreadId) {
-      const matched = currentThreads.find((t) => t.id === initialThreadId);
+      const matched = currentThreads.find((th) => th.id === initialThreadId);
       if (matched) {
         setRecipientMode("thread");
         setSelectedThreadId(matched.id);
@@ -187,27 +221,24 @@ export function ScheduledMessagesModal({
     }
   }, [open, initialThreadId]);
 
-  // Escape to close
+  // Escape to close (suppressed while app is locked or IME is composing)
   useEffect(() => {
-    if (!open) return;
+    if (!open || isLocked) return;
     const onKeyDown = (e: KeyboardEvent) => {
+      if (isImeComposingEvent(e)) return;
       if (e.defaultPrevented || e.key !== "Escape") return;
       e.preventDefault();
+      e.stopPropagation();
       onClose();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, onClose]);
+  }, [open, isLocked, onClose]);
 
-  const filteredThreads = useMemo(() => {
-    const q = threadSearch.trim().toLowerCase();
-    if (!q) return threads.slice(0, 60);
-    return threads
-      .filter(
-        (t) => t.title.toLowerCase().includes(q) || t.id.toLowerCase().includes(q),
-      )
-      .slice(0, 60);
-  }, [threads, threadSearch]);
+  const filteredThreads = useMemo(
+    () => filterThreadsBySearchQuery(threads, threadSearch, 60),
+    [threads, threadSearch],
+  );
 
   const selectedThread = useMemo(
     () => threads.find((t) => t.id === selectedThreadId) ?? null,
@@ -270,33 +301,102 @@ export function ScheduledMessagesModal({
     setDateTimeStr(toLocalDatetimeInputValue(d.getTime()));
   };
 
-  const resetFormToCreate = () => {
+  const resetFormFields = () => {
     setEditingItem(null);
     setText("");
+    setAttachmentPath("");
+    setAttachmentSizeBytes(null);
     setDateTimeStr(toLocalDatetimeInputValue(Date.now() + 10 * 60_000));
     setRecurrence("once");
     setMisfirePolicy("send_on_resume");
+  };
+
+  const resetFormToCreate = () => {
+    resetFormFields();
     setFeedback(null);
   };
 
   const startEditing = (item: ScheduledMessageDto) => {
+    const now = Date.now();
     setEditingItem(item);
     setText(item.text);
-    const futureFallback = item.send_at_ts > Date.now() ? item.send_at_ts : Date.now() + 10 * 60_000;
-    setDateTimeStr(toLocalDatetimeInputValue(futureFallback));
+    setAttachmentPath(item.attachment_path || "");
+    setAttachmentSizeBytes(null);
+    const futureFallback = item.send_at_ts > now ? item.send_at_ts : now + 10 * 60_000;
+    setDateTimeStr(toLocalDatetimeInputValue(futureFallback, now));
     setRecurrence(item.recurrence);
     setMisfirePolicy(item.misfire_policy);
     setFeedback(null);
   };
 
+  const handlePickAttachment = async () => {
+    if (pickingAttachmentRef.current || submittingRef.current) return;
+    setFeedback(null);
+    if (onPickAttachment || isTauri()) {
+      pickingAttachmentRef.current = true;
+      setPickingAttachment(true);
+      try {
+        const meta = onPickAttachment
+          ? await onPickAttachment()
+          : await bridge.pickAttachmentFile();
+        if (meta?.path) {
+          setAttachmentPath(meta.path);
+          setAttachmentSizeBytes(typeof meta.size_bytes === "number" ? meta.size_bytes : null);
+        }
+      } catch (err) {
+        setFeedback({
+          tone: "error",
+          text: err instanceof Error ? err.message : String(err),
+        });
+      } finally {
+        pickingAttachmentRef.current = false;
+        setPickingAttachment(false);
+      }
+      return;
+    }
+    fallbackFileInputRef.current?.click();
+  };
+
+  const handleFallbackFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setFeedback(null);
+    if (file.size === 0) {
+      setFeedback({ tone: "error", text: t("composerAttachmentEmptyError") });
+      return;
+    }
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      setFeedback({
+        tone: "error",
+        text: t("composerAttachmentTooLargeError", {
+          name: file.name,
+          size: formatAttachmentBytes(file.size),
+          maxMb: MAX_ATTACHMENT_BYTES / (1024 * 1024),
+        }),
+      });
+      return;
+    }
+    setAttachmentPath(file.name);
+    setAttachmentSizeBytes(file.size);
+  };
+
+  const preventInputEnterSubmit = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (isImeComposingEvent(e)) return;
+    if (e.key === "Enter") {
+      e.preventDefault();
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (submitting) return;
+    if (submittingRef.current) return;
     setFeedback(null);
 
     const cleanText = text.trim();
-    if (!cleanText) {
-      setFeedback({ tone: "error", text: "Vui lòng nhập nội dung tin nhắn cần hẹn giờ." });
+    const cleanAttachment = attachmentPath.trim();
+    if (!cleanText && !cleanAttachment) {
+      setFeedback({ tone: "error", text: t("schedEmptyContentError") });
       return;
     }
     if (cleanText.length > 4000) {
@@ -311,43 +411,54 @@ export function ScheduledMessagesModal({
       return;
     }
 
+    if (!editingItem) {
+      if (recipientMode === "thread" && !selectedThread) {
+        setFeedback({
+          tone: "error",
+          text: "Vui lòng chọn hội thoại nhận tin hoặc chuyển sang chế độ Nhập ID thủ công.",
+        });
+        return;
+      }
+      if (recipientMode === "manual" && !manualThreadId.trim()) {
+        setFeedback({ tone: "error", text: "Vui lòng nhập ID hội thoại / người nhận." });
+        return;
+      }
+    }
+
+    submittingRef.current = true;
     setSubmitting(true);
     try {
       if (editingItem) {
-        await onUpdate(editingItem.id, {
+        const previousStatus = editingItem.status;
+        const updated = await onUpdate(editingItem.id, {
           text: cleanText,
+          attachment_path: cleanAttachment,
           send_at_ts: parsedMs,
           recurrence,
           misfire_policy: misfirePolicy,
         });
+        if (!updated) {
+          setEditingItem(null);
+          setFeedback({ tone: "warn", text: t("schedActionStaleNotice") });
+          void onRefresh?.();
+          return;
+        }
         setFeedback({ tone: "ok", text: "Đã cập nhật lịch gửi tin nhắn." });
-        setEditingItem(null);
-        setText("");
-        setDateTimeStr(toLocalDatetimeInputValue(Date.now() + 10 * 60_000));
+        resetFormFields();
+        if (previousStatus !== "pending") {
+          setFilterTab("pending");
+        }
       } else {
         let targetId = "";
         let targetTitle = "";
         let targetKind: ThreadKind = "direct";
 
-        if (recipientMode === "thread") {
-          if (!selectedThread) {
-            setFeedback({
-              tone: "error",
-              text: "Vui lòng chọn hội thoại nhận tin hoặc chuyển sang chế độ Nhập ID thủ công.",
-            });
-            setSubmitting(false);
-            return;
-          }
+        if (recipientMode === "thread" && selectedThread) {
           targetId = selectedThread.id;
           targetTitle = selectedThread.title;
           targetKind = selectedThread.kind;
         } else {
           targetId = manualThreadId.trim();
-          if (!targetId) {
-            setFeedback({ tone: "error", text: "Vui lòng nhập ID hội thoại / người nhận." });
-            setSubmitting(false);
-            return;
-          }
           targetTitle = manualThreadTitle.trim() || `ID ${targetId}`;
           targetKind = manualKind;
         }
@@ -357,13 +468,13 @@ export function ScheduledMessagesModal({
           thread_title: targetTitle,
           thread_kind: targetKind,
           text: cleanText,
+          attachment_path: cleanAttachment || undefined,
           send_at_ts: parsedMs,
           recurrence,
           misfire_policy: misfirePolicy,
         });
         setFeedback({ tone: "ok", text: "Đã tạo lịch hẹn gửi tin nhắn thành công." });
-        setText("");
-        setDateTimeStr(toLocalDatetimeInputValue(Date.now() + 10 * 60_000));
+        resetFormFields();
         setFilterTab("pending");
       }
     } catch (err) {
@@ -372,20 +483,39 @@ export function ScheduledMessagesModal({
         text: err instanceof Error ? err.message : String(err),
       });
     } finally {
+      submittingRef.current = false;
       setSubmitting(false);
     }
   };
 
-  const runRowAction = async (id: string, fn: () => Promise<unknown>, okMsg: string) => {
-    if (busyRowId) return;
+  const runRowAction = async (
+    id: string,
+    fn: () => Promise<boolean | ScheduledMessageDto | null | void>,
+    okMsg: string,
+    options?: {
+      expectTruthy?: boolean;
+      onSuccess?: () => void;
+    },
+  ) => {
+    if (busyRowRef.current) return;
+    busyRowRef.current = true;
     setBusyRowId(id);
     setFeedback(null);
     try {
-      await fn();
-      if (editingItem?.id === id) {
-        setEditingItem(null);
-        setText("");
+      const result = await fn();
+      const stale = options?.expectTruthy ? !result : result === false;
+      if (stale) {
+        if (editingItem?.id === id) {
+          resetFormFields();
+        }
+        setFeedback({ tone: "warn", text: t("schedActionStaleNotice") });
+        void onRefresh?.();
+        return;
       }
+      if (editingItem?.id === id) {
+        resetFormFields();
+      }
+      options?.onSuccess?.();
       setFeedback({ tone: "ok", text: okMsg });
     } catch (err) {
       setFeedback({
@@ -393,6 +523,7 @@ export function ScheduledMessagesModal({
         text: err instanceof Error ? err.message : String(err),
       });
     } finally {
+      busyRowRef.current = false;
       setBusyRowId(null);
     }
   };
@@ -407,10 +538,15 @@ export function ScheduledMessagesModal({
     }
   };
 
+  const hasDraftContent = Boolean(text.trim() || attachmentPath.trim());
+  const selectedAttachmentBasename = extractAttachmentBasename(attachmentPath);
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-xs"
-      onClick={onClose}
+      onClick={() => {
+        if (!isLocked) onClose();
+      }}
     >
       <div
         className="flex h-[86vh] max-h-[760px] w-full max-w-5xl flex-col overflow-hidden rounded-2xl shadow-2xl"
@@ -467,6 +603,11 @@ export function ScheduledMessagesModal({
           {/* Left Column: Create / Edit Form */}
           <form
             onSubmit={(e) => void handleSubmit(e)}
+            onKeyDown={(e) => {
+              if (isImeComposingEvent(e) && e.key === "Enter") {
+                e.preventDefault();
+              }
+            }}
             className="flex shrink-0 flex-col gap-3.5 overflow-y-auto p-4 md:w-[390px]"
             style={{
               background: "var(--bg-stage)",
@@ -550,6 +691,32 @@ export function ScheduledMessagesModal({
 
                 {recipientMode === "thread" ? (
                   <div className="space-y-1.5">
+                    {selectedThread && (
+                      <div
+                        className="flex items-center justify-between gap-2 rounded-xl px-2.5 py-1.5 text-[11.5px]"
+                        style={{
+                          background: "var(--accent-soft)",
+                          border: "1px solid var(--border-subtle)",
+                        }}
+                        title={`${selectedThread.title || selectedThread.id} (${selectedThread.id})`}
+                      >
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          <span className="shrink-0" style={{ color: "var(--text-secondary)" }}>
+                            {t("schedSelectedRecipientLabel")}
+                          </span>
+                          <span className="truncate font-semibold" style={{ color: "var(--accent)" }}>
+                            {selectedThread.title || selectedThread.id}
+                          </span>
+                        </div>
+                        <span
+                          className="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium"
+                          style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}
+                        >
+                          {formatThreadKindLabel(selectedThread.kind)}
+                        </span>
+                      </div>
+                    )}
+
                     <div
                       className="flex items-center gap-2 rounded-xl px-2.5 py-1.5"
                       style={{
@@ -561,6 +728,7 @@ export function ScheduledMessagesModal({
                       <input
                         value={threadSearch}
                         onChange={(e) => setThreadSearch(e.target.value)}
+                        onKeyDown={preventInputEnterSubmit}
                         placeholder="Lọc theo tên hoặc ID hội thoại..."
                         className="min-w-0 flex-1 bg-transparent text-xs outline-none"
                       />
@@ -634,6 +802,7 @@ export function ScheduledMessagesModal({
                       <input
                         value={manualThreadId}
                         onChange={(e) => setManualThreadId(e.target.value)}
+                        onKeyDown={preventInputEnterSubmit}
                         placeholder="Nhập thread_id (VD: 123456789)"
                         className="min-w-0 flex-1 bg-transparent font-mono text-xs outline-none"
                       />
@@ -641,6 +810,7 @@ export function ScheduledMessagesModal({
                     <input
                       value={manualThreadTitle}
                       onChange={(e) => setManualThreadTitle(e.target.value)}
+                      onKeyDown={preventInputEnterSubmit}
                       placeholder="Tên gợi nhớ (tùy chọn)"
                       className="w-full rounded-xl px-3 py-2 text-xs outline-none"
                       style={{
@@ -700,6 +870,85 @@ export function ScheduledMessagesModal({
                   color: "var(--text-primary)",
                 }}
               />
+            </div>
+
+            {/* Attachment picker (#31) */}
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between gap-2 text-xs">
+                <span className="font-medium" style={{ color: "var(--text-secondary)" }}>
+                  {t("schedAttachmentLabel")}
+                </span>
+                <button
+                  type="button"
+                  disabled={pickingAttachment || submitting}
+                  onClick={() => void handlePickAttachment()}
+                  className="hover-menu inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-[11.5px] font-medium transition disabled:opacity-50"
+                  style={{
+                    background: "var(--bg-surface)",
+                    border: "1px solid var(--border-subtle)",
+                    color: "var(--accent)",
+                  }}
+                >
+                  {pickingAttachment ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Paperclip className="h-3.5 w-3.5" />
+                  )}
+                  <span>
+                    {attachmentPath.trim()
+                      ? t("schedChangeAttachmentBtn")
+                      : t("schedAttachFileBtn")}
+                  </span>
+                </button>
+              </div>
+              <input
+                ref={fallbackFileInputRef}
+                type="file"
+                className="hidden"
+                onChange={handleFallbackFileChange}
+              />
+              {attachmentPath.trim() && (
+                <div
+                  className="flex items-center justify-between gap-2 rounded-xl px-2.5 py-2 text-xs"
+                  style={{
+                    background: "var(--bg-surface)",
+                    border: "1px solid var(--border-subtle)",
+                  }}
+                  title={attachmentPath}
+                >
+                  <div className="flex min-w-0 items-center gap-2">
+                    {isImageAttachmentPath(attachmentPath) ? (
+                      <ImageIcon className="h-4 w-4 shrink-0" style={{ color: "var(--accent)" }} />
+                    ) : (
+                      <FileText className="h-4 w-4 shrink-0" style={{ color: "var(--accent)" }} />
+                    )}
+                    <span className="truncate font-medium">
+                      {selectedAttachmentBasename || t("attachmentFallbackLabel")}
+                    </span>
+                    {attachmentSizeBytes !== null && (
+                      <span
+                        className="shrink-0 font-mono text-[10.5px]"
+                        style={{ color: "var(--text-secondary)" }}
+                      >
+                        ({formatAttachmentBytes(attachmentSizeBytes)})
+                      </span>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAttachmentPath("");
+                      setAttachmentSizeBytes(null);
+                    }}
+                    className="hover-menu shrink-0 rounded-md p-1 transition"
+                    style={{ color: "var(--text-secondary)" }}
+                    title={t("schedRemoveAttachmentTitle")}
+                    aria-label={t("schedRemoveAttachmentTitle")}
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              )}
             </div>
 
             {/* Date & Time */}
@@ -805,8 +1054,17 @@ export function ScheduledMessagesModal({
                 className="flex items-start gap-2 rounded-xl px-3 py-2 text-xs font-medium"
                 style={{
                   background:
-                    feedback.tone === "ok" ? "rgba(34, 197, 94, 0.12)" : "var(--danger-bg)",
-                  color: feedback.tone === "ok" ? "#4ade80" : "var(--danger-text)",
+                    feedback.tone === "ok"
+                      ? "rgba(34, 197, 94, 0.12)"
+                      : feedback.tone === "warn"
+                        ? "rgba(245, 158, 11, 0.14)"
+                        : "var(--danger-bg)",
+                  color:
+                    feedback.tone === "ok"
+                      ? "#4ade80"
+                      : feedback.tone === "warn"
+                        ? "#fbbf24"
+                        : "var(--danger-text)",
                 }}
               >
                 {feedback.tone === "ok" ? (
@@ -820,7 +1078,7 @@ export function ScheduledMessagesModal({
 
             <button
               type="submit"
-              disabled={submitting || !text.trim()}
+              disabled={submitting || !hasDraftContent}
               className="tf-btn mt-auto inline-flex w-full items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-xs font-semibold disabled:opacity-50"
             >
               {submitting ? (
@@ -911,6 +1169,9 @@ export function ScheduledMessagesModal({
                   const canCancel = item.status === "pending";
                   const canDelete = item.status !== "sending";
                   const isEditingThis = editingItem?.id === item.id;
+                  const itemAttachmentPath = (item.attachment_path || "").trim();
+                  const itemAttachmentName = extractAttachmentBasename(itemAttachmentPath);
+                  const hasItemAttachment = Boolean(itemAttachmentPath);
 
                   return (
                     <div
@@ -953,15 +1214,40 @@ export function ScheduledMessagesModal({
                         </span>
                       </div>
 
-                      {/* Message preview */}
+                      {/* Message & attachment preview */}
                       <div
-                        className="selectable-text wrap-anywhere whitespace-pre-wrap rounded-lg px-3 py-2 text-xs leading-relaxed"
+                        className="space-y-1.5 rounded-lg px-3 py-2 text-xs leading-relaxed"
                         style={{
                           background: "var(--card-bg)",
                           border: "1px solid var(--border-subtle)",
                         }}
                       >
-                        {item.text}
+                        {hasItemAttachment && (
+                          <div
+                            className="inline-flex max-w-full items-center gap-1.5 rounded-md px-2 py-1 text-[11.5px] font-medium"
+                            style={{
+                              background: "var(--accent-soft)",
+                              color: "var(--accent)",
+                            }}
+                            title={itemAttachmentPath}
+                          >
+                            {isImageAttachmentPath(itemAttachmentPath) ? (
+                              <ImageIcon className="h-3.5 w-3.5 shrink-0" />
+                            ) : (
+                              <FileText className="h-3.5 w-3.5 shrink-0" />
+                            )}
+                            <span className="truncate">
+                              {itemAttachmentName || t("attachmentFallbackLabel")}
+                            </span>
+                          </div>
+                        )}
+                        {item.text.trim() ? (
+                          <div className="selectable-text wrap-anywhere whitespace-pre-wrap">
+                            {item.text}
+                          </div>
+                        ) : !hasItemAttachment ? (
+                          <div style={{ color: "var(--text-secondary)" }}>—</div>
+                        ) : null}
                       </div>
 
                       {/* Metadata row */}
@@ -1013,6 +1299,14 @@ export function ScheduledMessagesModal({
                                 item.id,
                                 () => onSendNow(item.id),
                                 "Đã đưa tin nhắn vào hàng đợi gửi ngay.",
+                                {
+                                  expectTruthy: true,
+                                  onSuccess: () => {
+                                    if (item.status !== "pending") {
+                                      setFilterTab("pending");
+                                    }
+                                  },
+                                },
                               )
                             }
                             className="tf-btn inline-flex items-center gap-1 rounded-lg px-2.5 py-1 text-[11.5px] font-semibold disabled:opacity-50"

@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -285,6 +286,10 @@ fn decode_outbound_video_au(data_b64: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+fn should_pop_incoming_call_window(passcode_locked: &AtomicBool) -> bool {
+    !passcode_locked.load(Ordering::Relaxed)
+}
+
 pub struct CallManager {
     lifecycle: Arc<Mutex<()>>,
     engine: Arc<Mutex<Option<Arc<CallEngine>>>>,
@@ -294,11 +299,17 @@ pub struct CallManager {
     telemetry_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     lp_poll_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     devices: Arc<Mutex<AudioDeviceSelection>>,
+    passcode_locked: Arc<AtomicBool>,
     paths: StoragePaths,
 }
 
 impl CallManager {
+    #[allow(dead_code)]
     pub fn new(paths: StoragePaths) -> Self {
+        Self::new_with_passcode_lock(paths, Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn new_with_passcode_lock(paths: StoragePaths, passcode_locked: Arc<AtomicBool>) -> Self {
         let initial_devices = load_saved_devices(&paths.call_audio_file());
         Self {
             lifecycle: Arc::new(Mutex::new(())),
@@ -309,6 +320,7 @@ impl CallManager {
             telemetry_task: Arc::new(Mutex::new(None)),
             lp_poll_task: Arc::new(Mutex::new(None)),
             devices: Arc::new(Mutex::new(initial_devices)),
+            passcode_locked,
             paths,
         }
     }
@@ -522,6 +534,7 @@ impl CallManager {
         let app_ev = app.clone();
         let eng_ev = eng.clone();
         let store_ev = store_arc.clone();
+        let passcode_locked_ev = self.passcode_locked.clone();
         let fwd_handle = tokio::spawn(async move {
             loop {
                 match rx.recv().await {
@@ -545,7 +558,9 @@ impl CallManager {
                             _ => (None, None),
                         };
 
-                        if matches!(ev, CallEvent::IncomingCall { .. }) {
+                        if matches!(ev, CallEvent::IncomingCall { .. })
+                            && should_pop_incoming_call_window(&passcode_locked_ev)
+                        {
                             if let Some(win) = app_ev.get_window("main") {
                                 if matches!(win.is_visible(), Ok(false)) {
                                     let _ = win.show();
@@ -1328,5 +1343,15 @@ mod tests {
         });
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incoming_call_window_pop_suppressed_while_passcode_locked() {
+        let locked = AtomicBool::new(false);
+        assert!(should_pop_incoming_call_window(&locked));
+        locked.store(true, Ordering::Relaxed);
+        assert!(!should_pop_incoming_call_window(&locked));
+        locked.store(false, Ordering::Relaxed);
+        assert!(should_pop_incoming_call_window(&locked));
     }
 }

@@ -1,4 +1,5 @@
-import { Network, QrCode, RefreshCw } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Clock, Network, QrCode, RefreshCw } from "lucide-react";
 import { useI18n } from "../i18n";
 import type { RelayConfigSummary } from "../types";
 
@@ -7,9 +8,22 @@ interface Props {
   statusText: string;
   errorText: string | null;
   relayCfg?: RelayConfigSummary | null;
+  qrTimeoutSec?: number | null;
+  qrIssuedAtMs?: number | null;
+  refreshing?: boolean;
   onOpenRelaySettings?: () => void;
   onRefresh: () => void;
   onEnterDemo: () => void;
+}
+
+function formatCountdown(seconds: number): string {
+  const s = Math.max(0, Math.ceil(seconds));
+  if (s >= 60) {
+    const mins = Math.floor(s / 60);
+    const rem = s % 60;
+    return `${mins}:${String(rem).padStart(2, "0")}`;
+  }
+  return `${s}s`;
 }
 
 export function QrLoginModal({
@@ -17,11 +31,64 @@ export function QrLoginModal({
   statusText,
   errorText,
   relayCfg,
+  qrTimeoutSec = null,
+  qrIssuedAtMs = null,
+  refreshing = false,
   onOpenRelaySettings,
   onRefresh,
   onEnterDemo,
 }: Props) {
   const { t } = useI18n();
+  const [fallbackIssuedAtMs, setFallbackIssuedAtMs] = useState<number | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const onRefreshRef = useRef(onRefresh);
+  onRefreshRef.current = onRefresh;
+  const autoRefreshedKeyRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!qrSvg) {
+      setFallbackIssuedAtMs(null);
+      return;
+    }
+    setFallbackIssuedAtMs(Date.now());
+    setNowMs(Date.now());
+  }, [qrSvg]);
+
+  const effectiveTimeoutSec =
+    typeof qrTimeoutSec === "number" && Number.isFinite(qrTimeoutSec) && qrTimeoutSec > 0
+      ? qrTimeoutSec
+      : null;
+  const effectiveIssuedAtMs =
+    typeof qrIssuedAtMs === "number" && Number.isFinite(qrIssuedAtMs) && qrIssuedAtMs > 0
+      ? qrIssuedAtMs
+      : fallbackIssuedAtMs;
+
+  const expiresAtMs =
+    qrSvg && effectiveTimeoutSec !== null && effectiveIssuedAtMs !== null
+      ? effectiveIssuedAtMs + effectiveTimeoutSec * 1000
+      : null;
+
+  const remainingSec =
+    expiresAtMs !== null ? Math.max(0, Math.ceil((expiresAtMs - nowMs) / 1000)) : null;
+
+  useEffect(() => {
+    if (!qrSvg || expiresAtMs === null || refreshing) return;
+    setNowMs(Date.now());
+    const timer = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, [qrSvg, expiresAtMs, refreshing]);
+
+  useEffect(() => {
+    if (!qrSvg || expiresAtMs === null || refreshing) return;
+    if (remainingSec === null || remainingSec > 0) return;
+    const key = `${effectiveIssuedAtMs ?? 0}:${qrSvg.slice(0, 64)}`;
+    if (autoRefreshedKeyRef.current === key) return;
+    autoRefreshedKeyRef.current = key;
+    onRefreshRef.current();
+  }, [qrSvg, expiresAtMs, effectiveIssuedAtMs, remainingSec, refreshing]);
+
   return (
     <div className="flex h-full w-full items-center justify-center p-6" style={{ background: "var(--bg-stage)" }}>
       <div
@@ -50,9 +117,28 @@ export function QrLoginModal({
         <p className="text-sm font-medium" style={{ color: "var(--accent)" }}>
           {statusText}
         </p>
+        {remainingSec !== null && !refreshing && (
+          <p
+            className={`mt-1.5 inline-flex items-center justify-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium tabular-nums ${
+              remainingSec <= 30 ? "bg-amber-500/15 text-amber-400" : ""
+            }`}
+            style={
+              remainingSec > 30
+                ? { background: "var(--bg-surface)", color: "var(--text-secondary)" }
+                : undefined
+            }
+          >
+            <Clock className="h-3.5 w-3.5" />
+            <span>{t("qrExpiresIn", { time: formatCountdown(remainingSec) })}</span>
+          </p>
+        )}
         {relayCfg?.enabled && (
           <p className="mt-1.5 text-xs font-medium text-emerald-400">
-            Đang kết nối qua Relay ({relayCfg.mode.toUpperCase()} · {relayCfg.host}:{relayCfg.port})
+            {t("qrRelayConnectedHint", {
+              mode: relayCfg.mode.toUpperCase(),
+              host: relayCfg.host,
+              port: relayCfg.port,
+            })}
           </p>
         )}
         {errorText && (
@@ -66,11 +152,13 @@ export function QrLoginModal({
 
         <div className="mt-6 flex flex-wrap items-center justify-center gap-2.5">
           <button
+            type="button"
+            disabled={refreshing}
             onClick={onRefresh}
-            className="tf-btn inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold"
+            className="tf-btn inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-60"
           >
-            <RefreshCw className="h-4 w-4" />
-            {t("qrRegenerate")}
+            <RefreshCw className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`} />
+            <span>{refreshing ? t("qrRefreshing") : t("qrRegenerate")}</span>
           </button>
           {onOpenRelaySettings && (
             <button
@@ -88,6 +176,7 @@ export function QrLoginModal({
             </button>
           )}
           <button
+            type="button"
             onClick={onEnterDemo}
             className="rounded-lg px-3.5 py-2 text-sm font-medium transition hover:opacity-80"
             style={{ background: "var(--bg-surface)", color: "var(--text-secondary)" }}

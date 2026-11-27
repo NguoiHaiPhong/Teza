@@ -1,74 +1,139 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ArrowDownToLine, CheckCircle2, RefreshCw, Sparkles, X } from "lucide-react";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { bridge } from "../bridge";
 import { useI18n } from "../i18n";
 import type { AppUpdateInfo } from "../types";
+import { isImeComposingEvent } from "../utils/searchNormalize";
+
+export interface UpdateInstallProgress {
+  downloadedBytes: number;
+  totalBytes: number | null;
+  stageText?: string;
+  percent?: number | null;
+}
 
 interface Props {
   open: boolean;
+  isLocked?: boolean;
   currentVersion: string;
   availableUpdate: AppUpdateInfo | null;
   checking: boolean;
   errorText: string | null;
   lastCheckedAt: number | null;
+  installing?: boolean;
+  progress?: UpdateInstallProgress | null;
+  error?: string | null;
+  onInstall?: () => Promise<void> | void;
   onCheckNow: () => Promise<void>;
   onClose: () => void;
 }
 
 export function UpdateModal({
   open,
+  isLocked = false,
   currentVersion,
   availableUpdate,
   checking,
   errorText,
   lastCheckedAt,
+  installing: installingProp,
+  progress: progressProp,
+  error: errorProp,
+  onInstall,
   onCheckNow,
   onClose,
 }: Props) {
   const { t } = useI18n();
-  const [installing, setInstalling] = useState(false);
-  const [installError, setInstallError] = useState<string | null>(null);
-  const [downloadedBytes, setDownloadedBytes] = useState(0);
-  const [totalBytes, setTotalBytes] = useState<number | null>(null);
-  const [stageText, setStageText] = useState("");
+  const [localInstalling, setLocalInstalling] = useState(false);
+  const [localInstallError, setLocalInstallError] = useState<string | null>(null);
+  const [localDownloadedBytes, setLocalDownloadedBytes] = useState(0);
+  const [localTotalBytes, setLocalTotalBytes] = useState<number | null>(null);
+  const [localStageText, setLocalStageText] = useState("");
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const effectiveInstalling = installingProp ?? localInstalling;
+  const effectiveDownloadedBytes = progressProp ? progressProp.downloadedBytes : localDownloadedBytes;
+  const effectiveTotalBytes = progressProp ? progressProp.totalBytes : localTotalBytes;
+  const effectiveStageText =
+    progressProp?.stageText !== undefined
+      ? progressProp.stageText
+      : localStageText || (effectiveInstalling ? t("updateDownloading") : "");
+  const effectiveInstallError = errorProp !== undefined ? errorProp : localInstallError;
+
+  const percent =
+    progressProp?.percent !== undefined
+      ? progressProp.percent
+      : effectiveTotalBytes && effectiveTotalBytes > 0
+        ? Math.min(100, Math.round((effectiveDownloadedBytes / effectiveTotalBytes) * 100))
+        : null;
+
+  useEffect(() => {
+    if (!open || isLocked) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (isImeComposingEvent(e)) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!effectiveInstalling) {
+          onClose();
+        }
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [open, isLocked, effectiveInstalling, onClose]);
 
   if (!open) return null;
 
-  const percent =
-    totalBytes && totalBytes > 0
-      ? Math.min(100, Math.round((downloadedBytes / totalBytes) * 100))
-      : null;
+  const handleRequestClose = () => {
+    if (effectiveInstalling) return;
+    onClose();
+  };
 
   const handleInstall = async () => {
-    if (!availableUpdate || installing) return;
-    setInstalling(true);
-    setInstallError(null);
-    setDownloadedBytes(0);
-    setTotalBytes(null);
-    setStageText(t("updateDownloading"));
+    if (!availableUpdate || effectiveInstalling) return;
+    if (onInstall) {
+      await onInstall();
+      return;
+    }
+    setLocalInstalling(true);
+    setLocalInstallError(null);
+    setLocalDownloadedBytes(0);
+    setLocalTotalBytes(null);
+    setLocalStageText(t("updateDownloading"));
     let unlisten: UnlistenFn | null = null;
     try {
       unlisten = await listen<{ event: string; total?: number | null; chunk?: number }>(
         "core://update-progress",
         (ev) => {
+          if (!mountedRef.current) return;
           const p = ev.payload;
           if (p.event === "started") {
-            setTotalBytes(p.total ?? null);
-            setStageText(t("updateDownloadingPkg"));
+            setLocalTotalBytes(p.total ?? null);
+            setLocalStageText(t("updateDownloadingPkg"));
           } else if (p.event === "progress" && p.chunk) {
-            setDownloadedBytes((prev) => prev + (p.chunk ?? 0));
+            setLocalDownloadedBytes((prev) => prev + (p.chunk ?? 0));
           } else if (p.event === "finished") {
-            setStageText(t("updateFinishingRestart"));
+            setLocalStageText(t("updateFinishingRestart"));
           }
         },
       );
       await bridge.installAppUpdate();
       await relaunch();
     } catch (err) {
-      setInstallError(String(err));
-      setInstalling(false);
+      if (mountedRef.current) {
+        setLocalInstallError(String(err));
+        setLocalInstalling(false);
+      }
     } finally {
       unlisten?.();
     }
@@ -77,9 +142,12 @@ export function UpdateModal({
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4"
-      onClick={onClose}
+      onClick={handleRequestClose}
     >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={t("updateModalTitle")}
         className="w-full max-w-md overflow-hidden rounded-2xl shadow-2xl"
         style={{
           background: "var(--bg-sidebar)",
@@ -98,8 +166,9 @@ export function UpdateModal({
           </div>
           <button
             type="button"
-            onClick={onClose}
-            className="rounded-lg p-1.5 hover:bg-black/10"
+            disabled={effectiveInstalling}
+            onClick={handleRequestClose}
+            className="rounded-lg p-1.5 hover:bg-black/10 disabled:cursor-not-allowed disabled:opacity-40"
             title={t("close")}
           >
             <X className="h-4 w-4" />
@@ -152,10 +221,10 @@ export function UpdateModal({
             </div>
           )}
 
-          {installing && (
+          {effectiveInstalling && (
             <div className="space-y-1.5">
               <div className="flex justify-between text-xs" style={{ color: "var(--text-secondary)" }}>
-                <span>{stageText}</span>
+                <span>{effectiveStageText}</span>
                 {percent !== null && <span>{percent}%</span>}
               </div>
               <div
@@ -173,22 +242,23 @@ export function UpdateModal({
             </div>
           )}
 
-          {(errorText || installError) && (
+          {(errorText || effectiveInstallError) && (
             <div
+              role="alert"
               className="rounded-xl px-3 py-2 text-[13px]"
               style={{
                 background: "var(--danger-bg)",
                 color: "var(--danger-text)",
               }}
             >
-              {installError || errorText}
+              {effectiveInstallError || errorText}
             </div>
           )}
 
           <div className="flex justify-end gap-2 pt-1">
             <button
               type="button"
-              disabled={checking || installing}
+              disabled={checking || effectiveInstalling}
               onClick={() => void onCheckNow()}
               className="flex items-center gap-1.5 rounded-xl px-3.5 py-2 text-[14px] font-medium disabled:opacity-55"
               style={{
@@ -202,12 +272,12 @@ export function UpdateModal({
             {availableUpdate && (
               <button
                 type="button"
-                disabled={installing}
+                disabled={effectiveInstalling}
                 onClick={() => void handleInstall()}
                 className="tf-btn flex items-center gap-1.5 rounded-xl px-4 py-2 text-[14px] font-semibold disabled:opacity-60"
               >
                 <ArrowDownToLine className="h-4 w-4" />
-                <span>{installing ? t("updateInstallingBtn") : t("updateInstallRestartBtn")}</span>
+                <span>{effectiveInstalling ? t("updateInstallingBtn") : t("updateInstallRestartBtn")}</span>
               </button>
             )}
           </div>

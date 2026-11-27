@@ -2407,7 +2407,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "litechat-desktop"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2430,7 +2430,7 @@ dependencies = [
 
 [[package]]
 name = "litechat-relay"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4910,7 +4910,7 @@ dependencies = [
 
 [[package]]
 name = "teza-call"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4927,7 +4927,7 @@ dependencies = [
 
 [[package]]
 name = "teza-video"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -6225,7 +6225,7 @@ dependencies = [
 
 [[package]]
 name = "zalo-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "aes",
  "aes-gcm",

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   extractKoreanChoseong,
+  filterThreadsBySearchQuery,
   isImeComposingEvent,
   isKoreanChoseongQuery,
   looksLikeInternationalPhoneQuery,
@@ -34,6 +35,33 @@ test("normalizeForSearch strips Vietnamese/Latin diacritics without decomposing 
   // Mixed Korean + Vietnamese + English
   assert.equal(normalizeForSearch("Team 회의 Báo Cáo"), "team 회의 bao cao");
   assert.equal(normalizeForSearch(""), "");
+
+  // Whitespace normalization (leading/trailing, repeated spaces, tabs, NBSP)
+  assert.equal(normalizeForSearch("  Trần   Minh  "), "tran minh");
+  assert.equal(normalizeForSearch("Đào\u00A0\tNụ\n"), "dao nu");
+  assert.equal(normalizeForSearch("   \t\n  "), "");
+
+  // Eth lookalike `Ð`/`ð` (U+00D0/U+00F0) from legacy fonts folds to `d` just like `Đ`/`đ`
+  assert.equal(normalizeForSearch("Ðào Nụ — ðức"), "dao nu — duc");
+});
+
+test("normalizeForSearch folds every Vietnamese diacritic vowel and đ/Đ identically in NFC and NFD", () => {
+  const groups: readonly [string, string][] = [
+    ["áàảãạăắằẳẵặâấầẩẫậÁÀẢÃẠĂẮẰẲẴẶÂẤẦẨẪẬ", "a"],
+    ["éèẻẽẹêếềểễệÉÈẺẼẸÊẾỀỂỄỆ", "e"],
+    ["íìỉĩịÍÌỈĨỊ", "i"],
+    ["óòỏõọôốồổỗộơớờởỡợÓÒỎÕỌÔỐỒỔỖỘƠỚỜỞỠỢ", "o"],
+    ["úùủũụưứừửữựÚÙỦŨỤƯỨỪỬỮỰ", "u"],
+    ["ýỳỷỹỵÝỲỶỸỴ", "y"],
+    ["đĐðÐ", "d"],
+  ];
+
+  for (const [chars, expectedBase] of groups) {
+    for (const ch of chars) {
+      assert.equal(normalizeForSearch(ch), expectedBase, `NFC char ${ch}`);
+      assert.equal(normalizeForSearch(ch.normalize("NFD")), expectedBase, `NFD char ${ch}`);
+    }
+  }
 });
 
 test("extractKoreanChoseong and isKoreanChoseongQuery handle all 19 consonants, NFD, and non-choseong inputs", () => {
@@ -102,6 +130,88 @@ test("matchesSearchQuery supports Vietnamese, Korean substrings, Choseong, NFD/N
   assert.equal(matchesSearchQuery("김민수", ""), true);
   assert.equal(matchesSearchQuery("김민수", "   "), true);
   assert.equal(matchesSearchQuery("", "부장"), false);
+});
+
+test("matchesSearchQuery handles Vietnamese recipient names (Tran Minh -> Trần Minh, Dao Nu -> Đào Nụ)", () => {
+  // Reported ForwardModal repros and case/whitespace/token-order variants
+  assert.equal(matchesSearchQuery("Trần Minh", "Tran Minh"), true);
+  assert.equal(matchesSearchQuery("Trần Minh", "tran minh"), true);
+  assert.equal(matchesSearchQuery("Trần Minh", "TRAN MINH"), true);
+  assert.equal(matchesSearchQuery("Trần Minh", "  Tran   Minh  "), true);
+  assert.equal(matchesSearchQuery("Trần\u00A0Minh", "Tran Minh"), true);
+  assert.equal(matchesSearchQuery("Trần Minh", "Minh Tran"), true);
+  assert.equal(matchesSearchQuery("Trần Văn Minh", "Tran Minh"), true);
+  assert.equal(matchesSearchQuery("Tran Minh", "Trần Minh"), true);
+
+  // `đ`/`Đ` and combined tones (`Đào Nụ`, `Đức Dũng`, `Phượng`)
+  assert.equal(matchesSearchQuery("Đào Nụ", "Dao Nu"), true);
+  assert.equal(matchesSearchQuery("ĐÀO NỤ", "dao nu"), true);
+  assert.equal(matchesSearchQuery("Đào Nụ", "  dao\tnu "), true);
+  assert.equal(matchesSearchQuery("Ðào Nụ", "Dao Nu"), true);
+  assert.equal(matchesSearchQuery("Nguyễn Thị Phượng", "nguyen phuong"), true);
+  assert.equal(matchesSearchQuery("Phòng Kỹ Thuật — Đà Nẵng", "phong ky thuat da nang"), true);
+
+  // Decomposed NFD Vietnamese names match accentless queries (and vice versa)
+  const nfdTranMinh = "Tra\u0302\u0300n Minh";
+  const nfdDaoNu = "\u0110a\u0300o Nu\u0323";
+  assert.equal(matchesSearchQuery(nfdTranMinh, "Tran Minh"), true);
+  assert.equal(matchesSearchQuery("Trần Minh", nfdTranMinh), true);
+  assert.equal(matchesSearchQuery(nfdDaoNu, "Dao Nu"), true);
+  assert.equal(matchesSearchQuery("Đào Nụ", nfdDaoNu), true);
+
+  // Non-matching Vietnamese names remain rejected
+  assert.equal(matchesSearchQuery("Trần Minh", "Tran Tuan"), false);
+  assert.equal(matchesSearchQuery("Đào Nụ", "Dao Anh"), false);
+});
+
+test("filterThreadsBySearchQuery filters diacritic-insensitively before applying result limit", () => {
+  const filler = Array.from({ length: 50 }, (_, idx) => ({
+    id: `uid-${idx + 1}`,
+    title: `Liên hệ ${idx + 1}`,
+  }));
+  const threads = [
+    ...filler,
+    { id: "uid-tran-minh", title: "Trần Minh" },
+    { id: "uid-dao-nu", title: "Đào Nụ" },
+    { id: "uid-nhom-kd", title: "Nhóm Kinh Doanh — Đà Nẵng" },
+    { id: "uid-kr-1", title: "김민수 부장님" },
+  ];
+  const snapshot = threads.map((t) => t.id);
+
+  // Empty / whitespace query returns leading items up to limit without mutating input
+  assert.equal(filterThreadsBySearchQuery(threads, "", 40).length, 40);
+  assert.equal(filterThreadsBySearchQuery(threads, "   ", 40).length, 40);
+  assert.deepEqual(
+    threads.map((t) => t.id),
+    snapshot,
+  );
+
+  // Deep items past the ForwardModal 40-item slice cap are still found via accentless queries
+  assert.deepEqual(
+    filterThreadsBySearchQuery(threads, "Tran Minh", 40).map((t) => t.title),
+    ["Trần Minh"],
+  );
+  assert.deepEqual(
+    filterThreadsBySearchQuery(threads, "Dao Nu", 40).map((t) => t.title),
+    ["Đào Nụ"],
+  );
+  assert.deepEqual(
+    filterThreadsBySearchQuery(threads, "da nang", 40).map((t) => t.title),
+    ["Nhóm Kinh Doanh — Đà Nẵng"],
+  );
+
+  // Supports thread ID lookup and Korean Choseong lookup
+  assert.deepEqual(
+    filterThreadsBySearchQuery(threads, "uid-dao-nu", 40).map((t) => t.title),
+    ["Đào Nụ"],
+  );
+  assert.deepEqual(
+    filterThreadsBySearchQuery(threads, "ㄱㅁㅅ", 40).map((t) => t.title),
+    ["김민수 부장님"],
+  );
+
+  // Non-matching query returns empty list
+  assert.deepEqual(filterThreadsBySearchQuery(threads, "Khong Ton Tai", 40), []);
 });
 
 test("isImeComposingEvent detects React nativeEvent composition, DOM composition, and keyCode 229", () => {

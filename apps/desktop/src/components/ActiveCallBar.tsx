@@ -19,6 +19,7 @@ import {
   normalizeLevelPercent,
   resolveEffectiveCallDevices,
 } from "../utils/callState";
+import { isImeComposingEvent } from "../utils/searchNormalize";
 import type { LocalCameraStatus } from "../utils/videoCallMedia";
 import { ThreadAvatar } from "./ThreadAvatar";
 
@@ -29,6 +30,7 @@ interface Props {
   devicesLoading: boolean;
   busy: boolean;
   hangupBusy?: boolean;
+  inline?: boolean;
   localCameraStatus?: LocalCameraStatus;
   onToggleMute: (nextMuted: boolean) => void;
   onToggleCamera?: (nextEnabled: boolean) => void;
@@ -47,6 +49,7 @@ export function ActiveCallBar({
   devicesLoading,
   busy,
   hangupBusy,
+  inline = false,
   localCameraStatus = "idle",
   onToggleMute,
   onToggleCamera,
@@ -63,11 +66,13 @@ export function ActiveCallBar({
   const onDevicesPopoverChangeRef = useRef(onDevicesPopoverChange);
   onDevicesPopoverChangeRef.current = onDevicesPopoverChange;
   const effectiveHangupBusy = hangupBusy ?? busy;
+  const matchedTelemetry =
+    telemetry && telemetry.call_id === active.call_id ? telemetry : null;
 
   const isVideoCall = active.call_type === "DirectVideo";
   const isConnected = active.phase === "connected";
   const isCancellingStage = active.phase === "dialing" || active.phase === "ringing_outgoing";
-  const effectiveMuted = telemetry?.mic_muted ?? active.mic_muted;
+  const effectiveMuted = matchedTelemetry?.mic_muted ?? active.mic_muted;
   const effectiveCamEnabled = active.cam_enabled;
   const cameraHasIssue = isCameraFailureStatus(localCameraStatus);
   const cameraStarting = localCameraStatus === "starting";
@@ -77,7 +82,7 @@ export function ActiveCallBar({
       setLocalElapsed(0);
       return;
     }
-    const baseSecs = Math.max(active.duration_secs, telemetry?.duration_secs ?? 0);
+    const baseSecs = Math.max(active.duration_secs, matchedTelemetry?.duration_secs ?? 0);
     setLocalElapsed(baseSecs);
     const startedAt = Date.now() - baseSecs * 1000;
     const timer = window.setInterval(() => {
@@ -89,17 +94,21 @@ export function ActiveCallBar({
 
   const effectiveDuration = Math.max(
     active.duration_secs,
-    telemetry?.duration_secs ?? 0,
+    matchedTelemetry?.duration_secs ?? 0,
     localElapsed,
   );
-  const micPct = effectiveMuted ? 0 : normalizeLevelPercent(telemetry?.mic_level_permille ?? 0);
-  const remotePct = normalizeLevelPercent(telemetry?.remote_level_permille ?? 0);
-  const remoteSpeaking = Boolean(isConnected && telemetry?.remote_speaking);
-  const missingMic = Boolean(isConnected && telemetry && !telemetry.has_input_device);
+  const micPct = effectiveMuted
+    ? 0
+    : normalizeLevelPercent(matchedTelemetry?.mic_level_permille ?? 0);
+  const remotePct = normalizeLevelPercent(matchedTelemetry?.remote_level_permille ?? 0);
+  const remoteSpeaking = Boolean(isConnected && matchedTelemetry?.remote_speaking);
+  const missingMic = Boolean(
+    isConnected && matchedTelemetry && !matchedTelemetry.has_input_device,
+  );
   const usingVirtualAudio = Boolean(
     isConnected &&
-      telemetry &&
-      (telemetry.input_is_virtual || telemetry.output_is_virtual),
+      matchedTelemetry &&
+      (matchedTelemetry.input_is_virtual || matchedTelemetry.output_is_virtual),
   );
   const effectiveDevices = resolveEffectiveCallDevices(devices);
 
@@ -116,8 +125,9 @@ export function ActiveCallBar({
   useEffect(() => {
     if (!devicesOpen) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.defaultPrevented || e.key !== "Escape") return;
+      if (e.defaultPrevented || isImeComposingEvent(e) || e.key !== "Escape") return;
       e.preventDefault();
+      e.stopPropagation();
       setDevicesOpen(false);
     };
     window.addEventListener("keydown", onKey, true);
@@ -136,11 +146,29 @@ export function ActiveCallBar({
           : `${t("callPhaseConnected")} · ${formatCallDuration(effectiveDuration)}`;
 
   return (
-    <div className="pointer-events-none fixed inset-x-0 top-3 z-[70] flex justify-center px-4">
+    <div
+      className={
+        inline
+          ? "flex w-full shrink-0 justify-center px-3 py-1.5"
+          : "pointer-events-none fixed inset-x-0 top-3 z-[70] flex justify-center px-4"
+      }
+      style={
+        inline
+          ? {
+              background: "var(--bg-sidebar)",
+              borderBottom: "1px solid var(--border-subtle)",
+            }
+          : undefined
+      }
+    >
       <div
-        className="pointer-events-auto relative flex w-full max-w-2xl flex-wrap items-center justify-between gap-3 rounded-2xl px-3.5 py-2 shadow-2xl"
+        className={`pointer-events-auto relative flex w-full flex-wrap items-center justify-between gap-3 ${
+          inline
+            ? "max-w-4xl rounded-xl px-3 py-1.5 shadow-sm"
+            : "max-w-2xl rounded-2xl px-3.5 py-2 shadow-2xl"
+        }`}
         style={{
-          background: "var(--bg-sidebar)",
+          background: inline ? "var(--bg-surface)" : "var(--bg-sidebar)",
           border: "1px solid var(--border-subtle)",
           color: "var(--text-primary)",
         }}
@@ -393,7 +421,7 @@ export function ActiveCallBar({
                 <span>{t("callRefreshDevicesBtn")}</span>
               </button>
             </div>
-            {isConnected && telemetry && (
+            {isConnected && matchedTelemetry && (
               <div
                 className="space-y-1 rounded-lg px-2.5 py-2 text-[11px]"
                 style={{
@@ -408,24 +436,24 @@ export function ActiveCallBar({
               >
                 <div className="break-words font-medium" style={{ color: "var(--text-primary)" }}>
                   {t("callActiveDevicesLabel", {
-                    mic: telemetry.active_input_device || "-",
-                    speaker: telemetry.active_output_device || "-",
+                    mic: matchedTelemetry.active_input_device || "-",
+                    speaker: matchedTelemetry.active_output_device || "-",
                   })}
                 </div>
                 <div className="tabular-nums">
-                  TX: {telemetry.tx_packets} · RX: {telemetry.rx_packets}
-                  {telemetry.tx_errors > 0 ? ` · TX err: ${telemetry.tx_errors}` : ""}
+                  TX: {matchedTelemetry.tx_packets} · RX: {matchedTelemetry.rx_packets}
+                  {matchedTelemetry.tx_errors > 0 ? ` · TX err: ${matchedTelemetry.tx_errors}` : ""}
                 </div>
                 {isVideoCall &&
-                  (telemetry.video_tx_frames !== undefined ||
-                    telemetry.video_rx_frames !== undefined) && (
+                  (matchedTelemetry.video_tx_frames !== undefined ||
+                    matchedTelemetry.video_rx_frames !== undefined) && (
                     <div className="tabular-nums">
-                      Video TX: {telemetry.video_tx_frames ?? 0} · RX:{" "}
-                      {telemetry.video_rx_frames ?? 0}
+                      Video TX: {matchedTelemetry.video_tx_frames ?? 0} · RX:{" "}
+                      {matchedTelemetry.video_rx_frames ?? 0}
                     </div>
                   )}
                 {usingVirtualAudio && <div>{t("callVirtualAudioWarningShort")}</div>}
-                {effectiveDuration >= 4 && telemetry.rx_packets === 0 && (
+                {effectiveDuration >= 4 && matchedTelemetry.rx_packets === 0 && (
                   <div style={{ color: "#fbbf24" }}>{t("callNoRemotePacketsHint")}</div>
                 )}
               </div>

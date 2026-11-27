@@ -9,6 +9,7 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
+use std::time::{Duration, SystemTime};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -32,6 +33,7 @@ const DOWNLOAD_CONCURRENCY_LIMIT: usize = 4;
 const TOUCH_FLUSH_THRESHOLD: usize = 32;
 const IO_BUF_LEN: usize = 64 * 1024;
 const MIME_PROBE_WINDOW_BYTES: usize = 64 * 1024;
+const CLEAR_CACHE_TMP_STALE_AGE: Duration = Duration::from_secs(3600);
 
 static NEXT_VAULT_TMP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -1058,21 +1060,54 @@ impl ChunkedAeadFile {
         dst_key: &[u8; 32],
         sha256_bytes: &[u8; 32],
     ) -> Result<u64> {
+        Self::reencrypt_file_streaming_checked(
+            src_enc_path,
+            dst_enc_path,
+            src_key,
+            dst_key,
+            sha256_bytes,
+        )
+        .map_err(|e| match e {
+            ReencryptFailure::CorruptSource(err) | ReencryptFailure::Other(err) => err,
+        })
+    }
+
+    fn reencrypt_file_streaming_checked(
+        src_enc_path: &Path,
+        dst_enc_path: &Path,
+        src_key: &[u8; 32],
+        dst_key: &[u8; 32],
+        sha256_bytes: &[u8; 32],
+    ) -> std::result::Result<u64, ReencryptFailure> {
         let mut src = File::open(src_enc_path)
-            .with_context(|| format!("Không mở được tệp media {}", src_enc_path.display()))?;
-        let hdr = Self::read_and_validate_header(&mut src)?;
+            .with_context(|| format!("Không mở được tệp media {}", src_enc_path.display()))
+            .map_err(ReencryptFailure::Other)?;
+        let hdr = Self::read_and_validate_header(&mut src).map_err(|err| {
+            let is_non_corrupt_io = err.downcast_ref::<std::io::Error>().is_some_and(|io_err| {
+                io_err.kind() != std::io::ErrorKind::UnexpectedEof
+            });
+            if is_non_corrupt_io {
+                ReencryptFailure::Other(err)
+            } else {
+                ReencryptFailure::CorruptSource(err)
+            }
+        })?;
         let src_cipher = Aes256Gcm::new_from_slice(src_key).expect("32-byte AES-256 key");
         let dst_cipher = Aes256Gcm::new_from_slice(dst_key).expect("32-byte AES-256 key");
 
         let mut dst_base_nonce = [0u8; 12];
-        getrandom::fill(&mut dst_base_nonce).context("OS CSPRNG failure")?;
+        getrandom::fill(&mut dst_base_nonce)
+            .context("OS CSPRNG failure")
+            .map_err(ReencryptFailure::Other)?;
 
-        let dst = Self::open_private_write(dst_enc_path)?;
-        let res: Result<u64> = (|| {
+        let dst = Self::open_private_write(dst_enc_path).map_err(ReencryptFailure::Other)?;
+        let res: std::result::Result<u64, ReencryptFailure> = (|| {
             let mut writer =
                 BufWriter::with_capacity(hdr.chunk_size as usize + Self::TAG_LEN, dst);
             let dst_header = Self::encode_header(hdr.chunk_size, &dst_base_nonce, hdr.plain_len);
-            writer.write_all(&dst_header)?;
+            writer
+                .write_all(&dst_header)
+                .map_err(|e| ReencryptFailure::Other(e.into()))?;
             let mut written: u64 = Self::HEADER_LEN as u64;
 
             let num_chunks = hdr.num_chunks();
@@ -1082,7 +1117,13 @@ impl ChunkedAeadFile {
                 let plain_chunk_len = hdr.chunk_plain_len(chunk_idx);
                 let enc_chunk_len = plain_chunk_len + Self::TAG_LEN;
                 ct_buf.resize(enc_chunk_len, 0);
-                src.read_exact(&mut ct_buf)?;
+                if let Err(io_err) = src.read_exact(&mut ct_buf) {
+                    return if io_err.kind() == std::io::ErrorKind::UnexpectedEof {
+                        Err(ReencryptFailure::CorruptSource(io_err.into()))
+                    } else {
+                        Err(ReencryptFailure::Other(io_err.into()))
+                    };
+                }
 
                 let is_final = chunk_idx + 1 == num_chunks;
                 let src_nonce = Self::derive_chunk_nonce(&hdr.base_nonce, chunk_idx);
@@ -1096,7 +1137,9 @@ impl ChunkedAeadFile {
                         },
                     )
                     .map_err(|_| {
-                        anyhow!("Giải mã tệp media cục bộ thất bại (sai khóa hoặc dữ liệu bị sửa đổi)")
+                        ReencryptFailure::CorruptSource(anyhow!(
+                            "Giải mã tệp media cục bộ thất bại (sai khóa hoặc dữ liệu bị sửa đổi)"
+                        ))
                     })?;
 
                 let dst_nonce = Self::derive_chunk_nonce(&dst_base_nonce, chunk_idx);
@@ -1108,14 +1151,22 @@ impl ChunkedAeadFile {
                     },
                 );
                 volatile_zeroize(&mut pt);
-                let out_ct =
-                    enc_res.map_err(|_| anyhow!("Mã hóa chunk media đám mây thất bại"))?;
-                writer.write_all(&out_ct)?;
+                let out_ct = enc_res.map_err(|_| {
+                    ReencryptFailure::Other(anyhow!("Mã hóa chunk media đám mây thất bại"))
+                })?;
+                writer
+                    .write_all(&out_ct)
+                    .map_err(|e| ReencryptFailure::Other(e.into()))?;
                 written = written.saturating_add(out_ct.len() as u64);
             }
 
-            writer.flush()?;
-            writer.get_ref().sync_all()?;
+            writer
+                .flush()
+                .map_err(|e| ReencryptFailure::Other(e.into()))?;
+            writer
+                .get_ref()
+                .sync_all()
+                .map_err(|e| ReencryptFailure::Other(e.into()))?;
             Ok(written)
         })();
 
@@ -1124,6 +1175,11 @@ impl ChunkedAeadFile {
         }
         res
     }
+}
+
+enum ReencryptFailure {
+    CorruptSource(anyhow::Error),
+    Other(anyhow::Error),
 }
 
 struct InflightGuard<'a> {
@@ -1176,6 +1232,50 @@ fn wipe_dir_contents(dir: &Path) {
         } else {
             let _ = std::fs::remove_file(&path);
         }
+    }
+}
+
+fn is_active_transfer_tmp_name(name: &str) -> bool {
+    name.starts_with("gdrive-up-")
+        || name.starts_with("gdrive-dl-")
+        || name.starts_with("cloud-rehydrate-")
+        || name.starts_with("dl-")
+        || name.starts_with("stage-")
+        || name.ends_with(".part")
+}
+
+/// Cleans stale scratch files in `vault/tmp` while preserving active or recent transfer files
+/// (`gdrive-up-*`, `gdrive-dl-*`, `cloud-rehydrate-*`, `dl-*.part`, `stage-*`) so clearing cache
+/// never deletes files belonging to concurrent Google Drive or CDN transfers.
+fn wipe_stale_tmp_contents(dir: &Path, min_age: Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    let current_pid_tag = format!("-{}-", std::process::id());
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let _ = std::fs::remove_dir_all(&path);
+            continue;
+        }
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if is_active_transfer_tmp_name(&name) {
+            if name.contains(&current_pid_tag) {
+                continue;
+            }
+            let is_recent = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|mtime| now.duration_since(mtime).ok())
+                .is_none_or(|age| age < min_age);
+            if is_recent {
+                continue;
+            }
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }
 
@@ -1409,6 +1509,14 @@ impl MediaVault {
         }
     }
 
+    fn default_variant_for_kind(kind: &str) -> &'static str {
+        if kind.eq_ignore_ascii_case("thumb") {
+            "thumb"
+        } else {
+            "primary"
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn commit_media_metadata(
         &self,
@@ -1420,15 +1528,13 @@ impl MediaVault {
         local_rel_path: String,
         is_encrypted: bool,
         url_opt: Option<&str>,
-        msg_ref: Option<(&str, &str)>,
+        msg_ref: Option<(&str, &str, &str)>,
         original_name: Option<&str>,
+        cdn_status: i32,
+        preserve_existing_updated_ts: bool,
     ) -> Result<MediaObjectRecord> {
         let now = chrono::Utc::now().timestamp_millis();
-        let variant = if kind.eq_ignore_ascii_case("thumb") {
-            "thumb".to_string()
-        } else {
-            "primary".to_string()
-        };
+        let default_variant = Self::default_variant_for_kind(kind);
         let obj = MediaObjectRecord {
             sha256: sha256_hex.to_string(),
             kind: kind.to_string(),
@@ -1454,7 +1560,18 @@ impl MediaVault {
 
         let guard = store.lock().await;
         guard.upsert_media_object(&obj)?;
-        if let Some((tid, mid)) = msg_ref {
+        let link_updated_ts = if preserve_existing_updated_ts {
+            0
+        } else {
+            guard.next_local_mutation_ts().unwrap_or_else(|_| now.max(1))
+        };
+        if let Some((tid, mid, raw_variant)) = msg_ref {
+            let trimmed = raw_variant.trim();
+            let variant = if trimmed.is_empty() {
+                default_variant.to_string()
+            } else {
+                trimmed.to_string()
+            };
             guard.link_message_media(&MessageMediaRecord {
                 thread_id: tid.to_string(),
                 msg_id: mid.to_string(),
@@ -1463,24 +1580,20 @@ impl MediaVault {
                 sha256: Some(sha256_hex.to_string()),
                 original_name: original_name.map(str::to_string),
                 saved_user_path: None,
-                cdn_status: if url_opt.is_some() {
-                    MEDIA_CDN_STATUS_OK
-                } else {
-                    MEDIA_CDN_STATUS_UNKNOWN
-                },
-                updated_ts: now,
+                cdn_status,
+                updated_ts: link_updated_ts,
             })?;
         } else if !url_hash.is_empty() {
             guard.link_message_media(&MessageMediaRecord {
                 thread_id: "__url__".to_string(),
                 msg_id: url_hash.clone(),
-                variant,
+                variant: default_variant.to_string(),
                 url_hash,
                 sha256: Some(sha256_hex.to_string()),
                 original_name: original_name.map(str::to_string),
                 saved_user_path: None,
-                cdn_status: MEDIA_CDN_STATUS_OK,
-                updated_ts: now,
+                cdn_status,
+                updated_ts: link_updated_ts,
             })?;
         }
         let persisted = guard.get_media_object(sha256_hex)?.unwrap_or(obj);
@@ -1521,8 +1634,10 @@ impl MediaVault {
         kind: &str,
         mime: &str,
         url_opt: Option<&str>,
-        msg_ref: Option<(&str, &str)>,
+        msg_ref: Option<(&str, &str, &str)>,
         original_name: Option<&str>,
+        cdn_status: i32,
+        preserve_existing_updated_ts: bool,
     ) -> Result<MediaObjectRecord> {
         let effective_mime = if is_generic_mime(mime) {
             let src_probe = src_path.to_path_buf();
@@ -1574,6 +1689,8 @@ impl MediaVault {
             url_opt,
             msg_ref,
             original_name,
+            cdn_status,
+            preserve_existing_updated_ts,
         )
         .await
     }
@@ -1595,6 +1712,12 @@ impl MediaVault {
                 .await
                 .context("Tác vụ tính SHA-256 bị hủy")??;
 
+        let default_variant = Self::default_variant_for_kind(kind);
+        let cdn_status = if url_opt.is_some() {
+            MEDIA_CDN_STATUS_OK
+        } else {
+            MEDIA_CDN_STATUS_UNKNOWN
+        };
         self.ingest_file_with_precomputed_hash(
             store,
             src_path,
@@ -1604,8 +1727,10 @@ impl MediaVault {
             kind,
             mime,
             url_opt,
-            msg_ref,
+            msg_ref.map(|(t, m)| (t, m, default_variant)),
             original_name,
+            cdn_status,
+            false,
         )
         .await
     }
@@ -1668,6 +1793,12 @@ impl MediaVault {
             (rel, encrypt)
         };
 
+        let default_variant = Self::default_variant_for_kind(kind);
+        let cdn_status = if url_opt.is_some() {
+            MEDIA_CDN_STATUS_OK
+        } else {
+            MEDIA_CDN_STATUS_UNKNOWN
+        };
         self.commit_media_metadata(
             store,
             &sha256_hex,
@@ -1677,8 +1808,10 @@ impl MediaVault {
             rel_path,
             is_encrypted,
             url_opt,
-            msg_ref,
+            msg_ref.map(|(t, m)| (t, m, default_variant)),
             original_name,
+            cdn_status,
+            false,
         )
         .await
     }
@@ -1744,24 +1877,35 @@ impl MediaVault {
 
         let pending_count = self.record_access_touch(&obj.sha256);
         if let Some((tid, mid)) = msg_ref {
-            let now = chrono::Utc::now().timestamp_millis();
-            let variant = if kind.eq_ignore_ascii_case("thumb") {
-                "thumb".to_string()
-            } else {
-                "primary".to_string()
-            };
+            let variant = Self::default_variant_for_kind(kind);
             let guard = store.lock().await;
-            let _ = guard.link_message_media(&MessageMediaRecord {
-                thread_id: tid.to_string(),
-                msg_id: mid.to_string(),
-                variant,
-                url_hash: url_hash.to_string(),
-                sha256: Some(obj.sha256.clone()),
-                original_name: None,
-                saved_user_path: None,
-                cdn_status: MEDIA_CDN_STATUS_OK,
-                updated_ts: now,
-            });
+            let existing_link = guard
+                .get_message_media_record(tid, mid, variant)
+                .ok()
+                .flatten();
+            let needs_link = match existing_link {
+                None => true,
+                Some(ref rec) => {
+                    rec.sha256.as_deref() != Some(obj.sha256.as_str())
+                        || (rec.url_hash.is_empty() && !url_hash.is_empty())
+                }
+            };
+            if needs_link {
+                let mut_ts = guard
+                    .next_local_mutation_ts()
+                    .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis().max(1));
+                let _ = guard.link_message_media(&MessageMediaRecord {
+                    thread_id: tid.to_string(),
+                    msg_id: mid.to_string(),
+                    variant: variant.to_string(),
+                    url_hash: url_hash.to_string(),
+                    sha256: Some(obj.sha256.clone()),
+                    original_name: None,
+                    saved_user_path: None,
+                    cdn_status: MEDIA_CDN_STATUS_UNKNOWN,
+                    updated_ts: mut_ts,
+                });
+            }
         }
         if pending_count >= TOUCH_FLUSH_THRESHOLD {
             self.flush_access_touches(store).await;
@@ -1860,7 +2004,6 @@ impl MediaVault {
                     .downcast_ref::<MediaDownloadError>()
                     .is_some_and(MediaDownloadError::is_cdn_expired)
                 {
-                    let now = chrono::Utc::now().timestamp_millis();
                     let guard = store.lock().await;
                     let updated = guard
                         .mark_media_cdn_status(&url_hash, MEDIA_CDN_STATUS_EXPIRED)
@@ -1870,11 +2013,7 @@ impl MediaVault {
                             Some((t, m)) => (t.to_string(), m.to_string()),
                             None => ("__url__".to_string(), url_hash.clone()),
                         };
-                        let variant = if kind.eq_ignore_ascii_case("thumb") {
-                            "thumb".to_string()
-                        } else {
-                            "primary".to_string()
-                        };
+                        let variant = Self::default_variant_for_kind(kind).to_string();
                         let _ = guard.link_message_media(&MessageMediaRecord {
                             thread_id: tid,
                             msg_id: mid,
@@ -1884,7 +2023,7 @@ impl MediaVault {
                             original_name: None,
                             saved_user_path: None,
                             cdn_status: MEDIA_CDN_STATUS_EXPIRED,
-                            updated_ts: now,
+                            updated_ts: 0,
                         });
                     }
                 }
@@ -1902,6 +2041,7 @@ impl MediaVault {
             }
         };
 
+        let default_variant = Self::default_variant_for_kind(kind);
         let ingest_res = self
             .ingest_file_with_precomputed_hash(
                 store,
@@ -1912,8 +2052,10 @@ impl MediaVault {
                 kind,
                 &meta.mime,
                 Some(url),
-                msg_ref,
+                msg_ref.map(|(t, m)| (t, m, default_variant)),
                 meta.file_name.as_deref(),
+                MEDIA_CDN_STATUS_OK,
+                false,
             )
             .await;
         let _ = tokio::fs::remove_file(&tmp_path).await;
@@ -2125,7 +2267,10 @@ impl MediaVault {
         let rels: Vec<String> = blobs.into_iter().map(|(_, rel)| rel).collect();
         self.unlink_rel_paths(&rels).await;
         let tmp_dir = self.vault_dir.join("tmp");
-        let _ = tokio::task::spawn_blocking(move || wipe_dir_contents(&tmp_dir)).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            wipe_stale_tmp_contents(&tmp_dir, CLEAR_CACHE_TMP_STALE_AGE)
+        })
+        .await;
         Ok(stats)
     }
 
@@ -2163,13 +2308,23 @@ impl MediaVault {
 
         tokio::task::spawn_blocking(move || -> Result<u64> {
             let res = if is_encrypted {
-                ChunkedAeadFile::reencrypt_file_streaming(
+                match ChunkedAeadFile::reencrypt_file_streaming_checked(
                     &blob_path,
                     &out_path,
                     local_key.as_bytes(),
                     &cloud_key_copy,
                     &sha256_bytes,
-                )
+                ) {
+                    Ok(n) => Ok(n),
+                    Err(ReencryptFailure::CorruptSource(err)) => {
+                        // Permanently corrupted local encrypted cache file (invalid header, truncated
+                        // chunk, or AEAD tag mismatch): remove the unreadable cache file after `src`
+                        // is closed so Step 1 can evict it and continue uploading healthy blobs.
+                        let _ = std::fs::remove_file(&blob_path);
+                        Err(err)
+                    }
+                    Err(ReencryptFailure::Other(err)) => Err(err),
+                }
             } else {
                 ChunkedAeadFile::encrypt_file_streaming(
                     &blob_path,
@@ -2258,44 +2413,21 @@ impl MediaVault {
             .ingest_file_with_precomputed_hash(
                 store,
                 &plain_tmp,
-                actual_hex.clone(),
+                actual_hex,
                 actual_bytes,
                 size_bytes,
                 kind,
                 mime,
                 url_opt,
-                msg_ref.map(|(t, m, _)| (t, m)),
+                msg_ref,
                 original_name,
+                MEDIA_CDN_STATUS_UNKNOWN,
+                true,
             )
             .await;
         let _ = tokio::fs::remove_file(&plain_tmp).await;
 
-        let obj = ingest_res?;
-        if let Some((tid, mid, variant)) = msg_ref {
-            let trimmed_var = variant.trim();
-            let default_var = if kind.eq_ignore_ascii_case("thumb") {
-                "thumb"
-            } else {
-                "primary"
-            };
-            if !trimmed_var.is_empty() && trimmed_var != default_var {
-                let now = chrono::Utc::now().timestamp_millis();
-                let url_hash = url_opt.map(Self::sha256_url).unwrap_or_default();
-                let guard = store.lock().await;
-                guard.link_message_media(&MessageMediaRecord {
-                    thread_id: tid.to_string(),
-                    msg_id: mid.to_string(),
-                    variant: trimmed_var.to_string(),
-                    url_hash,
-                    sha256: Some(actual_hex),
-                    original_name: original_name.map(str::to_string),
-                    saved_user_path: None,
-                    cdn_status: MEDIA_CDN_STATUS_UNKNOWN,
-                    updated_ts: now,
-                })?;
-            }
-        }
-        Ok(obj)
+        ingest_res
     }
 }
 
@@ -3108,6 +3240,216 @@ mod tests {
             guard.get_media_object(&obj_webp.sha256).unwrap().unwrap()
         };
         assert_eq!(persisted.mime, "image/webp");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn try_hit_cache_skips_redundant_link_updates_and_preserves_cdn_status() {
+        let dir = test_temp_dir("cache-hit-idempotent");
+        let paths = StoragePaths::from_dir(&dir).unwrap();
+        let store = Arc::new(AsyncMutex::new(
+            MessageStore::open(&paths.history_db(Some("u_cache"))).unwrap(),
+        ));
+        let vault = MediaVault::open(&paths, Some("u_cache"), MediaVaultConfig::default()).unwrap();
+
+        let url = "https://f10-zpc.zdn.vn/cached_photo.jpg";
+        let url_hash = MediaVault::sha256_url(url);
+        let payload = b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00cached image payload".to_vec();
+        let obj = vault
+            .ingest_bytes(
+                &store,
+                &payload,
+                "image",
+                "image/jpeg",
+                Some(url),
+                Some(("t1", "m1")),
+                Some("cached.jpg"),
+            )
+            .await
+            .unwrap();
+
+        let initial_updated_ts = {
+            let guard = store.lock().await;
+            guard
+                .mark_media_cdn_status(&url_hash, MEDIA_CDN_STATUS_EXPIRED)
+                .unwrap();
+            guard
+                .get_message_media_record("t1", "m1", "primary")
+                .unwrap()
+                .unwrap()
+                .updated_ts
+        };
+
+        // Repeated read-only cache hits for ("t1", "m1") MUST NOT bump updated_ts or clobber EXPIRED!
+        for _ in 0..3 {
+            let hit = vault
+                .try_hit_cache(&store, &url_hash, "image", Some(("t1", "m1")))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(hit.sha256, obj.sha256);
+        }
+        {
+            let guard = store.lock().await;
+            let rec = guard
+                .get_message_media_record("t1", "m1", "primary")
+                .unwrap()
+                .unwrap();
+            assert_eq!(rec.updated_ts, initial_updated_ts);
+            assert_eq!(rec.cdn_status, MEDIA_CDN_STATUS_EXPIRED);
+        }
+
+        // Cache hit for a NEW message ("t1", "m2") referencing the same cached URL creates its link cleanly
+        let hit2 = vault
+            .try_hit_cache(&store, &url_hash, "image", Some(("t1", "m2")))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit2.sha256, obj.sha256);
+        {
+            let guard = store.lock().await;
+            let rec2 = guard
+                .get_message_media_record("t1", "m2", "primary")
+                .unwrap()
+                .unwrap();
+            assert_eq!(rec2.sha256.as_deref(), Some(obj.sha256.as_str()));
+            assert_eq!(rec2.cdn_status, MEDIA_CDN_STATUS_UNKNOWN);
+            assert!(rec2.updated_ts > initial_updated_ts);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cloud_rehydrate_preserves_expired_cdn_and_variant_and_corrupt_local_blob_unblocks() {
+        let dir = test_temp_dir("rehydrate-variant-corrupt");
+        let paths = StoragePaths::from_dir(&dir).unwrap();
+        let store = Arc::new(AsyncMutex::new(
+            MessageStore::open(&paths.history_db(Some("u_reh"))).unwrap(),
+        ));
+        let vault = MediaVault::open(&paths, Some("u_reh"), MediaVaultConfig::default()).unwrap();
+
+        // Prepare a cloud-encrypted blob
+        let payload = b"gallery image payload for variant and expired cdn test".to_vec();
+        let (sha_hex, sha_bytes) = sha256_of(&payload);
+        let cloud_key = [0x77u8; 32];
+        let enc_tmp = vault.next_cloud_tmp_path("gdrive-dl", "tzmb");
+        ChunkedAeadFile::encrypt_bytes_to_file(&payload, &enc_tmp, &cloud_key, &sha_bytes).unwrap();
+
+        let expired_url = "https://f10-zpc.zdn.vn/expired_gallery_item.jpg";
+        let url_hash = MediaVault::sha256_url(expired_url);
+        {
+            let guard = store.lock().await;
+            guard
+                .link_message_media(&MessageMediaRecord {
+                    thread_id: "t1".into(),
+                    msg_id: "m_gal".into(),
+                    variant: "gallery_2".into(),
+                    url_hash: url_hash.clone(),
+                    sha256: Some(sha_hex.clone()),
+                    original_name: Some("gal2.jpg".into()),
+                    saved_user_path: None,
+                    cdn_status: MEDIA_CDN_STATUS_EXPIRED,
+                    updated_ts: 123_456,
+                })
+                .unwrap();
+        }
+
+        let obj = vault
+            .ingest_from_cloud_encrypted_temp(
+                &store,
+                &enc_tmp,
+                &cloud_key,
+                &sha_hex,
+                "image",
+                "image/jpeg",
+                Some(expired_url),
+                Some(("t1", "m_gal", "gallery_2")),
+                Some("gal2.jpg"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(obj.sha256, sha_hex);
+
+        {
+            let guard = store.lock().await;
+            // Exact variant kept EXPIRED status and original updated_ts (not clobbered to OK!)
+            let rec_gal = guard
+                .get_message_media_record("t1", "m_gal", "gallery_2")
+                .unwrap()
+                .unwrap();
+            assert_eq!(rec_gal.cdn_status, MEDIA_CDN_STATUS_EXPIRED);
+            assert_eq!(rec_gal.updated_ts, 123_456);
+            // NO bogus default "primary" row created!
+            assert!(guard
+                .get_message_media_record("t1", "m_gal", "primary")
+                .unwrap()
+                .is_none());
+        }
+
+        // Corrupt the local `.enc` blob on disk -> `prepare_cloud_encrypted_temp` returns Err AND
+        // removes the unreadable local cache file so Step 1 can evict it and upload newer blobs!
+        let local_blob_path = vault
+            .resolve_blob_path(obj.local_rel_path.as_deref().unwrap())
+            .unwrap();
+        assert!(local_blob_path.exists());
+        let mut raw = std::fs::read(&local_blob_path).unwrap();
+        let last = raw.len() - 1;
+        raw[last] ^= 0xFF;
+        std::fs::write(&local_blob_path, &raw).unwrap();
+
+        let out_tmp = vault.next_cloud_tmp_path("gdrive-up", "tzmb");
+        let prep_res = vault
+            .prepare_cloud_encrypted_temp(&obj, &cloud_key, &out_tmp)
+            .await;
+        assert!(prep_res.is_err());
+        assert!(
+            !local_blob_path.exists(),
+            "corrupted local encrypted blob should be unlinked to avoid head-of-line blocking"
+        );
+        assert!(!out_tmp.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn clear_cache_preserves_active_transfer_tmp_files() {
+        let dir = test_temp_dir("clear-cache-tmp-safe");
+        let paths = StoragePaths::from_dir(&dir).unwrap();
+        let store = Arc::new(AsyncMutex::new(
+            MessageStore::open(&paths.history_db(Some("u_tmp"))).unwrap(),
+        ));
+        let vault = MediaVault::open(&paths, Some("u_tmp"), MediaVaultConfig::default()).unwrap();
+
+        let active_up = vault.next_cloud_tmp_path("gdrive-up", "tzmb");
+        let active_dl = vault.next_cloud_tmp_path("gdrive-dl", "tzmb");
+        let active_part = vault.next_tmp_path("dl", "part");
+        let active_rehydrate = vault.next_tmp_path("cloud-rehydrate", "bin");
+        let stale_other = vault.vault_dir().join("tmp").join("orphan-scratch.txt");
+        for p in [
+            &active_up,
+            &active_dl,
+            &active_part,
+            &active_rehydrate,
+            &stale_other,
+        ] {
+            std::fs::write(p, b"in-flight").unwrap();
+        }
+
+        let _ = vault.clear_cache(&store, true).await.unwrap();
+
+        assert!(active_up.exists(), "active gdrive-up temp file must survive clear_cache");
+        assert!(active_dl.exists(), "active gdrive-dl temp file must survive clear_cache");
+        assert!(active_part.exists(), "active dl-*.part temp file must survive clear_cache");
+        assert!(
+            active_rehydrate.exists(),
+            "active cloud-rehydrate temp file must survive clear_cache"
+        );
+        assert!(
+            !stale_other.exists(),
+            "non-transfer scratch file should still be removed by clear_cache"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

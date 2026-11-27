@@ -578,8 +578,8 @@ fn run_video_tx_loop(
     let mut nego_seq: u32 = 1;
 
     let mut next_frame_at = Instant::now();
-    let mut last_rtcp = Instant::now() - Duration::from_secs(2);
-    let mut last_pli = Instant::now() - Duration::from_secs(1);
+    let mut last_rtcp: Option<Instant> = None;
+    let mut last_pli: Option<Instant> = None;
 
     while !stop.load(Ordering::Relaxed) {
         let now = Instant::now();
@@ -671,8 +671,8 @@ fn run_video_tx_loop(
 
         // 3. Periodic compound RTCP SR/RR + SDES + REMB + ZRTP IncallNegotiateInfo (every 2s),
         //    sent for active DirectVideo sessions even when local camera is off (receive-only).
-        if last_rtcp.elapsed() >= Duration::from_secs(2) {
-            last_rtcp = Instant::now();
+        if last_rtcp.is_none_or(|t| t.elapsed() >= Duration::from_secs(2)) {
+            last_rtcp = Some(Instant::now());
             let sr_info = state.rx_state.lock().ok().map(|mut rx| {
                 let peer_ssrc = rx.peer_ssrc;
                 let (lsr, dlsr) = match rx.last_peer_sr {
@@ -714,8 +714,11 @@ fn run_video_tx_loop(
         // 4. Rate-limited PLI when unsynced or after incoming RTP sequence gap (<= 2 Hz),
         //    or immediately on explicit keyframe recovery request (coalesced at >= 50 ms).
         let want_immediate = state.immediate_pli.load(Ordering::Relaxed);
-        let pli_due = (want_immediate && last_pli.elapsed() >= Duration::from_millis(50))
-            || last_pli.elapsed() >= Duration::from_millis(500);
+        let pli_due = last_pli.is_none_or(|t| {
+            let elapsed = t.elapsed();
+            (want_immediate && elapsed >= Duration::from_millis(50))
+                || elapsed >= Duration::from_millis(500)
+        });
         if pli_due {
             let pli_peer = state.rx_state.lock().ok().and_then(|mut rx| {
                 let synced = state.video_synced.load(Ordering::Relaxed);
@@ -736,7 +739,7 @@ fn run_video_tx_loop(
             });
             if let Some(peer_ssrc) = pli_peer {
                 state.immediate_pli.store(false, Ordering::Relaxed);
-                last_pli = Instant::now();
+                last_pli = Some(Instant::now());
                 let rr_pli = build_rtcp_rr_pli(ssrc, peer_ssrc);
                 send_rtcp_wire(&ctx, &rr_pli, &state.tx_errors);
                 state.pli_sent.fetch_add(1, Ordering::Relaxed);

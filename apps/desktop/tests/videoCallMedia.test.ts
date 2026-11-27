@@ -10,6 +10,7 @@ import {
   listBrowserCameras,
   normalizeWebCodecsChunkToAnnexB,
   type LocalCameraStatus,
+  type RemoteKeyframeReason,
 } from "../src/utils/videoCallMedia.ts";
 
 // Valid Constrained Baseline SPS (avc1.42C01E), PPS, IDR, and P-slice NAL units
@@ -543,7 +544,7 @@ test("RemoteH264Renderer gates keyframes, configures SPS codec dynamically, alwa
     () => {
       const dims: Array<[number, number]> = [];
       const errors: string[] = [];
-      const keyframeReasons: Array<"overflow" | "decode_error"> = [];
+      const keyframeReasons: RemoteKeyframeReason[] = [];
       let firstFrameCount = 0;
 
       const renderer = new RemoteH264Renderer({
@@ -1291,7 +1292,7 @@ test("RemoteH264Renderer.pushFrame skips base64 decoding for dropped delta frame
       },
     },
     () => {
-      const keyframeReasons: Array<"overflow" | "decode_error"> = [];
+      const keyframeReasons: RemoteKeyframeReason[] = [];
       const errors: string[] = [];
       const renderer = new RemoteH264Renderer({
         onError: (err) => errors.push(err),
@@ -1443,6 +1444,128 @@ test("LocalCameraEncoder waits for video metadata and falls back to videoEl dime
 
       enc.stop();
       enc.destroy();
+    },
+  );
+});
+
+test("RemoteH264Renderer caches last decoded frame and repaints immediately on canvas reattach", async () => {
+  class FakeOffscreenCanvas {
+    width: number;
+    height: number;
+    drawCount = 0;
+    clearCount = 0;
+    lastSource: unknown = null;
+
+    constructor(width: number, height: number) {
+      this.width = width;
+      this.height = height;
+    }
+
+    getContext(kind: string) {
+      if (kind !== "2d") return null;
+      return {
+        drawImage: (source: unknown) => {
+          this.drawCount += 1;
+          this.lastSource = source;
+        },
+        clearRect: () => {
+          this.clearCount += 1;
+        },
+      };
+    }
+  }
+
+  class ReattachMockDecoder {
+    state: CodecState = "unconfigured";
+    decodeQueueSize = 0;
+    readonly init: VideoDecoderInit;
+
+    constructor(init: VideoDecoderInit) {
+      this.init = init;
+    }
+
+    configure(): void {
+      this.state = "configured";
+    }
+
+    decode(chunk: MockEncodedVideoChunk): void {
+      const vf = new MockVideoFrame(null, {
+        timestamp: chunk.timestamp,
+        displayWidth: 800,
+        displayHeight: 450,
+      });
+      this.init.output(vf as unknown as VideoFrame);
+    }
+
+    reset(): void {
+      this.state = "unconfigured";
+    }
+
+    close(): void {
+      this.state = "closed";
+    }
+  }
+
+  const makeMockCanvas = () => {
+    const draws: Array<{ source: unknown; w: number; h: number }> = [];
+    const canvas = {
+      width: 0,
+      height: 0,
+      getContext: (kind: string) =>
+        kind === "2d"
+          ? {
+              drawImage: (source: unknown, _x: number, _y: number, w: number, h: number) => {
+                draws.push({ source, w, h });
+              },
+              clearRect: () => undefined,
+            }
+          : null,
+    };
+    return { canvas, draws };
+  };
+
+  await withMockedGlobals(
+    {
+      VideoDecoder: ReattachMockDecoder,
+      EncodedVideoChunk: MockEncodedVideoChunk,
+      OffscreenCanvas: FakeOffscreenCanvas,
+    },
+    () => {
+      const keyframeReasons: RemoteKeyframeReason[] = [];
+      const renderer = new RemoteH264Renderer({
+        onKeyframeNeeded: (reason) => keyframeReasons.push(reason),
+      });
+
+      const first = makeMockCanvas();
+      renderer.attachCanvas(first.canvas as unknown as HTMLCanvasElement);
+      // Initial attach before any frame must not trigger keyframe request
+      assert.deepEqual(keyframeReasons, []);
+
+      const keyB64 = encodeBytesToBase64(
+        annexB4(SAMPLE_SPS_BASELINE, SAMPLE_PPS, SAMPLE_IDR),
+      );
+      renderer.pushFrame({ timestamp: 90000, is_keyframe: true, data_b64: keyB64 });
+      assert.equal(first.draws.length, 1);
+
+      // Detach canvas (e.g. remount) and attach a fresh canvas -> immediate cached repaint + PLI request
+      renderer.attachCanvas(null);
+      const second = makeMockCanvas();
+      renderer.attachCanvas(second.canvas as unknown as HTMLCanvasElement);
+      assert.equal(second.canvas.width, 800);
+      assert.equal(second.canvas.height, 450);
+      assert.equal(second.draws.length, 1);
+      assert.ok(second.draws[0].source instanceof FakeOffscreenCanvas);
+      assert.deepEqual(keyframeReasons, ["reattach"]);
+
+      // After reset(), cached frame is cleared so reattaching does not repaint stale frame
+      renderer.reset();
+      renderer.attachCanvas(null);
+      const third = makeMockCanvas();
+      renderer.attachCanvas(third.canvas as unknown as HTMLCanvasElement);
+      assert.equal(third.draws.length, 0);
+      assert.deepEqual(keyframeReasons, ["reattach"]);
+
+      renderer.destroy();
     },
   );
 });

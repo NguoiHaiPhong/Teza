@@ -46,7 +46,7 @@ export interface ImeKeyEventLike {
  *
  * 1. Composes decomposed Hangul Jamo (NFD -> NFC) first via `.normalize("NFC")`.
  * 2. Strips diacritics ONLY on Latin/Vietnamese characters and Latin combining marks.
- * 3. Maps `đ`/`Đ` to `d` and lowercases.
+ * 3. Maps `đ`/`Đ` (and visually identical `ð`/`Ð`) to `d`, lowercases, and collapses whitespace.
  */
 export function normalizeForSearch(input: string): string {
   if (!input) return "";
@@ -55,8 +55,10 @@ export function normalizeForSearch(input: string): string {
     .replace(LATIN_ACCENT_OR_COMBINING_RE, (segment) =>
       segment.normalize("NFD").replace(/[\u0300-\u036F]/g, ""),
     )
-    .replace(/[đĐ]/g, "d")
-    .toLowerCase();
+    .replace(/[đĐðÐ]/g, "d")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 /**
@@ -128,6 +130,23 @@ export function matchesSearchQuery(haystack: string, rawQuery: string): boolean 
     return false;
   }
   return true;
+}
+
+/**
+ * Filters thread/recipient picker items using diacritic-insensitive Vietnamese/Latin
+ * and Korean Hangul/Choseong search against `title` and `id`, applying any optional
+ * result cap *after* filtering so deep matches are never hidden.
+ */
+export function filterThreadsBySearchQuery<T extends { id: string; title: string }>(
+  threads: readonly T[],
+  rawQuery: string,
+  limit?: number,
+): T[] {
+  const q = rawQuery.trim();
+  const matched = q
+    ? threads.filter((t) => matchesSearchQuery(`${t.title ?? ""}\n${t.id ?? ""}`, q))
+    : threads;
+  return limit !== undefined ? matched.slice(0, limit) : [...matched];
 }
 
 /**

@@ -6,17 +6,18 @@
 //! policies (`skip`, `ask`, `send_on_resume`), paces batch sends, and applies bounded
 //! retry backoff on transient errors.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Emitter};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 
 use zalo_core::chat::messaging;
 use zalo_core::chat::parser::format_thread_preview;
 use zalo_core::chat::ThreadKind;
+use zalo_core::media_vault::MediaVault;
 use zalo_core::session::{Session, SessionError};
 use zalo_core::store::{MessageStore, ScheduledMessageDto};
 
@@ -85,6 +86,33 @@ pub fn is_recurring(recurrence: &str) -> bool {
     matches!(
         recurrence.trim().to_ascii_lowercase().as_str(),
         "daily" | "weekly" | "monthly"
+    )
+}
+
+/// Resolve the effective grace window in seconds: honors explicit `0` (strict 0s grace)
+/// and positive values, only falling back to [`DEFAULT_MISFIRE_GRACE_SECS`] if negative.
+pub fn effective_misfire_grace_secs(raw_grace_secs: i64) -> i64 {
+    if raw_grace_secs < 0 {
+        DEFAULT_MISFIRE_GRACE_SECS
+    } else {
+        raw_grace_secs
+    }
+}
+
+/// Evaluate misfire decision for a claimed [`ScheduledMessageDto`].
+/// Always returns [`MisfireDecision::Proceed`] when `item.bypass_misfire == true` ("Gửi ngay"),
+/// honors explicit `misfire_grace_secs == 0`, and measures lateness against canonical `item.send_at_ts`.
+pub fn evaluate_misfire_decision(item: &ScheduledMessageDto, now_ms: i64) -> MisfireDecision {
+    if item.bypass_misfire {
+        return MisfireDecision::Proceed;
+    }
+    let grace_secs = effective_misfire_grace_secs(item.misfire_grace_secs);
+    classify_misfire(
+        item.send_at_ts,
+        now_ms,
+        &item.misfire_policy,
+        grace_secs,
+        &item.recurrence,
     )
 }
 
@@ -190,30 +218,55 @@ fn emit_schedule_updated(app: &AppHandle, updated: Option<&ScheduledMessageDto>)
     }
 }
 
+enum ScheduleStepOutcome {
+    NoNetworkAttempt,
+    Attempted,
+    Unauthenticated,
+    SessionExpired { expected_uid: String, reason: String },
+}
+
 /// Spawn the background scheduled-message worker task.
 ///
-/// On startup it recovers any crash-interrupted `'sending'` rows, then loops using
-/// event-driven waits (`tokio::select!` on `sleep` vs `notify.notified()`) with zero
-/// busy-waiting.
+/// On startup it recovers any crash-interrupted `'sending'` rows (when authenticated), then
+/// loops using event-driven waits (`tokio::select!` on `sleep` vs `notify.notified()`) with
+/// zero busy-waiting. When unauthenticated, it parks cleanly on `notify.notified()` without
+/// claiming due schedules or burning retries.
 pub fn spawn_scheduler(
     app: AppHandle,
     sess_arc: Arc<Mutex<Session>>,
     store_arc: Arc<Mutex<MessageStore>>,
+    media_vault_arc: Arc<RwLock<Arc<MediaVault>>>,
+    gdrive_arc: Arc<crate::GDriveRuntime>,
     notify: Arc<Notify>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         {
-            let now = now_epoch_ms();
-            let store = store_arc.lock().await;
-            let _ = store.recover_stuck_sending_schedules(now);
+            let is_authed = sess_arc.lock().await.is_authenticated();
+            if is_authed {
+                let now = now_epoch_ms();
+                let store = store_arc.lock().await;
+                let _ = store.recover_stuck_sending_schedules(now);
+            }
         }
 
         loop {
-            // Register waiter before querying SQLite so a `notify_changed()` racing with
-            // the query still wakes the loop immediately.
+            // Register waiter before checking auth/SQLite so a `notify_changed()` racing with
+            // the query (e.g. right after QR login) still wakes the loop immediately.
             let notified = notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
+
+            // #3: Never claim due schedules or burn retries while unauthenticated (QR login
+            // calls `notify_changed()`, waking this task cleanly so `misfire_policy` evaluates
+            // against canonical `send_at_ts`).
+            let is_authed = {
+                let sess = sess_arc.lock().await;
+                sess.is_authenticated()
+            };
+            if !is_authed {
+                notified.await;
+                continue;
+            }
 
             let now = now_epoch_ms();
             let next_ts_res = {
@@ -242,6 +295,11 @@ pub fn spawn_scheduler(
                 continue;
             }
 
+            // Re-verify authentication right before atomically claiming due rows.
+            if !sess_arc.lock().await.is_authenticated() {
+                continue;
+            }
+
             let claim_now = now_epoch_ms();
             let due_items = {
                 let store = store_arc.lock().await;
@@ -263,12 +321,69 @@ pub fn spawn_scheduler(
             }
 
             let mut sent_in_batch: usize = 0;
-            for item in due_items {
-                let did_attempt_send =
-                    process_claimed_schedule(&app, &sess_arc, &store_arc, item, sent_in_batch)
-                        .await;
-                if did_attempt_send {
-                    sent_in_batch = sent_in_batch.saturating_add(1);
+            let mut iter = due_items.into_iter();
+            while let Some(item) = iter.next() {
+                match process_claimed_schedule(
+                    &app,
+                    &sess_arc,
+                    &store_arc,
+                    &media_vault_arc,
+                    &gdrive_arc,
+                    item,
+                    sent_in_batch,
+                )
+                .await
+                {
+                    ScheduleStepOutcome::Attempted => {
+                        sent_in_batch = sent_in_batch.saturating_add(1);
+                    }
+                    ScheduleStepOutcome::NoNetworkAttempt => {}
+                    ScheduleStepOutcome::Unauthenticated => {
+                        // Revert any remaining claimed rows in this batch without burning retries.
+                        let remaining: Vec<ScheduledMessageDto> = iter.collect();
+                        if !remaining.is_empty() {
+                            let store = store_arc.lock().await;
+                            for rem in remaining {
+                                let _ = store.revert_scheduled_message_to_pending(&rem.id);
+                            }
+                        }
+                        break;
+                    }
+                    ScheduleStepOutcome::SessionExpired {
+                        expected_uid,
+                        reason,
+                    } => {
+                        // Still same account? Revert any remaining claimed rows BEFORE
+                        // `clear_expired_session_for_app` swaps `store_arc` to anonymous history.db.
+                        let same_account = {
+                            let sess = sess_arc.lock().await;
+                            sess.is_authenticated() && sess.profile.uid == expected_uid
+                        };
+                        if same_account {
+                            let remaining: Vec<ScheduledMessageDto> = iter.collect();
+                            if !remaining.is_empty() {
+                                let reverted: Vec<Option<ScheduledMessageDto>> = {
+                                    let store = store_arc.lock().await;
+                                    remaining
+                                        .into_iter()
+                                        .map(|rem| {
+                                            store
+                                                .revert_scheduled_message_to_pending(&rem.id)
+                                                .ok()
+                                                .flatten()
+                                        })
+                                        .collect()
+                                };
+                                for updated in reverted {
+                                    if updated.is_some() {
+                                        emit_schedule_updated(&app, updated.as_ref());
+                                    }
+                                }
+                            }
+                            crate::clear_expired_session_for_app(&app, reason, true).await;
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -276,28 +391,17 @@ pub fn spawn_scheduler(
 }
 
 /// Process a single atomically-claimed scheduled item.
-/// Returns `true` if a network send was attempted (so pacing applies to the next item).
 async fn process_claimed_schedule(
     app: &AppHandle,
     sess_arc: &Arc<Mutex<Session>>,
     store_arc: &Arc<Mutex<MessageStore>>,
+    media_vault_arc: &Arc<RwLock<Arc<MediaVault>>>,
+    gdrive_arc: &Arc<crate::GDriveRuntime>,
     item: ScheduledMessageDto,
     sent_in_batch: usize,
-) -> bool {
+) -> ScheduleStepOutcome {
     let now = now_epoch_ms();
-    let grace_secs = if item.misfire_grace_secs > 0 {
-        item.misfire_grace_secs
-    } else {
-        DEFAULT_MISFIRE_GRACE_SECS
-    };
-
-    match classify_misfire(
-        item.send_at_ts,
-        now,
-        &item.misfire_policy,
-        grace_secs,
-        &item.recurrence,
-    ) {
+    match evaluate_misfire_decision(&item, now) {
         MisfireDecision::Ask => {
             let updated = {
                 let store = store_arc.lock().await;
@@ -311,7 +415,7 @@ async fn process_claimed_schedule(
                     .flatten()
             };
             emit_schedule_updated(app, updated.as_ref());
-            return false;
+            return ScheduleStepOutcome::NoNetworkAttempt;
         }
         MisfireDecision::Skip { .. } => {
             // `mark_scheduled_message_missed` atomically rolls `skip` + recurring
@@ -329,7 +433,7 @@ async fn process_claimed_schedule(
                     .flatten()
             };
             emit_schedule_updated(app, updated.as_ref());
-            return false;
+            return ScheduleStepOutcome::NoNetworkAttempt;
         }
         MisfireDecision::Proceed => {}
     }
@@ -346,22 +450,20 @@ async fn process_claimed_schedule(
     };
 
     if !sess_snapshot.is_authenticated() {
-        let retry_at = next_retry_ts(item.retry_count, now_epoch_ms());
         let updated = {
             let store = store_arc.lock().await;
             store
-                .fail_or_retry_scheduled_message(
-                    &item.id,
-                    "Chưa đăng nhập tài khoản",
-                    retry_at,
-                    now_epoch_ms(),
-                )
+                .revert_scheduled_message_to_pending(&item.id)
                 .ok()
                 .flatten()
         };
-        emit_schedule_updated(app, updated.as_ref());
-        return false;
+        if updated.is_some() {
+            emit_schedule_updated(app, updated.as_ref());
+        }
+        return ScheduleStepOutcome::Unauthenticated;
     }
+
+    let expected_uid = sess_snapshot.profile.uid.clone();
 
     let kind = if item.thread_kind.trim().is_empty() {
         let store = store_arc.lock().await;
@@ -405,7 +507,7 @@ async fn process_claimed_schedule(
                         .flatten()
                 };
                 emit_schedule_updated(app, updated.as_ref());
-                return false;
+                return ScheduleStepOutcome::NoNetworkAttempt;
             }
         }
     } else {
@@ -423,24 +525,42 @@ async fn process_claimed_schedule(
                     .flatten()
             };
             emit_schedule_updated(app, updated.as_ref());
-            return false;
+            return ScheduleStepOutcome::NoNetworkAttempt;
         }
         messaging::send_text(&sess_snapshot, &item.thread_id, kind, text_trimmed).await
     };
 
+    // #6: Re-check that the active account UID has not changed mid-send before mutating
+    // `store_arc`, ingesting into `media_vault`, emitting UI events, or clearing session.
+    let same_account = {
+        let sess = sess_arc.lock().await;
+        sess.is_authenticated() && sess.profile.uid == expected_uid
+    };
+    if !same_account {
+        eprintln!(
+            "[teza][scheduler] account switched mid-send for schedule {}; aborting DB/UI updates",
+            item.id
+        );
+        return ScheduleStepOutcome::Attempted;
+    }
+
     let finish_now = now_epoch_ms();
     match send_result {
         Ok(msg) => {
+            let fallback_title = Some(item.thread_title.trim()).filter(|s| !s.is_empty());
             let updated_sched = {
                 let mut store = store_arc.lock().await;
                 let _ = store.upsert_message(&msg);
                 let preview = format_thread_preview(&msg.text, true, "", false);
-                let _ = store.update_thread_preview_returning_created(
+                let _ = store.update_thread_preview_with_fallback_kind_and_meta(
                     &msg.thread_id,
                     &preview,
                     msg.ts,
                     false,
                     true,
+                    Some(kind),
+                    fallback_title,
+                    None,
                 );
                 store
                     .complete_scheduled_message(&item.id, finish_now)
@@ -450,19 +570,71 @@ async fn process_claimed_schedule(
             let _ = app.emit("core://message-new", &msg);
             let _ = app.emit("core://threads-updated", ());
             emit_schedule_updated(app, updated_sched.as_ref());
+
+            // #31: Ingest sent attachment into MediaVault and notify Google Drive sync.
+            if !att_trimmed.is_empty() {
+                let src_path = PathBuf::from(att_trimmed);
+                let file_name = src_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .filter(|n| !n.trim().is_empty())
+                    .unwrap_or("attachment.bin")
+                    .to_string();
+                let media_kind = crate::infer_media_kind_for_attachment(&file_name, &msg.msg_type);
+                let mime = crate::infer_mime_from_filename_and_bytes(&file_name, None);
+                let url_opt = msg.attachment_url.clone();
+                let tid = msg.thread_id.clone();
+                let mid = msg.msg_id.clone();
+                let orig_name = msg.attachment_name.clone().or(Some(file_name));
+                let vault = media_vault_arc.read().await.clone();
+                let store_ingest = store_arc.clone();
+                let gdrive_ingest = gdrive_arc.clone();
+                let sess_ingest = sess_arc.clone();
+                let expected_uid_ingest = expected_uid.clone();
+                tokio::spawn(async move {
+                    let still_same = {
+                        let sess = sess_ingest.lock().await;
+                        sess.is_authenticated() && sess.profile.uid == expected_uid_ingest
+                    };
+                    if !still_same {
+                        return;
+                    }
+                    let _ = vault
+                        .ingest_local_file(
+                            &store_ingest,
+                            &src_path,
+                            media_kind,
+                            mime,
+                            url_opt.as_deref(),
+                            Some((tid.as_str(), mid.as_str())),
+                            orig_name.as_deref(),
+                        )
+                        .await;
+                    gdrive_ingest.notify_sync();
+                });
+            }
+            gdrive_arc.notify_sync();
+            ScheduleStepOutcome::Attempted
         }
         Err(err) => {
-            let (err_text, retry_at) = if is_expired_err(&err) {
-                (
-                    "Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.".to_string(),
-                    None,
-                )
-            } else {
-                (
-                    format!("Gửi tin nhắn hẹn giờ thất bại: {err}"),
-                    next_retry_ts(item.retry_count, finish_now),
-                )
-            };
+            if is_expired_err(&err) {
+                // #5: Revert schedule back to 'pending' WITHOUT incrementing retry_count,
+                // BEFORE `clear_expired_session_for_app` swaps `store_arc` to anonymous DB.
+                let updated = {
+                    let store = store_arc.lock().await;
+                    store
+                        .revert_scheduled_message_to_pending(&item.id)
+                        .ok()
+                        .flatten()
+                };
+                emit_schedule_updated(app, updated.as_ref());
+                return ScheduleStepOutcome::SessionExpired {
+                    expected_uid,
+                    reason: "Phiên đăng nhập đã hết hạn. Vui lòng quét lại mã QR.".to_string(),
+                };
+            }
+            let err_text = format!("Gửi tin nhắn hẹn giờ thất bại: {err}");
+            let retry_at = next_retry_ts(item.retry_count, finish_now);
             let updated = {
                 let store = store_arc.lock().await;
                 store
@@ -471,10 +643,9 @@ async fn process_claimed_schedule(
                     .flatten()
             };
             emit_schedule_updated(app, updated.as_ref());
+            ScheduleStepOutcome::Attempted
         }
     }
-
-    true
 }
 
 #[cfg(test)]
@@ -615,5 +786,70 @@ mod tests {
             let woke = tokio::time::timeout(Duration::from_millis(200), notify.notified()).await;
             assert!(woke.is_ok(), "stored notify permit should wake immediately");
         });
+    }
+
+    #[test]
+    fn evaluate_misfire_respects_bypass_and_explicit_zero_grace_secs() {
+        let send_at = 1_700_000_000_000_i64;
+        let base_item = ScheduledMessageDto {
+            id: "sched_1".into(),
+            thread_id: "u_1".into(),
+            thread_title: "User 1".into(),
+            thread_kind: "direct".into(),
+            text: "Hello".into(),
+            attachment_path: String::new(),
+            send_at_ts: send_at,
+            next_attempt_ts: Some(send_at + 120_000),
+            bypass_misfire: false,
+            anchor_day: Some(15),
+            recurrence: "daily".into(),
+            misfire_policy: "ask".into(),
+            misfire_grace_secs: 0,
+            status: "sending".into(),
+            retry_count: 1,
+            last_error: String::new(),
+            created_at: send_at - 60_000,
+            updated_at: send_at,
+            sent_at_ts: 0,
+        };
+
+        // Explicit 0s grace must be honored (NOT overridden to 600s!):
+        // even 1ms late triggers Ask (and lateness is measured against canonical send_at_ts).
+        assert_eq!(effective_misfire_grace_secs(0), 0);
+        assert_eq!(effective_misfire_grace_secs(-1), DEFAULT_MISFIRE_GRACE_SECS);
+        assert_eq!(effective_misfire_grace_secs(30), 30);
+
+        assert_eq!(
+            evaluate_misfire_decision(&base_item, send_at),
+            MisfireDecision::Proceed
+        );
+        assert_eq!(
+            evaluate_misfire_decision(&base_item, send_at + 1),
+            MisfireDecision::Ask
+        );
+
+        let mut skip_zero = base_item.clone();
+        skip_zero.misfire_policy = "skip".into();
+        assert_eq!(
+            evaluate_misfire_decision(&skip_zero, send_at + 1),
+            MisfireDecision::Skip {
+                advance_recurring: true
+            }
+        );
+
+        // bypass_misfire == true ("Gửi ngay") must ALWAYS Proceed regardless of lateness/policy.
+        let mut send_now_item = base_item.clone();
+        send_now_item.bypass_misfire = true;
+        assert_eq!(
+            evaluate_misfire_decision(&send_now_item, send_at + 86_400_000),
+            MisfireDecision::Proceed
+        );
+
+        let mut send_now_skip = skip_zero;
+        send_now_skip.bypass_misfire = true;
+        assert_eq!(
+            evaluate_misfire_decision(&send_now_skip, send_at + 86_400_000),
+            MisfireDecision::Proceed
+        );
     }
 }

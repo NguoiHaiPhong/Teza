@@ -260,6 +260,13 @@ impl RelayConfig {
         if user.len() > 255 {
             bail!("Tài khoản Relay tối đa 255 ký tự");
         }
+        if !upd.clear_password {
+            if let Some(ref pw) = upd.password {
+                if pw.len() > 255 {
+                    bail!("Mật khẩu Relay tối đa 255 ký tự");
+                }
+            }
+        }
 
         self.enabled = upd.enabled;
         self.mode = upd.mode;
@@ -276,9 +283,6 @@ impl RelayConfig {
             self.password.clear();
         } else if let Some(pw) = upd.password {
             if !pw.is_empty() {
-                if pw.len() > 255 {
-                    bail!("Mật khẩu Relay tối đa 255 ký tự");
-                }
                 self.password = pw;
             }
         }
@@ -903,5 +907,31 @@ mod tests {
             "expected CONNECT via configured HTTP relay, got: {req_head}"
         );
         assert!(req_head.contains("Proxy-Authorization: Basic ") || req_head.contains("proxy-authorization: Basic "));
+    }
+
+    #[test]
+    fn apply_update_does_not_mutate_self_when_password_exceeds_limit() {
+        let original = RelayConfig {
+            enabled: true,
+            mode: RelayMode::Socks5,
+            host: "10.7.12.233".into(),
+            port: 1088,
+            username: "orig_user".into(),
+            password: "orig_password".into(),
+            route_webview_media: true,
+        };
+        let mut cfg = original.clone();
+        let res = cfg.apply_update(RelayConfigUpdate {
+            enabled: false,
+            mode: RelayMode::Http,
+            host: "10.0.0.1".into(),
+            port: 8080,
+            username: "new_user".into(),
+            password: Some("x".repeat(256)),
+            clear_password: false,
+            route_webview_media: false,
+        });
+        assert!(res.is_err());
+        assert_eq!(cfg, original, "failed apply_update must leave RelayConfig completely untouched");
     }
 }

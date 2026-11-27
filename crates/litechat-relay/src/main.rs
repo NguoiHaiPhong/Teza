@@ -6,14 +6,16 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{RwLock, Semaphore};
 
@@ -22,6 +24,10 @@ const MAX_CONCURRENT_CONNS: usize = 512;
 const MAX_HTTP_HEADER_BYTES: usize = 8192;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+const OVERALL_CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
+const MAX_CONNECT_ATTEMPTS: usize = 4;
+const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const REPLY_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const SYSTEM_DNS_TIMEOUT: Duration = Duration::from_secs(20);
 const UDP_DNS_TIMEOUT: Duration = Duration::from_secs(3);
 const DNS_CACHE_MAX_ENTRIES: usize = 1024;
@@ -52,11 +58,9 @@ const DEFAULT_ALLOWED_SUFFIXES: &[&str] = &[
     "dlmd.me",
     "mdchat.vn",
     "mdchat.me",
-    // Translation & updater endpoints
+    // Translation (DeepL) & updater / ZeroClaw download endpoints
     "api-free.deepl.com",
     "api.deepl.com",
-    "generativelanguage.googleapis.com",
-    "api.cognitive.microsofttranslator.com",
     "github.com",
     "githubusercontent.com",
 ];
@@ -120,20 +124,161 @@ impl RelayServerConfig {
         if !self.auth_required() {
             return true;
         }
-        constant_time_eq(user.as_bytes(), self.username.as_bytes())
-            && constant_time_eq(pass.as_bytes(), self.password.as_bytes())
+        let user_ok = constant_time_eq(user.as_bytes(), self.username.as_bytes());
+        let pass_ok = constant_time_eq(pass.as_bytes(), self.password.as_bytes());
+        user_ok & pass_ok
     }
 }
 
+/// Pure-Rust FIPS 180-4 SHA-256 used for fixed-length constant-time credential verification
+/// without leaking stored secret length via loop iteration count.
+fn sha256_bytes(chunks: &[&[u8]]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+    let mut state: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+    let total_len: usize = chunks.iter().map(|c| c.len()).sum();
+    let mut padded = Vec::with_capacity(total_len + 72);
+    for c in chunks {
+        padded.extend_from_slice(c);
+    }
+    padded.push(0x80);
+    while (padded.len() % 64) != 56 {
+        padded.push(0);
+    }
+    let bit_len = (total_len as u64).wrapping_mul(8);
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    for block in padded.as_chunks::<64>().0 {
+        let mut w = [0u32; 64];
+        for (i, word) in block.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*word);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+        state[4] = state[4].wrapping_add(e);
+        state[5] = state[5].wrapping_add(f);
+        state[6] = state[6].wrapping_add(g);
+        state[7] = state[7].wrapping_add(h);
+    }
+
+    let mut out = [0u8; 32];
+    for (i, word) in state.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+fn auth_hash_key() -> &'static [u8; 32] {
+    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
+    KEY.get_or_init(|| {
+        let mut key = [0u8; 32];
+        for pair in key.as_chunks_mut::<2>().0 {
+            pair.copy_from_slice(&generate_dns_txid().to_ne_bytes());
+        }
+        key
+    })
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let max_len = a.len().max(b.len());
-    let mut diff: usize = a.len() ^ b.len();
-    for i in 0..max_len {
-        let x = *a.get(i).unwrap_or(&0);
-        let y = *b.get(i).unwrap_or(&0);
-        diff |= usize::from(x ^ y);
+    let key = auth_hash_key();
+    let da = sha256_bytes(&[key, a]);
+    let db = sha256_bytes(&[key, b]);
+    let mut diff = 0u8;
+    for i in 0..32 {
+        diff |= std::hint::black_box(da[i] ^ db[i]);
     }
     diff == 0
+}
+
+fn sanitize_for_log(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_control() {
+            for esc in ch.escape_default() {
+                out.push(esc);
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn is_valid_target_host(host: &str) -> bool {
+    if host.is_empty() || host.len() > 254 {
+        return false;
+    }
+    if host
+        .bytes()
+        .any(|b| !b.is_ascii() || b.is_ascii_control() || b.is_ascii_whitespace())
+    {
+        return false;
+    }
+    let bare_ip = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    if bare_ip.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    // RFC 1123 hostname (allowing optional single trailing root dot)
+    let dns = host.strip_suffix('.').unwrap_or(host);
+    if dns.is_empty() || dns.len() > 253 {
+        return false;
+    }
+    dns.split('.').all(|label| {
+        let bytes = label.as_bytes();
+        !bytes.is_empty()
+            && bytes.len() <= 63
+            && bytes[0].is_ascii_alphanumeric()
+            && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+    })
 }
 
 fn is_forbidden_ip(ip: IpAddr) -> bool {
@@ -148,12 +293,32 @@ fn is_forbidden_ip(ip: IpAddr) -> bool {
                 || v4.is_broadcast()
                 || v4.is_unspecified()
                 || (octets[0] == 100 && (octets[1] & 0xC0) == 64) // CGNAT 100.64.0.0/10
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0) // IETF protocol 192.0.0.0/24
+                || (octets[0] == 198 && (octets[1] & 0xFE) == 18) // Benchmarking 198.18.0.0/15
+                || (octets[0] & 0xF0) == 240 // Reserved 240.0.0.0/4
         }
         IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
+            // Covers both deprecated IPv4-compatible (::/96) and IPv4-mapped (::ffff:0:0/96)
+            if let Some(v4) = v6.to_ipv4() {
                 return is_forbidden_ip(IpAddr::V4(v4));
             }
             let segs = v6.segments();
+            // SIIT IPv4-translated prefix ::ffff:0:0:0/96 (RFC 2765 / RFC 6890)
+            if segs[0] == 0
+                && segs[1] == 0
+                && segs[2] == 0
+                && segs[3] == 0
+                && segs[4] == 0xffff
+                && segs[5] == 0
+            {
+                let v4 = Ipv4Addr::from((u32::from(segs[6]) << 16) | u32::from(segs[7]));
+                return is_forbidden_ip(IpAddr::V4(v4));
+            }
+            // 6to4 prefix 2002::/16 (RFC 3056) embeds IPv4 in segs[1..=2]
+            if segs[0] == 0x2002 {
+                let v4 = Ipv4Addr::from((u32::from(segs[1]) << 16) | u32::from(segs[2]));
+                return is_forbidden_ip(IpAddr::V4(v4));
+            }
             // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052) and local-use 64:ff9b:1::/48 (RFC 8215)
             if segs[0] == 0x0064
                 && segs[1] == 0xff9b
@@ -167,6 +332,8 @@ fn is_forbidden_ip(ip: IpAddr) -> bool {
                 || v6.is_unspecified()
                 || ((segs[0] & 0xfe00) == 0xfc00) // ULA fc00::/7
                 || ((segs[0] & 0xffc0) == 0xfe80) // link-local fe80::/10
+                || ((segs[0] & 0xffc0) == 0xfec0) // deprecated site-local fec0::/10
+                || (segs[0] == 0x2001 && segs[1] == 0x0000) // Teredo 2001::/32
         }
     }
 }
@@ -181,7 +348,7 @@ fn host_matches_suffix(host: &str, suffix: &str) -> bool {
 }
 
 fn is_allowed_target(host: &str, port: u16, cfg: &RelayServerConfig) -> bool {
-    if host.trim().is_empty() || port == 0 {
+    if !is_valid_target_host(host) || port == 0 {
         return false;
     }
     if cfg.allow_all {
@@ -631,7 +798,11 @@ async fn resolve_target_ips(
         match resolve_via_udp_dns(host, &cfg.dns_servers).await {
             Ok(pair) => resolved = Some(pair),
             Err(e) if cfg.verbose => {
-                eprintln!("[DNS-UDP] {host}: {e}; fallback về DNS hệ thống");
+                eprintln!(
+                    "[DNS-UDP] {}: {}; fallback về DNS hệ thống",
+                    sanitize_for_log(host),
+                    sanitize_for_log(&e.to_string())
+                );
             }
             Err(_) => {}
         }
@@ -691,14 +862,144 @@ impl std::fmt::Display for OutboundError {
 
 impl std::error::Error for OutboundError {}
 
+struct ActivityTracker {
+    started: Instant,
+    last_activity_ms: AtomicU64,
+}
+
+impl ActivityTracker {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            last_activity_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        let ms = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        self.last_activity_ms.store(ms, Ordering::Relaxed);
+    }
+
+    fn idle_for(&self) -> Duration {
+        let now_ms = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let last_ms = self.last_activity_ms.load(Ordering::Relaxed);
+        Duration::from_millis(now_ms.saturating_sub(last_ms))
+    }
+}
+
+struct ActivityStream<'a, T> {
+    inner: &'a mut T,
+    tracker: Arc<ActivityTracker>,
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for ActivityStream<'_, T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let res = Pin::new(&mut *self.inner).poll_read(cx, buf);
+        if matches!(res, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            self.tracker.touch();
+        }
+        res
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for ActivityStream<'_, T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let res = Pin::new(&mut *self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = res {
+            if n > 0 {
+                self.tracker.touch();
+            }
+        }
+        res
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
+}
+
+async fn copy_bidirectional_with_idle_timeout<A, B>(
+    a: &mut A,
+    b: &mut B,
+    idle_timeout: Duration,
+) -> std::io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let tracker = Arc::new(ActivityTracker::new());
+    let mut tracked_a = ActivityStream {
+        inner: a,
+        tracker: tracker.clone(),
+    };
+    let mut tracked_b = ActivityStream {
+        inner: b,
+        tracker: tracker.clone(),
+    };
+    let copy_fut = tokio::io::copy_bidirectional_with_sizes(
+        &mut tracked_a,
+        &mut tracked_b,
+        TUNNEL_COPY_BUFFER_BYTES,
+        TUNNEL_COPY_BUFFER_BYTES,
+    );
+    let idle_watchdog = async {
+        loop {
+            let idle = tracker.idle_for();
+            if idle >= idle_timeout {
+                return;
+            }
+            tokio::time::sleep(idle_timeout - idle).await;
+        }
+    };
+    tokio::select! {
+        res = copy_fut => res,
+        _ = idle_watchdog => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "tunnel idle timeout",
+        )),
+    }
+}
+
+fn select_connect_candidates(
+    ips: Vec<IpAddr>,
+    port: u16,
+    allow_private_targets: bool,
+) -> Vec<SocketAddr> {
+    let mut usable: Vec<SocketAddr> = ips
+        .into_iter()
+        .filter(|ip| allow_private_targets || !is_forbidden_ip(*ip))
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect();
+    usable.sort_by_key(|a| if a.is_ipv4() { 0u8 } else { 1u8 });
+    usable.truncate(MAX_CONNECT_ATTEMPTS);
+    usable
+}
+
 async fn connect_outbound(
     host: &str,
     port: u16,
     cfg: &RelayServerConfig,
 ) -> std::result::Result<TcpStream, OutboundError> {
+    let safe_host = sanitize_for_log(host);
     if !is_allowed_target(host, port, cfg) {
         return Err(OutboundError::PolicyDenied(format!(
-            "Target {host}:{port} bị từ chối bởi chính sách relay"
+            "Target {safe_host}:{port} bị từ chối bởi chính sách relay"
         )));
     }
 
@@ -706,23 +1007,24 @@ async fn connect_outbound(
         .await
         .map_err(|e| OutboundError::UpstreamFailed(e.to_string()))?;
 
-    let mut usable: Vec<SocketAddr> = ips
-        .into_iter()
-        .filter(|ip| cfg.allow_private_targets || !is_forbidden_ip(*ip))
-        .map(|ip| SocketAddr::new(ip, port))
-        .collect();
+    let usable = select_connect_candidates(ips, port, cfg.allow_private_targets);
 
     if usable.is_empty() {
         return Err(OutboundError::PolicyDenied(format!(
-            "Địa chỉ IP đích {host}:{port} nằm trong dải nội bộ bị cấm"
+            "Địa chỉ IP đích {safe_host}:{port} nằm trong dải nội bộ bị cấm"
         )));
     }
 
-    usable.sort_by_key(|a| if a.is_ipv4() { 0u8 } else { 1u8 });
-
+    let deadline = tokio::time::Instant::now() + OVERALL_CONNECT_TIMEOUT;
     let mut last_err: Option<String> = None;
     for addr in usable {
-        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            last_err = Some(format!("Hết tổng thời gian kết nối tới {safe_host}:{port}"));
+            break;
+        }
+        let attempt_budget = (deadline - now).min(CONNECT_TIMEOUT);
+        match tokio::time::timeout(attempt_budget, TcpStream::connect(addr)).await {
             Ok(Ok(stream)) => {
                 let _ = stream.set_nodelay(true);
                 return Ok(stream);
@@ -735,14 +1037,15 @@ async fn connect_outbound(
         dns_cache().write().await.remove(&key);
     }
     Err(OutboundError::UpstreamFailed(
-        last_err.unwrap_or_else(|| format!("Không kết nối được tới {host}:{port}")),
+        last_err.unwrap_or_else(|| format!("Không kết nối được tới {safe_host}:{port}")),
     ))
 }
 
 async fn handle_client(client: TcpStream, peer: SocketAddr, cfg: Arc<RelayServerConfig>) -> Result<()> {
     let _ = client.set_nodelay(true);
+    let handshake_deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
     let mut first = [0u8; 1];
-    let n = tokio::time::timeout(HANDSHAKE_TIMEOUT, client.peek(&mut first))
+    let n = tokio::time::timeout_at(handshake_deadline, client.peek(&mut first))
         .await
         .context("Timeout đọc byte đầu")??;
     if n == 0 {
@@ -750,15 +1053,18 @@ async fn handle_client(client: TcpStream, peer: SocketAddr, cfg: Arc<RelayServer
     }
 
     if first[0] == 0x05 {
-        handle_socks5(client, peer, cfg).await
+        handle_socks5(client, peer, cfg, handshake_deadline).await
     } else {
-        handle_http_connect(client, peer, cfg).await
+        handle_http_connect(client, peer, cfg, handshake_deadline).await
     }
 }
 
 async fn reply_and_close(stream: &mut TcpStream, bytes: &[u8]) {
-    let _ = stream.write_all(bytes).await;
-    let _ = stream.shutdown().await;
+    let _ = tokio::time::timeout(REPLY_WRITE_TIMEOUT, async {
+        let _ = stream.write_all(bytes).await;
+        let _ = stream.shutdown().await;
+    })
+    .await;
     // Drain small unread request bytes (e.g. SOCKS5 dst addr or HTTP body) so Windows
     // Winsock does not emit TCP RST on closesocket() before the client reads the reply.
     let mut drain = [0u8; 512];
@@ -769,8 +1075,9 @@ async fn handle_socks5(
     mut client: TcpStream,
     peer: SocketAddr,
     cfg: Arc<RelayServerConfig>,
+    handshake_deadline: tokio::time::Instant,
 ) -> Result<()> {
-    let (host, port) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+    let (host, port) = tokio::time::timeout_at(handshake_deadline, async {
         let mut head = [0u8; 2];
         client.read_exact(&mut head).await?;
         if head[0] != 0x05 {
@@ -851,34 +1158,35 @@ async fn handle_socks5(
     })
     .await??;
 
+    let safe_host = sanitize_for_log(&host);
     let mut outbound = match connect_outbound(&host, port, &cfg).await {
         Ok(stream) => stream,
         Err(OutboundError::PolicyDenied(reason)) => {
-            eprintln!("[RELAY-BLOCKED] {peer} -> {host}:{port}: {reason}");
+            let safe_reason = sanitize_for_log(&reason);
+            eprintln!("[RELAY-BLOCKED] {peer} -> {safe_host}:{port}: {safe_reason}");
             reply_and_close(&mut client, &[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
-            bail!("{reason}");
+            bail!("{safe_reason}");
         }
         Err(OutboundError::UpstreamFailed(reason)) => {
-            eprintln!("[RELAY-ERR] {peer} -> {host}:{port}: {reason}");
+            let safe_reason = sanitize_for_log(&reason);
+            eprintln!("[RELAY-ERR] {peer} -> {safe_host}:{port}: {safe_reason}");
             reply_and_close(&mut client, &[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
-            bail!("{reason}");
+            bail!("{safe_reason}");
         }
     };
 
     if cfg.verbose {
-        eprintln!("[SOCKS5] {peer} -> {host}:{port}");
+        eprintln!("[SOCKS5] {peer} -> {safe_host}:{port}");
     }
 
-    client
-        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .await?;
-    let _ = tokio::io::copy_bidirectional_with_sizes(
-        &mut client,
-        &mut outbound,
-        TUNNEL_COPY_BUFFER_BYTES,
-        TUNNEL_COPY_BUFFER_BYTES,
+    tokio::time::timeout(
+        REPLY_WRITE_TIMEOUT,
+        client.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]),
     )
-    .await;
+    .await
+    .context("Timeout gửi phản hồi SOCKS5 CONNECT")??;
+    let _ = copy_bidirectional_with_idle_timeout(&mut client, &mut outbound, TUNNEL_IDLE_TIMEOUT)
+        .await;
     Ok(())
 }
 
@@ -918,9 +1226,10 @@ async fn handle_http_connect(
     client: TcpStream,
     peer: SocketAddr,
     cfg: Arc<RelayServerConfig>,
+    handshake_deadline: tokio::time::Instant,
 ) -> Result<()> {
     let mut reader = BufReader::new(client);
-    let (host, port, auth_header) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+    let (host, port, auth_header) = tokio::time::timeout_at(handshake_deadline, async {
         let mut remaining = MAX_HTTP_HEADER_BYTES;
         let mut req_buf = Vec::with_capacity(128);
         let req_read = (&mut reader)
@@ -1050,7 +1359,7 @@ async fn handle_http_connect(
                 b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n",
             )
             .await;
-            bail!("Đích CONNECT không hợp lệ: {target}");
+            bail!("Đích CONNECT không hợp lệ: {}", sanitize_for_log(target));
         };
 
         Ok::<_, anyhow::Error>((host, port, auth_header))
@@ -1070,44 +1379,46 @@ async fn handle_http_connect(
         bail!("Sai hoặc thiếu xác thực HTTP CONNECT từ {peer}");
     }
 
+    let safe_host = sanitize_for_log(&host);
     let mut outbound = match connect_outbound(&host, port, &cfg).await {
         Ok(stream) => stream,
         Err(OutboundError::PolicyDenied(reason)) => {
-            eprintln!("[RELAY-BLOCKED] {peer} -> {host}:{port}: {reason}");
+            let safe_reason = sanitize_for_log(&reason);
+            eprintln!("[RELAY-BLOCKED] {peer} -> {safe_host}:{port}: {safe_reason}");
             reply_and_close(
                 reader.get_mut(),
                 b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n",
             )
             .await;
-            bail!("{reason}");
+            bail!("{safe_reason}");
         }
         Err(OutboundError::UpstreamFailed(reason)) => {
-            eprintln!("[RELAY-ERR] {peer} -> {host}:{port}: {reason}");
+            let safe_reason = sanitize_for_log(&reason);
+            eprintln!("[RELAY-ERR] {peer} -> {safe_host}:{port}: {safe_reason}");
             reply_and_close(
                 reader.get_mut(),
                 b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n",
             )
             .await;
-            bail!("{reason}");
+            bail!("{safe_reason}");
         }
     };
 
     if cfg.verbose {
-        eprintln!("[CONNECT] {peer} -> {host}:{port}");
+        eprintln!("[CONNECT] {peer} -> {safe_host}:{port}");
     }
 
-    reader
-        .get_mut()
-        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        .await?;
-    // Keep BufReader around TcpStream so any pipelined bytes read during header parsing are preserved.
-    let _ = tokio::io::copy_bidirectional_with_sizes(
-        &mut reader,
-        &mut outbound,
-        TUNNEL_COPY_BUFFER_BYTES,
-        TUNNEL_COPY_BUFFER_BYTES,
+    tokio::time::timeout(
+        REPLY_WRITE_TIMEOUT,
+        reader
+            .get_mut()
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n"),
     )
-    .await;
+    .await
+    .context("Timeout gửi phản hồi HTTP CONNECT")??;
+    // Keep BufReader around TcpStream so any pipelined bytes read during header parsing are preserved.
+    let _ = copy_bidirectional_with_idle_timeout(&mut reader, &mut outbound, TUNNEL_IDLE_TIMEOUT)
+        .await;
     Ok(())
 }
 
@@ -1280,7 +1591,7 @@ pub async fn run_server(listener: TcpListener, cfg: Arc<RelayServerConfig>) {
             let _permit = permit;
             if let Err(err) = handle_client(stream, peer, cfg_clone.clone()).await {
                 if cfg_clone.verbose {
-                    eprintln!("[ERR] {peer}: {err}");
+                    eprintln!("[ERR] {peer}: {}", sanitize_for_log(&err.to_string()));
                 }
             }
         });
@@ -1328,6 +1639,9 @@ mod tests {
         assert!(is_allowed_target("CHAT.ZALO.ME.", 443, &cfg));
         assert!(is_allowed_target("f10-zpc.zdn.vn", 443, &cfg));
         assert!(is_allowed_target("api-free.deepl.com", 443, &cfg));
+        assert!(!is_allowed_target("opencode.ai", 443, &cfg));
+        assert!(!is_allowed_target("generativelanguage.googleapis.com", 443, &cfg));
+        assert!(!is_allowed_target("api.cognitive.microsofttranslator.com", 443, &cfg));
         assert!(is_allowed_target("objects.githubusercontent.com", 443, &cfg));
         assert!(!is_allowed_target("chat.zalo.me", 80, &cfg));
         assert!(!is_allowed_target("evilzalo.me", 443, &cfg));
@@ -2053,5 +2367,171 @@ mod tests {
         h_up.write_all(connect_closed.as_bytes()).await.unwrap();
         let n = h_up.read(&mut buf).await.unwrap();
         assert!(std::str::from_utf8(&buf[..n]).unwrap().contains("502 Bad Gateway"));
+    }
+
+    #[test]
+    fn is_forbidden_ip_blocks_ipv6_transition_and_reserved_ipv4_ranges() {
+        for forbidden in [
+            // IPv4-compatible ::/96
+            "::127.0.0.1",
+            "::10.0.0.1",
+            "::169.254.169.254",
+            "::192.168.1.1",
+            // SIIT ::ffff:0:0:0/96 with internal embedded IPv4
+            "::ffff:0:127.0.0.1",
+            "::ffff:0:10.7.12.233",
+            "::ffff:0:169.254.169.254",
+            // 6to4 2002::/16 with internal embedded IPv4
+            "2002:7f00:0001::1",
+            "2002:0a00:0001::1",
+            "2002:a9fe:a9fe::1",
+            "2002:c0a8:0101::1",
+            // Deprecated site-local fec0::/10
+            "fec0::1",
+            "feff::1",
+            // Teredo 2001::/32
+            "2001::1",
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            // IPv4 benchmarking 198.18.0.0/15, reserved 240.0.0.0/4, IETF protocol 192.0.0.0/24
+            "198.18.0.1",
+            "198.19.255.254",
+            "240.0.0.1",
+            "254.0.0.1",
+            "192.0.0.1",
+            "192.0.0.254",
+        ] {
+            let ip: IpAddr = forbidden.parse().unwrap();
+            assert!(is_forbidden_ip(ip), "expected forbidden IP: {forbidden}");
+        }
+
+        for allowed in [
+            "1.1.1.1",
+            "198.20.0.1",
+            "192.0.1.1",
+            "::ffff:1.1.1.1",
+            "::ffff:0:1.1.1.1",
+            "2002:0101:0101::1",
+            "2001:4860:4860::8888",
+            "2606:4700:4700::1111",
+        ] {
+            let ip: IpAddr = allowed.parse().unwrap();
+            assert!(!is_forbidden_ip(ip), "expected allowed public IP: {allowed}");
+        }
+    }
+
+    #[test]
+    fn select_connect_candidates_caps_attempts_and_prefers_ipv4() {
+        let ips: Vec<IpAddr> = vec![
+            "2606:4700:4700::1111".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+            "1.1.1.1".parse().unwrap(),
+            "10.0.0.1".parse().unwrap(),
+            "2001:4860:4860::8888".parse().unwrap(),
+            "8.8.8.8".parse().unwrap(),
+            "9.9.9.9".parse().unwrap(),
+            "4.2.2.1".parse().unwrap(),
+            "4.2.2.2".parse().unwrap(),
+        ];
+        let picked = select_connect_candidates(ips, 443, false);
+        assert_eq!(picked.len(), MAX_CONNECT_ATTEMPTS);
+        assert!(picked.iter().all(|a| a.is_ipv4()));
+        assert!(!picked.iter().any(|a| is_forbidden_ip(a.ip())));
+    }
+
+    #[tokio::test]
+    async fn copy_bidirectional_with_idle_timeout_closes_idle_and_keeps_active_alive() {
+        // 1. Silent tunnel times out promptly
+        let (mut a1, _a2) = tokio::io::duplex(256);
+        let (mut b1, _b2) = tokio::io::duplex(256);
+        let started = Instant::now();
+        let err = copy_bidirectional_with_idle_timeout(&mut a1, &mut b1, Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        // 2. Active unidirectional stream stays alive past the idle timeout and completes cleanly
+        let (mut left_srv, mut left_cli) = tokio::io::duplex(256);
+        let (mut right_srv, mut right_cli) = tokio::io::duplex(256);
+        let pump = tokio::spawn(async move {
+            copy_bidirectional_with_idle_timeout(
+                &mut left_srv,
+                &mut right_srv,
+                Duration::from_millis(140),
+            )
+            .await
+        });
+        let sender = tokio::spawn(async move {
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                left_cli.write_all(b"x").await.unwrap();
+            }
+            left_cli.shutdown().await.unwrap();
+        });
+        let mut received = Vec::new();
+        right_cli.read_to_end(&mut received).await.unwrap();
+        drop(right_cli);
+        sender.await.unwrap();
+        assert_eq!(received, b"xxxxx");
+        assert!(pump.await.unwrap().is_ok());
+    }
+
+    #[test]
+    fn sha256_vectors_auth_timing_hostname_validation_and_log_sanitization() {
+        // NIST FIPS 180-4 SHA-256 test vectors
+        let empty_hex: String = sha256_bytes(&[b""])
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            empty_hex,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let abc_hex: String = sha256_bytes(&[b"abc"])
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            abc_hex,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+
+        let cfg = RelayServerConfig {
+            username: "admin".into(),
+            password: "long_secret_password".into(),
+            allow_all: true,
+            ..Default::default()
+        };
+        assert!(cfg.verify_credentials("admin", "long_secret_password"));
+        assert!(!cfg.verify_credentials("wrong", "long_secret_password"));
+        assert!(!cfg.verify_credentials("admin", "short"));
+        assert!(!cfg.verify_credentials("wrong", "short"));
+
+        // Control chars / ANSI escapes / invalid labels rejected even with allow_all=true
+        for bad_host in [
+            "chat.zalo.me\r\nFAKE",
+            "chat.zalo.me\n[RELAY] ok",
+            "chat.zalo.me\x1b[31m",
+            "chat.zalo.me\x00",
+            " chat.zalo.me",
+            "-bad.zalo.me",
+            "bad-.zalo.me",
+            "bad..zalo.me",
+            "bad_host.zalo.me",
+            "chat.zalo.me/path",
+        ] {
+            assert!(
+                !is_allowed_target(bad_host, 443, &cfg),
+                "expected invalid host rejected: {bad_host:?}"
+            );
+        }
+        assert!(is_allowed_target("chat.zalo.me", 443, &cfg));
+        assert!(is_allowed_target("127.0.0.1", 443, &cfg));
+        assert!(is_allowed_target("::1", 443, &cfg));
+
+        let sanitized = sanitize_for_log("evil\r\n\x1b[31m\x00\x7f.zalo.me");
+        assert!(!sanitized.chars().any(char::is_control));
+        assert!(sanitized.contains("\\r"));
+        assert!(sanitized.contains("\\n"));
     }
 }

@@ -1,4 +1,4 @@
-//! Multi-provider message translation (DeepL, Gemini, Azure Translator) with DPAPI-sealed API keys.
+//! Message translation (DeepL) with DPAPI-sealed API keys and local smart-skip heuristics.
 
 use std::path::Path;
 use std::time::Duration;
@@ -15,9 +15,8 @@ use crate::{data_dir, dpapi};
 #[serde(rename_all = "snake_case")]
 pub enum TranslateProvider {
     #[default]
+    #[serde(alias = "opencode_zen", alias = "gemini", alias = "azure")]
     Deepl,
-    Gemini,
-    Azure,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -31,9 +30,15 @@ pub enum TranslateDetectMode {
 pub fn provider_name(p: TranslateProvider) -> &'static str {
     match p {
         TranslateProvider::Deepl => "deepl",
-        TranslateProvider::Gemini => "gemini",
-        TranslateProvider::Azure => "azure",
     }
+}
+
+/// Enforce intranet Relay policy for translation (DeepL is permitted over Relay).
+pub fn check_translate_relay_policy(
+    _provider: TranslateProvider,
+    _relay: &RelayConfig,
+) -> Result<()> {
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -42,10 +47,6 @@ pub struct TranslateConfig {
     pub detect_mode: TranslateDetectMode,
     pub target_lang: String,
     pub deepl_key: String,
-    pub gemini_key: String,
-    pub gemini_model: String,
-    pub azure_key: String,
-    pub azure_region: String,
 }
 
 impl std::fmt::Debug for TranslateConfig {
@@ -56,10 +57,6 @@ impl std::fmt::Debug for TranslateConfig {
             .field("detect_mode", &self.detect_mode)
             .field("target_lang", &self.target_lang)
             .field("deepl_key", &redact(&self.deepl_key))
-            .field("gemini_key", &redact(&self.gemini_key))
-            .field("gemini_model", &self.gemini_model)
-            .field("azure_key", &redact(&self.azure_key))
-            .field("azure_region", &self.azure_region)
             .finish()
     }
 }
@@ -71,44 +68,28 @@ impl Default for TranslateConfig {
             detect_mode: TranslateDetectMode::ApiCache,
             target_lang: "VI".into(),
             deepl_key: String::new(),
-            gemini_key: String::new(),
-            gemini_model: "gemini-2.0-flash".into(),
-            azure_key: String::new(),
-            azure_region: "eastasia".into(),
         }
     }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 struct SealedTranslateFile {
-    #[serde(default)]
-    provider: TranslateProvider,
+    #[serde(default = "default_provider_raw")]
+    provider: String,
     #[serde(default)]
     detect_mode: TranslateDetectMode,
     #[serde(default = "default_target_lang")]
     target_lang: String,
     #[serde(default)]
     sealed_deepl_key: String,
-    #[serde(default)]
-    sealed_gemini_key: String,
-    #[serde(default = "default_gemini_model")]
-    gemini_model: String,
-    #[serde(default)]
-    sealed_azure_key: String,
-    #[serde(default = "default_azure_region")]
-    azure_region: String,
+}
+
+fn default_provider_raw() -> String {
+    "deepl".into()
 }
 
 fn default_target_lang() -> String {
     "VI".into()
-}
-
-fn default_gemini_model() -> String {
-    "gemini-2.0-flash".into()
-}
-
-fn default_azure_region() -> String {
-    "eastasia".into()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -116,26 +97,19 @@ pub struct TranslateConfigSummary {
     pub provider: TranslateProvider,
     pub detect_mode: TranslateDetectMode,
     pub target_lang: String,
-    pub gemini_model: String,
-    pub azure_region: String,
     pub has_deepl_key: bool,
-    pub has_gemini_key: bool,
-    pub has_azure_key: bool,
     pub deepl_preview: String,
-    pub gemini_preview: String,
-    pub azure_preview: String,
 }
 
 #[derive(Clone, Deserialize)]
 pub struct TranslateConfigUpdate {
+    #[serde(default)]
     pub provider: TranslateProvider,
     pub target_lang: String,
     pub detect_mode: Option<TranslateDetectMode>,
     pub deepl_key: Option<String>,
-    pub gemini_key: Option<String>,
-    pub gemini_model: Option<String>,
-    pub azure_key: Option<String>,
-    pub azure_region: Option<String>,
+    #[serde(default)]
+    pub clear_deepl_key: Option<bool>,
 }
 
 impl std::fmt::Debug for TranslateConfigUpdate {
@@ -149,10 +123,7 @@ impl std::fmt::Debug for TranslateConfigUpdate {
             .field("target_lang", &self.target_lang)
             .field("detect_mode", &self.detect_mode)
             .field("deepl_key", &redact_opt(&self.deepl_key))
-            .field("gemini_key", &redact_opt(&self.gemini_key))
-            .field("gemini_model", &self.gemini_model)
-            .field("azure_key", &redact_opt(&self.azure_key))
-            .field("azure_region", &self.azure_region)
+            .field("clear_deepl_key", &self.clear_deepl_key)
             .finish()
     }
 }
@@ -186,19 +157,6 @@ fn mask_key(raw: &str) -> String {
     format!("{prefix}...{suffix}")
 }
 
-fn sanitize_gemini_model_opt(raw: &str) -> Option<String> {
-    let clean: String = raw
-        .trim()
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(*c, '-' | '.' | '_'))
-        .collect();
-    (!clean.is_empty()).then_some(clean)
-}
-
-fn sanitize_gemini_model(raw: &str) -> String {
-    sanitize_gemini_model_opt(raw).unwrap_or_else(default_gemini_model)
-}
-
 impl TranslateConfig {
     pub fn load_from_file(path: &Path) -> Self {
         let Ok(raw) = std::fs::read_to_string(path) else {
@@ -207,8 +165,10 @@ impl TranslateConfig {
         let Ok(file) = serde_json::from_str::<SealedTranslateFile>(&raw) else {
             return Self::default();
         };
+        // Legacy "opencode_zen" / "gemini" / "azure" safely migrate to DeepL without leaking keys.
+        let _ = file.provider;
         Self {
-            provider: file.provider,
+            provider: TranslateProvider::Deepl,
             detect_mode: file.detect_mode,
             target_lang: if file.target_lang.trim().is_empty() {
                 default_target_lang()
@@ -216,23 +176,15 @@ impl TranslateConfig {
                 file.target_lang.trim().to_uppercase()
             },
             deepl_key: dpapi::unprotect_secret(&file.sealed_deepl_key).unwrap_or_default(),
-            gemini_key: dpapi::unprotect_secret(&file.sealed_gemini_key).unwrap_or_default(),
-            gemini_model: sanitize_gemini_model(&file.gemini_model),
-            azure_key: dpapi::unprotect_secret(&file.sealed_azure_key).unwrap_or_default(),
-            azure_region: file.azure_region.trim().to_string(),
         }
     }
 
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
         let payload = SealedTranslateFile {
-            provider: self.provider,
+            provider: provider_name(TranslateProvider::Deepl).to_string(),
             detect_mode: self.detect_mode,
             target_lang: self.target_lang.trim().to_uppercase(),
             sealed_deepl_key: dpapi::protect_secret(self.deepl_key.trim())?,
-            sealed_gemini_key: dpapi::protect_secret(self.gemini_key.trim())?,
-            gemini_model: sanitize_gemini_model(&self.gemini_model),
-            sealed_azure_key: dpapi::protect_secret(self.azure_key.trim())?,
-            azure_region: self.azure_region.trim().to_string(),
         };
         let json = serde_json::to_string_pretty(&payload)?;
         data_dir::write_private_atomic(path, json.as_bytes())
@@ -240,53 +192,29 @@ impl TranslateConfig {
 
     pub fn summary(&self) -> TranslateConfigSummary {
         TranslateConfigSummary {
-            provider: self.provider,
+            provider: TranslateProvider::Deepl,
             detect_mode: self.detect_mode,
             target_lang: self.target_lang.clone(),
-            gemini_model: self.gemini_model.clone(),
-            azure_region: self.azure_region.clone(),
             has_deepl_key: !self.deepl_key.trim().is_empty(),
-            has_gemini_key: !self.gemini_key.trim().is_empty(),
-            has_azure_key: !self.azure_key.trim().is_empty(),
             deepl_preview: mask_key(&self.deepl_key),
-            gemini_preview: mask_key(&self.gemini_key),
-            azure_preview: mask_key(&self.azure_key),
         }
     }
 
     pub fn apply_update(&mut self, upd: TranslateConfigUpdate) {
-        self.provider = upd.provider;
+        self.provider = TranslateProvider::Deepl;
         if let Some(m) = upd.detect_mode {
             self.detect_mode = m;
         }
         if !upd.target_lang.trim().is_empty() {
             self.target_lang = upd.target_lang.trim().to_uppercase();
         }
-        if let Some(k) = upd.deepl_key {
+        if upd.clear_deepl_key == Some(true) {
+            self.deepl_key.clear();
+        } else if let Some(k) = upd.deepl_key {
             let trimmed = k.trim();
             if !trimmed.is_empty() {
                 self.deepl_key = trimmed.to_string();
             }
-        }
-        if let Some(k) = upd.gemini_key {
-            let trimmed = k.trim();
-            if !trimmed.is_empty() {
-                self.gemini_key = trimmed.to_string();
-            }
-        }
-        if let Some(m) = upd.gemini_model {
-            if let Some(clean) = sanitize_gemini_model_opt(&m) {
-                self.gemini_model = clean;
-            }
-        }
-        if let Some(k) = upd.azure_key {
-            let trimmed = k.trim();
-            if !trimmed.is_empty() {
-                self.azure_key = trimmed.to_string();
-            }
-        }
-        if let Some(r) = upd.azure_region {
-            self.azure_region = r.trim().to_string();
         }
     }
 }
@@ -296,53 +224,6 @@ pub fn deepl_endpoint_for_key(key: &str) -> &'static str {
         "https://api-free.deepl.com/v2/translate"
     } else {
         "https://api.deepl.com/v2/translate"
-    }
-}
-
-fn normalize_azure_lang(lang: &str) -> String {
-    match lang.trim().to_ascii_uppercase().as_str() {
-        "EN-US" | "EN-GB" => "en".into(),
-        "ZH" | "ZH-HANS" => "zh-Hans".into(),
-        "ZH-HANT" => "zh-Hant".into(),
-        other => other.to_ascii_lowercase(),
-    }
-}
-
-fn validate_azure_to_lang(target_lang: &str) -> Result<String> {
-    let to_lang = normalize_azure_lang(target_lang);
-    if to_lang.is_empty()
-        || to_lang.len() > 16
-        || !to_lang
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
-        bail!("Mã ngôn ngữ đích Azure không hợp lệ");
-    }
-    Ok(to_lang)
-}
-
-fn build_azure_translate_url(target_lang: &str) -> Result<String> {
-    let to_lang = validate_azure_to_lang(target_lang)?;
-    Ok(format!(
-        "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to={to_lang}"
-    ))
-}
-
-fn target_language_label(code: &str) -> &str {
-    match code.trim().to_ascii_uppercase().as_str() {
-        "VI" => "Vietnamese",
-        "EN" | "EN-US" | "EN-GB" => "English",
-        "JA" => "Japanese",
-        "KO" => "Korean",
-        "ZH" | "ZH-HANS" => "Simplified Chinese",
-        "ZH-HANT" => "Traditional Chinese",
-        "FR" => "French",
-        "DE" => "German",
-        "ES" => "Spanish",
-        "TH" => "Thai",
-        "ID" => "Indonesian",
-        "RU" => "Russian",
-        _ => code,
     }
 }
 
@@ -1498,6 +1379,8 @@ pub async fn translate_api_only_with_relay(
     }
 
     let provider = provider_override.unwrap_or(cfg.provider);
+    check_translate_relay_policy(provider, relay)?;
+
     let target_lang = target_lang_override
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -1513,12 +1396,6 @@ pub async fn translate_api_only_with_relay(
     for chunk in items.chunks(25) {
         let mut part = match provider {
             TranslateProvider::Deepl => translate_deepl(&client, &cfg.deepl_key, chunk, &target_lang).await?,
-            TranslateProvider::Gemini => {
-                translate_gemini(&client, &cfg.gemini_key, &cfg.gemini_model, chunk, &target_lang).await?
-            }
-            TranslateProvider::Azure => {
-                translate_azure(&client, &cfg.azure_key, &cfg.azure_region, chunk, &target_lang).await?
-            }
         };
         part.retain_mut(|r| {
             let Some(orig) = chunk.iter().find(|it| it.msg_id == r.msg_id) else {
@@ -1638,183 +1515,6 @@ async fn translate_deepl(
         .collect())
 }
 
-fn json_id_matches(v: &Value, expected: &str) -> bool {
-    let Some(id_val) = v.get("id") else {
-        return false;
-    };
-    if let Some(s) = id_val.as_str() {
-        return s.trim() == expected;
-    }
-    if let Some(n) = id_val.as_i64() {
-        return n.to_string() == expected;
-    }
-    if let Some(n) = id_val.as_u64() {
-        return n.to_string() == expected;
-    }
-    false
-}
-
-fn has_nonempty_json_id(v: &Value) -> bool {
-    match v.get("id") {
-        None | Some(Value::Null) => false,
-        Some(Value::String(s)) => !s.trim().is_empty(),
-        Some(_) => true,
-    }
-}
-
-fn parse_gemini_results(
-    raw_text: &str,
-    items: &[TranslateInputItem],
-) -> Result<Vec<TranslationResult>> {
-    let parsed: Vec<Value> =
-        serde_json::from_str(raw_text).context("Không parse được JSON phản hồi từ Gemini")?;
-    let mut out = Vec::with_capacity(items.len());
-    for (idx, item) in items.iter().enumerate() {
-        let found = parsed
-            .iter()
-            .find(|v| json_id_matches(v, &item.msg_id))
-            .or_else(|| {
-                if parsed.len() == items.len() {
-                    parsed.get(idx).filter(|v| !has_nonempty_json_id(v))
-                } else {
-                    None
-                }
-            });
-        if let Some(tr) = found {
-            out.push(TranslationResult {
-                msg_id: item.msg_id.clone(),
-                translated_text: tr
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                detected_source_lang: tr
-                    .get("src")
-                    .and_then(Value::as_str)
-                    .map(|s| s.to_ascii_uppercase()),
-                skipped: false,
-            });
-        }
-    }
-    Ok(out)
-}
-
-async fn translate_gemini(
-    client: &Client,
-    api_key: &str,
-    model: &str,
-    items: &[TranslateInputItem],
-    target_lang: &str,
-) -> Result<Vec<TranslationResult>> {
-    let key = api_key.trim();
-    if key.is_empty() {
-        bail!("Chưa cấu hình Gemini API key trong Cài đặt dịch thuật");
-    }
-    let model_name = sanitize_gemini_model(model);
-    let input_json: Vec<Value> = items
-        .iter()
-        .map(|it| json!({ "id": it.msg_id, "text": it.text }))
-        .collect();
-    let lang_name = target_language_label(target_lang);
-    let target_base = normalize_lang_base(target_lang);
-    let prompt = format!(
-        "Translate each object's `text` field naturally into {lang_name} ({target_lang}). If a message's text is already written in {lang_name} ({target_lang}), return its original `text` UNCHANGED (do not paraphrase or rewrite) and set `src` to \"{target_base}\". Preserve emojis, line breaks, and @mentions. Return a JSON array of objects with exact fields: `id` (matching input `id`), `text` (translated string), and `src` (2-letter detected source language code).\nInput:\n{}",
-        serde_json::to_string(&input_json)?
-    );
-
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
-    );
-    let resp = client
-        .post(&url)
-        .header("x-goog-api-key", key)
-        .json(&json!({
-            "contents": [{ "parts": [{ "text": prompt }] }],
-            "generationConfig": {
-                "responseMimeType": "application/json",
-                "temperature": 0.1
-            }
-        }))
-        .send()
-        .await
-        .context("Không kết nối được Gemini API")?;
-
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or(Value::Null);
-    if !status.is_success() {
-        let msg = body
-            .pointer("/error/message")
-            .and_then(Value::as_str)
-            .unwrap_or("Lỗi Gemini API");
-        bail!("Gemini lỗi HTTP {}: {msg}", status.as_u16());
-    }
-
-    let raw_text = body
-        .pointer("/candidates/0/content/parts/0/text")
-        .and_then(Value::as_str)
-        .context("Gemini không trả về nội dung dịch")?;
-    parse_gemini_results(raw_text, items)
-}
-
-async fn translate_azure(
-    client: &Client,
-    api_key: &str,
-    region: &str,
-    items: &[TranslateInputItem],
-    target_lang: &str,
-) -> Result<Vec<TranslationResult>> {
-    let key = api_key.trim();
-    if key.is_empty() {
-        bail!("Chưa cấu hình Azure Translator key trong Cài đặt dịch thuật");
-    }
-    let url = build_azure_translate_url(target_lang)?;
-    let payload: Vec<Value> = items.iter().map(|it| json!({ "Text": it.text })).collect();
-
-    let mut req = client
-        .post(&url)
-        .header("Ocp-Apim-Subscription-Key", key)
-        .json(&payload);
-    if !region.trim().is_empty() {
-        req = req.header("Ocp-Apim-Subscription-Region", region.trim());
-    }
-
-    let resp = req
-        .send()
-        .await
-        .context("Không kết nối được Azure Translator API")?;
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or(Value::Null);
-    if !status.is_success() {
-        let msg = body
-            .pointer("/error/message")
-            .and_then(Value::as_str)
-            .unwrap_or("Lỗi Azure Translator");
-        bail!("Azure lỗi HTTP {}: {msg}", status.as_u16());
-    }
-
-    let arr = body.as_array().context("Phản hồi Azure không hợp lệ")?;
-    Ok(items
-        .iter()
-        .zip(arr.iter())
-        .map(|(item, entry)| {
-            let tr = entry.pointer("/translations/0");
-            TranslationResult {
-                msg_id: item.msg_id.clone(),
-                translated_text: tr
-                    .and_then(|v| v.get("text"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                detected_source_lang: entry
-                    .pointer("/detectedLanguage/language")
-                    .and_then(Value::as_str)
-                    .map(|s| s.to_ascii_uppercase()),
-                skipped: false,
-            }
-        })
-        .collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1844,24 +1544,27 @@ mod tests {
             detect_mode: TranslateDetectMode::LocalSmartSkip,
             target_lang: "VI".into(),
             deepl_key: "secret-deepl-test:fx".into(),
-            gemini_key: "secret-gemini-test".into(),
-            gemini_model: "gemini-2.0-flash".into(),
-            azure_key: "secret-azure-test".into(),
-            azure_region: "southeastasia".into(),
         };
         cfg.save_to_file(&file).unwrap();
 
         let disk = std::fs::read_to_string(&file).unwrap();
         assert!(!disk.contains("secret-deepl-test:fx"));
-        assert!(!disk.contains("secret-gemini-test"));
-        assert!(!disk.contains("secret-azure-test"));
 
         let loaded = TranslateConfig::load_from_file(&file);
+        assert_eq!(loaded.provider, TranslateProvider::Deepl);
         assert_eq!(loaded.detect_mode, TranslateDetectMode::LocalSmartSkip);
         assert_eq!(loaded.deepl_key, "secret-deepl-test:fx");
-        assert_eq!(loaded.gemini_key, "secret-gemini-test");
-        assert_eq!(loaded.azure_key, "secret-azure-test");
-        assert_eq!(loaded.azure_region, "southeastasia");
+
+        // Legacy OpenCode/Gemini/Azure translate files migrate cleanly to DeepL default.
+        let legacy_file = dir.join("translate_legacy.json");
+        std::fs::write(
+            &legacy_file,
+            r#"{"provider":"opencode_zen","target_lang":"VI","sealed_opencode_key":"legacy-secret"}"#,
+        )
+        .unwrap();
+        let migrated = TranslateConfig::load_from_file(&legacy_file);
+        assert_eq!(migrated.provider, TranslateProvider::Deepl);
+        assert!(migrated.deepl_key.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2107,122 +1810,77 @@ mod tests {
     }
 
     #[test]
-    fn parse_gemini_results_never_cross_wires_on_missing_or_numeric_ids() {
-        let items = vec![
-            TranslateInputItem {
-                msg_id: "101".into(),
-                text: "Hello".into(),
-            },
-            TranslateInputItem {
-                msg_id: "102".into(),
-                text: "Goodbye".into(),
-            },
-        ];
-        // When item 101 is omitted, item 102 must NOT fall into 101 by index
-        let partial = r#"[{"id":"102","text":"Tạm biệt","src":"en"}]"#;
-        let partial_res = parse_gemini_results(partial, &items).unwrap();
-        assert_eq!(partial_res.len(), 1);
-        assert_eq!(partial_res[0].msg_id, "102");
-        assert_eq!(partial_res[0].translated_text, "Tạm biệt");
-
-        // Numeric JSON id is also matched cleanly
-        let numeric = r#"[{"id":101,"text":"Xin chào","src":"en"},{"id":102,"text":"Tạm biệt","src":"en"}]"#;
-        let num_res = parse_gemini_results(numeric, &items).unwrap();
-        assert_eq!(num_res.len(), 2);
-        assert_eq!(num_res[0].msg_id, "101");
-        assert_eq!(num_res[1].msg_id, "102");
-
-        // Equal-length response without IDs still matches by position
-        let idless = r#"[{"text":"Xin chào","src":"en"},{"text":"Tạm biệt","src":"en"}]"#;
-        let idless_res = parse_gemini_results(idless, &items).unwrap();
-        assert_eq!(idless_res.len(), 2);
-        assert_eq!(idless_res[0].translated_text, "Xin chào");
-        assert_eq!(idless_res[1].translated_text, "Tạm biệt");
-    }
-
-    #[test]
     fn debug_impls_redact_translation_api_keys() {
         let cfg = TranslateConfig {
-            provider: TranslateProvider::Gemini,
+            provider: TranslateProvider::Deepl,
             detect_mode: TranslateDetectMode::ApiCache,
             target_lang: "VI".into(),
             deepl_key: "secret-deepl-key-xyz:fx".into(),
-            gemini_key: "secret-gemini-key-abc".into(),
-            gemini_model: "gemini-2.0-flash".into(),
-            azure_key: "secret-azure-key-999".into(),
-            azure_region: "southeastasia".into(),
         };
         let cfg_dbg = format!("{cfg:?}");
         assert!(!cfg_dbg.contains("secret-deepl-key-xyz:fx"));
-        assert!(!cfg_dbg.contains("secret-gemini-key-abc"));
-        assert!(!cfg_dbg.contains("secret-azure-key-999"));
         assert!(cfg_dbg.contains("[REDACTED]"));
-        assert!(cfg_dbg.contains("gemini-2.0-flash"));
 
         let upd = TranslateConfigUpdate {
-            provider: TranslateProvider::Azure,
+            provider: TranslateProvider::Deepl,
             target_lang: "EN".into(),
             detect_mode: Some(TranslateDetectMode::LocalSmartSkip),
             deepl_key: Some("upd-deepl-secret".into()),
-            gemini_key: Some("upd-gemini-secret".into()),
-            gemini_model: Some("gemini-2.0-flash".into()),
-            azure_key: Some("upd-azure-secret".into()),
-            azure_region: Some("eastasia".into()),
+            clear_deepl_key: None,
         };
         let upd_dbg = format!("{upd:?}");
         assert!(!upd_dbg.contains("upd-deepl-secret"));
-        assert!(!upd_dbg.contains("upd-gemini-secret"));
-        assert!(!upd_dbg.contains("upd-azure-secret"));
         assert!(upd_dbg.contains("[REDACTED]"));
     }
 
-    #[tokio::test]
-    async fn azure_translate_validates_to_lang_against_query_injection() {
-        assert_eq!(
-            build_azure_translate_url("VI").unwrap(),
-            "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=vi"
-        );
-        assert_eq!(
-            build_azure_translate_url("EN-US").unwrap(),
-            "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=en"
-        );
-        assert_eq!(
-            build_azure_translate_url("ZH-HANS").unwrap(),
-            "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=zh-Hans"
-        );
-        assert_eq!(
-            build_azure_translate_url("sr_Latn").unwrap(),
-            "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=sr_latn"
-        );
+    #[test]
+    fn relay_policy_allows_deepl_translation() {
+        let relay_on = RelayConfig {
+            enabled: true,
+            ..RelayConfig::default()
+        };
+        let relay_off = RelayConfig::default();
+        assert!(check_translate_relay_policy(TranslateProvider::Deepl, &relay_on).is_ok());
+        assert!(check_translate_relay_policy(TranslateProvider::Deepl, &relay_off).is_ok());
+    }
 
-        let too_long = "a".repeat(17);
-        for bad in [
-            "",
-            "   ",
-            "vi&from=en",
-            "en?extra=1",
-            "en#fragment",
-            "en\r\nX-Injected: 1",
-            "vi/../../etc",
-            "en vi",
-            "vi%26from%3Den",
-            too_long.as_str(),
-        ] {
-            assert!(
-                build_azure_translate_url(bad).is_err(),
-                "expected invalid Azure target_lang to be rejected: {bad:?}"
-            );
-        }
+    #[test]
+    fn apply_update_clears_deepl_key_when_requested_and_persists_empty_key() {
+        let dir = std::env::temp_dir().join(format!("litechat-tr-clear-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("translate.json");
 
-        // `translate_azure` must fail immediately before attempting any network I/O
-        let client = Client::new();
-        let items = vec![TranslateInputItem {
-            msg_id: "m1".into(),
-            text: "Hello".into(),
-        }];
-        let err = translate_azure(&client, "dummy-key", "eastasia", &items, "vi&from=en")
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("không hợp lệ"));
+        let mut cfg = TranslateConfig {
+            provider: TranslateProvider::Deepl,
+            detect_mode: TranslateDetectMode::ApiCache,
+            target_lang: "VI".into(),
+            deepl_key: "existing-secret-key:fx".into(),
+        };
+
+        // Omitting clear_deepl_key (legacy JSON payload) preserves existing key when deepl_key is empty/missing.
+        let keep_upd: TranslateConfigUpdate =
+            serde_json::from_str(r#"{"target_lang":"EN","deepl_key":"   "}"#).unwrap();
+        assert_eq!(keep_upd.clear_deepl_key, None);
+        cfg.apply_update(keep_upd);
+        assert_eq!(cfg.target_lang, "EN");
+        assert_eq!(cfg.deepl_key, "existing-secret-key:fx");
+        assert!(cfg.summary().has_deepl_key);
+
+        // Explicit clear_deepl_key = true clears the stored key even if deepl_key is absent.
+        let clear_upd: TranslateConfigUpdate =
+            serde_json::from_str(r#"{"target_lang":"VI","clear_deepl_key":true}"#).unwrap();
+        cfg.apply_update(clear_upd);
+        assert!(cfg.deepl_key.is_empty());
+        assert!(!cfg.summary().has_deepl_key);
+        assert!(cfg.summary().deepl_preview.is_empty());
+
+        // Persisting and reloading keeps the cleared key empty.
+        cfg.save_to_file(&file).unwrap();
+        let reloaded = TranslateConfig::load_from_file(&file);
+        assert!(reloaded.deepl_key.is_empty());
+        assert!(!reloaded.summary().has_deepl_key);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

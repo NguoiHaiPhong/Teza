@@ -29,11 +29,13 @@ export interface CameraDeviceInfo {
 
 export type AvcChunkFormat = "annexb" | "avc";
 
+export type RemoteKeyframeReason = "overflow" | "decode_error" | "reattach";
+
 export interface RemoteH264RendererOptions {
   onDimensions?: (width: number, height: number) => void;
   onError?: (err: string) => void;
   onFirstFrame?: () => void;
-  onKeyframeNeeded?: (reason: "overflow" | "decode_error") => void;
+  onKeyframeNeeded?: (reason: RemoteKeyframeReason) => void;
 }
 
 export interface RemoteH264FrameInput {
@@ -570,6 +572,12 @@ export class RemoteH264Renderer {
   private reportedUnsupported = false;
   private lastRtpTimestamp: number | null = null;
   private unwrappedRtpTicks = 0;
+  private frameCacheCanvas: HTMLCanvasElement | OffscreenCanvas | null = null;
+  private frameCacheCtx:
+    | CanvasRenderingContext2D
+    | OffscreenCanvasRenderingContext2D
+    | null = null;
+  private hasCachedFrame = false;
 
   constructor(options?: RemoteH264RendererOptions) {
     this.options = options ?? {};
@@ -584,8 +592,52 @@ export class RemoteH264Renderer {
     if (this.canvas === canvas) {
       return;
     }
+    const hadPrevCanvas = this.canvas !== null;
     this.canvas = canvas;
     this.ctx = canvas ? canvas.getContext("2d") : null;
+    if (canvas && this.ctx && this.hasEmittedFirstFrame) {
+      const repainted = this.repaintCachedFrame();
+      if (!hadPrevCanvas || !repainted) {
+        this.options.onKeyframeNeeded?.("reattach");
+      }
+    }
+  }
+
+  repaintCachedFrame(): boolean {
+    if (
+      this.destroyed ||
+      !this.hasCachedFrame ||
+      !this.frameCacheCanvas ||
+      !this.canvas ||
+      !this.ctx ||
+      this.lastWidth <= 0 ||
+      this.lastHeight <= 0
+    ) {
+      return false;
+    }
+    try {
+      if (this.canvas.width !== this.lastWidth) {
+        this.canvas.width = this.lastWidth;
+      }
+      if (this.canvas.height !== this.lastHeight) {
+        this.canvas.height = this.lastHeight;
+      }
+      this.ctx.drawImage(
+        this.frameCacheCanvas as CanvasImageSource,
+        0,
+        0,
+        this.lastWidth,
+        this.lastHeight,
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  requestKeyframe(): void {
+    if (this.destroyed) return;
+    this.options.onKeyframeNeeded?.("reattach");
   }
 
   pushFrame(frame: RemoteH264FrameInput): void {
@@ -716,6 +768,7 @@ export class RemoteH264Renderer {
     this.lastRtpTimestamp = null;
     this.unwrappedRtpTicks = 0;
     this.closeDecoder();
+    this.clearFrameCache(false);
     if (this.canvas && this.ctx && typeof this.ctx.clearRect === "function") {
       try {
         this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
@@ -728,8 +781,100 @@ export class RemoteH264Renderer {
   destroy(): void {
     this.destroyed = true;
     this.reset();
+    this.clearFrameCache(true);
     this.canvas = null;
     this.ctx = null;
+  }
+
+  private ensureFrameCache(width: number, height: number): boolean {
+    if (width <= 0 || height <= 0) return false;
+    if (!this.frameCacheCanvas || !this.frameCacheCtx) {
+      const g = globalThis as Record<string, unknown>;
+      const OffscreenCanvasCtor = g.OffscreenCanvas as
+        | (new (w: number, h: number) => OffscreenCanvas)
+        | undefined;
+      if (typeof OffscreenCanvasCtor === "function") {
+        try {
+          const c = new OffscreenCanvasCtor(width, height);
+          const ctx = c.getContext("2d");
+          if (ctx) {
+            this.frameCacheCanvas = c;
+            this.frameCacheCtx = ctx;
+          }
+        } catch {
+          // Fall through to HTMLCanvasElement fallback
+        }
+      }
+      if (!this.frameCacheCanvas) {
+        const doc = g.document as
+          | { createElement?: (tag: string) => HTMLCanvasElement }
+          | undefined;
+        if (doc && typeof doc.createElement === "function") {
+          try {
+            const c = doc.createElement("canvas");
+            c.width = width;
+            c.height = height;
+            const ctx = c.getContext("2d");
+            if (ctx) {
+              this.frameCacheCanvas = c;
+              this.frameCacheCtx = ctx;
+            }
+          } catch {
+            // No offscreen canvas available in headless environment
+          }
+        }
+      }
+    }
+    if (!this.frameCacheCanvas || !this.frameCacheCtx) {
+      return false;
+    }
+    if (this.frameCacheCanvas.width !== width) {
+      this.frameCacheCanvas.width = width;
+    }
+    if (this.frameCacheCanvas.height !== height) {
+      this.frameCacheCanvas.height = height;
+    }
+    return true;
+  }
+
+  private cacheDecodedFrame(
+    videoFrame: VideoFrame,
+    width: number,
+    height: number,
+  ): void {
+    if (!this.ensureFrameCache(width, height) || !this.frameCacheCtx) {
+      return;
+    }
+    try {
+      this.frameCacheCtx.drawImage(videoFrame, 0, 0, width, height);
+      this.hasCachedFrame = true;
+    } catch {
+      this.hasCachedFrame = false;
+    }
+  }
+
+  private clearFrameCache(releaseCanvas: boolean): void {
+    this.hasCachedFrame = false;
+    if (
+      this.frameCacheCanvas &&
+      this.frameCacheCtx &&
+      typeof this.frameCacheCtx.clearRect === "function"
+    ) {
+      try {
+        this.frameCacheCtx.clearRect(
+          0,
+          0,
+          this.frameCacheCanvas.width,
+          this.frameCacheCanvas.height,
+        );
+      } catch {
+        // Ignore clear errors
+      }
+    }
+    if (releaseCanvas) {
+      this.frameCacheCanvas = null;
+      this.frameCacheCtx = null;
+    }
   }
 
   private createDecoder(VideoDecoderCtor: typeof VideoDecoder): void {
@@ -765,6 +910,8 @@ export class RemoteH264Renderer {
         this.lastHeight = height;
         this.options.onDimensions?.(width, height);
       }
+
+      this.cacheDecodedFrame(videoFrame, width, height);
 
       if (this.canvas && this.ctx) {
         if (this.canvas.width !== width) {

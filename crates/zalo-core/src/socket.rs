@@ -59,6 +59,10 @@ pub const CMD_CTRL_PULL_610: u16 = 610;
 
 const PING_SECS: u64 = 15;
 const WS_WRITE_TIMEOUT_SECS: u64 = 10;
+const WS_HANDSHAKE_TIMEOUT_SECS: u64 = 15;
+const WS_AUTH_TIMEOUT_SECS: u64 = 20;
+const WS_IDLE_READ_TIMEOUT_SECS: u64 = 55;
+const MAX_WS_INFLATE_BYTES: usize = 16 * 1024 * 1024;
 const BROWSER_UA: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) ZaloPC/26.10.11 Chrome/122.0.0.0 Electron/29.0.0 Safari/537.36";
 
@@ -244,7 +248,25 @@ fn percent_decode(s: &str) -> String {
 
 type DecompressFn = fn(&[u8]) -> Box<dyn Read + '_>;
 
-fn inflate(buf: &[u8]) -> Result<Vec<u8>> {
+enum BoundedReadError {
+    LimitExceeded,
+    Io(std::io::Error),
+}
+
+fn read_bounded<R: Read>(reader: R, max_bytes: usize) -> std::result::Result<Vec<u8>, BoundedReadError> {
+    let mut out = Vec::new();
+    let limit = (max_bytes as u64).saturating_add(1);
+    reader
+        .take(limit)
+        .read_to_end(&mut out)
+        .map_err(BoundedReadError::Io)?;
+    if out.len() > max_bytes {
+        return Err(BoundedReadError::LimitExceeded);
+    }
+    Ok(out)
+}
+
+fn inflate_with_limit(buf: &[u8], max_bytes: usize) -> Result<Vec<u8>> {
     let attempts: [DecompressFn; 2] = [
         |b| Box::new(flate2::read::GzDecoder::new(b)),
         |b| Box::new(flate2::read::ZlibDecoder::new(b)),
@@ -256,19 +278,30 @@ fn inflate(buf: &[u8]) -> Result<Vec<u8>> {
     };
     let mut last_err = None;
     for idx in order {
-        let mut out = Vec::new();
-        match attempts[idx](buf).read_to_end(&mut out) {
-            Ok(_) if !out.is_empty() => return Ok(out),
+        match read_bounded(attempts[idx](buf), max_bytes) {
+            Ok(out) if !out.is_empty() => return Ok(out),
             Ok(_) => last_err = Some(anyhow!("empty compressed stream")),
-            Err(e) => last_err = Some(anyhow!(e)),
+            Err(BoundedReadError::LimitExceeded) => {
+                bail!("decompressed ws payload exceeds limit ({max_bytes} bytes)");
+            }
+            Err(BoundedReadError::Io(e)) => last_err = Some(anyhow!(e)),
         }
     }
-    let mut out = Vec::new();
-    flate2::read::DeflateDecoder::new(buf).read_to_end(&mut out)?;
+    let out = match read_bounded(flate2::read::DeflateDecoder::new(buf), max_bytes) {
+        Ok(out) => out,
+        Err(BoundedReadError::LimitExceeded) => {
+            bail!("decompressed ws payload exceeds limit ({max_bytes} bytes)");
+        }
+        Err(BoundedReadError::Io(e)) => return Err(anyhow!(e)),
+    };
     if out.is_empty() {
         return Err(last_err.unwrap_or_else(|| anyhow!("empty inflate output")));
     }
     Ok(out)
+}
+
+fn inflate(buf: &[u8]) -> Result<Vec<u8>> {
+    inflate_with_limit(buf, MAX_WS_INFLATE_BYTES)
 }
 
 /// AES-GCM with 16-byte nonce: `iv(16) | aad(16) | ciphertext||tag(16)`.
@@ -383,6 +416,20 @@ fn pull_next_frame(cmd: u16, sub_cmd: u8, req_id: &str, last_id: Value, pre_ids:
     encode_frame(cmd, sub_cmd, 1, Some(&data))
 }
 
+fn compute_backoff_after_run(
+    current_backoff: u64,
+    is_clean_disconnect: bool,
+    reached_authed: bool,
+) -> (u64, u64) {
+    let sleep_secs = if is_clean_disconnect || reached_authed {
+        2
+    } else {
+        current_backoff
+    };
+    let next_backoff = (sleep_secs * 2).min(30);
+    (sleep_secs, next_backoff)
+}
+
 /// Spawn background `zpw_ws` loop. Dropping the returned receiver terminates the loop.
 pub fn spawn(sess: Session) -> mpsc::UnboundedReceiver<WsSignal> {
     let (tx, rx) = mpsc::unbounded_channel();
@@ -390,13 +437,20 @@ pub fn spawn(sess: Session) -> mpsc::UnboundedReceiver<WsSignal> {
         let mut backoff = 2u64;
         let mut endpoint_idx = 0usize;
         loop {
-            if endpoint_idx == 0 {
-                let _ = tx.send(WsSignal::Status(WsStatus::Connecting));
+            if tx.is_closed() {
+                break;
             }
-            match run_once(&sess, &tx, endpoint_idx).await {
-                Ok(WsRunOutcome::Disconnected) => {
-                    backoff = 2;
-                }
+            if endpoint_idx == 0 && tx.send(WsSignal::Status(WsStatus::Connecting)).is_err() {
+                break;
+            }
+            let mut reached_authed = false;
+            let run_res = tokio::select! {
+                biased;
+                _ = tx.closed() => break,
+                res = run_once(&sess, &tx, endpoint_idx, &mut reached_authed) => res,
+            };
+            let is_clean_disconnect = match run_res {
+                Ok(WsRunOutcome::Disconnected) => true,
                 Ok(WsRunOutcome::Expired { code, message }) => {
                     let _ = tx.send(WsSignal::Expired { code, message });
                     break;
@@ -404,15 +458,20 @@ pub fn spawn(sess: Session) -> mpsc::UnboundedReceiver<WsSignal> {
                 Ok(WsRunOutcome::UntrustedHost) => {
                     break;
                 }
-                Err(_) => {}
-            }
-            if tx.is_closed() {
+                Err(_) => false,
+            };
+            if tx.send(WsSignal::Status(WsStatus::Reconnecting)).is_err() {
                 break;
             }
-            let _ = tx.send(WsSignal::Status(WsStatus::Reconnecting));
+            let (sleep_secs, next_backoff) =
+                compute_backoff_after_run(backoff, is_clean_disconnect, reached_authed);
+            backoff = next_backoff;
             endpoint_idx = endpoint_idx.wrapping_add(1);
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
-            backoff = (backoff * 2).min(30);
+            tokio::select! {
+                biased;
+                _ = tx.closed() => break,
+                _ = tokio::time::sleep(Duration::from_secs(sleep_secs)) => {}
+            }
         }
     });
     rx
@@ -422,6 +481,7 @@ async fn run_once(
     sess: &Session,
     tx: &mpsc::UnboundedSender<WsSignal>,
     endpoint_idx: usize,
+    reached_authed: &mut bool,
 ) -> Result<WsRunOutcome> {
     let url = build_ws_url(sess, endpoint_idx);
     if !crate::session::is_allowed_zalo_ws_url(&url) {
@@ -449,12 +509,36 @@ async fn run_once(
             .to_string();
         let port = parsed.port_or_known_default().unwrap_or(443);
         let tls_stream = sess.relay.connect_tls(&host, port).await?;
-        let (ws, _resp) = tokio_tungstenite::client_async(req, tls_stream).await?;
-        ws_loop(ws, tx).await
+        let (ws, _resp) = tokio::time::timeout(
+            Duration::from_secs(WS_HANDSHAKE_TIMEOUT_SECS),
+            tokio_tungstenite::client_async(req, tls_stream),
+        )
+        .await
+        .map_err(|_| anyhow!("ws relay upgrade timeout"))??;
+        ws_loop(ws, tx, reached_authed).await
     } else {
-        let (ws, _resp) = connect_async(req).await?;
-        ws_loop(ws, tx).await
+        let (ws, _resp) = tokio::time::timeout(
+            Duration::from_secs(WS_HANDSHAKE_TIMEOUT_SECS),
+            connect_async(req),
+        )
+        .await
+        .map_err(|_| anyhow!("ws connect timeout"))??;
+        ws_loop(ws, tx, reached_authed).await
     }
+}
+
+fn is_ws_liveness_expired(
+    authed: bool,
+    connected_elapsed: Duration,
+    last_rx_elapsed: Duration,
+) -> Option<&'static str> {
+    if !authed && connected_elapsed >= Duration::from_secs(WS_AUTH_TIMEOUT_SECS) {
+        return Some("ws auth handshake timeout");
+    }
+    if authed && last_rx_elapsed >= Duration::from_secs(WS_IDLE_READ_TIMEOUT_SECS) {
+        return Some("ws server read timeout (zombie connection)");
+    }
+    None
 }
 
 fn unwrap_data_str(mut v: Value) -> Value {
@@ -471,9 +555,36 @@ fn unwrap_data_str(mut v: Value) -> Value {
     v
 }
 
+async fn send_ws_with_timeout_dur<S>(
+    ws: &mut WebSocketStream<S>,
+    msg: Message,
+    timeout: Duration,
+    label: &'static str,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::time::timeout(timeout, ws.send(msg))
+        .await
+        .map_err(|_| anyhow!("ws {label} write timeout"))??;
+    Ok(())
+}
+
+async fn send_ws_with_timeout<S>(
+    ws: &mut WebSocketStream<S>,
+    msg: Message,
+    label: &'static str,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    send_ws_with_timeout_dur(ws, msg, Duration::from_secs(WS_WRITE_TIMEOUT_SECS), label).await
+}
+
 async fn ws_loop<S>(
     mut ws: WebSocketStream<S>,
     tx: &mpsc::UnboundedSender<WsSignal>,
+    reached_authed: &mut bool,
 ) -> Result<WsRunOutcome>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -481,6 +592,8 @@ where
     let mut cipher_key: Option<Vec<u8>> = None;
     let mut authed = false;
     let mut req_id = 0u64;
+    let connected_at = tokio::time::Instant::now();
+    let mut last_rx_at = connected_at;
 
     let mut ping = tokio::time::interval(Duration::from_secs(PING_SECS));
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -488,16 +601,22 @@ where
 
     loop {
         tokio::select! {
+            biased;
+            _ = tx.closed() => {
+                return Ok(WsRunOutcome::Disconnected);
+            }
             _ = ping.tick() => {
+                if let Some(reason) = is_ws_liveness_expired(
+                    authed,
+                    connected_at.elapsed(),
+                    last_rx_at.elapsed(),
+                ) {
+                    bail!("{reason}");
+                }
                 if authed {
                     let body = json!({ "eventId": now_ms() });
                     let f = encode_frame(CMD_PING, SUB_KEEP_CONNECTION, 1, Some(&body));
-                    tokio::time::timeout(
-                        Duration::from_secs(WS_WRITE_TIMEOUT_SECS),
-                        ws.send(Message::Binary(f)),
-                    )
-                    .await
-                    .map_err(|_| anyhow!("ws ping write timeout"))??;
+                    send_ws_with_timeout(&mut ws, Message::Binary(f), "ping").await?;
                 }
             }
             incoming = ws.next() => {
@@ -505,10 +624,14 @@ where
                     return Ok(WsRunOutcome::Disconnected);
                 };
                 let incoming = incoming?;
+                last_rx_at = tokio::time::Instant::now();
                 let buf = match incoming {
                     Message::Binary(b) => b,
                     Message::Ping(p) => {
-                        ws.send(Message::Pong(p)).await?;
+                        if tx.is_closed() {
+                            return Ok(WsRunOutcome::Disconnected);
+                        }
+                        send_ws_with_timeout(&mut ws, Message::Pong(p), "pong").await?;
                         continue;
                     }
                     Message::Close(_) => return Ok(WsRunOutcome::Disconnected),
@@ -540,13 +663,34 @@ where
                         bail!("ws auth rejected: {}", truncate(&auth.to_string(), 200));
                     }
                     authed = true;
-                    let _ = tx.send(WsSignal::Status(WsStatus::Connected));
-                    let _ = tx.send(WsSignal::Event(WsEvent { cmd, sub_cmd, version, payload: auth.clone() }));
+                    *reached_authed = true;
+                    if tx.send(WsSignal::Status(WsStatus::Connected)).is_err() {
+                        return Ok(WsRunOutcome::Disconnected);
+                    }
+                    if tx
+                        .send(WsSignal::Event(WsEvent {
+                            cmd,
+                            sub_cmd,
+                            version,
+                            payload: auth.clone(),
+                        }))
+                        .is_err()
+                    {
+                        return Ok(WsRunOutcome::Disconnected);
+                    }
 
                     for (qcmd, qsub) in queues_from_auth(&auth) {
+                        if tx.is_closed() {
+                            return Ok(WsRunOutcome::Disconnected);
+                        }
                         let id = format!("req_{req_id}");
                         req_id += 1;
-                        ws.send(Message::Binary(pull_frame(qcmd, qsub, &id))).await?;
+                        send_ws_with_timeout(
+                            &mut ws,
+                            Message::Binary(pull_frame(qcmd, qsub, &id)),
+                            "pull",
+                        )
+                        .await?;
                     }
                     continue;
                 }
@@ -564,6 +708,10 @@ where
                 };
                 let payload = unwrap_data_str(raw_payload);
 
+                if tx.is_closed() {
+                    return Ok(WsRunOutcome::Disconnected);
+                }
+
                 if cmd == CMD_HAS_MSG {
                     if let (Some(qid), Some(ids)) = (
                         payload.pointer("/data/queueId").cloned(),
@@ -580,7 +728,12 @@ where
                             "lastId": "1",
                             "reqId": id,
                         });
-                        let _ = ws.send(Message::Binary(encode_frame(CMD_GET_MSG, 0, 1, Some(&get_req)))).await;
+                        send_ws_with_timeout(
+                            &mut ws,
+                            Message::Binary(encode_frame(CMD_GET_MSG, 0, 1, Some(&get_req))),
+                            "get_msg",
+                        )
+                        .await?;
                     }
                 }
 
@@ -597,7 +750,12 @@ where
                         .unwrap_or_else(|| json!([]));
                     let id = format!("req_{req_id}");
                     req_id += 1;
-                    let _ = ws.send(Message::Binary(pull_next_frame(cmd, sub_cmd, &id, last_id, pre_ids))).await;
+                    send_ws_with_timeout(
+                        &mut ws,
+                        Message::Binary(pull_next_frame(cmd, sub_cmd, &id, last_id, pre_ids)),
+                        "pull_next",
+                    )
+                    .await?;
                 }
 
                 if tx.send(WsSignal::Event(WsEvent { cmd, sub_cmd, version, payload })).is_err() {
@@ -809,5 +967,225 @@ mod tests {
             }),
         };
         assert!(!empty_ev.has_chat_message_payload());
+    }
+
+    #[test]
+    fn ws_liveness_detects_auth_hang_and_zombie_relay_connections() {
+        assert_eq!(
+            is_ws_liveness_expired(false, Duration::from_secs(5), Duration::from_secs(5)),
+            None
+        );
+        assert!(is_ws_liveness_expired(false, Duration::from_secs(21), Duration::from_secs(21)).is_some());
+        assert_eq!(
+            is_ws_liveness_expired(true, Duration::from_secs(120), Duration::from_secs(30)),
+            None
+        );
+        assert!(is_ws_liveness_expired(true, Duration::from_secs(120), Duration::from_secs(55)).is_some());
+    }
+
+    #[test]
+    fn inflate_rejects_oversized_gzip_zlib_and_deflate_payloads() {
+        let big = vec![0u8; MAX_WS_INFLATE_BYTES + 1024];
+
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut gz, &big).unwrap();
+        let gz_bytes = gz.finish().unwrap();
+        let gz_err = inflate(&gz_bytes).unwrap_err().to_string();
+        assert!(gz_err.contains("exceeds limit"), "unexpected gz err: {gz_err}");
+
+        let mut zl = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut zl, &big).unwrap();
+        let zl_bytes = zl.finish().unwrap();
+        let zl_err = inflate(&zl_bytes).unwrap_err().to_string();
+        assert!(zl_err.contains("exceeds limit"), "unexpected zlib err: {zl_err}");
+        let b64_err = decrypt_payload(None, 1, &B64.encode(&zl_bytes))
+            .unwrap_err()
+            .to_string();
+        assert!(b64_err.contains("exceeds limit"), "unexpected decrypt_payload err: {b64_err}");
+
+        let mut df = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut df, &big).unwrap();
+        let df_bytes = df.finish().unwrap();
+        let df_err = inflate(&df_bytes).unwrap_err().to_string();
+        assert!(df_err.contains("exceeds limit"), "unexpected deflate err: {df_err}");
+
+        // Exact boundary passes, boundary + 1 fails
+        let mut exact_enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut exact_enc, &[b'A'; 64]).unwrap();
+        let exact_bytes = exact_enc.finish().unwrap();
+        assert_eq!(inflate_with_limit(&exact_bytes, 64).unwrap().len(), 64);
+        assert!(inflate_with_limit(&exact_bytes, 63).is_err());
+    }
+
+    #[test]
+    fn backoff_resets_after_error_terminated_authed_session() {
+        let mut backoff = 2u64;
+        let mut sleeps = Vec::new();
+        for _ in 0..5 {
+            let (s, next) = compute_backoff_after_run(backoff, false, false);
+            sleeps.push(s);
+            backoff = next;
+        }
+        assert_eq!(sleeps, vec![2, 4, 8, 16, 30]);
+        assert_eq!(backoff, 30);
+
+        // Error-terminated session that previously reached authed=true MUST reset sleep to 2s
+        let (sleep_after_healthy_err, next_after_healthy_err) =
+            compute_backoff_after_run(backoff, false, true);
+        assert_eq!(sleep_after_healthy_err, 2);
+        assert_eq!(next_after_healthy_err, 4);
+
+        // Clean disconnect also resets to 2s
+        let (sleep_clean, next_clean) = compute_backoff_after_run(30, true, false);
+        assert_eq!(sleep_clean, 2);
+        assert_eq!(next_clean, 4);
+    }
+
+    #[tokio::test]
+    async fn send_ws_with_timeout_times_out_on_stalled_transport() {
+        let (client_io, server_io) = tokio::io::duplex(64);
+        let server_task = tokio::spawn(async move {
+            tokio_tungstenite::accept_async(server_io).await.unwrap()
+        });
+        let (mut client_ws, _) =
+            tokio_tungstenite::client_async("ws://localhost/", client_io)
+                .await
+                .unwrap();
+        // Hold server stream open without reading so client duplex buffer fills and blocks writes.
+        let _server_ws = server_task.await.unwrap();
+
+        let big_msg = Message::Binary(vec![0xAB; 4096]);
+        let err = send_ws_with_timeout_dur(
+            &mut client_ws,
+            big_msg,
+            Duration::from_millis(80),
+            "pull",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("ws pull write timeout"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_loop_exits_on_dropped_rx_without_sending_auth_pulls_and_propagates_write_errors() {
+        // 1. Idle ws_loop exits immediately when rx is dropped (no server frames needed).
+        {
+            let (client_io, server_io) = tokio::io::duplex(4096);
+            let srv = tokio::spawn(async move {
+                tokio_tungstenite::accept_async(server_io).await.unwrap()
+            });
+            let (client_ws, _) = tokio_tungstenite::client_async("ws://localhost/", client_io)
+                .await
+                .unwrap();
+            let _server_ws = srv.await.unwrap();
+
+            let (tx, rx) = mpsc::unbounded_channel();
+            drop(rx);
+            let mut reached_authed = false;
+            let outcome = tokio::time::timeout(
+                Duration::from_millis(300),
+                ws_loop(client_ws, &tx, &mut reached_authed),
+            )
+            .await
+            .expect("ws_loop must exit promptly once rx is dropped")
+            .unwrap();
+            assert!(matches!(outcome, WsRunOutcome::Disconnected));
+            assert!(!reached_authed);
+        }
+
+        // 2. CMD_AUTHEN with dropped rx MUST NOT send any pull frames.
+        {
+            let (client_io, server_io) = tokio::io::duplex(4096);
+            let srv = tokio::spawn(async move {
+                let mut server_ws = tokio_tungstenite::accept_async(server_io).await.unwrap();
+                let auth_body = json!({
+                    "error_code": 0,
+                    "data": { "qCmds": [{ "cmd": 510, "subCmd": 0 }] }
+                });
+                let auth_envelope = json!({
+                    "encrypt": 0,
+                    "data": auth_body.to_string()
+                });
+                let frame = encode_frame(CMD_AUTHEN, 0, 1, Some(&auth_envelope));
+                server_ws.send(Message::Binary(frame)).await.unwrap();
+                // Wait briefly to confirm client sends no pull frame before closing.
+                tokio::time::timeout(Duration::from_millis(120), server_ws.next()).await
+            });
+            let (client_ws, _) = tokio_tungstenite::client_async("ws://localhost/", client_io)
+                .await
+                .unwrap();
+
+            let (tx, rx) = mpsc::unbounded_channel();
+            // Keep rx alive briefly until client is inside ws_loop, wait: dropping rx right now
+            // exercises the biased select / CMD_AUTHEN guard cleanly.
+            drop(rx);
+            let mut reached_authed = false;
+            let outcome = ws_loop(client_ws, &tx, &mut reached_authed).await.unwrap();
+            assert!(matches!(outcome, WsRunOutcome::Disconnected));
+            let srv_seen = srv.await.unwrap();
+            assert!(
+                !matches!(srv_seen, Ok(Some(Ok(Message::Binary(_))))),
+                "dead consumer must never emit pull_frame to server"
+            );
+        }
+
+        // 3. Authenticated session sets reached_authed=true and propagates CMD_GET_MSG write errors.
+        {
+            let (client_io, server_io) = tokio::io::duplex(4096);
+            let srv = tokio::spawn(async move {
+                let mut server_ws = tokio_tungstenite::accept_async(server_io).await.unwrap();
+                let auth_body = json!({
+                    "error_code": 0,
+                    "data": { "qCmds": [] }
+                });
+                let auth_envelope = json!({
+                    "encrypt": 0,
+                    "data": auth_body.to_string()
+                });
+                server_ws
+                    .send(Message::Binary(encode_frame(
+                        CMD_AUTHEN,
+                        0,
+                        1,
+                        Some(&auth_envelope),
+                    )))
+                    .await
+                    .unwrap();
+                let has_msg = json!({
+                    "encrypt": 0,
+                    "data": { "queueId": "q1", "ids": [1, 2] }
+                });
+                server_ws
+                    .send(Message::Binary(encode_frame(
+                        CMD_HAS_MSG,
+                        0,
+                        1,
+                        Some(&has_msg),
+                    )))
+                    .await
+                    .unwrap();
+                // Immediately drop server stream so client's CMD_GET_MSG write hits broken pipe.
+                drop(server_ws);
+            });
+            let (client_ws, _) = tokio_tungstenite::client_async("ws://localhost/", client_io)
+                .await
+                .unwrap();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let mut reached_authed = false;
+            let res = ws_loop(client_ws, &tx, &mut reached_authed).await;
+            srv.await.unwrap();
+            assert!(reached_authed, "reached_authed must be recorded after CMD_AUTHEN");
+            assert!(
+                res.is_err(),
+                "CMD_HAS_MSG -> CMD_GET_MSG write failure must propagate as Err instead of being swallowed"
+            );
+            assert!(matches!(
+                rx.try_recv().ok(),
+                Some(WsSignal::Status(WsStatus::Connected))
+            ));
+        }
     }
 }

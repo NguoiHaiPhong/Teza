@@ -5,7 +5,9 @@ import type {
   NotifyPosition,
   NotifyPreviewMode,
   ThreadDto,
+  ThreadKind,
 } from "../types.ts";
+import { matchBlockedStickerRule, type BlockedStickerRule } from "./blockedStickers.ts";
 import { tokenizeMentions } from "./mentions.ts";
 
 const PREFS_STORAGE_KEY = "teza.notifyPrefs";
@@ -129,15 +131,24 @@ export function isMessageMentioningMe(
   msg: MessageDto,
   myUid: string,
   myName: string,
+  options?: boolean | { allowAll?: boolean; threadKind?: ThreadKind },
 ): boolean {
   const normalizedUid = myUid.trim();
   const cleanName = myName.trim();
+  const allowAll =
+    typeof options === "boolean"
+      ? options
+      : options?.allowAll !== undefined
+        ? options.allowAll
+        : options?.threadKind !== undefined
+          ? options.threadKind === "group"
+          : true;
   const candidates =
     normalizedUid && cleanName ? [{ id: normalizedUid, name: cleanName }] : [];
-  const tokens = tokenizeMentions(msg.text || "", candidates);
+  const tokens = tokenizeMentions(msg.text || "", candidates, { allowAll });
   for (const tok of tokens) {
     if (tok.kind !== "mention") continue;
-    if (tok.isAll) return true;
+    if (allowAll && tok.isAll) return true;
     if (normalizedUid && tok.userId === normalizedUid) return true;
   }
   const quotedSender = (msg.quote?.sender_name || "").normalize("NFC").trim().toLowerCase();
@@ -153,6 +164,25 @@ export function isMessageMentioningMe(
   return false;
 }
 
+/**
+ * Decide whether an incoming message should trigger a notification/sound/buzz.
+ *
+ * - `is_live === true` (real-time server push) always qualifies regardless of local PC clock drift
+ *   (critical on offline intranet Relay workstations without NTP).
+ * - `is_live === false` (duplicate or already-read message) is always suppressed.
+ * - Otherwise falls back to a recency window compensated by the observed server clock offset.
+ */
+export function isMessageRecentForNotification(
+  msg: Pick<MessageDto, "ts" | "is_live">,
+  nowMs = Date.now(),
+  serverClockOffsetMs = 0,
+  windowMs = 90_000,
+): boolean {
+  if (msg.is_live === true) return true;
+  if (msg.is_live === false) return false;
+  return Math.abs(nowMs + serverClockOffsetMs - msg.ts) < windowMs;
+}
+
 export function shouldNotifyMessage(params: {
   msg: MessageDto;
   thread?: ThreadDto;
@@ -162,10 +192,26 @@ export function shouldNotifyMessage(params: {
   myUid: string;
   myName: string;
   nowMs?: number;
+  blockedStickerRules?: readonly BlockedStickerRule[];
 }): { showPopup: boolean; playSound: boolean } {
-  const { msg, thread, isActiveThread, windowFocused, prefs, myUid, myName, nowMs } = params;
+  const {
+    msg,
+    thread,
+    isActiveThread,
+    windowFocused,
+    prefs,
+    myUid,
+    myName,
+    nowMs,
+    blockedStickerRules,
+  } = params;
   if (msg.is_outgoing || thread?.kind === "cloud") {
     return { showPopup: false, playSound: false };
+  }
+  if (blockedStickerRules && blockedStickerRules.length > 0) {
+    if (matchBlockedStickerRule(msg, blockedStickerRules) !== null) {
+      return { showPopup: false, playSound: false };
+    }
   }
   if (isActiveThread && windowFocused) {
     return { showPopup: false, playSound: false };
@@ -181,7 +227,8 @@ export function shouldNotifyMessage(params: {
 
   if (isThreadCurrentlyMuted(thread, nowMs)) {
     const allowedByMention =
-      prefs.mentionOverride && isMessageMentioningMe(msg, myUid, myName);
+      prefs.mentionOverride &&
+      isMessageMentioningMe(msg, myUid, myName, { allowAll: kind === "group" });
     if (!allowedByMention) {
       return { showPopup: false, playSound: false };
     }

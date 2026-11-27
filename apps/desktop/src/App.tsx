@@ -1,11 +1,23 @@
-import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Suspense,
+  lazy,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { relaunch } from "@tauri-apps/plugin-process";
 import {
+  AlertCircle,
   Archive,
   ArchiveRestore,
+  ArrowDownToLine,
   ArrowLeft,
   Bell,
   BellOff,
@@ -15,6 +27,7 @@ import {
   CheckCheck,
   ChevronDown,
   ChevronUp,
+  Clock,
   Download,
   ExternalLink,
   FileText,
@@ -76,8 +89,31 @@ import {
 } from "./utils/mediaCache";
 import { playMessageSound, showDesktopNotification } from "./utils/notify";
 import {
+  isExplicitPointerClick,
+  isPrimaryMouseDown,
+} from "./components/notifyPopupInteraction";
+import {
+  addBlockedStickerRule,
+  buildBlockedStickerRuleFromMessage,
+  isStickerMsgType,
+  loadBlockedStickersConfig,
+  matchBlockedStickerRule,
+  removeBlockedStickerRule,
+  saveBlockedStickersConfig,
+  setBlockedStickerDisplayMode,
+  type BlockedStickerDisplayMode,
+  type BlockedStickerKind,
+  type BlockedStickersConfig,
+} from "./utils/blockedStickers";
+import {
+  getAiBackendBadgeLabel,
+  type AiCommandResultDto,
+  type AiSessionDto,
+} from "./utils/automationHelpers";
+import {
   computeTotalUnreadBadge,
   formatNotificationContent,
+  isMessageRecentForNotification,
   isThreadCurrentlyMuted,
   loadNotifyPrefs,
   saveNotifyPrefs,
@@ -141,14 +177,25 @@ import { IncomingCallModal } from "./components/IncomingCallModal";
 import type { LightboxItem } from "./components/MediaLightbox";
 import { MessageBubble, type MessageTranslationState } from "./components/MessageBubble";
 import { NavDrawer } from "./components/NavDrawer";
-import { PasscodeLockScreen } from "./components/PasscodeLockScreen";
+import {
+  PasscodeLockScreen,
+  type PasscodeActiveCallBanner,
+} from "./components/PasscodeLockScreen";
 import { QrLoginModal } from "./components/QrLoginModal";
 import { RelayImage } from "./components/RelayImage";
-import { ReplyThreadPanel } from "./components/ReplyThreadPanel";
 import type { DensityMode, FontSizeScale, SettingsTab } from "./components/SettingsModal";
 import { ThreadAvatar } from "./components/ThreadAvatar";
 import { TriforceEffects } from "./components/TriforceEffects";
+import { UpdateBanner } from "./components/UpdateBanner";
+import type { UpdateInstallProgress } from "./components/UpdateModal";
 import { useI18n, type TranslationKey } from "./i18n";
+import {
+  formatUpdateVersionTag,
+  isUpdateBannerVisible,
+  loadDismissedUpdateVersion,
+  normalizeUpdateVersion,
+  saveDismissedUpdateVersion,
+} from "./utils/updateBanner";
 import {
   DEFAULT_PASSCODE_CONFIG,
   loadPasscodeConfig,
@@ -159,6 +206,24 @@ import {
   applyDownloadProgress,
   type DownloadProgressItem,
 } from "./utils/downloadState";
+import {
+  MAX_STAGED_ATTACHMENTS,
+  appendStagedAttachments,
+  collectAllOutboxEntries,
+  collectRevocableAttachmentUrls,
+  diffRevocableAttachmentUrls,
+  findOutboxEntry,
+  getOutboxMessages,
+  isRevocableBlobUrl,
+  markOutboxFailed,
+  mergeOutboxIntoMessages,
+  removeOutboxEntriesForThread,
+  removeOutboxEntry,
+  removeStagedAttachmentAt,
+  summarizeThreadOutbox,
+  upsertOutboxEntry,
+  type OutboxByThread,
+} from "./utils/outboxState";
 import { buildComposerMentionMembers, isPlaceholderMemberName } from "./utils/mentions";
 import { parsePollPayload } from "./utils/richMessage";
 import {
@@ -170,8 +235,10 @@ import {
 import type {
   AccountProfile,
   AiConfigDto,
+  AiConfigUpdateDto,
   AiStoredMessageDto,
   AiSummaryDto,
+  ZeroClawInstallProgressDto,
   AppUpdateInfo,
   BuiltInRailFolderId,
   CallDevicesDto,
@@ -204,6 +271,24 @@ import type {
   UserProfileDto,
 } from "./types";
 
+const AI_AUTO_PROBE_COMPLETED_KEY = "teza.aiAutoProbeCompleted";
+
+function hasCompletedAiAutoProbe(): boolean {
+  try {
+    return localStorage.getItem(AI_AUTO_PROBE_COMPLETED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function markAiAutoProbeCompleted(): void {
+  try {
+    localStorage.setItem(AI_AUTO_PROBE_COMPLETED_KEY, "1");
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
 const AddGroupMembersModal = lazy(() =>
   import("./components/AddGroupMembersModal").then((m) => ({ default: m.AddGroupMembersModal })),
 );
@@ -229,6 +314,9 @@ const MediaLightbox = lazy(() =>
 );
 const QuickSearchModal = lazy(() =>
   import("./components/QuickSearchModal").then((m) => ({ default: m.QuickSearchModal })),
+);
+const ReplyThreadPanel = lazy(() =>
+  import("./components/ReplyThreadPanel").then((m) => ({ default: m.ReplyThreadPanel })),
 );
 const ScheduledMessagesModal = lazy(() => import("./components/ScheduledMessagesModal"));
 const ScreenshotEditorModal = lazy(() =>
@@ -313,13 +401,16 @@ export default function App() {
       : "triforce";
   });
   const [fxEnabled, setFxEnabled] = useState<boolean>(
-    () => localStorage.getItem("litechat.fx") !== "0",
+    () => localStorage.getItem("litechat.fx") === "1",
   );
   const [authChecking, setAuthChecking] = useState(true);
   const [authed, setAuthed] = useState(false);
   const [qrSvg, setQrSvg] = useState("");
-  const [qrStatus, setQrStatus] = useState("Đang khởi tạo mã QR...");
+  const [qrStatus, setQrStatus] = useState(() => t("qrStatusInit"));
   const [qrError, setQrError] = useState<string | null>(null);
+  const [qrTimeoutSec, setQrTimeoutSec] = useState<number | null>(null);
+  const [qrIssuedAtMs, setQrIssuedAtMs] = useState<number | null>(null);
+  const [qrRefreshing, setQrRefreshing] = useState(false);
   const [connStatus, setConnStatus] = useState<ConnectionStatus>("connecting");
   const [syncing, setSyncing] = useState(false);
   const [toastError, setToastError] = useState<string | null>(null);
@@ -336,6 +427,7 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [messages, setMessages] = useState<MessageDto[]>([]);
   const [hasMoreHistory, setHasMoreHistory] = useState(false);
+  const [hasNewerHistory, setHasNewerHistory] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [replyTo, setReplyTo] = useState<MessageDto | null>(null);
   const [replyFocusSeq, setReplyFocusSeq] = useState(0);
@@ -350,7 +442,8 @@ export default function App() {
       return {};
     }
   });
-  const [pendingAttachment, setPendingAttachment] = useState<PendingAttachment | null>(null);
+  const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
+  const [outboxByThread, setOutboxByThread] = useState<OutboxByThread>({});
   const [highlightedId, setHighlightedId] = useState<string | null>(null);
   const [lightboxState, setLightboxState] = useState<{
     items: LightboxItem[];
@@ -401,6 +494,7 @@ export default function App() {
     sourceUrl: string;
     revokeUrl?: string;
     initialMode: "crop" | "annotate";
+    editingAttachmentId?: string | null;
     monitors: MonitorInfoDto[];
     activeMonitorIndex: number | null;
     canRecapture: boolean;
@@ -443,10 +537,25 @@ export default function App() {
   const [navDrawerOpen, setNavDrawerOpen] = useState(false);
   const [aiConfig, setAiConfig] = useState<AiConfigDto | null>(null);
   const [aiChatOpen, setAiChatOpen] = useState(false);
+  const [showTezaAiCard, setShowTezaAiCard] = useState<boolean>(
+    () => localStorage.getItem("teza.showAiCard") !== "0",
+  );
   const [aiMessages, setAiMessages] = useState<AiStoredMessageDto[]>([]);
+  const [aiSessions, setAiSessions] = useState<AiSessionDto[]>([]);
+  const [activeAiSessionId, setActiveAiSessionId] = useState<string>(() => {
+    try {
+      const saved = localStorage.getItem("teza.aiActiveSessionId");
+      return saved && saved.trim() ? saved.trim() : "default";
+    } catch {
+      return "default";
+    }
+  });
   const [aiStreamingText, setAiStreamingText] = useState("");
   const [aiIsStreaming, setAiIsStreaming] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
+  const [activeAttachmentUploadIds, setActiveAttachmentUploadIds] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [aiSummaryByThread, setAiSummaryByThread] = useState<
     Record<
       string,
@@ -462,11 +571,27 @@ export default function App() {
   const [schedulesLoading, setSchedulesLoading] = useState(false);
   const [scheduledModalOpen, setScheduledModalOpen] = useState(false);
   const [scheduledInitialThreadId, setScheduledInitialThreadId] = useState<string | null>(null);
+  const [scheduleAlertNotice, setScheduleAlertNotice] = useState<{
+    text: string;
+    tone: "warn" | "error";
+  } | null>(null);
+  const [muteTickNow, setMuteTickNow] = useState(() => Date.now());
   const aiIsStreamingRef = useRef(false);
   aiIsStreamingRef.current = aiIsStreaming;
+  const activeAiSessionIdRef = useRef(activeAiSessionId);
+  activeAiSessionIdRef.current = activeAiSessionId;
+  const aiSessionsRef = useRef<AiSessionDto[]>(aiSessions);
+  aiSessionsRef.current = aiSessions;
+  const aiCancelRequestedRef = useRef(false);
   const [notifyPrefs, setNotifyPrefs] = useState<NotificationPrefs>(() => loadNotifyPrefs());
+  const [blockedStickersCfg, setBlockedStickersCfg] = useState<BlockedStickersConfig>(() =>
+    loadBlockedStickersConfig(),
+  );
   const [sendOnEnter, setSendOnEnter] = useState<boolean>(
     () => localStorage.getItem("teza.sendOnEnter") !== "0",
+  );
+  const [stickerSuggestEnabled, setStickerSuggestEnabled] = useState<boolean>(
+    () => localStorage.getItem("teza.stickerSuggestEnabled") !== "0",
   );
   const [webNotifyToast, setWebNotifyToast] = useState<NotifyToastPayload | null>(null);
   const [webToastHovered, setWebToastHovered] = useState(false);
@@ -526,10 +651,19 @@ export default function App() {
   const [appVersion, setAppVersion] = useState("0.6.1");
   const [updateModalOpen, setUpdateModalOpen] = useState(false);
   const [availableUpdate, setAvailableUpdate] = useState<AppUpdateInfo | null>(null);
+  const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<string | null>(() =>
+    loadDismissedUpdateVersion(),
+  );
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
   const [lastUpdateCheckAt, setLastUpdateCheckAt] = useState<number | null>(null);
+  const [updateInstalling, setUpdateInstalling] = useState(false);
+  const [updateInstallProgress, setUpdateInstallProgress] = useState<UpdateInstallProgress | null>(
+    null,
+  );
+  const [updateInstallError, setUpdateInstallError] = useState<string | null>(null);
   const [relayCfg, setRelayCfg] = useState<RelayConfigSummary | null>(null);
+  const [relayCfgLoaded, setRelayCfgLoaded] = useState(false);
   const [focusRelaySettings, setFocusRelaySettings] = useState(false);
   const [callState, setCallState] = useState<CallStateDto>(DEFAULT_CALL_STATE);
   const [callTelemetry, setCallTelemetry] = useState<CallTelemetryDto | null>(null);
@@ -574,6 +708,8 @@ export default function App() {
   const reactionSeqCounterRef = useRef(0);
   const reactionSeqByMsgRef = useRef<Map<string, number>>(new Map());
   const notifyPrefsRef = useRef<NotificationPrefs>(notifyPrefs);
+  const blockedStickersCfgRef = useRef<BlockedStickersConfig>(blockedStickersCfg);
+  const serverClockOffsetMsRef = useRef<number>(0);
   const themeRef = useRef<ThemeMode>(theme);
   const tRef = useRef(t);
   const myProfileRef = useRef<AccountProfile | null>(myProfile);
@@ -583,6 +719,23 @@ export default function App() {
   const toastErrorTimerRef = useRef<number | null>(null);
   const callNoticeTimerRef = useRef<number | null>(null);
   const socialNoticeTimerRef = useRef<number | null>(null);
+  const scheduleAlertTimerRef = useRef<number | null>(null);
+  const scheduleRefreshSeqRef = useRef(0);
+  const appShellRef = useRef<HTMLDivElement | null>(null);
+  const pendingOpenThreadIdRef = useRef<string | null>(null);
+  const hasNewerHistoryRef = useRef(false);
+  const loadingLatestHistoryRef = useRef(false);
+  const qrRefreshingRef = useRef(false);
+  const updateInstallingRef = useRef(false);
+  const quickSearchOpenRef = useRef(false);
+  const olderScrollAnchorRef = useRef<{
+    threadId: string;
+    msgId: string;
+    prevOffsetTop: number;
+  } | null>(null);
+  const pinnedBarRef = useRef<HTMLDivElement | null>(null);
+  const threadMenuRef = useRef<HTMLDivElement | null>(null);
+  const folderMenuRef = useRef<HTMLDivElement | null>(null);
   const pendingFriendRequestsCountRef = useRef<number>(pendingFriendRequestsCount);
   const silentSyncInFlightRef = useRef<boolean>(false);
   const recentlyLeftGroupIdsRef = useRef<Set<string>>(new Set());
@@ -599,7 +752,25 @@ export default function App() {
   const lastPliRequestAtRef = useRef<number>(0);
   const inFlightVideoPushesRef = useRef(0);
   const groupMembersCacheRef = useRef<Record<string, ThreadMemberDto[]>>(groupMembersCache);
-  const pendingAttachmentRef = useRef<PendingAttachment | null>(pendingAttachment);
+  const pendingAttachmentsRef = useRef<PendingAttachment[]>(pendingAttachments);
+  const outboxByThreadRef = useRef<OutboxByThread>(outboxByThread);
+  const outboxSeqRef = useRef(0);
+  const lastOptimisticTsRef = useRef(0);
+  const aiChatOpenRef = useRef(aiChatOpen);
+  const aiConfigRef = useRef<AiConfigDto | null>(aiConfig);
+  const aiAutoProbeDoneRef = useRef(false);
+  const aiMsgFetchSeqRef = useRef(0);
+  const aiSessionsReqSeqRef = useRef(0);
+  const attachmentUploadQueueRef = useRef<Map<string, Promise<void>>>(new Map());
+  const activeAttachmentUploadIdsRef = useRef<Set<string>>(new Set());
+  const draftsPersistTimerRef = useRef<number | null>(null);
+  const draftsSnapshotRef = useRef<Record<string, string>>(draftsByThread);
+  const prevMessageMentionCandidatesRef = useRef<Array<{ id: string; name: string }>>([]);
+  const replyGraphRef = useRef<{
+    byId: Map<string, MessageDto>;
+    resolveRoot: (msgId: string) => string;
+    repliesByRoot: Record<string, MessageDto[]>;
+  } | null>(null);
   const hasActiveWebAppRef = useRef<boolean>(false);
   const webAppHubOpenRef = useRef<boolean>(false);
   const chatPaneVisibleRef = useRef<boolean>(true);
@@ -637,6 +808,13 @@ export default function App() {
   const capturingScreenRef = useRef<boolean>(capturingScreen);
   const screenshotEditorRef = useRef(screenshotEditor);
   const handleCaptureScreenRef = useRef<() => void>(() => {});
+  const handleSendAttachmentRef = useRef<
+    (
+      att: PendingAttachment,
+      caption: string,
+      opts?: { threadId?: string; rootMsgId?: string },
+    ) => Promise<MessageDto | false>
+  >(async () => false);
   const progressiveEscStateRef = useRef({
     hasOverlay: false,
     hasMenu: false,
@@ -651,6 +829,7 @@ export default function App() {
   filterTextRef.current = filterText;
   threadsRef.current = threads;
   notifyPrefsRef.current = notifyPrefs;
+  blockedStickersCfgRef.current = blockedStickersCfg;
   themeRef.current = theme;
   tRef.current = t;
   myProfileRef.current = myProfile;
@@ -669,15 +848,29 @@ export default function App() {
   activeCallRef.current = callState.active;
   selectedCameraIdRef.current = selectedCameraId;
   groupMembersCacheRef.current = groupMembersCache;
-  pendingAttachmentRef.current = pendingAttachment;
+  pendingAttachmentsRef.current = pendingAttachments;
+  aiChatOpenRef.current = aiChatOpen;
+  aiConfigRef.current = aiConfig;
+  hasNewerHistoryRef.current = hasNewerHistory;
+  updateInstallingRef.current = updateInstalling;
+  quickSearchOpenRef.current = quickSearchOpen;
   webAppHubOpenRef.current = Boolean(webAppsCfg.enabled && webAppHubOpen);
+  const effectiveLocked = Boolean(authed && isLocked);
+  const hasActiveVideoCall = Boolean(
+    authed &&
+      !isLocked &&
+      callState.active &&
+      callState.active.call_type === "DirectVideo" &&
+      callState.phase !== "idle" &&
+      callState.phase !== "incoming_ringing",
+  );
   const showVideoOverlay = Boolean(
     authed &&
       !isLocked &&
       shouldShowVideoOverlay(callState.active, videoOverlayMode === "minimized"),
   );
   const hasBlockingOverlay = Boolean(
-    isLocked ||
+    effectiveLocked ||
       settingsOpen ||
       navDrawerOpen ||
       folderModalOpen ||
@@ -695,6 +888,7 @@ export default function App() {
       forwardMessages.length > 0 ||
       updateModalOpen ||
       translateModalOpen ||
+      Boolean(completedDownload) ||
       (showVideoOverlay && videoOverlayMode === "expanded") ||
       activeCallDevicesOpen ||
       callState.phase === "incoming_ringing",
@@ -702,26 +896,54 @@ export default function App() {
   hasBlockingOverlayRef.current = hasBlockingOverlay;
   progressiveEscStateRef.current = {
     hasOverlay: Boolean(hasBlockingOverlay || selectMode),
-    hasMenu: Boolean(threadMenu || folderMenu || drawerMuteOpen),
+    hasMenu: Boolean(threadMenu || folderMenu || drawerMuteOpen || pinnedListOpen),
     inChatSearch: inChatSearchOpen,
     hasThreadPanel: Boolean(activeThreadRootId),
     hasReply: Boolean(replyTo),
   };
 
-  const updatePendingAttachment = useCallback((next: PendingAttachment | null) => {
-    const prev = pendingAttachmentRef.current;
-    const prevUrl = prev?.kind === "raw" ? prev.previewUrl : null;
-    const nextUrl = next?.kind === "raw" ? next.previewUrl : null;
-    if (prevUrl && prevUrl !== nextUrl) {
-      URL.revokeObjectURL(prevUrl);
-    }
-    pendingAttachmentRef.current = next;
-    setPendingAttachment(next);
+  const nextOptimisticTs = useCallback(() => {
+    const now = Date.now();
+    const ts = now > lastOptimisticTsRef.current ? now : lastOptimisticTsRef.current + 1;
+    lastOptimisticTsRef.current = ts;
+    return ts;
   }, []);
+
+  const commitOutbox = useCallback((next: OutboxByThread) => {
+    outboxByThreadRef.current = next;
+    setOutboxByThread(next);
+  }, []);
+
+  const replacePendingAttachments = useCallback((next: PendingAttachment[]) => {
+    const prev = pendingAttachmentsRef.current;
+    for (const url of diffRevocableAttachmentUrls(prev, next)) {
+      URL.revokeObjectURL(url);
+    }
+    pendingAttachmentsRef.current = next;
+    setPendingAttachments(next);
+  }, []);
+
+  const removePendingAttachment = useCallback((index: number) => {
+    const res = removeStagedAttachmentAt(pendingAttachmentsRef.current, index);
+    for (const url of res.revokedUrls) {
+      URL.revokeObjectURL(url);
+    }
+    if (res.next !== pendingAttachmentsRef.current) {
+      pendingAttachmentsRef.current = res.next;
+      setPendingAttachments(res.next);
+    }
+  }, []);
+
+  const clearPendingAttachments = useCallback(() => {
+    replacePendingAttachments([]);
+  }, [replacePendingAttachments]);
 
   const leaveWebApps = useCallback(() => {
     setActiveWebAppId(null);
     setWebAppHubOpen(false);
+    if (!selectedIdRef.current) {
+      setMobilePane("list");
+    }
     void bridge.webappHideAll();
   }, []);
 
@@ -751,11 +973,46 @@ export default function App() {
       const list = await bridge.listPinnedMessages(tid);
       if (selectedIdRef.current === tid) {
         setPinnedMessages(list);
+        if (list.length === 0) {
+          setPinnedListOpen(false);
+        }
       }
     } catch {
       // Ignore transient pin sync failures
     }
   }, []);
+
+  useLayoutEffect(() => {
+    const el = appShellRef.current as (HTMLDivElement & { inert: boolean }) | null;
+    if (!el) return;
+    el.inert = effectiveLocked;
+    if (effectiveLocked) {
+      el.setAttribute("inert", "");
+      const active = document.activeElement;
+      if (active instanceof HTMLElement && el.contains(active)) {
+        active.blur();
+      }
+    } else {
+      el.removeAttribute("inert");
+    }
+  }, [effectiveLocked]);
+
+  useEffect(() => {
+    void bridge.appSetPasscodeLocked(effectiveLocked).catch(() => undefined);
+  }, [effectiveLocked]);
+
+  const hasTimedMute = useMemo(
+    () => threads.some((th) => th.is_muted && (th.muted_until_ts ?? 0) > muteTickNow),
+    [threads, muteTickNow],
+  );
+
+  useEffect(() => {
+    if (!hasTimedMute) return;
+    const timer = window.setInterval(() => {
+      setMuteTickNow(Date.now());
+    }, 60_000);
+    return () => window.clearInterval(timer);
+  }, [hasTimedMute]);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -781,8 +1038,16 @@ export default function App() {
   }, [notifyPrefs]);
 
   useEffect(() => {
+    saveBlockedStickersConfig(blockedStickersCfg);
+  }, [blockedStickersCfg]);
+
+  useEffect(() => {
     localStorage.setItem("teza.sendOnEnter", sendOnEnter ? "1" : "0");
   }, [sendOnEnter]);
+
+  useEffect(() => {
+    localStorage.setItem("teza.stickerSuggestEnabled", stickerSuggestEnabled ? "1" : "0");
+  }, [stickerSuggestEnabled]);
 
   useEffect(() => {
     localStorage.setItem("litechat.closeToTray", closeToTray ? "1" : "0");
@@ -798,25 +1063,53 @@ export default function App() {
         .setTitle(title)
         .catch(() => undefined);
     }
-  }, [threads, notifyPrefs]);
+  }, [threads, notifyPrefs, muteTickNow]);
 
-  const setDraftForThread = useCallback((tid: string, val: string) => {
-    setDraftsByThread((prev) => {
-      const next = { ...prev };
-      if (!val) {
-        delete next[tid];
-      } else {
-        next[tid] = val;
-      }
-      try {
-        const entries = Object.entries(next).slice(-80);
-        localStorage.setItem("litechat.drafts", JSON.stringify(Object.fromEntries(entries)));
-      } catch {
-        // Ignore storage quota errors
-      }
-      return next;
-    });
+  const flushDraftsToStorage = useCallback(() => {
+    if (draftsPersistTimerRef.current !== null) {
+      window.clearTimeout(draftsPersistTimerRef.current);
+      draftsPersistTimerRef.current = null;
+    }
+    try {
+      const entries = Object.entries(draftsSnapshotRef.current).slice(-80);
+      localStorage.setItem("litechat.drafts", JSON.stringify(Object.fromEntries(entries)));
+    } catch {
+      // Ignore storage quota errors
+    }
   }, []);
+
+  useEffect(() => {
+    window.addEventListener("beforeunload", flushDraftsToStorage);
+    return () => {
+      window.removeEventListener("beforeunload", flushDraftsToStorage);
+      flushDraftsToStorage();
+    };
+  }, [flushDraftsToStorage]);
+
+  const setDraftForThread = useCallback(
+    (tid: string, val: string) => {
+      setDraftsByThread((prev) => {
+        const cur = prev[tid] ?? "";
+        if (cur === val) return prev;
+        const next = { ...prev };
+        if (!val) {
+          delete next[tid];
+        } else {
+          next[tid] = val;
+        }
+        draftsSnapshotRef.current = next;
+        if (draftsPersistTimerRef.current !== null) {
+          window.clearTimeout(draftsPersistTimerRef.current);
+        }
+        draftsPersistTimerRef.current = window.setTimeout(() => {
+          draftsPersistTimerRef.current = null;
+          flushDraftsToStorage();
+        }, 1000);
+        return next;
+      });
+    },
+    [flushDraftsToStorage],
+  );
 
   const applyRelaySummary = useCallback((cfg: RelayConfigSummary) => {
     setRelayCfg(cfg);
@@ -827,13 +1120,14 @@ export default function App() {
     void bridge
       .getRelayConfig()
       .then(applyRelaySummary)
-      .catch(() => undefined);
+      .catch(() => undefined)
+      .finally(() => setRelayCfgLoaded(true));
   }, [applyRelaySummary]);
 
   const checkForUpdates = useCallback(async (silent = false) => {
     if (!isTauri()) {
       if (!silent) {
-        setUpdateError("Tính năng tự động cập nhật chỉ hoạt động trên bản cài đặt desktop.");
+        setUpdateError(tRef.current("updateDesktopOnlyError"));
       }
       return;
     }
@@ -850,6 +1144,64 @@ export default function App() {
     }
   }, []);
 
+  const handleStartAppUpdateInstall = useCallback(async () => {
+    if (!availableUpdate || updateInstallingRef.current) return;
+    updateInstallingRef.current = true;
+    setUpdateInstalling(true);
+    setUpdateInstallError(null);
+    let downloaded = 0;
+    let total: number | null = null;
+    setUpdateInstallProgress({
+      downloadedBytes: 0,
+      totalBytes: null,
+      stageText: tRef.current("updateDownloading"),
+      percent: null,
+    });
+    let unlisten: UnlistenFn | null = null;
+    try {
+      if (isTauri()) {
+        unlisten = await listen<{ event: string; total?: number | null; chunk?: number }>(
+          "core://update-progress",
+          (ev) => {
+            const p = ev.payload;
+            if (p.event === "started") {
+              total = p.total ?? null;
+              setUpdateInstallProgress({
+                downloadedBytes: downloaded,
+                totalBytes: total,
+                stageText: tRef.current("updateDownloadingPkg"),
+                percent: total && total > 0 ? Math.min(100, Math.round((downloaded / total) * 100)) : null,
+              });
+            } else if (p.event === "progress" && p.chunk) {
+              downloaded += p.chunk;
+              setUpdateInstallProgress({
+                downloadedBytes: downloaded,
+                totalBytes: total,
+                stageText: tRef.current("updateDownloadingPkg"),
+                percent: total && total > 0 ? Math.min(100, Math.round((downloaded / total) * 100)) : null,
+              });
+            } else if (p.event === "finished") {
+              setUpdateInstallProgress({
+                downloadedBytes: downloaded,
+                totalBytes: total,
+                stageText: tRef.current("updateFinishingRestart"),
+                percent: 100,
+              });
+            }
+          },
+        );
+      }
+      await bridge.installAppUpdate();
+      await relaunch();
+    } catch (err) {
+      setUpdateInstallError(String(err));
+      updateInstallingRef.current = false;
+      setUpdateInstalling(false);
+    } finally {
+      unlisten?.();
+    }
+  }, [availableUpdate]);
+
   useEffect(() => {
     if (!isTauri()) return;
     void getVersion()
@@ -860,6 +1212,24 @@ export default function App() {
     }, 4500);
     return () => window.clearTimeout(timer);
   }, [checkForUpdates]);
+
+  const availableUpdateVersion = useMemo(
+    () => normalizeUpdateVersion(availableUpdate?.version),
+    [availableUpdate],
+  );
+  const availableUpdateTag = useMemo(
+    () => formatUpdateVersionTag(availableUpdateVersion),
+    [availableUpdateVersion],
+  );
+  const showUpdateBanner = useMemo(
+    () => isUpdateBannerVisible(availableUpdate, dismissedUpdateVersion),
+    [availableUpdate, dismissedUpdateVersion],
+  );
+  const handleDismissUpdateBanner = useCallback(() => {
+    if (!availableUpdate) return;
+    const saved = saveDismissedUpdateVersion(availableUpdate.version);
+    setDismissedUpdateVersion(saved);
+  }, [availableUpdate]);
 
   const activeBuzzUntil = selectedId ? buzzCooldownUntil[selectedId] ?? 0 : 0;
   const buzzCooldownSec =
@@ -895,6 +1265,7 @@ export default function App() {
         !e.altKey &&
         isCodeOrKey("KeyS", "s")
       ) {
+        if (hasBlockingOverlayRef.current) return;
         if (
           authedRef.current &&
           selectedIdRef.current &&
@@ -909,14 +1280,17 @@ export default function App() {
         return;
       }
       if ((e.ctrlKey || e.metaKey) && isCodeOrKey("KeyK", "k")) {
+        if (hasBlockingOverlayRef.current && !quickSearchOpenRef.current) return;
         e.preventDefault();
         setQuickSearchOpen((v) => !v);
       } else if ((e.ctrlKey || e.metaKey) && isCodeOrKey("KeyF", "f")) {
+        if (hasBlockingOverlayRef.current) return;
         if (
           selectedIdRef.current &&
           !activeThreadRootIdRef.current &&
           !hasActiveWebAppRef.current &&
-          !webAppHubOpenRef.current
+          !webAppHubOpenRef.current &&
+          !aiChatOpenRef.current
         ) {
           e.preventDefault();
           setInChatSearchOpen(true);
@@ -929,6 +1303,7 @@ export default function App() {
         e.key >= "1" &&
         e.key <= "9"
       ) {
+        if (hasBlockingOverlayRef.current) return;
         const railIds: string[] = [
           ...FOLDERS.filter(
             (item) => item.id === "all" || !hiddenBuiltInFoldersRef.current.includes(item.id),
@@ -942,6 +1317,7 @@ export default function App() {
           setFolder(targetFolder);
         }
       } else if (e.altKey && (e.key === "ArrowUp" || e.key === "ArrowDown")) {
+        if (hasBlockingOverlayRef.current || aiChatOpenRef.current) return;
         const list = visibleThreadsRef.current;
         if (list.length === 0) return;
         e.preventDefault();
@@ -964,6 +1340,7 @@ export default function App() {
           setThreadMenu(null);
           setFolderMenu(null);
           setDrawerMuteOpen(false);
+          setPinnedListOpen(false);
         } else if (esc.inChatSearch) {
           e.preventDefault();
           setInChatSearchOpen(false);
@@ -999,15 +1376,43 @@ export default function App() {
     const events: (keyof WindowEventMap)[] = [
       "mousemove",
       "mousedown",
+      "pointermove",
+      "pointerdown",
       "keydown",
       "wheel",
       "touchstart",
+      "focus",
     ];
     for (const evName of events) {
       window.addEventListener(evName, markActivity, { passive: true });
     }
     const thresholdMs = passcodeCfg.autoLockMinutes * 60_000;
     const timer = window.setInterval(() => {
+      if (hasActiveWebAppRef.current && document.visibilityState === "visible") {
+        if (isTauri()) {
+          void getCurrentWindow()
+            .isFocused()
+            .then((focused) => {
+              if (focused) {
+                lastActivityAtRef.current = Date.now();
+              } else if (Date.now() - lastActivityAtRef.current >= thresholdMs) {
+                setIsLocked(true);
+              }
+            })
+            .catch(() => {
+              if (document.hasFocus()) {
+                lastActivityAtRef.current = Date.now();
+              } else if (Date.now() - lastActivityAtRef.current >= thresholdMs) {
+                setIsLocked(true);
+              }
+            });
+          return;
+        }
+        if (document.hasFocus()) {
+          lastActivityAtRef.current = Date.now();
+          return;
+        }
+      }
       if (Date.now() - lastActivityAtRef.current >= thresholdMs) {
         setIsLocked(true);
       }
@@ -1060,6 +1465,47 @@ export default function App() {
       toastErrorTimerRef.current = null;
       setToastError(null);
     }, 5000);
+  }, []);
+
+  const addPendingAttachments = useCallback(
+    (incoming: PendingAttachment[]): boolean => {
+      const res = appendStagedAttachments(
+        pendingAttachmentsRef.current,
+        incoming,
+        MAX_STAGED_ATTACHMENTS,
+      );
+      for (const url of res.rejectedUrls) {
+        URL.revokeObjectURL(url);
+      }
+      if (res.overflowCount > 0) {
+        showError(tRef.current("composerAttachmentsMaxLimit", { max: MAX_STAGED_ATTACHMENTS }));
+      }
+      if (res.next !== pendingAttachmentsRef.current) {
+        pendingAttachmentsRef.current = res.next;
+        setPendingAttachments(res.next);
+      }
+      return res.addedCount > 0;
+    },
+    [showError],
+  );
+
+  const dismissScheduleAlert = useCallback(() => {
+    if (scheduleAlertTimerRef.current !== null) {
+      window.clearTimeout(scheduleAlertTimerRef.current);
+      scheduleAlertTimerRef.current = null;
+    }
+    setScheduleAlertNotice(null);
+  }, []);
+
+  const showScheduleAlert = useCallback((text: string, tone: "warn" | "error" = "warn") => {
+    setScheduleAlertNotice({ text, tone });
+    if (scheduleAlertTimerRef.current !== null) {
+      window.clearTimeout(scheduleAlertTimerRef.current);
+    }
+    scheduleAlertTimerRef.current = window.setTimeout(() => {
+      scheduleAlertTimerRef.current = null;
+      setScheduleAlertNotice(null);
+    }, 9000);
   }, []);
 
   const dismissCallNotice = useCallback(() => {
@@ -1589,6 +2035,10 @@ export default function App() {
         window.clearTimeout(jumpRetryTimerRef.current);
         jumpRetryTimerRef.current = null;
       }
+      if (scheduleAlertTimerRef.current !== null) {
+        window.clearTimeout(scheduleAlertTimerRef.current);
+        scheduleAlertTimerRef.current = null;
+      }
       sidebarDragCleanupRef.current?.();
       sidebarDragCleanupRef.current = null;
       localCameraEncoderRef.current?.destroy();
@@ -1599,15 +2049,23 @@ export default function App() {
   }, []);
 
   const refreshQr = useCallback(async () => {
+    if (qrRefreshingRef.current) return;
+    qrRefreshingRef.current = true;
+    setQrRefreshing(true);
     setQrError(null);
-    setQrStatus("Đang lấy mã QR...");
+    setQrStatus(tRef.current("qrStatusLoading"));
     try {
       const res = await bridge.startQr();
       setQrSvg(res.qr_svg);
-      setQrStatus("Quét mã trên điện thoại...");
+      setQrTimeoutSec(res.qr_timeout > 0 ? res.qr_timeout : 180);
+      setQrIssuedAtMs(Date.now());
+      setQrStatus(tRef.current("qrStatusScanPrompt"));
     } catch (err) {
       setQrError(String(err));
-      setQrStatus("Không thể kết nối máy chủ QR");
+      setQrStatus(tRef.current("qrStatusConnectFailed"));
+    } finally {
+      qrRefreshingRef.current = false;
+      setQrRefreshing(false);
     }
   }, []);
 
@@ -1645,7 +2103,13 @@ export default function App() {
     setSelectedId(null);
     setReplyTo(null);
     setActiveThreadRootId(null);
-    updatePendingAttachment(null);
+    replacePendingAttachments([]);
+    for (const entry of collectAllOutboxEntries(outboxByThreadRef.current)) {
+      if (isRevocableBlobUrl(entry.attachment?.ownedPreviewUrl)) {
+        URL.revokeObjectURL(entry.attachment.ownedPreviewUrl);
+      }
+    }
+    commitOutbox({});
     setThreadDetails(null);
     setGroupMembersCache({});
     detailsFetchKeyRef.current = null;
@@ -1677,8 +2141,22 @@ export default function App() {
     setRemoteVideoDims(null);
     setIsLocked(false);
     setLastOpenedWebAppId(null);
+    aiAutoProbeDoneRef.current = false;
+    aiCancelRequestedRef.current = false;
+    aiMsgFetchSeqRef.current += 1;
+    aiSessionsReqSeqRef.current += 1;
+    activeAttachmentUploadIdsRef.current.clear();
+    setActiveAttachmentUploadIds(new Set());
     setAiChatOpen(false);
     setAiMessages([]);
+    setAiSessions([]);
+    activeAiSessionIdRef.current = "default";
+    setActiveAiSessionId("default");
+    try {
+      localStorage.removeItem("teza.aiActiveSessionId");
+    } catch {
+      // Ignore storage errors
+    }
     setAiStreamingText("");
     setAiIsStreaming(false);
     setAiError(null);
@@ -1686,23 +2164,45 @@ export default function App() {
     setSchedules([]);
     setScheduledModalOpen(false);
     setScheduledInitialThreadId(null);
+    setScheduleAlertNotice(null);
+    setHasNewerHistory(false);
+    pendingOpenThreadIdRef.current = null;
     leaveWebApps();
-  }, [stopLocalCameraEncoder, updatePendingAttachment, leaveWebApps]);
+  }, [stopLocalCameraEncoder, replacePendingAttachments, commitOutbox, leaveWebApps]);
 
   const pendingSchedulesCount = useMemo(
     () => schedules.filter((s) => s.status === "pending" || s.status === "sending").length,
     [schedules],
   );
 
+  const attentionScheduleCount = useMemo(
+    () => schedules.filter((s) => s.status === "missed" || s.status === "failed").length,
+    [schedules],
+  );
+
   const refreshSchedules = useCallback(async () => {
+    const seq = ++scheduleRefreshSeqRef.current;
     setSchedulesLoading(true);
     try {
       const list = await bridge.scheduleList("all", 200);
-      setSchedules(list);
+      if (seq === scheduleRefreshSeqRef.current) {
+        setSchedules(list);
+      }
     } catch {
       // Ignore transient refresh failures
     } finally {
-      setSchedulesLoading(false);
+      if (seq === scheduleRefreshSeqRef.current) {
+        setSchedulesLoading(false);
+      }
+    }
+  }, []);
+
+  const handleToggleShowTezaAiCard = useCallback((show: boolean) => {
+    setShowTezaAiCard(show);
+    try {
+      localStorage.setItem("teza.showAiCard", show ? "1" : "0");
+    } catch {
+      // Ignore storage quota errors
     }
   }, []);
 
@@ -1714,56 +2214,268 @@ export default function App() {
     setMobilePane("chat");
   }, [leaveWebApps]);
 
-  const handleAiSend = useCallback(async (rawPrompt: string) => {
-    const trimmed = rawPrompt.trim();
-    if (!trimmed || aiIsStreamingRef.current) return;
-    const tempUserId = `tmp-ai-user-${Date.now()}`;
-    const optimisticUser: AiStoredMessageDto = {
-      id: tempUserId,
-      session_id: "default",
-      role: "user",
-      content: trimmed,
-      model: aiConfig?.gemini_model || "",
-      backend: aiConfig?.backend || "gemini_api",
-      ts: Date.now(),
-    };
-    setAiError(null);
-    setAiStreamingText("");
-    setAiIsStreaming(true);
-    setAiMessages((prev) => [...prev, optimisticUser]);
-    try {
-      const reply = await bridge.aiChatSend(trimmed, "default");
-      try {
-        const synced = await bridge.aiListMessages("default", 100);
-        setAiMessages(synced);
-      } catch {
-        setAiMessages((prev) => [...prev, reply]);
-      }
-      setAiStreamingText("");
-    } catch (err) {
-      setAiError(err instanceof Error ? err.message : String(err));
-      setAiStreamingText("");
-      void bridge
-        .aiListMessages("default", 100)
-        .then(setAiMessages)
-        .catch(() => {
-          setAiMessages((prev) => prev.filter((m) => m.id !== tempUserId));
-        });
-    } finally {
-      setAiIsStreaming(false);
-    }
-  }, [aiConfig?.backend, aiConfig?.gemini_model]);
+  const handleAiQuickSwitchConfig = useCallback(async (update: AiConfigUpdateDto) => {
+    const saved = await bridge.aiUpdateConfig(update);
+    aiAutoProbeDoneRef.current = true;
+    markAiAutoProbeCompleted();
+    aiConfigRef.current = saved;
+    setAiConfig(saved);
+    return saved;
+  }, []);
 
-  const handleAiClearHistory = useCallback(async () => {
+  const handleAiListModels = useCallback((baseUrl?: string, apiKey?: string) => {
+    return bridge.aiListModels(baseUrl, apiKey);
+  }, []);
+
+  const handleAiInstallZeroClaw = useCallback(async () => {
+    const res = await bridge.aiInstallZeroClaw();
+    aiConfigRef.current = res.config;
+    setAiConfig(res.config);
+    return res;
+  }, []);
+
+  const handleSubscribeZeroClawProgress = useCallback(
+    (handler: (ev: ZeroClawInstallProgressDto) => void) => {
+      return bridge.onZeroClawInstallProgress(handler);
+    },
+    [],
+  );
+
+  const selectActiveAiSessionId = useCallback((sessionId: string) => {
+    const nextId = (sessionId || "").trim() || "default";
+    activeAiSessionIdRef.current = nextId;
+    setActiveAiSessionId(nextId);
     try {
-      await bridge.aiClearMessages("default");
+      localStorage.setItem("teza.aiActiveSessionId", nextId);
+    } catch {
+      // Ignore storage quota errors
+    }
+  }, []);
+
+  const refreshAiSessions = useCallback(async (): Promise<AiSessionDto[]> => {
+    const seq = ++aiSessionsReqSeqRef.current;
+    const list = await bridge.aiListSessions(100);
+    if (seq === aiSessionsReqSeqRef.current) {
+      aiSessionsRef.current = list;
+      setAiSessions(list);
+    }
+    return list;
+  }, []);
+
+  const handleAiSend = useCallback(
+    async (rawPrompt: string) => {
+      const trimmed = rawPrompt.trim();
+      if (!trimmed || aiIsStreamingRef.current) return;
+      const targetSid = activeAiSessionIdRef.current || "default";
+      const activeCfg = aiConfigRef.current;
+      const tempUserId = `tmp-ai-user-${Date.now()}`;
+      const optimisticUser: AiStoredMessageDto = {
+        id: tempUserId,
+        session_id: targetSid,
+        role: "user",
+        content: trimmed,
+        model: activeCfg?.model || "",
+        backend: activeCfg?.backend || "zeroclaw",
+        ts: Date.now(),
+      };
+      aiCancelRequestedRef.current = false;
+      aiMsgFetchSeqRef.current += 1;
+      setAiError(null);
+      setAiStreamingText("");
+      setAiIsStreaming(true);
+      setAiMessages((prev) => [...prev, optimisticUser]);
+      try {
+        const reply = await bridge.aiChatSend(trimmed, targetSid);
+        const msgReqSeq = ++aiMsgFetchSeqRef.current;
+        try {
+          const synced = await bridge.aiListMessages(targetSid, 100);
+          if (
+            msgReqSeq === aiMsgFetchSeqRef.current &&
+            activeAiSessionIdRef.current === targetSid
+          ) {
+            setAiMessages(synced);
+          }
+        } catch {
+          if (
+            msgReqSeq === aiMsgFetchSeqRef.current &&
+            activeAiSessionIdRef.current === targetSid
+          ) {
+            setAiMessages((prev) => [...prev, reply]);
+          }
+        }
+        void refreshAiSessions().catch(() => undefined);
+        setAiStreamingText("");
+      } catch (err) {
+        if (activeAiSessionIdRef.current === targetSid && !aiCancelRequestedRef.current) {
+          setAiError(err instanceof Error ? err.message : String(err));
+        }
+        setAiStreamingText("");
+        const msgReqSeq = ++aiMsgFetchSeqRef.current;
+        try {
+          const synced = await bridge.aiListMessages(targetSid, 100);
+          if (
+            msgReqSeq === aiMsgFetchSeqRef.current &&
+            activeAiSessionIdRef.current === targetSid
+          ) {
+            setAiMessages(synced);
+          }
+        } catch {
+          if (
+            msgReqSeq === aiMsgFetchSeqRef.current &&
+            activeAiSessionIdRef.current === targetSid
+          ) {
+            setAiMessages((prev) => prev.filter((m) => m.id !== tempUserId));
+          }
+        }
+        void refreshAiSessions().catch(() => undefined);
+      } finally {
+        aiCancelRequestedRef.current = false;
+        setAiIsStreaming(false);
+      }
+    },
+    [refreshAiSessions],
+  );
+
+  const handleAiSelectSession = useCallback(
+    async (sessionId: string) => {
+      const targetSid = (sessionId || "").trim() || "default";
+      if (aiIsStreamingRef.current) return;
+      if (targetSid === activeAiSessionIdRef.current) return;
+      selectActiveAiSessionId(targetSid);
+      setAiError(null);
+      setAiStreamingText("");
+      setAiMessages([]);
+      const msgReqSeq = ++aiMsgFetchSeqRef.current;
+      try {
+        const list = await bridge.aiListMessages(targetSid, 100);
+        if (
+          msgReqSeq === aiMsgFetchSeqRef.current &&
+          activeAiSessionIdRef.current === targetSid
+        ) {
+          setAiMessages(list);
+        }
+      } catch (err) {
+        if (
+          msgReqSeq === aiMsgFetchSeqRef.current &&
+          activeAiSessionIdRef.current === targetSid
+        ) {
+          setAiError(err instanceof Error ? err.message : String(err));
+        }
+      }
+    },
+    [selectActiveAiSessionId],
+  );
+
+  const handleAiCreateSession = useCallback(async () => {
+    if (aiIsStreamingRef.current) return;
+    try {
+      const created = await bridge.aiCreateSession();
+      aiSessionsReqSeqRef.current += 1;
+      aiMsgFetchSeqRef.current += 1;
+      selectActiveAiSessionId(created.id);
       setAiMessages([]);
       setAiStreamingText("");
       setAiError(null);
+      try {
+        await refreshAiSessions();
+      } catch {
+        const nextList = [created, ...aiSessionsRef.current.filter((s) => s.id !== created.id)];
+        aiSessionsRef.current = nextList;
+        setAiSessions(nextList);
+      }
     } catch (err) {
       setAiError(err instanceof Error ? err.message : String(err));
+      throw err;
     }
+  }, [selectActiveAiSessionId, refreshAiSessions]);
+
+  const handleAiRenameSession = useCallback(
+    async (sessionId: string, title: string) => {
+      const updated = await bridge.aiRenameSession(sessionId, title);
+      try {
+        await refreshAiSessions();
+      } catch {
+        setAiSessions((prev) => prev.map((s) => (s.id === updated.id ? updated : s)));
+      }
+    },
+    [refreshAiSessions],
+  );
+
+  const handleAiDeleteSession = useCallback(
+    async (sessionId: string) => {
+      if (aiIsStreamingRef.current && sessionId === activeAiSessionIdRef.current) return;
+      await bridge.aiDeleteSession(sessionId);
+      let remaining: AiSessionDto[];
+      try {
+        remaining = await refreshAiSessions();
+      } catch {
+        remaining = aiSessionsRef.current.filter((s) => s.id !== sessionId);
+        aiSessionsRef.current = remaining;
+        setAiSessions(remaining);
+      }
+      if (activeAiSessionIdRef.current === sessionId) {
+        const nextSid = remaining[0]?.id || "default";
+        selectActiveAiSessionId(nextSid);
+        setAiError(null);
+        setAiStreamingText("");
+        const msgReqSeq = ++aiMsgFetchSeqRef.current;
+        try {
+          const list = await bridge.aiListMessages(nextSid, 100);
+          if (
+            msgReqSeq === aiMsgFetchSeqRef.current &&
+            activeAiSessionIdRef.current === nextSid
+          ) {
+            setAiMessages(list);
+          }
+        } catch {
+          if (
+            msgReqSeq === aiMsgFetchSeqRef.current &&
+            activeAiSessionIdRef.current === nextSid
+          ) {
+            setAiMessages([]);
+          }
+        }
+      }
+    },
+    [refreshAiSessions, selectActiveAiSessionId],
+  );
+
+  const handleAiClearHistory = useCallback(async () => {
+    const targetSid = activeAiSessionIdRef.current || "default";
+    aiMsgFetchSeqRef.current += 1;
+    try {
+      await bridge.aiClearMessages(targetSid);
+      aiMsgFetchSeqRef.current += 1;
+      if (activeAiSessionIdRef.current === targetSid) {
+        setAiMessages([]);
+        setAiStreamingText("");
+        setAiError(null);
+      }
+      void refreshAiSessions().catch(() => undefined);
+    } catch (err) {
+      if (activeAiSessionIdRef.current === targetSid) {
+        setAiError(err instanceof Error ? err.message : String(err));
+      }
+    }
+  }, [refreshAiSessions]);
+
+  const handleAiCancelStream = useCallback(() => {
+    if (!aiIsStreamingRef.current) return;
+    aiCancelRequestedRef.current = true;
+    void bridge.aiChatCancel(activeAiSessionIdRef.current || "default").catch(() => undefined);
   }, []);
+
+  const handleAiRunZeroClawCommand = useCallback(
+    async (command: "memory" | "memory_clear" | "skills" | "status"): Promise<AiCommandResultDto> => {
+      const targetSid = activeAiSessionIdRef.current || "default";
+      const result = await bridge.aiRunZeroClawCommand(command, targetSid);
+      if (command === "memory_clear") {
+        void refreshAiSessions().catch(() => undefined);
+      }
+      return result;
+    },
+    [refreshAiSessions],
+  );
 
   const handleSummarizeUnread = useCallback(async (threadId: string) => {
     if (!threadId) return;
@@ -1828,24 +2540,91 @@ export default function App() {
   }, [authed, refreshCallDevices, refreshSchedules]);
 
   useEffect(() => {
-    if (!authed || !aiChatOpen) return;
+    if (!authed || !relayCfgLoaded || !aiConfig || aiAutoProbeDoneRef.current) return;
+    if (hasCompletedAiAutoProbe()) {
+      aiAutoProbeDoneRef.current = true;
+      return;
+    }
+    if (aiConfig.enabled || aiConfig.has_api_key) {
+      aiAutoProbeDoneRef.current = true;
+      markAiAutoProbeCompleted();
+      return;
+    }
+    if (relayCfg?.enabled) return;
+    aiAutoProbeDoneRef.current = true;
+    markAiAutoProbeCompleted();
     let cancelled = false;
     void bridge
-      .aiGetConfig()
-      .then((cfg) => {
-        if (!cancelled) setAiConfig(cfg);
-      })
-      .catch(() => undefined);
-    void bridge
-      .aiListMessages("default", 100)
-      .then((list) => {
-        if (!cancelled) setAiMessages(list);
+      .aiProbeCli()
+      .then(async (probe) => {
+        if (cancelled || !probe.available) return;
+        const latest = aiConfigRef.current;
+        if (latest?.enabled || latest?.has_api_key) return;
+        const updated = await bridge.aiUpdateConfig({
+          enabled: true,
+          backend: "zeroclaw",
+        });
+        if (!cancelled) {
+          aiConfigRef.current = updated;
+          setAiConfig(updated);
+        }
       })
       .catch(() => undefined);
     return () => {
       cancelled = true;
     };
-  }, [authed, aiChatOpen]);
+  }, [authed, relayCfgLoaded, aiConfig, relayCfg?.enabled]);
+
+  useEffect(() => {
+    if (!authed || !aiChatOpen) return;
+    let cancelled = false;
+    void bridge
+      .aiGetConfig()
+      .then((cfg) => {
+        if (!cancelled) {
+          aiConfigRef.current = cfg;
+          setAiConfig(cfg);
+        }
+      })
+      .catch(() => undefined);
+
+    const requestedSid = activeAiSessionIdRef.current || "default";
+    const sessionsReqSeq = ++aiSessionsReqSeqRef.current;
+    void (async () => {
+      let targetSid = requestedSid;
+      try {
+        const sessions = await bridge.aiListSessions(100);
+        if (cancelled || sessionsReqSeq !== aiSessionsReqSeqRef.current) return;
+        aiSessionsRef.current = sessions;
+        setAiSessions(sessions);
+        const exists = sessions.some((s) => s.id === targetSid);
+        if (!exists && sessions.length > 0 && targetSid !== "default") {
+          targetSid = sessions[0].id || "default";
+          selectActiveAiSessionId(targetSid);
+        }
+      } catch {
+        // Keep current targetSid if listing sessions fails transiently
+      }
+      if (cancelled || sessionsReqSeq !== aiSessionsReqSeqRef.current) return;
+      const msgReqSeq = ++aiMsgFetchSeqRef.current;
+      try {
+        const list = await bridge.aiListMessages(targetSid, 100);
+        if (
+          !cancelled &&
+          msgReqSeq === aiMsgFetchSeqRef.current &&
+          activeAiSessionIdRef.current === targetSid
+        ) {
+          setAiMessages(list);
+        }
+      } catch {
+        // Ignore transient message fetch failure
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [authed, aiChatOpen, selectActiveAiSessionId]);
 
   useEffect(() => {
     if (!authed) return;
@@ -1868,7 +2647,7 @@ export default function App() {
       bridge.onAiStreamDelta((ev) => {
         if (disposed) return;
         const sid = ev.session_id || "default";
-        if (sid !== "default" || !aiIsStreamingRef.current) return;
+        if (sid !== activeAiSessionIdRef.current || !aiIsStreamingRef.current) return;
         if (ev.delta) {
           setAiStreamingText((prev) => prev + ev.delta);
         }
@@ -1893,9 +2672,19 @@ export default function App() {
     );
 
     register(
-      bridge.onScheduleUpdated(() => {
-        if (!disposed) {
-          void refreshSchedules();
+      bridge.onScheduleUpdated((ev) => {
+        if (disposed) return;
+        void refreshSchedules();
+        if (ev && (ev.status === "missed" || ev.status === "failed")) {
+          const targetTitle = ev.thread_title || ev.thread_id;
+          const text =
+            ev.status === "missed"
+              ? tRef.current("schedMissedToast", { title: targetTitle })
+              : tRef.current("schedFailedToast", {
+                  title: targetTitle,
+                  error: ev.last_error || tRef.current("schedFailedGenericReason"),
+                });
+          showScheduleAlert(text, ev.status === "failed" ? "error" : "warn");
         }
       }),
     );
@@ -1910,7 +2699,7 @@ export default function App() {
         }
       }
     };
-  }, [authed, refreshSchedules]);
+  }, [authed, refreshSchedules, showScheduleAlert]);
 
   useEffect(() => {
     if (!authed || isLocked || callState.phase !== "incoming_ringing") return;
@@ -1949,7 +2738,7 @@ export default function App() {
 
   useEffect(() => {
     const active = callState.active;
-    if (shouldCaptureLocalVideo(active) && active) {
+    if (shouldCaptureLocalVideo(active, effectiveLocked) && active) {
       if (
         encoderRunningCallIdRef.current !== active.call_id ||
         encoderRunningDeviceIdRef.current !== selectedCameraId
@@ -1961,7 +2750,7 @@ export default function App() {
 
     if (localCameraEncoderRef.current || encoderRunningCallIdRef.current !== null) {
       stopLocalCameraEncoder(true);
-      if (active?.call_type === "DirectVideo" && !active.cam_enabled) {
+      if (active?.call_type === "DirectVideo" && (!active.cam_enabled || effectiveLocked)) {
         setLocalCameraStatus((prev) => (isCameraFailureStatus(prev) ? prev : "off"));
       }
     }
@@ -1970,6 +2759,7 @@ export default function App() {
     callState.active?.call_type,
     callState.active?.phase,
     callState.active?.cam_enabled,
+    effectiveLocked,
     selectedCameraId,
     startLocalCameraForCall,
     stopLocalCameraEncoder,
@@ -2254,6 +3044,15 @@ export default function App() {
     );
     setKickTarget((prev) => (prev?.groupId === groupId ? null : prev));
     setLeaveGroupTarget((prev) => (prev?.id === groupId ? null : prev));
+    const clearedOutbox = removeOutboxEntriesForThread(outboxByThreadRef.current, groupId);
+    if (clearedOutbox.removed.length > 0) {
+      for (const entry of clearedOutbox.removed) {
+        if (isRevocableBlobUrl(entry.attachment?.ownedPreviewUrl)) {
+          URL.revokeObjectURL(entry.attachment.ownedPreviewUrl);
+        }
+      }
+      commitOutbox(clearedOutbox.next);
+    }
     if (selectedIdRef.current === groupId) {
       selectedIdRef.current = null;
       if (pendingMarkReadRef.current === groupId) {
@@ -2263,6 +3062,7 @@ export default function App() {
       detailsInFlightRef.current = null;
       setSelectedId(null);
       setMessages([]);
+      replacePendingAttachments([]);
       setThreadDetails(null);
       setDrawerOpen(false);
       setAddMembersOpen(false);
@@ -2271,10 +3071,13 @@ export default function App() {
       setActiveThreadRootId(null);
       setReplyTo(null);
       setPinnedMessages([]);
+      setPinnedListOpen(false);
       setHasMoreHistory(false);
+      setHasNewerHistory(false);
+      setMobilePane("list");
       void bridge.setActiveThread(null);
     }
-  }, []);
+  }, [commitOutbox, replacePendingAttachments]);
 
   const markRecentlyLeftGroup = useCallback((groupId: string) => {
     recentlyLeftGroupIdsRef.current.add(groupId);
@@ -2427,6 +3230,7 @@ export default function App() {
       !isLockedRef.current &&
       !hasActiveWebAppRef.current &&
       !webAppHubOpenRef.current &&
+      !aiChatOpenRef.current &&
       chatPaneVisibleRef.current
     ) {
       void bridge.setActiveThread(tid);
@@ -2436,7 +3240,7 @@ export default function App() {
 
   const tryAutoMarkReadActiveThread = useCallback(() => {
     const tid = selectedIdRef.current;
-    if (!tid) return;
+    if (!tid || aiChatOpenRef.current) return;
     const activeThreadUnread =
       threadsRef.current.find((t) => t.id === tid)?.unread_count ?? 0;
     const el = scrollContainerRef.current;
@@ -2460,7 +3264,7 @@ export default function App() {
         activeThreadUnread,
         distFromBottom,
         isScrollable,
-        chatPaneVisible: chatPaneVisibleRef.current,
+        chatPaneVisible: chatPaneVisibleRef.current && !aiChatOpenRef.current,
         initialScrollReady: initialScrollReadyRef.current,
       })
     ) {
@@ -2542,6 +3346,49 @@ export default function App() {
     [leaveWebApps, selectAndRevealThread],
   );
 
+  useEffect(() => {
+    if (!authed || isLocked) return;
+    const queued = pendingOpenThreadIdRef.current;
+    if (queued) {
+      pendingOpenThreadIdRef.current = null;
+      openThreadById(queued);
+    }
+  }, [authed, isLocked, openThreadById]);
+
+  const reloadLatestMessages = useCallback(
+    async (tid: string) => {
+      if (!tid || loadingLatestHistoryRef.current) return;
+      loadingLatestHistoryRef.current = true;
+      try {
+        const page = await bridge.loadMessages(tid, undefined, false);
+        if (selectedIdRef.current !== tid) return;
+        setMessages(
+          mergeOutboxIntoMessages(
+            tid,
+            dedupeOptimisticPollMessages(page.messages),
+            outboxByThreadRef.current,
+          ),
+        );
+        setHasMoreHistory(page.has_more);
+        setHasNewerHistory(false);
+        setUnreadBelow(0);
+        setShowScrollDown(false);
+        stickToBottomRef.current = true;
+        window.requestAnimationFrame(() => {
+          if (selectedIdRef.current === tid) {
+            snapScrollToBottom();
+          }
+        });
+        completeMarkReadForThread(tid);
+      } catch (err) {
+        showError(err);
+      } finally {
+        loadingLatestHistoryRef.current = false;
+      }
+    },
+    [completeMarkReadForThread, showError, snapScrollToBottom],
+  );
+
   const triggerNotifyPopup = useCallback((payload: NotifyToastPayload) => {
     if (isTauri()) {
       if (notifyPrefsRef.current.useCustomPopup) {
@@ -2573,8 +3420,8 @@ export default function App() {
         listen<string | null>("core://qr-scanned", (ev) => {
           setQrStatus(
             ev.payload
-              ? `Đã quét (${ev.payload}) — vui lòng bấm Xác nhận trên điện thoại`
-              : "Đã quét mã — vui lòng Xác nhận trên điện thoại",
+              ? tRef.current("qrStatusScannedUser", { user: ev.payload })
+              : tRef.current("qrStatusScannedGeneric"),
           );
         }),
         listen<string>("core://auth-stage", (ev) => {
@@ -2588,7 +3435,7 @@ export default function App() {
         }),
         listen<string>("core://auth-error", (ev) => {
           setQrError(ev.payload);
-          setQrStatus("Đăng nhập thất bại");
+          setQrStatus(tRef.current("qrStatusAuthFailed"));
         }),
         listen<string>("core://auth-expired", (ev) => {
           setAuthed(false);
@@ -2616,17 +3463,17 @@ export default function App() {
           if (prev === "reconnecting" && ev.payload === "connected") {
             void syncRemoteThreads();
             const curTid = selectedIdRef.current;
-            if (curTid) {
+            if (curTid && !hasNewerHistoryRef.current) {
               void bridge
                 .loadMessages(curTid, undefined, true)
                 .then((page) => {
-                  if (selectedIdRef.current !== curTid) return;
+                  if (selectedIdRef.current !== curTid || hasNewerHistoryRef.current) return;
                   setMessages((prevMsgs) => {
                     let next = prevMsgs;
                     for (const m of page.messages) {
                       next = upsertMsg(next, m);
                     }
-                    return next;
+                    return mergeOutboxIntoMessages(curTid, next, outboxByThreadRef.current);
                   });
                 })
                 .catch(() => undefined);
@@ -2641,6 +3488,7 @@ export default function App() {
             !isLockedRef.current &&
             !hasActiveWebAppRef.current &&
             !webAppHubOpenRef.current &&
+            !aiChatOpenRef.current &&
             chatPaneVisibleRef.current;
           const el = isActiveThread && chatVisible ? scrollContainerRef.current : null;
           const nearBottom =
@@ -2650,14 +3498,18 @@ export default function App() {
             (stickToBottomRef.current ||
               el!.scrollHeight - el!.scrollTop - el!.clientHeight < 140);
           const wasPendingMarkRead = pendingMarkReadRef.current === msg.thread_id;
+          const isBlockedSticker =
+            matchBlockedStickerRule(msg, blockedStickersCfgRef.current.rules) !== null;
           const readingLive =
             !msg.is_outgoing &&
             nearBottom &&
             document.hasFocus() &&
             document.visibilityState === "visible" &&
             !wasPendingMarkRead;
-          const incUnread = !msg.is_outgoing && !readingLive;
-          setThreads((prev) => bumpThreadList(prev, msg, incUnread));
+          const incUnread = !msg.is_outgoing && !readingLive && !isBlockedSticker;
+          if (!isBlockedSticker || !hasThread) {
+            setThreads((prev) => bumpThreadList(prev, msg, incUnread));
+          }
           if (!hasThread) {
             void bridge
               .listThreads("all")
@@ -2665,40 +3517,74 @@ export default function App() {
               .catch(() => undefined);
           }
           if (isActiveThread) {
-            setMessages((prev) => upsertMsg(prev, msg));
-            if (msg.attachment_url) {
-              setDetailsRefreshTick((n) => n + 1);
-            }
-            if (!msg.is_outgoing && readingLive) {
-              completeMarkReadForThread(msg.thread_id);
-            } else if (!msg.is_outgoing) {
-              pendingMarkReadRef.current = msg.thread_id;
-              void bridge.setActiveThread(null);
-            } else if (wasPendingMarkRead) {
-              pendingMarkReadRef.current = null;
-              if (authedRef.current && chatVisible) {
-                void bridge.setActiveThread(msg.thread_id);
+            if (hasNewerHistoryRef.current) {
+              if (msg.attachment_url) {
+                setDetailsRefreshTick((n) => n + 1);
               }
-            }
-            if (msg.is_outgoing) {
-              stickToBottomRef.current = true;
-              setUnreadDividerCount(0);
-              setUnreadBelow(0);
-            }
-            if ((nearBottom && !wasPendingMarkRead) || msg.is_outgoing) {
-              setTimeout(() => {
-                lastProgrammaticScrollAtRef.current = performance.now();
-                bottomRef.current?.scrollIntoView({
-                  behavior: document.visibilityState === "visible" ? "smooth" : "auto",
-                });
-              }, 40);
-            } else if (!msg.is_outgoing) {
-              setUnreadBelow((n) => n + 1);
-              setShowScrollDown(true);
+              if (msg.is_outgoing) {
+                void reloadLatestMessages(msg.thread_id);
+              } else if (!isBlockedSticker) {
+                pendingMarkReadRef.current = msg.thread_id;
+                void bridge.setActiveThread(null);
+                setUnreadBelow((n) => n + 1);
+                setShowScrollDown(true);
+              }
+            } else {
+              setMessages((prev) =>
+                mergeOutboxIntoMessages(
+                  msg.thread_id,
+                  upsertMsg(prev, msg),
+                  outboxByThreadRef.current,
+                ),
+              );
+              if (msg.attachment_url) {
+                setDetailsRefreshTick((n) => n + 1);
+              }
+              if (!msg.is_outgoing) {
+                if (readingLive) {
+                  completeMarkReadForThread(msg.thread_id);
+                } else if (!isBlockedSticker) {
+                  pendingMarkReadRef.current = msg.thread_id;
+                  void bridge.setActiveThread(null);
+                }
+              } else if (wasPendingMarkRead) {
+                pendingMarkReadRef.current = null;
+                if (authedRef.current && chatVisible) {
+                  void bridge.setActiveThread(msg.thread_id);
+                }
+              }
+              if (msg.is_outgoing) {
+                stickToBottomRef.current = true;
+                setUnreadDividerCount(0);
+                setUnreadBelow(0);
+              }
+              if (
+                (nearBottom &&
+                  !wasPendingMarkRead &&
+                  !(isBlockedSticker && blockedStickersCfgRef.current.mode === "hide")) ||
+                msg.is_outgoing
+              ) {
+                setTimeout(() => {
+                  lastProgrammaticScrollAtRef.current = performance.now();
+                  bottomRef.current?.scrollIntoView({
+                    behavior: document.visibilityState === "visible" ? "smooth" : "auto",
+                  });
+                }, 40);
+              } else if (!msg.is_outgoing && !isBlockedSticker) {
+                setUnreadBelow((n) => n + 1);
+                setShowScrollDown(true);
+              }
             }
           }
           const matchedThread = threadsRef.current.find((t) => t.id === msg.thread_id);
-          const isRecent = Math.abs(Date.now() - msg.ts) < 90_000;
+          if (msg.is_live === true && msg.ts > 1_000_000_000_000) {
+            serverClockOffsetMsRef.current = msg.ts - Date.now();
+          }
+          const isRecent = isMessageRecentForNotification(
+            msg,
+            Date.now(),
+            serverClockOffsetMsRef.current,
+          );
           const prefs = notifyPrefsRef.current;
           const threadMuted = isThreadCurrentlyMuted(matchedThread);
           if (!isBuzzMessage(msg)) {
@@ -2714,9 +3600,11 @@ export default function App() {
               );
               if (!streak.isDuplicate) {
                 const fullScreenBuzz = streak.shouldShakeScreen;
-                playBuzzSound(fullScreenBuzz);
-                const senderName = msg.sender_name || matchedThread?.title || "Liên hệ";
                 const locked = isLockedRef.current;
+                if (!locked) {
+                  playBuzzSound(fullScreenBuzz);
+                }
+                const senderName = msg.sender_name || matchedThread?.title || "Liên hệ";
                 if (prefs.enabled) {
                   triggerNotifyPopup({
                     thread_id: msg.thread_id,
@@ -2753,29 +3641,29 @@ export default function App() {
                     setBuzzToastHovered(false);
                     setBuzzToast(null);
                   }, 5000);
-                }
-                if (buzzShakeTimerRef.current !== null) {
-                  window.clearTimeout(buzzShakeTimerRef.current);
-                  buzzShakeTimerRef.current = null;
-                }
-                if (fullScreenBuzz && isTauri()) {
-                  setBuzzShaking(false);
-                  buzzShakeTimerRef.current = window.setTimeout(() => {
+                  if (buzzShakeTimerRef.current !== null) {
+                    window.clearTimeout(buzzShakeTimerRef.current);
                     buzzShakeTimerRef.current = null;
-                    void bridge.buzzShakeScreen().catch(() => undefined);
-                  }, 60);
-                } else {
-                  setBuzzShaking(false);
-                  window.requestAnimationFrame(() => setBuzzShaking(true));
-                  buzzShakeTimerRef.current = window.setTimeout(() => {
-                    buzzShakeTimerRef.current = null;
+                  }
+                  if (fullScreenBuzz && isTauri()) {
                     setBuzzShaking(false);
-                  }, 1200);
-                }
-                if (isTauri()) {
-                  void getCurrentWindow()
-                    .requestUserAttention(2)
-                    .catch(() => undefined);
+                    buzzShakeTimerRef.current = window.setTimeout(() => {
+                      buzzShakeTimerRef.current = null;
+                      void bridge.buzzShakeScreen().catch(() => undefined);
+                    }, 60);
+                  } else {
+                    setBuzzShaking(false);
+                    window.requestAnimationFrame(() => setBuzzShaking(true));
+                    buzzShakeTimerRef.current = window.setTimeout(() => {
+                      buzzShakeTimerRef.current = null;
+                      setBuzzShaking(false);
+                    }, 1200);
+                  }
+                  if (isTauri()) {
+                    void getCurrentWindow()
+                      .requestUserAttention(2)
+                      .catch(() => undefined);
+                  }
                 }
               }
             }
@@ -2783,17 +3671,18 @@ export default function App() {
             const { showPopup, playSound } = shouldNotifyMessage({
               msg,
               thread: matchedThread,
-              isActiveThread: msg.thread_id === selectedIdRef.current,
-              windowFocused: document.hasFocus(),
+              isActiveThread: !aiChatOpenRef.current && msg.thread_id === selectedIdRef.current,
+              windowFocused: document.hasFocus() && document.visibilityState === "visible",
               prefs,
               myUid: myProfileRef.current?.uid ?? "",
               myName: myProfileRef.current?.display_name ?? "",
+              blockedStickerRules: blockedStickersCfgRef.current.rules,
             });
-            if (playSound) {
+            const locked = isLockedRef.current;
+            if (playSound && !locked) {
               playMessageSound();
             }
             if (showPopup) {
-              const locked = isLockedRef.current;
               const { title, body } = formatNotificationContent({
                 msg,
                 thread: matchedThread,
@@ -2891,6 +3780,7 @@ export default function App() {
                 !isLockedRef.current &&
                 !hasActiveWebAppRef.current &&
                 !webAppHubOpenRef.current &&
+                !aiChatOpenRef.current &&
                 chatPaneVisibleRef.current &&
                 nearBottomOrFlat
               ) {
@@ -2915,6 +3805,16 @@ export default function App() {
           "core://thread-messages-synced",
           (ev) => {
             if (ev.payload.thread_id !== selectedIdRef.current) return;
+            if (hasNewerHistoryRef.current) {
+              const newest = ev.payload.messages.reduce<MessageDto | null>(
+                (best, m) => (!best || m.ts > best.ts ? m : best),
+                null,
+              );
+              if (newest) {
+                setThreads((prev) => bumpThreadList(prev, newest, false));
+              }
+              return;
+            }
             const el = scrollContainerRef.current;
             const shouldStick =
               stickToBottomRef.current ||
@@ -2928,7 +3828,11 @@ export default function App() {
               for (const m of ev.payload.messages) {
                 next = upsertMsg(next, m);
               }
-              return next;
+              return mergeOutboxIntoMessages(
+                ev.payload.thread_id,
+                next,
+                outboxByThreadRef.current,
+              );
             });
             if (typeof ev.payload.has_more === "boolean") {
               setHasMoreHistory((prev) => prev || Boolean(ev.payload.has_more));
@@ -2953,6 +3857,7 @@ export default function App() {
                 !isLockedRef.current &&
                 !hasActiveWebAppRef.current &&
                 !webAppHubOpenRef.current &&
+                !aiChatOpenRef.current &&
                 chatPaneVisibleRef.current
               ) {
                 completeMarkReadForThread(ev.payload.thread_id);
@@ -3020,6 +3925,10 @@ export default function App() {
           }
         }),
         listen<CallTelemetryDto>("core://call-telemetry", (ev) => {
+          const cur = activeCallRef.current;
+          if (!cur || cur.phase !== "connected" || ev.payload.call_id !== cur.call_id) {
+            return;
+          }
           setCallTelemetry(ev.payload);
         }),
         listen<CallVideoFrameDto>("core://call-video-frame", (ev) => {
@@ -3048,9 +3957,12 @@ export default function App() {
           localCameraEncoderRef.current?.requestKeyframe();
         }),
         listen<string>("core://open-thread", (ev) => {
-          if (ev.payload) {
-            openThreadById(ev.payload);
+          if (!ev.payload) return;
+          if (isLockedRef.current) {
+            pendingOpenThreadIdRef.current = ev.payload;
+            return;
           }
+          openThreadById(ev.payload);
         }),
         listen<DownloadProgressDto>("core://download-progress", (ev) => {
           const p = ev.payload;
@@ -3093,6 +4005,7 @@ export default function App() {
     showCallNotice,
     ensureRemoteVideoRenderer,
     stopLocalCameraEncoder,
+    reloadLatestMessages,
   ]);
 
   useEffect(() => {
@@ -3195,17 +4108,19 @@ export default function App() {
   ]);
 
   useEffect(() => {
-    if (!leaveGroupTarget) return;
+    if (!leaveGroupTarget || effectiveLocked) return;
     const onKeyDown = (e: KeyboardEvent) => {
+      if (isImeComposingEvent(e) || e.defaultPrevented) return;
       if (e.key === "Escape" && !leaveGroupBusy) {
         e.preventDefault();
+        e.stopPropagation();
         setLeaveGroupTarget(null);
         setLeaveGroupError(null);
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [leaveGroupTarget, leaveGroupBusy]);
+  }, [leaveGroupTarget, leaveGroupBusy, effectiveLocked]);
 
   useEffect(() => {
     setKickTarget(null);
@@ -3215,8 +4130,23 @@ export default function App() {
   useEffect(() => {
     if (!folderMenu) return;
     const close = () => setFolderMenu(null);
+    const onScroll = (e: Event) => {
+      const target = e.target as Node | null;
+      if (target && folderMenuRef.current?.contains(target)) return;
+      setFolderMenu(null);
+    };
     window.addEventListener("click", close);
-    return () => window.removeEventListener("click", close);
+    window.addEventListener("contextmenu", close);
+    window.addEventListener("scroll", onScroll, true);
+    window.addEventListener("resize", close);
+    window.addEventListener("blur", close);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("contextmenu", close);
+      window.removeEventListener("scroll", onScroll, true);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("blur", close);
+    };
   }, [folderMenu]);
 
   const activeThreadKind = useMemo(
@@ -3287,9 +4217,49 @@ export default function App() {
     setThreadMenuFoldersExpanded(false);
     if (!threadMenu) return;
     const close = () => setThreadMenu(null);
+    const onScroll = (e: Event) => {
+      const target = e.target as Node | null;
+      if (target && threadMenuRef.current?.contains(target)) return;
+      setThreadMenu(null);
+    };
     window.addEventListener("click", close);
-    return () => window.removeEventListener("click", close);
+    window.addEventListener("contextmenu", close);
+    window.addEventListener("scroll", onScroll, true);
+    window.addEventListener("resize", close);
+    window.addEventListener("blur", close);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("contextmenu", close);
+      window.removeEventListener("scroll", onScroll, true);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("blur", close);
+    };
   }, [threadMenu]);
+
+  useEffect(() => {
+    if (!pinnedListOpen || effectiveLocked) return;
+    const onPointerDown = (e: Event) => {
+      const target = e.target as Node | null;
+      if (target && pinnedBarRef.current?.contains(target)) return;
+      setPinnedListOpen(false);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (isImeComposingEvent(e) || e.defaultPrevented) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        setPinnedListOpen(false);
+      }
+    };
+    window.addEventListener("pointerdown", onPointerDown, true);
+    window.addEventListener("mousedown", onPointerDown, true);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown, true);
+      window.removeEventListener("mousedown", onPointerDown, true);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [pinnedListOpen, effectiveLocked]);
 
   const jumpToMsg = useCallback(
     async (msgId: string) => {
@@ -3317,8 +4287,18 @@ export default function App() {
         if (found && selectedIdRef.current === tid) {
           const around = await bridge.loadMessagesAround(tid, found.ts);
           if (selectedIdRef.current === tid) {
-            setMessages(dedupeOptimisticPollMessages(around.messages));
-            setHasMoreHistory(around.has_more);
+            setMessages(
+              mergeOutboxIntoMessages(
+                tid,
+                dedupeOptimisticPollMessages(around.messages),
+                outboxByThreadRef.current,
+              ),
+            );
+            setHasMoreHistory(Boolean(around.has_more));
+            setHasNewerHistory(Boolean(around.has_newer));
+            if (around.has_newer) {
+              setShowScrollDown(true);
+            }
             if (jumpRetryTimerRef.current !== null) {
               window.clearTimeout(jumpRetryTimerRef.current);
             }
@@ -3328,7 +4308,7 @@ export default function App() {
             }, 60);
           }
         } else {
-          showError("Không tìm thấy tin nhắn gốc trong lịch sử cục bộ");
+          showError(tRef.current("jumpToMsgNotFound"));
         }
       } catch (err) {
         showError(err);
@@ -3357,32 +4337,34 @@ export default function App() {
         setDragHover(false);
         const paths = payload.paths ?? [];
         if (paths.length === 0) return;
-        try {
-          if (paths.length === 1) {
-            const meta = await bridge.inspectAttachmentPath(paths[0]);
-            if (!active) return;
-            updatePendingAttachment({
+        const dropThreadId = selectedIdRef.current;
+        if (!dropThreadId || isLockedRef.current || aiChatOpenRef.current) return;
+        const staged: PendingAttachment[] = [];
+        let firstErr: unknown = null;
+        for (const p of paths) {
+          try {
+            const meta = await bridge.inspectAttachmentPath(p);
+            if (!active || selectedIdRef.current !== dropThreadId) return;
+            staged.push({
+              id: `path-${Date.now()}-${++outboxSeqRef.current}`,
               kind: "path",
               path: meta.path,
               fileName: meta.file_name,
               sizeBytes: meta.size_bytes,
               isImage: meta.is_image,
             });
-          } else {
-            const tid = selectedIdRef.current;
-            if (!tid) return;
-            for (const p of paths) {
-              const meta = await bridge.inspectAttachmentPath(p);
-              if (!active) return;
-              const sent = await bridge.sendAttachmentPath(tid, meta.path, "");
-              setMessages((prev) => upsertMsg(prev, sent));
-              setThreads((prev) => bumpThreadList(prev, sent, false));
+          } catch (err) {
+            if (firstErr === null) {
+              firstErr = err;
             }
-            setDetailsRefreshTick((n) => n + 1);
-            setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
           }
-        } catch (err) {
-          showError(err);
+        }
+        if (!active || selectedIdRef.current !== dropThreadId) return;
+        if (staged.length > 0) {
+          addPendingAttachments(staged);
+        }
+        if (firstErr !== null) {
+          showError(firstErr);
         }
       })
       .then((fn) => {
@@ -3397,7 +4379,7 @@ export default function App() {
       setDragHover(false);
       unlisten?.();
     };
-  }, [authed, showError, updatePendingAttachment]);
+  }, [authed, showError, addPendingAttachments]);
 
   useEffect(() => {
     if (!authed || !selectedId) return;
@@ -3418,6 +4400,7 @@ export default function App() {
       isLockedRef.current ||
         hasActiveWebAppRef.current ||
         webAppHubOpenRef.current ||
+        aiChatOpenRef.current ||
         !chatPaneVisibleRef.current,
     );
     if (initUnread === 0 && !chatObscured) {
@@ -3441,10 +4424,11 @@ export default function App() {
     lastOlderCursorRef.current = null;
     setReplyTo(null);
     setActiveThreadRootId(null);
-    updatePendingAttachment(null);
+    replacePendingAttachments([]);
     setThreadDetails(null);
     setMessages([]);
     setHasMoreHistory(false);
+    setHasNewerHistory(false);
     setLoadingOlder(false);
     setLoadingMessages(true);
     setShowScrollDown(false);
@@ -3461,11 +4445,28 @@ export default function App() {
           if (!page.messages.some((m) => m.msg_id === pending.msgId)) {
             const around = await bridge.loadMessagesAround(selectedId, pending.ts);
             if (cancelled) return;
-            setMessages(dedupeOptimisticPollMessages(around.messages));
-            setHasMoreHistory(around.has_more);
+            setMessages(
+              mergeOutboxIntoMessages(
+                selectedId,
+                dedupeOptimisticPollMessages(around.messages),
+                outboxByThreadRef.current,
+              ),
+            );
+            setHasMoreHistory(Boolean(around.has_more));
+            setHasNewerHistory(Boolean(around.has_newer));
+            if (around.has_newer) {
+              setShowScrollDown(true);
+            }
           } else {
-            setMessages(dedupeOptimisticPollMessages(page.messages));
+            setMessages(
+              mergeOutboxIntoMessages(
+                selectedId,
+                dedupeOptimisticPollMessages(page.messages),
+                outboxByThreadRef.current,
+              ),
+            );
             setHasMoreHistory(page.has_more);
+            setHasNewerHistory(false);
           }
           timers.push(
             window.setTimeout(() => {
@@ -3476,9 +4477,21 @@ export default function App() {
           );
         } else {
           const cleanMessages = dedupeOptimisticPollMessages(page.messages);
-          setMessages(cleanMessages);
+          setMessages(
+            mergeOutboxIntoMessages(selectedId, cleanMessages, outboxByThreadRef.current),
+          );
           setHasMoreHistory(page.has_more);
-          const targetUnreadId = findFirstUnreadMsgId(cleanMessages, initWatermark, initUnread);
+          const visibleForUnread =
+            blockedStickersCfgRef.current.mode === "hide" &&
+            blockedStickersCfgRef.current.rules.length > 0
+              ? cleanMessages.filter(
+                  (m) =>
+                    m.is_outgoing ||
+                    m.is_recalled ||
+                    matchBlockedStickerRule(m, blockedStickersCfgRef.current.rules) === null,
+                )
+              : cleanMessages;
+          const targetUnreadId = findFirstUnreadMsgId(visibleForUnread, initWatermark, initUnread);
           if (targetUnreadId) {
             stickToBottomRef.current = false;
             raf1 = window.requestAnimationFrame(() => {
@@ -3552,6 +4565,11 @@ export default function App() {
           }
         }
       })
+      .catch(() => {
+        if (!cancelled) {
+          setMessages(getOutboxMessages(outboxByThreadRef.current, selectedId));
+        }
+      })
       .finally(() => {
         if (!cancelled) setLoadingMessages(false);
       });
@@ -3571,7 +4589,7 @@ export default function App() {
     completeMarkReadForThread,
     tryAutoMarkReadActiveThread,
     snapScrollToBottom,
-    updatePendingAttachment,
+    replacePendingAttachments,
   ]);
 
   const activeThreadLang = selectedId ? threadAutoTranslate[selectedId] : undefined;
@@ -3609,13 +4627,28 @@ export default function App() {
     void translateBatchMessages(messages, activeThreadLang);
   }, [authed, selectedId, activeThreadLang, messages, translateBatchMessages]);
 
+  useLayoutEffect(() => {
+    const pending = olderScrollAnchorRef.current;
+    if (!pending) return;
+    olderScrollAnchorRef.current = null;
+    if (pending.threadId !== selectedId) return;
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    const anchorEl = document.getElementById(`msg-${pending.msgId}`);
+    if (!anchorEl) return;
+    const containerRect = container.getBoundingClientRect();
+    const nextOffsetTop = anchorEl.getBoundingClientRect().top - containerRect.top;
+    const delta = nextOffsetTop - pending.prevOffsetTop;
+    if (Math.abs(delta) > 0.5) {
+      lastProgrammaticScrollAtRef.current = performance.now();
+      container.scrollTop += delta;
+    }
+  }, [messages, selectedId]);
+
   const loadOlderMessages = useCallback(async () => {
     if (!selectedId || loadingOlder || !hasMoreHistory || messages.length === 0) return;
     stickToBottomRef.current = false;
     const oldest = messages[0];
-    const container = scrollContainerRef.current;
-    const prevScrollHeight = container?.scrollHeight ?? 0;
-    const prevScrollTop = container?.scrollTop ?? 0;
     const existingIds = new Set(messages.map((m) => m.msg_id));
     const prevCursor = lastOlderCursorRef.current;
     lastOlderCursorRef.current = oldest.msg_id;
@@ -3626,17 +4659,28 @@ export default function App() {
       if (selectedIdRef.current !== selectedId) return;
       const hasFresh = page.messages.some((m) => !existingIds.has(m.msg_id));
       if (hasFresh) {
+        const container = scrollContainerRef.current;
+        if (container) {
+          const containerRect = container.getBoundingClientRect();
+          const msgNodes = container.querySelectorAll<HTMLElement>("[id^='msg-']");
+          let anchor: { threadId: string; msgId: string; prevOffsetTop: number } | null = null;
+          for (const node of msgNodes) {
+            const rect = node.getBoundingClientRect();
+            if (rect.bottom > containerRect.top + 1) {
+              anchor = {
+                threadId: selectedId,
+                msgId: node.id.slice(4),
+                prevOffsetTop: rect.top - containerRect.top,
+              };
+              break;
+            }
+          }
+          olderScrollAnchorRef.current = anchor;
+        }
         setMessages((prev) => {
           const seen = new Set(prev.map((m) => m.msg_id));
           const fresh = page.messages.filter((m) => !seen.has(m.msg_id));
           return fresh.length > 0 ? dedupeOptimisticPollMessages([...fresh, ...prev]) : prev;
-        });
-        requestAnimationFrame(() => {
-          if (container) {
-            lastProgrammaticScrollAtRef.current = performance.now();
-            const delta = container.scrollHeight - prevScrollHeight;
-            container.scrollTop = prevScrollTop + delta;
-          }
         });
         setHasMoreHistory(page.has_more);
       } else {
@@ -3660,8 +4704,19 @@ export default function App() {
         } else {
           try {
             const around = await bridge.loadMessagesAround(hit.thread_id, hit.ts);
-            setMessages(dedupeOptimisticPollMessages(around.messages));
-            setHasMoreHistory(around.has_more);
+            if (selectedIdRef.current !== hit.thread_id) return;
+            setMessages(
+              mergeOutboxIntoMessages(
+                hit.thread_id,
+                dedupeOptimisticPollMessages(around.messages),
+                outboxByThreadRef.current,
+              ),
+            );
+            setHasMoreHistory(Boolean(around.has_more));
+            setHasNewerHistory(Boolean(around.has_newer));
+            if (around.has_newer) {
+              setShowScrollDown(true);
+            }
             setTimeout(() => jumpToMsg(hit.msg_id), 60);
           } catch (err) {
             showError(err);
@@ -3676,7 +4731,7 @@ export default function App() {
   );
 
   const visibleThreads = useMemo(() => {
-    const byFolder = filterThreadsByFolder(threads, folder, customFolders);
+    const byFolder = filterThreadsByFolder(threads, folder, customFolders, muteTickNow);
     const q = filterText.trim();
     const base = q
       ? byFolder.filter((t) =>
@@ -3684,7 +4739,7 @@ export default function App() {
         )
       : [...byFolder];
     return base.sort(compareThreads);
-  }, [threads, folder, customFolders, filterText]);
+  }, [threads, folder, customFolders, filterText, muteTickNow]);
   visibleThreadsRef.current = visibleThreads;
 
   useEffect(() => {
@@ -3736,7 +4791,7 @@ export default function App() {
   );
 
   useEffect(() => {
-    if (!authed || !selectedId || !hasActiveThread) return;
+    if (!authed || !selectedId || !hasActiveThread || aiChatOpen) return;
     const contentEl = messagesContentRef.current;
     if (!contentEl || typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(() => {
@@ -3746,7 +4801,39 @@ export default function App() {
     });
     observer.observe(contentEl);
     return () => observer.disconnect();
-  }, [authed, selectedId, hasActiveThread, snapScrollToBottom]);
+  }, [authed, selectedId, hasActiveThread, aiChatOpen, snapScrollToBottom]);
+
+  const prevAiChatOpenRef = useRef(aiChatOpen);
+  useEffect(() => {
+    const wasAiOpen = prevAiChatOpenRef.current;
+    prevAiChatOpenRef.current = aiChatOpen;
+    if (!wasAiOpen || aiChatOpen || !authed || !selectedId || !hasActiveThread) return;
+    let raf1 = 0;
+    let raf2 = 0;
+    const restoreScrollPosition = () => {
+      if (aiChatOpenRef.current || selectedIdRef.current !== selectedId) return;
+      const el = scrollContainerRef.current;
+      if (!el) return;
+      if (stickToBottomRef.current) {
+        snapScrollToBottom();
+        setShowScrollDown(false);
+        setUnreadBelow(0);
+      } else {
+        const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+        setShowScrollDown(distFromBottom > 220);
+      }
+    };
+    raf1 = window.requestAnimationFrame(() => {
+      restoreScrollPosition();
+      raf2 = window.requestAnimationFrame(() => {
+        restoreScrollPosition();
+      });
+    });
+    return () => {
+      if (raf1) window.cancelAnimationFrame(raf1);
+      if (raf2) window.cancelAnimationFrame(raf2);
+    };
+  }, [authed, selectedId, hasActiveThread, aiChatOpen, snapScrollToBottom]);
 
   const inChatMatches = useMemo(() => {
     const q = inChatSearchQuery.trim();
@@ -3792,9 +4879,21 @@ export default function App() {
     el?.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [inChatActiveMatchId]);
 
+  const visibleMessages = useMemo(() => {
+    if (blockedStickersCfg.mode !== "hide" || blockedStickersCfg.rules.length === 0) {
+      return messages;
+    }
+    return messages.filter(
+      (m) =>
+        m.is_outgoing ||
+        m.is_recalled ||
+        matchBlockedStickerRule(m, blockedStickersCfg.rules) === null,
+    );
+  }, [messages, blockedStickersCfg.mode, blockedStickersCfg.rules]);
+
   const firstUnreadMsgId = useMemo(
-    () => findFirstUnreadMsgId(messages, unreadWatermarkTs, unreadDividerCount),
-    [messages, unreadWatermarkTs, unreadDividerCount],
+    () => findFirstUnreadMsgId(visibleMessages, unreadWatermarkTs, unreadDividerCount),
+    [visibleMessages, unreadWatermarkTs, unreadDividerCount],
   );
 
   const archivedThreads = useMemo(
@@ -3803,8 +4902,12 @@ export default function App() {
   );
 
   const archivedUnread = useMemo(
-    () => archivedThreads.reduce((acc, t) => acc + (t.is_muted ? 0 : t.unread_count), 0),
-    [archivedThreads],
+    () =>
+      archivedThreads.reduce(
+        (acc, t) => acc + (isThreadCurrentlyMuted(t, muteTickNow) ? 0 : t.unread_count),
+        0,
+      ),
+    [archivedThreads, muteTickNow],
   );
 
   const visibleBuiltInFolders = useMemo(
@@ -3856,7 +4959,7 @@ export default function App() {
   hasActiveWebAppRef.current = Boolean(activeWebApp);
 
   const webappSuspended = Boolean(
-    isLocked ||
+    effectiveLocked ||
       navDrawerOpen ||
       settingsOpen ||
       folderModalOpen ||
@@ -3876,10 +4979,33 @@ export default function App() {
       createPollOpen ||
       scheduledModalOpen ||
       screenshotEditor ||
+      Boolean(completedDownload) ||
+      activeDownloads.length > 0 ||
       showVideoOverlay ||
       activeCallDevicesOpen ||
       callState.phase === "incoming_ringing",
   );
+
+  useEffect(() => {
+    if (
+      layout.mode === "single" &&
+      mobilePane === "chat" &&
+      !activeThread &&
+      !aiChatOpen &&
+      !activeWebApp &&
+      !(webAppsCfg.enabled && webAppHubOpen)
+    ) {
+      setMobilePane("list");
+    }
+  }, [
+    layout.mode,
+    mobilePane,
+    activeThread,
+    aiChatOpen,
+    activeWebApp,
+    webAppsCfg.enabled,
+    webAppHubOpen,
+  ]);
 
   useEffect(() => {
     if (!activeWebApp) {
@@ -3888,11 +5014,21 @@ export default function App() {
   }, [activeWebApp]);
 
   const prevChatObscuredRef = useRef<boolean>(
-    Boolean(isLocked || activeWebApp || (webAppsCfg.enabled && webAppHubOpen) || !chatPaneVisible),
+    Boolean(
+      isLocked ||
+        activeWebApp ||
+        (webAppsCfg.enabled && webAppHubOpen) ||
+        aiChatOpen ||
+        !chatPaneVisible,
+    ),
   );
   useEffect(() => {
     const obscured = Boolean(
-      isLocked || activeWebApp || (webAppsCfg.enabled && webAppHubOpen) || !chatPaneVisible,
+      isLocked ||
+        activeWebApp ||
+        (webAppsCfg.enabled && webAppHubOpen) ||
+        aiChatOpen ||
+        !chatPaneVisible,
     );
     const wasObscured = prevChatObscuredRef.current;
     prevChatObscuredRef.current = obscured;
@@ -3929,6 +5065,7 @@ export default function App() {
     activeWebApp,
     webAppsCfg.enabled,
     webAppHubOpen,
+    aiChatOpen,
     chatPaneVisible,
     tryAutoMarkReadActiveThread,
   ]);
@@ -4078,6 +5215,7 @@ export default function App() {
             !isLockedRef.current &&
             !hasActiveWebAppRef.current &&
             !webAppHubOpenRef.current &&
+            !aiChatOpenRef.current &&
             chatPaneVisibleRef.current
           ) {
             void bridge.setActiveThread(target.id);
@@ -4140,6 +5278,7 @@ export default function App() {
             !isLockedRef.current &&
             !hasActiveWebAppRef.current &&
             !webAppHubOpenRef.current &&
+            !aiChatOpenRef.current &&
             chatPaneVisibleRef.current
           ) {
             void bridge.setActiveThread(curTid);
@@ -4211,9 +5350,23 @@ export default function App() {
     });
   }, []);
 
+  const removeLocalThreadLink = useCallback((msgId: string) => {
+    setLocalThreadLinks((prev) => {
+      if (!(msgId in prev)) return prev;
+      const next = { ...prev };
+      delete next[msgId];
+      try {
+        localStorage.setItem("litechat.threadLinks", JSON.stringify(next));
+      } catch {
+        // Ignore quota limits
+      }
+      return next;
+    });
+  }, []);
+
   const sendTextInternal = useCallback(
     async (targetThreadId: string, text: string, quoteTarget: MessageDto | null): Promise<boolean> => {
-      const tempId = `opt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const tempId = `opt-${Date.now()}-${++outboxSeqRef.current}-${Math.random().toString(36).slice(2, 6)}`;
       const quoteSnap = quoteTarget
         ? {
             msg_id: quoteTarget.msg_id,
@@ -4228,7 +5381,7 @@ export default function App() {
         sender_name: "Bạn",
         text,
         msg_type: "chat.text",
-        ts: Date.now(),
+        ts: nextOptimisticTs(),
         is_outgoing: true,
         is_recalled: false,
         is_pinned: false,
@@ -4238,34 +5391,70 @@ export default function App() {
         attachment_name: null,
         send_status: "sending",
       };
+      commitOutbox(
+        upsertOutboxEntry(outboxByThreadRef.current, {
+          msg: optimistic,
+          quoteTarget,
+        }),
+      );
       if (selectedIdRef.current === targetThreadId) {
         setMessages((prev) => upsertMsg(prev, optimistic));
         setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 30);
       }
-      try {
-        const msg = quoteTarget
-          ? await bridge.sendQuote(targetThreadId, text, quoteTarget)
-          : await bridge.sendText(targetThreadId, text);
-        if (selectedIdRef.current === targetThreadId) {
-          setMessages((prev) => upsertMsg(prev.filter((m) => m.msg_id !== tempId), msg));
-          setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
-        }
-        setThreads((prev) => bumpThreadList(prev, msg, false));
-        return true;
-      } catch (err) {
-        const errMsg = String(err);
-        if (selectedIdRef.current === targetThreadId) {
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.msg_id === tempId ? { ...m, send_status: "failed", send_error: errMsg } : m,
-            ),
+      void (async () => {
+        try {
+          const msg = quoteTarget
+            ? await bridge.sendQuote(targetThreadId, text, quoteTarget)
+            : await bridge.sendText(targetThreadId, text);
+          if (!authedRef.current) return;
+          commitOutbox(removeOutboxEntry(outboxByThreadRef.current, tempId, targetThreadId).next);
+          if (selectedIdRef.current === targetThreadId) {
+            setMessages((prev) =>
+              mergeOutboxIntoMessages(
+                targetThreadId,
+                upsertMsg(
+                  prev.filter((m) => m.msg_id !== tempId),
+                  msg,
+                ),
+                outboxByThreadRef.current,
+              ),
+            );
+            setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
+          }
+          setThreads((prev) => bumpThreadList(prev, msg, false));
+        } catch (err) {
+          const errMsg = String(err);
+          const { next, updated } = markOutboxFailed(
+            outboxByThreadRef.current,
+            targetThreadId,
+            tempId,
+            errMsg,
           );
+          if (!updated) {
+            return;
+          }
+          commitOutbox(next);
+          const failedMsg = updated.msg;
+          if (selectedIdRef.current === targetThreadId) {
+            setMessages((prev) =>
+              prev.some((m) => m.msg_id === tempId)
+                ? prev.map((m) => (m.msg_id === tempId ? failedMsg : m))
+                : upsertMsg(prev, failedMsg),
+            );
+            showError(err);
+          } else {
+            const targetTitle = threadsRef.current.find((th) => th.id === targetThreadId)?.title;
+            showError(
+              targetTitle
+                ? tRef.current("sendFailedInThreadToast", { title: targetTitle, error: errMsg })
+                : err,
+            );
+          }
         }
-        showError(err);
-        return true;
-      }
+      })();
+      return true;
     },
-    [myProfile?.uid, showError],
+    [commitOutbox, myProfile?.uid, nextOptimisticTs, showError],
   );
 
   const handleSendText = async (text: string): Promise<boolean> => {
@@ -4286,24 +5475,58 @@ export default function App() {
     [selectedId, sendTextInternal],
   );
 
-  const handleDiscardFailedMessage = useCallback((msgId: string) => {
-    setMessages((prev) => prev.filter((m) => m.msg_id !== msgId));
-  }, []);
+  const handleDiscardFailedMessage = useCallback(
+    (msgId: string) => {
+      if (activeAttachmentUploadIdsRef.current.has(msgId)) {
+        return;
+      }
+      const { next, removed } = removeOutboxEntry(outboxByThreadRef.current, msgId);
+      commitOutbox(next);
+      if (isRevocableBlobUrl(removed?.attachment?.ownedPreviewUrl)) {
+        URL.revokeObjectURL(removed.attachment.ownedPreviewUrl);
+      }
+      removeLocalThreadLink(msgId);
+      setMessages((prev) => prev.filter((m) => m.msg_id !== msgId));
+    },
+    [commitOutbox, removeLocalThreadLink],
+  );
 
   const handleRetryFailedMessage = useCallback(
     (failedMsg: MessageDto) => {
+      const { next, removed } = removeOutboxEntry(
+        outboxByThreadRef.current,
+        failedMsg.msg_id,
+        failedMsg.thread_id,
+      );
+      commitOutbox(next);
+      removeLocalThreadLink(failedMsg.msg_id);
       setMessages((prev) => prev.filter((m) => m.msg_id !== failedMsg.msg_id));
-      const quoteTarget = failedMsg.quote
-        ? messages.find((m) => m.msg_id === failedMsg.quote?.msg_id) ?? {
-            ...failedMsg,
-            msg_id: failedMsg.quote.msg_id,
-            sender_name: failedMsg.quote.sender_name,
-            text: failedMsg.quote.snippet,
-          }
-        : null;
+
+      if (removed?.attachment) {
+        const savedAtt = removed.attachment;
+        void handleSendAttachmentRef.current(savedAtt.att, savedAtt.caption, {
+          threadId: failedMsg.thread_id,
+          rootMsgId: savedAtt.rootMsgId,
+        });
+        if (isRevocableBlobUrl(savedAtt.ownedPreviewUrl)) {
+          URL.revokeObjectURL(savedAtt.ownedPreviewUrl);
+        }
+        return;
+      }
+
+      const quoteTarget =
+        removed?.quoteTarget ??
+        (failedMsg.quote
+          ? messagesRef.current.find((m) => m.msg_id === failedMsg.quote?.msg_id) ?? {
+              ...failedMsg,
+              msg_id: failedMsg.quote.msg_id,
+              sender_name: failedMsg.quote.sender_name,
+              text: failedMsg.quote.snippet,
+            }
+          : null);
       void sendTextInternal(failedMsg.thread_id, failedMsg.text, quoteTarget);
     },
-    [messages, sendTextInternal],
+    [commitOutbox, removeLocalThreadLink, sendTextInternal],
   );
 
   const avatarByUserId = useMemo(() => {
@@ -4378,20 +5601,23 @@ export default function App() {
   const openLightboxForUrl = useCallback(
     (url: string, title: string, opts?: { threadId?: string; msgId?: string }) => {
       const targetUrl = normalizeMediaRequestUrl(url) || url;
-      const gallery: LightboxItem[] = messages
+      const blockedRules = blockedStickersCfgRef.current.rules;
+      const gallery: LightboxItem[] = messagesRef.current
         .filter((m) => {
           const norm = normalizeMediaRequestUrl(m.attachment_url);
+          const msgTypeLower = m.msg_type.toLowerCase();
           return (
             !m.is_recalled &&
             !!norm &&
-            !m.msg_type.includes("sticker") &&
-            m.msg_type !== "5" &&
-            !m.msg_type.includes("voice") &&
+            !isStickerMsgType(m.msg_type) &&
+            matchBlockedStickerRule(m, blockedRules) === null &&
+            !msgTypeLower.includes("voice") &&
             m.msg_type !== "3" &&
-            !m.msg_type.includes("video") &&
+            !msgTypeLower.includes("video") &&
             m.msg_type !== "4" &&
-            (m.msg_type.includes("photo") ||
-              m.msg_type.includes("gif") ||
+            m.msg_type !== "44" &&
+            (msgTypeLower.includes("photo") ||
+              msgTypeLower.includes("gif") ||
               m.msg_type === "2" ||
               isDataImageUrl(norm) ||
               /\.(png|jpe?g|webp|gif|bmp)(\?|$)/i.test(norm))
@@ -4420,7 +5646,7 @@ export default function App() {
         });
       }
     },
-    [messages],
+    [],
   );
 
   const handleReactMessage = useCallback(
@@ -4517,6 +5743,55 @@ export default function App() {
     },
     [showError, refreshPinnedMessages],
   );
+
+  const handleBlockSticker = useCallback(
+    (target: MessageDto, opts: { kind: BlockedStickerKind; global: boolean }) => {
+      const threadTitle = threadsRef.current.find((th) => th.id === target.thread_id)?.title;
+      const input = buildBlockedStickerRuleFromMessage(target, {
+        kind: opts.kind,
+        global: opts.global,
+        threadTitle,
+      });
+      if (!input) return;
+      setBlockedStickersCfg((prev) => {
+        const next = addBlockedStickerRule(prev, input);
+        if (next !== prev) {
+          saveBlockedStickersConfig(next);
+        }
+        return next;
+      });
+    },
+    [],
+  );
+
+  const handleUnblockSticker = useCallback((ruleId: string) => {
+    setBlockedStickersCfg((prev) => {
+      const next = removeBlockedStickerRule(prev, ruleId);
+      if (next !== prev) {
+        saveBlockedStickersConfig(next);
+      }
+      return next;
+    });
+  }, []);
+
+  const handleBlockedStickerModeChange = useCallback((mode: BlockedStickerDisplayMode) => {
+    setBlockedStickersCfg((prev) => {
+      const next = setBlockedStickerDisplayMode(prev, mode);
+      if (next !== prev) {
+        saveBlockedStickersConfig(next);
+      }
+      return next;
+    });
+  }, []);
+
+  const handleClearBlockedStickers = useCallback(() => {
+    setBlockedStickersCfg((prev) => {
+      if (prev.rules.length === 0) return prev;
+      const next: BlockedStickersConfig = { ...prev, rules: [] };
+      saveBlockedStickersConfig(next);
+      return next;
+    });
+  }, []);
 
   const openDirectChatThread = useCallback(
     (rawUid: string, rawTitle: string, rawAvatar: string) => {
@@ -4650,15 +5925,18 @@ export default function App() {
       setMessages((prev) => prev.filter((m) => !deletedSet.has(m.msg_id)));
       setSelectMode(false);
       setSelectedMsgIds(new Set());
+      if (ids.some((id) => pinnedMsgIdsRef.current.has(id))) {
+        void refreshPinnedMessages(tid);
+      }
     } catch (err) {
       showError(err);
     }
-  }, [selectedMsgIds, showError]);
+  }, [selectedMsgIds, showError, refreshPinnedMessages]);
 
   const handleVotePoll = useCallback(
-    async (msg: MessageDto, optionIds: number[]) => {
+    async (msg: MessageDto, optionIds: number[]): Promise<boolean | string> => {
       const poll = parsePollPayload(msg);
-      if (!poll || poll.poll_id <= 0) return;
+      if (!poll || poll.poll_id <= 0) return false;
       try {
         const updated = await bridge.votePoll(
           poll.poll_id,
@@ -4667,15 +5945,21 @@ export default function App() {
           msg.msg_id,
         );
         setMessages((prev) => applyPollUpdateToMessages(prev, poll.poll_id, updated, msg.msg_id));
+        return true;
       } catch (err) {
         showError(err);
+        return err instanceof Error ? err.message : String(err);
       }
     },
     [showError],
   );
 
   const handleAddPollOption = useCallback(
-    async (msg: MessageDto, optionText: string, votedOptionIds: number[]): Promise<boolean> => {
+    async (
+      msg: MessageDto,
+      optionText: string,
+      votedOptionIds: number[],
+    ): Promise<boolean | string> => {
       const poll = parsePollPayload(msg);
       const trimmed = optionText.trim();
       if (!poll || poll.poll_id <= 0 || !trimmed) return false;
@@ -4690,14 +5974,14 @@ export default function App() {
         return true;
       } catch (err) {
         showError(err);
-        return false;
+        return err instanceof Error ? err.message : String(err);
       }
     },
     [showError],
   );
 
   const handleLockPoll = useCallback(
-    async (msg: MessageDto): Promise<boolean> => {
+    async (msg: MessageDto): Promise<boolean | string> => {
       const poll = parsePollPayload(msg);
       if (!poll || poll.poll_id <= 0) return false;
       try {
@@ -4708,21 +5992,23 @@ export default function App() {
         return true;
       } catch (err) {
         showError(err);
-        return false;
+        return err instanceof Error ? err.message : String(err);
       }
     },
     [showError],
   );
 
   const handleRefreshPoll = useCallback(
-    async (msg: MessageDto) => {
+    async (msg: MessageDto): Promise<boolean | string> => {
       const poll = parsePollPayload(msg);
-      if (!poll || poll.poll_id <= 0) return;
+      if (!poll || poll.poll_id <= 0) return false;
       try {
         const updated = await bridge.getPollDetail(poll.poll_id, msg.thread_id, msg.msg_id);
         setMessages((prev) => applyPollUpdateToMessages(prev, poll.poll_id, updated, msg.msg_id));
+        return true;
       } catch (err) {
         showError(err);
+        return err instanceof Error ? err.message : String(err);
       }
     },
     [showError],
@@ -4751,6 +6037,16 @@ export default function App() {
     }
     return groupMembersCache[activeThread.id] ?? [];
   }, [activeThread, activeThreadDetails, groupMembersCache]);
+
+  const canManageActivePolls = useMemo(() => {
+    if (!activeThread || activeThread.kind !== "group" || !myProfile?.uid) return false;
+    const uid = myProfile.uid;
+    if (activeThreadDetails?.creator_id && activeThreadDetails.creator_id === uid) return true;
+    if (activeThreadDetails?.admin_ids?.includes(uid)) return true;
+    const meMember = activeMentionMembers.find((m) => m.id === uid);
+    const role = (meMember?.role || "").toLowerCase();
+    return role === "creator" || role === "owner" || role === "admin" || role === "deputy";
+  }, [activeThread, activeThreadDetails, activeMentionMembers, myProfile?.uid]);
 
   const composerMentionMembers = useMemo<ThreadMemberDto[]>(
     () =>
@@ -4797,7 +6093,16 @@ export default function App() {
     if (activeThread && activeThread.kind === "direct") {
       add(activeThread.id, activeThread.title);
     }
-    return Array.from(byId.values());
+    const nextList = Array.from(byId.values());
+    const prevList = prevMessageMentionCandidatesRef.current;
+    if (
+      prevList.length === nextList.length &&
+      prevList.every((item, idx) => item.id === nextList[idx].id && item.name === nextList[idx].name)
+    ) {
+      return prevList;
+    }
+    prevMessageMentionCandidatesRef.current = nextList;
+    return nextList;
   }, [activeMentionMembers, messages, myProfile, activeThread, directDirectory]);
 
   const currentPinned =
@@ -4857,49 +6162,224 @@ export default function App() {
     } satisfies MessageDto;
   }, [activeThreadRootId, replyGraph, selectedId]);
 
-  const handleOpenReplyThread = useCallback(
-    (target: MessageDto) => {
-      const hasOwnReplies = (replyGraph.repliesByRoot[target.msg_id]?.length ?? 0) > 0;
-      const rootId =
-        hasOwnReplies || !target.quote?.msg_id
-          ? target.msg_id
-          : replyGraph.byId.has(target.quote.msg_id)
-            ? replyGraph.resolveRoot(target.quote.msg_id)
-            : target.quote.msg_id;
-      setActiveThreadRootId(rootId);
+  replyGraphRef.current = replyGraph;
+
+  const handleOpenReplyThread = useCallback((target: MessageDto) => {
+    const graph = replyGraphRef.current;
+    if (!graph) {
+      setActiveThreadRootId(target.msg_id);
+      return;
+    }
+    const hasOwnReplies = (graph.repliesByRoot[target.msg_id]?.length ?? 0) > 0;
+    const rootId =
+      hasOwnReplies || !target.quote?.msg_id
+        ? target.msg_id
+        : graph.byId.has(target.quote.msg_id)
+          ? graph.resolveRoot(target.quote.msg_id)
+          : target.quote.msg_id;
+    setActiveThreadRootId(rootId);
+  }, []);
+
+  const persistLocalThreadLink = useCallback((msgId: string, rootMsgId: string, replaceTempId?: string) => {
+    setLocalThreadLinks((prev) => {
+      const nextMap: Record<string, string> = { ...prev };
+      if (replaceTempId && replaceTempId !== msgId) {
+        delete nextMap[replaceTempId];
+      }
+      nextMap[msgId] = rootMsgId;
+      const entries = Object.entries(nextMap).slice(-500);
+      const next = Object.fromEntries(entries);
+      try {
+        localStorage.setItem("litechat.threadLinks", JSON.stringify(next));
+      } catch {
+        // Ignore quota limits
+      }
+      return next;
+    });
+  }, []);
+
+  const handleSendAttachment = useCallback(
+    async (
+      att: PendingAttachment,
+      caption: string,
+      opts?: { threadId?: string; rootMsgId?: string },
+    ): Promise<MessageDto | false> => {
+      const targetThreadId = opts?.threadId || selectedIdRef.current;
+      if (!targetThreadId) return false;
+      const cleanCaption = caption.trim();
+      setUnreadDividerCount(0);
+      setUnreadWatermarkTs(0);
+      completeMarkReadForThread(targetThreadId);
+
+      const tempId = `opt-att-${Date.now()}-${++outboxSeqRef.current}-${Math.random().toString(36).slice(2, 6)}`;
+      const ownedPreviewUrl =
+        att.kind === "raw" && att.isImage ? URL.createObjectURL(att.file) : null;
+      const optimistic: MessageDto = {
+        msg_id: tempId,
+        thread_id: targetThreadId,
+        sender_id: myProfileRef.current?.uid || "me",
+        sender_name: "Bạn",
+        text: att.isImage
+          ? cleanCaption || "[Hình ảnh]"
+          : cleanCaption
+            ? `[Tập tin] ${att.fileName}\n${cleanCaption}`
+            : `[Tập tin] ${att.fileName}`,
+        msg_type: att.isImage ? "chat.photo" : "chat.file",
+        ts: nextOptimisticTs(),
+        is_outgoing: true,
+        is_recalled: false,
+        is_pinned: false,
+        quote: null,
+        reactions: [],
+        attachment_url: ownedPreviewUrl,
+        attachment_name: att.fileName,
+        send_status: "sending",
+      };
+
+      commitOutbox(
+        upsertOutboxEntry(outboxByThreadRef.current, {
+          msg: optimistic,
+          attachment: {
+            att,
+            caption,
+            ownedPreviewUrl,
+            rootMsgId: opts?.rootMsgId,
+          },
+        }),
+      );
+
+      if (opts?.rootMsgId) {
+        persistLocalThreadLink(tempId, opts.rootMsgId);
+      }
+      if (selectedIdRef.current === targetThreadId) {
+        setMessages((prev) => upsertMsg(prev, optimistic));
+        setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 24);
+      }
+      setThreads((prev) => bumpThreadList(prev, optimistic, false));
+
+      const prevQueue = attachmentUploadQueueRef.current.get(targetThreadId) ?? Promise.resolve();
+      const uploadTask = prevQueue
+        .catch(() => undefined)
+        .then(async () => {
+          // Yield a paint tick so the cleared composer and optimistic photo render immediately.
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+          if (
+            !authedRef.current ||
+            !findOutboxEntry(outboxByThreadRef.current, tempId, targetThreadId)
+          ) {
+            return;
+          }
+          activeAttachmentUploadIdsRef.current.add(tempId);
+          setActiveAttachmentUploadIds((prev) => {
+            const next = new Set(prev);
+            next.add(tempId);
+            return next;
+          });
+          try {
+            let msg: MessageDto;
+            if (att.kind === "path") {
+              msg = await bridge.sendAttachmentPath(targetThreadId, att.path, caption);
+            } else {
+              const rawBytes = new Uint8Array(await att.file.arrayBuffer());
+              if (
+                !authedRef.current ||
+                !findOutboxEntry(outboxByThreadRef.current, tempId, targetThreadId)
+              ) {
+                return;
+              }
+              msg = await bridge.sendRawAttachment(
+                targetThreadId,
+                att.fileName,
+                rawBytes,
+                caption,
+                ownedPreviewUrl,
+              );
+            }
+            if (!authedRef.current) return;
+            const removedRes = removeOutboxEntry(
+              outboxByThreadRef.current,
+              tempId,
+              targetThreadId,
+            );
+            commitOutbox(removedRes.next);
+            if (!removedRes.removed) {
+              if (ownedPreviewUrl && msg.attachment_url !== ownedPreviewUrl) {
+                window.setTimeout(() => URL.revokeObjectURL(ownedPreviewUrl), 800);
+              }
+              return;
+            }
+            if (opts?.rootMsgId) {
+              persistLocalThreadLink(msg.msg_id, opts.rootMsgId, tempId);
+            }
+            if (selectedIdRef.current === targetThreadId) {
+              setMessages((prev) =>
+                mergeOutboxIntoMessages(
+                  targetThreadId,
+                  upsertMsg(
+                    prev.filter((m) => m.msg_id !== tempId),
+                    msg,
+                  ),
+                  outboxByThreadRef.current,
+                ),
+              );
+              setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
+            }
+            setThreads((prev) => bumpThreadList(prev, msg, false));
+            setDetailsRefreshTick((n) => n + 1);
+            if (ownedPreviewUrl && msg.attachment_url !== ownedPreviewUrl) {
+              window.setTimeout(() => URL.revokeObjectURL(ownedPreviewUrl), 800);
+            }
+          } catch (err) {
+            const errMsg = String(err);
+            const { next, updated } = markOutboxFailed(
+              outboxByThreadRef.current,
+              targetThreadId,
+              tempId,
+              errMsg,
+            );
+            if (!updated) {
+              return;
+            }
+            commitOutbox(next);
+            const failedMsg = updated.msg;
+            if (selectedIdRef.current === targetThreadId) {
+              setMessages((prev) =>
+                prev.some((m) => m.msg_id === tempId)
+                  ? prev.map((m) => (m.msg_id === tempId ? failedMsg : m))
+                  : upsertMsg(prev, failedMsg),
+              );
+              showError(err);
+            } else {
+              const targetTitle = threadsRef.current.find((th) => th.id === targetThreadId)?.title;
+              showError(
+                targetTitle
+                  ? tRef.current("sendFailedInThreadToast", { title: targetTitle, error: errMsg })
+                  : err,
+              );
+            }
+          } finally {
+            activeAttachmentUploadIdsRef.current.delete(tempId);
+            setActiveAttachmentUploadIds((prev) => {
+              if (!prev.has(tempId)) return prev;
+              const next = new Set(prev);
+              next.delete(tempId);
+              return next;
+            });
+          }
+        })
+        .finally(() => {
+          if (attachmentUploadQueueRef.current.get(targetThreadId) === uploadTask) {
+            attachmentUploadQueueRef.current.delete(targetThreadId);
+          }
+        });
+      attachmentUploadQueueRef.current.set(targetThreadId, uploadTask);
+
+      return optimistic;
     },
-    [replyGraph],
+    [commitOutbox, completeMarkReadForThread, nextOptimisticTs, persistLocalThreadLink, showError],
   );
 
-  const handleSendAttachment = async (
-    att: PendingAttachment,
-    caption: string,
-  ): Promise<MessageDto | false> => {
-    if (!selectedId) return false;
-    setUnreadDividerCount(0);
-    setUnreadWatermarkTs(0);
-    completeMarkReadForThread(selectedId);
-    try {
-      const msg =
-        att.kind === "path"
-          ? await bridge.sendAttachmentPath(selectedId, att.path, caption)
-          : await bridge.sendRawAttachment(
-              selectedId,
-              att.fileName,
-              new Uint8Array(await att.file.arrayBuffer()),
-              caption,
-              att.previewUrl,
-            );
-      setMessages((prev) => upsertMsg(prev, msg));
-      setThreads((prev) => bumpThreadList(prev, msg, false));
-      setDetailsRefreshTick((n) => n + 1);
-      setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 40);
-      return msg;
-    } catch (err) {
-      showError(err);
-      return false;
-    }
-  };
+  handleSendAttachmentRef.current = handleSendAttachment;
 
   const closeScreenshotEditor = useCallback(() => {
     setScreenshotEditor((prev) => {
@@ -4946,28 +6426,96 @@ export default function App() {
     }
   };
 
-  const handleEditPendingImage = () => {
-    if (!pendingAttachment || pendingAttachment.kind !== "raw" || !pendingAttachment.isImage) {
-      return;
-    }
-    const existingPreview = pendingAttachment.previewUrl;
-    const objectUrl = existingPreview ? undefined : URL.createObjectURL(pendingAttachment.file);
-    const sourceUrl = existingPreview ?? objectUrl ?? "";
-    if (!sourceUrl) return;
-    setScreenshotEditor((prev) => {
-      if (prev?.revokeUrl) {
-        URL.revokeObjectURL(prev.revokeUrl);
+  const handleEditPendingImage = useCallback(
+    async (attachmentId?: string) => {
+      const list = pendingAttachmentsRef.current;
+      const target = attachmentId
+        ? list.find((a) => a.id === attachmentId && a.isImage)
+        : list.length === 1 && list[0].isImage
+          ? list[0]
+          : list.find((a) => a.isImage);
+      if (!target) return;
+
+      let sourceUrl = "";
+      let revokeUrl: string | undefined;
+      if (target.kind === "raw") {
+        const existingPreview = target.previewUrl;
+        const objectUrl = existingPreview ? undefined : URL.createObjectURL(target.file);
+        sourceUrl = existingPreview ?? objectUrl ?? "";
+        revokeUrl = objectUrl;
+      } else {
+        try {
+          sourceUrl = await bridge.readAttachmentImageDataUrl(target.path);
+        } catch (err) {
+          showError(err);
+          return;
+        }
       }
-      return {
-        sourceUrl,
-        revokeUrl: objectUrl,
-        initialMode: "annotate",
-        monitors: [],
-        activeMonitorIndex: null,
-        canRecapture: false,
+      if (!sourceUrl) return;
+      setScreenshotEditor((prev) => {
+        if (prev?.revokeUrl) {
+          URL.revokeObjectURL(prev.revokeUrl);
+        }
+        return {
+          sourceUrl,
+          revokeUrl,
+          initialMode: "annotate",
+          editingAttachmentId: target.id ?? null,
+          monitors: [],
+          activeMonitorIndex: null,
+          canRecapture: false,
+        };
+      });
+    },
+    [showError],
+  );
+
+  const handleOpenMutualGroup = useCallback(
+    (gid: string) => {
+      const cleanId = gid.trim();
+      if (!cleanId) return;
+      leaveWebApps();
+      const existing = threadsRef.current.find((th) => th.id === cleanId);
+      if (existing) {
+        selectAndRevealThread(cleanId, { forceScroll: true });
+        setMobilePane("chat");
+        return;
+      }
+      const mutualMeta = profileInitial?.mutual_groups?.find((g) => g.id === cleanId);
+      const stub: ThreadDto = {
+        id: cleanId,
+        title: mutualMeta?.title?.trim() || cleanId,
+        avatar: mutualMeta?.avatar?.trim() || "",
+        kind: "group",
+        last_preview: "",
+        last_ts: 0,
+        unread_count: 0,
+        is_pinned: false,
+        is_muted: false,
       };
-    });
-  };
+      const nextList = [stub, ...threadsRef.current].sort(compareThreads);
+      threadsRef.current = nextList;
+      setThreads((prev) =>
+        prev.some((th) => th.id === cleanId) ? prev : [stub, ...prev].sort(compareThreads),
+      );
+      selectAndRevealThread(cleanId, { forceScroll: true, listOverride: nextList });
+      setMobilePane("chat");
+      void bridge
+        .listThreads("all")
+        .then((fresh) => {
+          if (fresh.length > 0) {
+            setThreads((prev) => {
+              const hasGroup = fresh.some((th) => th.id === cleanId);
+              if (hasGroup) return fresh;
+              const existingStub = prev.find((th) => th.id === cleanId);
+              return existingStub ? [existingStub, ...fresh].sort(compareThreads) : fresh;
+            });
+          }
+        })
+        .catch(() => undefined);
+    },
+    [leaveWebApps, profileInitial, selectAndRevealThread],
+  );
 
   handleCaptureScreenRef.current = () => {
     void handleCaptureScreen();
@@ -4975,35 +6523,32 @@ export default function App() {
 
   useEffect(() => {
     return () => {
-      const curAtt = pendingAttachmentRef.current;
-      if (curAtt?.kind === "raw" && curAtt.previewUrl) {
-        URL.revokeObjectURL(curAtt.previewUrl);
+      for (const url of collectRevocableAttachmentUrls(pendingAttachmentsRef.current)) {
+        URL.revokeObjectURL(url);
       }
       if (screenshotEditorRef.current?.revokeUrl) {
         URL.revokeObjectURL(screenshotEditorRef.current.revokeUrl);
       }
+      for (const entry of collectAllOutboxEntries(outboxByThreadRef.current)) {
+        if (isRevocableBlobUrl(entry.attachment?.ownedPreviewUrl)) {
+          URL.revokeObjectURL(entry.attachment.ownedPreviewUrl);
+        }
+      }
+      outboxByThreadRef.current = {};
     };
   }, []);
 
-  const handleSendThreadAttachment = async (
-    att: PendingAttachment,
-    caption: string,
-    rootMsgId: string,
-  ): Promise<boolean> => {
-    const sent = await handleSendAttachment(att, caption);
-    if (!sent) return false;
-    setLocalThreadLinks((prev) => {
-      const entries = Object.entries({ ...prev, [sent.msg_id]: rootMsgId }).slice(-500);
-      const next = Object.fromEntries(entries);
-      try {
-        localStorage.setItem("litechat.threadLinks", JSON.stringify(next));
-      } catch {
-        // Ignore quota limits
-      }
-      return next;
-    });
-    return true;
-  };
+  const handleSendThreadAttachment = useCallback(
+    async (
+      att: PendingAttachment,
+      caption: string,
+      rootMsgId: string,
+    ): Promise<boolean> => {
+      const sent = await handleSendAttachment(att, caption, { rootMsgId });
+      return Boolean(sent);
+    },
+    [handleSendAttachment],
+  );
 
   const handleSendBuzz = async () => {
     if (!selectedId) return;
@@ -5046,12 +6591,219 @@ export default function App() {
     </div>
   );
 
+  const passcodeActiveCallBanner = useMemo<PasscodeActiveCallBanner | null>(() => {
+    const active = callState.active;
+    if (!effectiveLocked || !active || callState.phase === "idle") return null;
+    return {
+      peerName: active.partner_name || active.partner_id,
+      isVideo: active.call_type === "DirectVideo",
+      muted: active.mic_muted,
+      onToggleMute: () => void handleToggleCallMute(!active.mic_muted),
+      onHangup: () => void handleHangupCall(),
+    };
+  }, [effectiveLocked, callState.active, callState.phase, handleToggleCallMute, handleHangupCall]);
+
+  const webAppInlineTopActive = Boolean(activeWebApp && !webappSuspended);
+
+  const webAppTopSlot = useMemo(() => {
+    if (!webAppInlineTopActive) return null;
+    const showInlineCallBar = Boolean(
+      authed &&
+        !isLocked &&
+        callState.active &&
+        callState.phase !== "idle" &&
+        callState.phase !== "incoming_ringing" &&
+        !(showVideoOverlay && videoOverlayMode !== "minimized"),
+    );
+    const hasInlineToast = Boolean(
+      toastError ||
+        (callNotice && !isLocked) ||
+        (socialNotice && !isLocked) ||
+        (scheduleAlertNotice && !isLocked),
+    );
+    if (!showInlineCallBar && !hasInlineToast) return null;
+    return (
+      <div
+        className="flex shrink-0 flex-col gap-1.5 px-3 py-1.5"
+        style={{
+          background: "var(--bg-stage)",
+          borderBottom: "1px solid var(--border-subtle)",
+        }}
+      >
+        {showInlineCallBar && callState.active && (
+          <ActiveCallBar
+            inline
+            active={callState.active}
+            telemetry={callTelemetry}
+            devices={callDevices}
+            devicesLoading={callDevicesLoading}
+            busy={callActionBusy}
+            hangupBusy={callHangupBusy}
+            localCameraStatus={localCameraStatus}
+            onToggleMute={(nextMuted) => void handleToggleCallMute(nextMuted)}
+            onToggleCamera={(nextEnabled) => void handleToggleCallCamera(nextEnabled)}
+            onExpandVideo={() => {
+              setVideoOverlayMode("floating");
+              remoteVideoRendererRef.current?.repaintCachedFrame();
+              remoteVideoRendererRef.current?.requestKeyframe();
+            }}
+            onHangup={() => void handleHangupCall()}
+            onSelectThread={(partnerId) => openThreadById(partnerId)}
+            onRefreshDevices={refreshCallDevices}
+            onSelectDevices={(inp, out) => void handleSelectCallDevices(inp, out)}
+            onDevicesPopoverChange={setActiveCallDevicesOpen}
+          />
+        )}
+        {toastError && (
+          <div
+            role="alert"
+            onClick={dismissToastError}
+            title={t("notifyCloseTitle")}
+            className="flex cursor-pointer items-center gap-2 rounded-xl bg-rose-600/95 px-3 py-1.5 text-xs text-white shadow transition hover:bg-rose-600"
+          >
+            <span className="min-w-0 flex-1 break-words">{toastError}</span>
+            <X className="h-3.5 w-3.5 shrink-0 opacity-85" />
+          </div>
+        )}
+        {callNotice && !isLocked && (
+          <button
+            type="button"
+            onClick={dismissCallNotice}
+            title={t("notifyCloseTitle")}
+            className="flex w-full items-center gap-2 rounded-xl px-3 py-1.5 text-left text-xs font-medium shadow transition hover:opacity-90"
+            style={{
+              background:
+                callNotice.tone === "error"
+                  ? "var(--danger-bg)"
+                  : callNotice.tone === "warn"
+                    ? "rgba(245, 158, 11, 0.16)"
+                    : "var(--bg-sidebar)",
+              border:
+                callNotice.tone === "warn"
+                  ? "1px solid rgba(245, 158, 11, 0.45)"
+                  : "1px solid var(--border-subtle)",
+              color:
+                callNotice.tone === "error"
+                  ? "var(--danger-text)"
+                  : callNotice.tone === "warn"
+                    ? "#f59e0b"
+                    : "var(--text-primary)",
+            }}
+          >
+            {callState.active?.call_type === "DirectVideo" ? (
+              <Video className="h-3.5 w-3.5 shrink-0" />
+            ) : (
+              <Phone className="h-3.5 w-3.5 shrink-0" />
+            )}
+            <span className="min-w-0 flex-1 truncate">{callNotice.text}</span>
+            <X className="h-3.5 w-3.5 shrink-0 opacity-70" />
+          </button>
+        )}
+        {socialNotice && !isLocked && (
+          <button
+            type="button"
+            onClick={dismissSocialNotice}
+            title={t("notifyCloseTitle")}
+            className="flex w-full items-center gap-2 rounded-xl px-3 py-1.5 text-left text-xs font-medium shadow transition hover:opacity-90"
+            style={{
+              background:
+                socialNotice.tone === "error" ? "var(--danger-bg)" : "var(--bg-sidebar)",
+              border:
+                socialNotice.tone === "error"
+                  ? "1px solid rgba(244, 63, 94, 0.45)"
+                  : socialNotice.tone === "warn"
+                    ? "1px solid rgba(245, 158, 11, 0.5)"
+                    : socialNotice.tone === "success"
+                      ? "1px solid rgba(16, 185, 129, 0.5)"
+                      : "1px solid var(--border-subtle)",
+              color: socialNotice.tone === "error" ? "var(--danger-text)" : "var(--text-primary)",
+            }}
+          >
+            <UserCheck className="h-3.5 w-3.5 shrink-0" />
+            <span className="min-w-0 flex-1 truncate">{socialNotice.text}</span>
+            <X className="h-3.5 w-3.5 shrink-0 opacity-70" />
+          </button>
+        )}
+        {scheduleAlertNotice && !isLocked && (
+          <div
+            role="alert"
+            className="flex items-center gap-2 rounded-xl px-3 py-1.5 text-xs font-medium shadow"
+            style={{
+              background:
+                scheduleAlertNotice.tone === "error"
+                  ? "var(--danger-bg)"
+                  : "rgba(245, 158, 11, 0.16)",
+              border:
+                scheduleAlertNotice.tone === "error"
+                  ? "1px solid rgba(244, 63, 94, 0.45)"
+                  : "1px solid rgba(245, 158, 11, 0.45)",
+              color: scheduleAlertNotice.tone === "error" ? "var(--danger-text)" : "#f59e0b",
+            }}
+          >
+            <Clock className="h-3.5 w-3.5 shrink-0" />
+            <span className="min-w-0 flex-1 truncate">{scheduleAlertNotice.text}</span>
+            <button
+              type="button"
+              onClick={() => {
+                dismissScheduleAlert();
+                setScheduledInitialThreadId(null);
+                setScheduledModalOpen(true);
+              }}
+              className="shrink-0 rounded-lg px-2 py-0.5 text-[11px] font-semibold underline-offset-2 hover:underline"
+              style={{ background: "rgba(0,0,0,0.18)" }}
+            >
+              {t("schedReviewAttentionBtn")}
+            </button>
+            <button
+              type="button"
+              onClick={dismissScheduleAlert}
+              className="shrink-0 rounded-md p-0.5 opacity-80 hover:opacity-100"
+              title={t("notifyCloseTitle")}
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  }, [
+    webAppInlineTopActive,
+    authed,
+    isLocked,
+    callState.active,
+    callState.phase,
+    showVideoOverlay,
+    videoOverlayMode,
+    callTelemetry,
+    callDevices,
+    callDevicesLoading,
+    callActionBusy,
+    callHangupBusy,
+    localCameraStatus,
+    handleToggleCallMute,
+    handleToggleCallCamera,
+    handleHangupCall,
+    openThreadById,
+    refreshCallDevices,
+    handleSelectCallDevices,
+    toastError,
+    dismissToastError,
+    callNotice,
+    dismissCallNotice,
+    socialNotice,
+    dismissSocialNotice,
+    scheduleAlertNotice,
+    dismissScheduleAlert,
+    t,
+  ]);
+
   const utilityModals = (
     <>
       {findUserOpen && (
         <Suspense fallback={null}>
           <FindUserModal
             open={findUserOpen}
+            isLocked={effectiveLocked}
             initialPhone={findUserInitialPhone}
             onClose={() => {
               setFindUserOpen(false);
@@ -5071,6 +6823,7 @@ export default function App() {
         <Suspense fallback={null}>
           <FriendRequestsModal
             open={friendRequestsOpen}
+            isLocked={effectiveLocked}
             onClose={() => setFriendRequestsOpen(false)}
             onOpenProfile={(uid) => {
               setProfileInitial(null);
@@ -5092,6 +6845,7 @@ export default function App() {
         <Suspense fallback={null}>
           <FolderEditorModal
             open={folderModalOpen}
+            isLocked={effectiveLocked}
             folders={customFolders}
             threads={threads}
             initialEditingFolder={editingFolder}
@@ -5127,6 +6881,8 @@ export default function App() {
         <Suspense fallback={null}>
           <SettingsModal
             open={settingsOpen}
+            authed={authed}
+            isLocked={effectiveLocked}
             initialTab={settingsInitialTab}
             myProfile={myProfile}
             connStatus={connStatus}
@@ -5134,11 +6890,14 @@ export default function App() {
               if (myProfile?.uid) setProfileUid(myProfile.uid);
             }}
             onLogout={() => {
-              void bridge.logout().then(() => {
-                setAuthed(false);
-                resetSessionUi();
-                void refreshQr();
-              });
+              void bridge
+                .logout()
+                .then(() => {
+                  setAuthed(false);
+                  resetSessionUi();
+                  void refreshQr();
+                })
+                .catch(showError);
             }}
             theme={theme}
             onThemeChange={setTheme}
@@ -5150,6 +6909,8 @@ export default function App() {
             onFxChange={setFxEnabled}
             sendOnEnter={sendOnEnter}
             onSendOnEnterChange={setSendOnEnter}
+            stickerSuggestEnabled={stickerSuggestEnabled}
+            onStickerSuggestEnabledChange={setStickerSuggestEnabled}
             notifyPrefs={notifyPrefs}
             onNotifyPrefsChange={setNotifyPrefs}
             onTestSound={() => playMessageSound(true)}
@@ -5215,8 +6976,17 @@ export default function App() {
             onOpenTranslateModal={() => setTranslateModalOpen(true)}
             threads={threads}
             aiConfig={aiConfig}
-            onAiConfigChange={setAiConfig}
+            onAiConfigChange={(cfg) => {
+              aiConfigRef.current = cfg;
+              setAiConfig(cfg);
+            }}
             onOpenAiChat={handleOpenAiChat}
+            blockedStickersConfig={blockedStickersCfg}
+            onBlockedStickerModeChange={handleBlockedStickerModeChange}
+            onUnblockStickerRule={handleUnblockSticker}
+            onClearBlockedStickers={handleClearBlockedStickers}
+            showTezaAiCard={showTezaAiCard}
+            onToggleShowTezaAiCard={handleToggleShowTezaAiCard}
             relayCfg={relayCfg}
             onRelaySaved={(cfg) => {
               applyRelaySummary(cfg);
@@ -5244,13 +7014,22 @@ export default function App() {
         <Suspense fallback={null}>
           <UpdateModal
             open={updateModalOpen}
+            isLocked={effectiveLocked}
             currentVersion={appVersion}
             availableUpdate={availableUpdate}
             checking={checkingUpdate}
             errorText={updateError}
             lastCheckedAt={lastUpdateCheckAt}
+            installing={updateInstalling}
+            progress={updateInstallProgress}
+            error={updateInstallError}
+            onInstall={handleStartAppUpdateInstall}
             onCheckNow={() => checkForUpdates(false)}
-            onClose={() => setUpdateModalOpen(false)}
+            onClose={() => {
+              if (!updateInstallingRef.current) {
+                setUpdateModalOpen(false);
+              }
+            }}
           />
         </Suspense>
       )}
@@ -5259,7 +7038,9 @@ export default function App() {
         <Suspense fallback={null}>
           <TranslateSettingsModal
             open={translateModalOpen}
+            isLocked={effectiveLocked}
             config={translateCfg}
+            relayEnabled={Boolean(relayCfg?.enabled)}
             onClose={() => setTranslateModalOpen(false)}
             onSaved={(cfg) => {
               const prevCfg = translateCfgRef.current;
@@ -5299,6 +7080,7 @@ export default function App() {
         <Suspense fallback={null}>
           <ScheduledMessagesModal
             open={scheduledModalOpen}
+            isLocked={effectiveLocked}
             threads={threads}
             schedules={schedules}
             loading={schedulesLoading}
@@ -5313,20 +7095,22 @@ export default function App() {
             onUpdate={async (id, input) => {
               const updated = await bridge.scheduleUpdate(id, input);
               await refreshSchedules();
-              return updated ?? undefined;
+              return updated;
             }}
             onCancel={async (id) => {
-              await bridge.scheduleCancel(id);
+              const ok = await bridge.scheduleCancel(id);
               await refreshSchedules();
+              return ok;
             }}
             onDelete={async (id) => {
-              await bridge.scheduleDelete(id);
+              const ok = await bridge.scheduleDelete(id);
               await refreshSchedules();
+              return ok;
             }}
             onSendNow={async (id) => {
               const updated = await bridge.scheduleSendNow(id);
               await refreshSchedules();
-              return updated ?? undefined;
+              return updated;
             }}
           />
         </Suspense>
@@ -5343,7 +7127,7 @@ export default function App() {
           style={{ background: "var(--bg-stage)", color: "var(--text-secondary)" }}
         >
           <RefreshCw className="h-6 w-6 animate-spin" style={{ color: "var(--accent)" }} />
-          <span>Đang xác minh phiên đăng nhập...</span>
+          <span>{t("authCheckingSession")}</span>
         </div>
       </>
     );
@@ -5353,19 +7137,31 @@ export default function App() {
     return (
       <>
         <TriforceEffects enabled={fxEnabled} dustEnabled={fxEnabled && theme === "triforce"} />
-        <div className="relative z-10 h-full w-full">
-          <QrLoginModal
-            qrSvg={qrSvg}
-            statusText={qrStatus}
-            errorText={qrError}
-            relayCfg={relayCfg}
-            onOpenRelaySettings={() => {
-              setFocusRelaySettings(true);
-              setSettingsOpen(true);
-            }}
-            onRefresh={() => void refreshQr()}
-            onEnterDemo={() => setAuthed(true)}
-          />
+        <div className="relative z-10 flex h-full w-full flex-col">
+          {showUpdateBanner && availableUpdate && (
+            <UpdateBanner
+              availableUpdate={availableUpdate}
+              onOpenUpdateModal={() => setUpdateModalOpen(true)}
+              onDismiss={handleDismissUpdateBanner}
+            />
+          )}
+          <div className="min-h-0 flex-1">
+            <QrLoginModal
+              qrSvg={qrSvg}
+              statusText={qrStatus}
+              errorText={qrError}
+              qrTimeoutSec={qrTimeoutSec}
+              qrIssuedAtMs={qrIssuedAtMs}
+              refreshing={qrRefreshing}
+              relayCfg={relayCfg}
+              onOpenRelaySettings={() => {
+                setFocusRelaySettings(true);
+                setSettingsOpen(true);
+              }}
+              onRefresh={() => void refreshQr()}
+              onEnterDemo={() => setAuthed(true)}
+            />
+          </div>
           {utilityModals}
         </div>
       </>
@@ -5374,9 +7170,11 @@ export default function App() {
 
   return (
     <div className={`relative flex h-full w-full overflow-hidden ${buzzShaking ? "buzz-shaking" : ""}`}>
+      <div ref={appShellRef} className="relative flex h-full w-full min-w-0 flex-1 overflow-hidden">
       <TriforceEffects enabled={fxEnabled} dustEnabled={fxEnabled && theme === "triforce"} />
       <NavDrawer
         open={navDrawerOpen}
+        isLocked={effectiveLocked}
         onClose={() => setNavDrawerOpen(false)}
         myProfile={myProfile}
         connStatus={connStatus}
@@ -5387,6 +7185,7 @@ export default function App() {
         hasPasscode={passcodeCfg.enabled}
         aiEnabled={Boolean(aiConfig?.enabled)}
         pendingSchedulesCount={pendingSchedulesCount}
+        attentionScheduleCount={attentionScheduleCount}
         onOpenMyProfile={() => {
           if (myProfile?.uid) setProfileUid(myProfile.uid);
         }}
@@ -5423,11 +7222,14 @@ export default function App() {
         onCycleTheme={cycleTheme}
         onOpenUpdateModal={() => setUpdateModalOpen(true)}
         onLogout={() => {
-          void bridge.logout().then(() => {
-            setAuthed(false);
-            resetSessionUi();
-            void refreshQr();
-          });
+          void bridge
+            .logout()
+            .then(() => {
+              setAuthed(false);
+              resetSessionUi();
+              void refreshQr();
+            })
+            .catch(showError);
         }}
       />
       {/* Column 1: Folder Rail */}
@@ -5453,13 +7255,21 @@ export default function App() {
           <button
             type="button"
             onClick={() => setNavDrawerOpen(true)}
-            title={t("menuMainSettings")}
+            title={
+              attentionScheduleCount > 0
+                ? `${t("menuMainSettings")} · ${t("navSchedulesAttentionTitle", { count: attentionScheduleCount })}`
+                : t("menuMainSettings")
+            }
             className="tf-rail-btn relative flex w-full items-center justify-center rounded-xl py-2"
             style={{ color: "var(--rail-text)" }}
           >
             <Menu className="h-5 w-5" />
-            {availableUpdate && (
-              <span className="absolute right-3 top-1.5 h-2 w-2 rounded-full bg-emerald-400" />
+            {attentionScheduleCount > 0 ? (
+              <span className="absolute right-3 top-1.5 h-2 w-2 rounded-full bg-amber-400" />
+            ) : (
+              availableUpdate && (
+                <span className="absolute right-3 top-1.5 h-2 w-2 rounded-full bg-emerald-400" />
+              )
             )}
           </button>
           <div className="mt-1.5 h-px w-8" style={{ background: "var(--border-subtle)" }} />
@@ -5469,7 +7279,10 @@ export default function App() {
           {visibleBuiltInFolders.map((item) => {
             const Icon = item.icon;
             const active = !activeWebApp && !webAppHubOpen && folder === item.id;
-            const badge = item.id === "all" ? 0 : countFolderUnread(threads, item.id, customFolders);
+            const badge =
+              item.id === "all"
+                ? 0
+                : countFolderUnread(threads, item.id, customFolders, muteTickNow);
             const itemLabel = t(item.labelKey);
             const isTextOnly = railDisplayMode === "text-only";
             return (
@@ -5527,19 +7340,21 @@ export default function App() {
           {customFolders.map((cf) => {
             const sel = `custom:${cf.id}`;
             const active = !activeWebApp && !webAppHubOpen && folder === sel;
-            const badge = countFolderUnread(threads, sel, customFolders);
+            const badge = countFolderUnread(threads, sel, customFolders, muteTickNow);
             const isTextOnly = railDisplayMode === "text-only";
             return (
               <button
                 key={cf.id}
                 type="button"
-                title={`${cf.name} (Chuột phải để tùy chỉnh)`}
+                title={`${cf.name} (${t("folderRightClickHint")})`}
                 onClick={() => {
                   leaveWebApps();
                   setFolder(sel);
                 }}
                 onContextMenu={(e) => {
                   e.preventDefault();
+                  e.stopPropagation();
+                  setThreadMenu(null);
                   setFolderMenu({ folder: cf, x: e.clientX, y: e.clientY });
                 }}
                 className={`tf-rail-btn ${active ? "tf-rail-btn-active" : ""} relative flex w-full shrink-0 rounded-xl ${
@@ -5605,6 +7420,52 @@ export default function App() {
               </span>
             )}
           </button>
+
+          {showTezaAiCard && (
+            <>
+              <div className="my-1 h-px w-8 shrink-0" style={{ background: "var(--border-subtle)" }} />
+              {(() => {
+                const active = aiChatOpen && !activeWebApp && !webAppHubOpen;
+                const isTextOnly = railDisplayMode === "text-only";
+                return (
+                  <button
+                    type="button"
+                    title="Teza AI"
+                    onClick={handleOpenAiChat}
+                    className={`tf-rail-btn ${active ? "tf-rail-btn-active" : ""} relative flex w-full shrink-0 rounded-xl ${
+                      railDisplayMode === "icon-only"
+                        ? "flex-col items-center justify-center py-2.5"
+                        : isTextOnly
+                          ? "flex-row items-center justify-between gap-1 py-2 pl-3 pr-2 text-left text-[12px] font-medium"
+                          : "flex-col items-center justify-center gap-1 py-2 text-xs font-medium"
+                    }`}
+                    style={{
+                      background: active ? "var(--rail-active-bg)" : undefined,
+                      color: active ? "var(--rail-text-active)" : "var(--rail-text)",
+                    }}
+                  >
+                    {!isTextOnly && (
+                      <Sparkles
+                        className="h-5 w-5 shrink-0"
+                        style={{ color: active ? "var(--rail-text-active)" : "var(--accent)" }}
+                      />
+                    )}
+                    {railDisplayMode !== "icon-only" && (
+                      <span
+                        className={
+                          isTextOnly
+                            ? "min-w-0 flex-1 truncate text-left leading-tight"
+                            : "max-w-full truncate px-0.5"
+                        }
+                      >
+                        Teza AI
+                      </span>
+                    )}
+                  </button>
+                );
+              })()}
+            </>
+          )}
 
           {webAppsCfg.enabled && (
             <>
@@ -5686,24 +7547,66 @@ export default function App() {
               <Lock className="h-5 w-5" />
             </button>
           )}
+          {availableUpdate && availableUpdateVersion && (
+            <button
+              type="button"
+              onClick={() => setUpdateModalOpen(true)}
+              title={t("railUpdateTooltip", { version: availableUpdateVersion })}
+              aria-label={t("railUpdateTooltip", { version: availableUpdateVersion })}
+              className={`tf-rail-btn relative flex w-full shrink-0 rounded-xl ${
+                railDisplayMode === "icon-only"
+                  ? "flex-col items-center justify-center py-2"
+                  : railDisplayMode === "text-only"
+                    ? "flex-col items-start justify-center gap-0.5 px-2 py-1.5 text-left"
+                    : "flex-col items-center justify-center gap-0.5 px-1 py-1.5 text-center"
+              }`}
+              style={{
+                background: "var(--accent-soft)",
+                color: "var(--accent)",
+                border: "1px solid var(--accent)",
+              }}
+            >
+              {railDisplayMode !== "text-only" && (
+                <>
+                  <ArrowDownToLine className="h-4 w-4 shrink-0" />
+                  <span
+                    className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-emerald-500"
+                    aria-hidden="true"
+                  />
+                </>
+              )}
+              {railDisplayMode === "text-only" && (
+                <span className="flex w-full items-center justify-between gap-1 text-[11.5px] font-semibold leading-tight">
+                  <span className="min-w-0 truncate">{t("railUpdateLabel")}</span>
+                  <span
+                    className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500"
+                    aria-hidden="true"
+                  />
+                </span>
+              )}
+              {railDisplayMode === "icon-text" && (
+                <span className="max-w-full truncate text-[10.5px] font-semibold leading-tight">
+                  {t("railUpdateLabel")}
+                </span>
+              )}
+              {railDisplayMode !== "icon-only" && availableUpdateTag && (
+                <span className="max-w-full truncate font-mono text-[9.5px] font-semibold leading-none opacity-85">
+                  {availableUpdateTag}
+                </span>
+              )}
+            </button>
+          )}
           <button
             type="button"
             onClick={() => {
               setSettingsInitialTab("notifications");
               setSettingsOpen(true);
             }}
-            title={
-              availableUpdate
-                ? t("settingsUpdateHint", { version: availableUpdate.version })
-                : t("settingsTeza")
-            }
+            title={t("settingsTeza")}
             className="tf-rail-btn relative flex w-full items-center justify-center rounded-lg py-2"
-            style={{ color: availableUpdate ? "var(--accent)" : "var(--rail-text)" }}
+            style={{ color: "var(--rail-text)" }}
           >
             <Settings className="h-5 w-5" />
-            {availableUpdate && (
-              <span className="absolute right-2.5 top-1.5 h-2 w-2 rounded-full bg-emerald-400" />
-            )}
           </button>
         </div>
       </aside>
@@ -5713,6 +7616,7 @@ export default function App() {
           <WebAppWorkspace
             app={activeWebApp}
             suspended={webappSuspended}
+            topSlot={webAppTopSlot}
             allEmbeddedApps={embeddedWebApps}
             onSelectApp={handleActivateWebApp}
             onBackToHub={() => {
@@ -5733,7 +7637,12 @@ export default function App() {
             onChangeConfig={handleWebAppsCfgChange}
             onLaunch={handleActivateWebApp}
             onOpenExternal={(url) => void bridge.openExternalUrl(url).catch(showError)}
-            onCloseToChat={() => setWebAppHubOpen(false)}
+            onCloseToChat={() => {
+              setWebAppHubOpen(false);
+              if (!selectedIdRef.current) {
+                setMobilePane("list");
+              }
+            }}
           />
         </Suspense>
       ) : (
@@ -5995,6 +7904,93 @@ export default function App() {
             </div>
           )}
 
+          {showTezaAiCard && folder === "all" && !filterText.trim() && (
+            layout.mode === "compact" ? (
+              <button
+                type="button"
+                onClick={handleOpenAiChat}
+                title={`Teza AI${aiConfig?.enabled ? ` · ${getAiBackendBadgeLabel(aiConfig)}` : ""}`}
+                className={`mb-1.5 flex w-full items-center justify-center rounded-xl py-2 transition ${
+                  aiChatOpen ? "" : "hover-surface"
+                }`}
+                style={{
+                  background: aiChatOpen ? "var(--bg-active)" : undefined,
+                  color: aiChatOpen ? "var(--text-on-active)" : "var(--accent)",
+                }}
+              >
+                <div
+                  className="flex h-10 w-10 items-center justify-center rounded-full"
+                  style={{
+                    background: aiChatOpen ? "rgba(255,255,255,0.18)" : "var(--accent-soft)",
+                    color: aiChatOpen ? "var(--text-on-active)" : "var(--accent)",
+                  }}
+                >
+                  <Sparkles className="h-5 w-5" />
+                </div>
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={handleOpenAiChat}
+                className={`tf-row mb-1 flex w-full items-center gap-3 rounded-xl px-2.5 text-left transition ${
+                  aiChatOpen ? "" : "hover-surface"
+                }`}
+                style={{
+                  paddingBlock: "var(--row-py)",
+                  background: aiChatOpen ? "var(--bg-active)" : undefined,
+                  color: aiChatOpen ? "var(--text-on-active)" : "var(--text-primary)",
+                }}
+              >
+                <div
+                  className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full"
+                  style={{
+                    background: aiChatOpen ? "rgba(255,255,255,0.18)" : "var(--accent-soft)",
+                    color: aiChatOpen ? "var(--text-on-active)" : "var(--accent)",
+                  }}
+                >
+                  <Sparkles className="h-5 w-5" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center justify-between gap-2">
+                    <span
+                      className="list-title-text truncate font-semibold"
+                      style={{
+                        color: aiChatOpen ? "var(--text-on-active)" : "var(--list-title)",
+                      }}
+                    >
+                      Teza AI
+                    </span>
+                    <span
+                      className="shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-semibold"
+                      style={{
+                        background: aiChatOpen ? "rgba(255,255,255,0.2)" : "var(--accent-soft)",
+                        color: aiChatOpen ? "var(--text-on-active)" : "var(--accent)",
+                      }}
+                    >
+                      {aiConfig?.enabled ? getAiBackendBadgeLabel(aiConfig) : "AI"}
+                    </span>
+                  </div>
+                  <div
+                    className="mt-0.5 truncate text-[12.5px]"
+                    style={{
+                      color: aiChatOpen
+                        ? "var(--text-secondary-on-active)"
+                        : "var(--text-secondary)",
+                    }}
+                  >
+                    {aiConfig?.enabled
+                      ? aiConfig.model && aiConfig.model !== "default"
+                        ? aiConfig.model.includes("/")
+                          ? aiConfig.model.slice(aiConfig.model.lastIndexOf("/") + 1)
+                          : aiConfig.model
+                        : t("navAiAssistantMenu")
+                      : "ZeroClaw · Groq · OpenRouter · Grok"}
+                  </div>
+                </div>
+              </button>
+            )
+          )}
+
           {folder === "all" && !filterText.trim() && archivedThreads.length > 0 && (
             layout.mode === "compact" ? (
               <button
@@ -6077,9 +8073,17 @@ export default function App() {
             </div>
           ) : (
             visibleThreads.slice(0, threadRenderLimit).map((thread) => {
-              const active = thread.id === selectedId;
+              const active = !aiChatOpen && thread.id === selectedId;
               const unread = thread.unread_count > 0;
+              const threadMuted = isThreadCurrentlyMuted(thread, muteTickNow);
               const draftText = draftsByThread[thread.id]?.trim() || "";
+              const outboxSummary = summarizeThreadOutbox(outboxByThread, thread.id);
+              const hasFailedOutbox = outboxSummary.failedCount > 0;
+              const hasSendingOutbox = outboxSummary.sendingCount > 0;
+              const failedPreviewText =
+                outboxSummary.latestFailed?.text ||
+                outboxSummary.latestFailed?.attachment_name ||
+                "";
               const fallbackPreview =
                 thread.kind === "group"
                   ? t("fallbackGroupPreview")
@@ -6092,13 +8096,21 @@ export default function App() {
                     key={thread.id}
                     data-thread-row={thread.id}
                     type="button"
-                    title={`${thread.title}${thread.last_preview ? ` — ${thread.last_preview}` : ""}`}
+                    title={`${thread.title}${
+                      hasFailedOutbox
+                        ? ` — ${t("sendFailedPrefix")} ${failedPreviewText}`
+                        : thread.last_preview
+                          ? ` — ${thread.last_preview}`
+                          : ""
+                    }`}
                     onClick={() => {
                       selectAndRevealThread(thread.id);
                       if (layout.mode === "single") setMobilePane("chat");
                     }}
                     onContextMenu={(e) => {
                       e.preventDefault();
+                      e.stopPropagation();
+                      setFolderMenu(null);
                       setThreadMenu({ thread, x: e.clientX, y: e.clientY });
                     }}
                     className={`mb-1 flex w-full items-center justify-center rounded-xl py-2 transition ${
@@ -6111,12 +8123,20 @@ export default function App() {
                   >
                     <div className="relative shrink-0">
                       <ThreadAvatar avatar={thread.avatar} title={thread.title} kind={thread.kind} size="md" />
+                      {hasFailedOutbox && (
+                        <span
+                          title={t("threadFailedMessagesTooltip", { count: outboxSummary.failedCount })}
+                          className="absolute -left-1 -top-1 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-rose-600 px-1 text-[10px] font-bold leading-none text-white shadow"
+                        >
+                          !
+                        </span>
+                      )}
                       {unread && (
                         <span
                           className="absolute -right-1 -top-1 min-w-[18px] rounded-full px-1 py-0.5 text-center text-[10px] font-bold leading-none shadow"
                           style={{
-                            background: thread.is_muted ? "var(--chip-bg)" : "var(--accent)",
-                            color: thread.is_muted ? "var(--text-secondary)" : "var(--text-on-accent)",
+                            background: threadMuted ? "var(--chip-bg)" : "var(--accent)",
+                            color: threadMuted ? "var(--text-secondary)" : "var(--text-on-accent)",
                           }}
                         >
                           {thread.unread_count > 99 ? "99+" : thread.unread_count}
@@ -6156,6 +8176,8 @@ export default function App() {
                   }}
                   onContextMenu={(e) => {
                     e.preventDefault();
+                    e.stopPropagation();
+                    setFolderMenu(null);
                     setThreadMenu({ thread, x: e.clientX, y: e.clientY });
                   }}
                   className={`tf-row thread-row-perf mb-0.5 flex w-full cursor-pointer items-center gap-3 rounded-xl px-2.5 text-left transition ${
@@ -6203,22 +8225,31 @@ export default function App() {
                           color: active ? "var(--text-secondary-on-active)" : "var(--text-secondary)",
                         }}
                       >
-                        {thread.is_muted && <BellOff className="h-3 w-3 opacity-75" />}
+                        {threadMuted && <BellOff className="h-3 w-3 opacity-75" />}
                         {thread.is_pinned && <Pin className="h-3 w-3 opacity-80" />}
-                        {thread.last_ts > 0 && thread.last_preview.startsWith("Bạn:") && !unread && (
-                          thread.kind === "cloud" || (thread.peer_read_ts ?? 0) >= thread.last_ts ? (
-                            <span title={t("youSeenStatus")} className="inline-flex items-center">
-                              <CheckCheck
-                                className="h-3.5 w-3.5"
-                                style={{ color: active ? "var(--text-on-active)" : "var(--accent)" }}
-                              />
-                            </span>
-                          ) : (
-                            <span title={t("youSentStatus")} className="inline-flex items-center">
-                              <Check className="h-3 w-3 opacity-80" />
-                            </span>
-                          )
+                        {hasSendingOutbox && !hasFailedOutbox && (
+                          <span title={t("sendingStatus")} className="inline-flex items-center">
+                            <Loader2 className="h-3 w-3 animate-spin opacity-80" />
+                          </span>
                         )}
+                        {thread.last_ts > 0 &&
+                          thread.last_preview.startsWith("Bạn:") &&
+                          !unread &&
+                          !hasFailedOutbox &&
+                          !hasSendingOutbox && (
+                            thread.kind === "cloud" || (thread.peer_read_ts ?? 0) >= thread.last_ts ? (
+                              <span title={t("youSeenStatus")} className="inline-flex items-center">
+                                <CheckCheck
+                                  className="h-3.5 w-3.5"
+                                  style={{ color: active ? "var(--text-on-active)" : "var(--accent)" }}
+                                />
+                              </span>
+                            ) : (
+                              <span title={t("youSentStatus")} className="inline-flex items-center">
+                                <Check className="h-3 w-3 opacity-80" />
+                              </span>
+                            )
+                          )}
                         {thread.last_ts > 0 && <span>{formatThreadTime(thread.last_ts, lang)}</span>}
                       </div>
                     </div>
@@ -6233,7 +8264,19 @@ export default function App() {
                               : "var(--text-secondary)",
                         }}
                       >
-                        {draftText && !active ? (
+                        {hasFailedOutbox ? (
+                          <>
+                            <span
+                              style={{
+                                color: active ? "var(--text-on-active)" : "var(--danger-text)",
+                                fontWeight: 600,
+                              }}
+                            >
+                              {t("sendFailedPrefix")}{" "}
+                            </span>
+                            {failedPreviewText || thread.last_preview || fallbackPreview}
+                          </>
+                        ) : draftText && !active ? (
                           <>
                             <span style={{ color: "var(--danger-text)", fontWeight: 600 }}>
                               {t("draftPrefix")}{" "}
@@ -6244,25 +8287,36 @@ export default function App() {
                           thread.last_preview || fallbackPreview
                         )}
                       </span>
-                      {unread && (
-                        <span
-                          className="shrink-0 rounded-full px-1.5 py-0.5 text-xs font-bold"
-                          style={{
-                            background: active
-                              ? "rgba(255,255,255,0.2)"
-                              : thread.is_muted
-                                ? "var(--chip-bg)"
-                                : "var(--accent)",
-                            color: active
-                              ? "var(--text-on-active)"
-                              : thread.is_muted
-                                ? "var(--text-secondary)"
-                                : "var(--text-on-accent)",
-                          }}
-                        >
-                          {thread.unread_count > 99 ? "99+" : thread.unread_count}
-                        </span>
-                      )}
+                      <div className="flex shrink-0 items-center gap-1">
+                        {hasFailedOutbox && (
+                          <span
+                            title={t("threadFailedMessagesTooltip", { count: outboxSummary.failedCount })}
+                            className="inline-flex items-center gap-0.5 rounded-full bg-rose-600 px-1.5 py-0.5 text-[11px] font-bold text-white"
+                          >
+                            <AlertCircle className="h-3 w-3" />
+                            {outboxSummary.failedCount > 1 && <span>{outboxSummary.failedCount}</span>}
+                          </span>
+                        )}
+                        {unread && (
+                          <span
+                            className="shrink-0 rounded-full px-1.5 py-0.5 text-xs font-bold"
+                            style={{
+                              background: active
+                                ? "rgba(255,255,255,0.2)"
+                                : threadMuted
+                                  ? "var(--chip-bg)"
+                                  : "var(--accent)",
+                              color: active
+                                ? "var(--text-on-active)"
+                                : threadMuted
+                                  ? "var(--text-secondary)"
+                                  : "var(--text-on-accent)",
+                            }}
+                          >
+                            {thread.unread_count > 99 ? "99+" : thread.unread_count}
+                          </span>
+                        )}
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -6352,7 +8406,12 @@ export default function App() {
             >
               <button
                 type="button"
-                onClick={() => {
+                tabIndex={-1}
+                onMouseDown={(e) => {
+                  if (isPrimaryMouseDown(e)) e.preventDefault();
+                }}
+                onClick={(e) => {
+                  if (!isExplicitPointerClick(e)) return;
                   const targetThreadId = buzzToast.threadId;
                   dismissBuzzToast();
                   selectAndRevealThread(targetThreadId, { forceScroll: true });
@@ -6369,14 +8428,16 @@ export default function App() {
               </button>
               <button
                 type="button"
+                tabIndex={-1}
                 onMouseDown={(e) => {
-                  if (e.button !== 0) return;
+                  if (!isPrimaryMouseDown(e)) return;
                   e.preventDefault();
                   e.stopPropagation();
                   dismissBuzzToast();
                 }}
                 onClick={(e) => {
                   e.stopPropagation();
+                  if (!isExplicitPointerClick(e)) return;
                   dismissBuzzToast();
                 }}
                 title={t("notifyCloseTitle")}
@@ -6392,8 +8453,8 @@ export default function App() {
         {dragHover && activeThread && !aiChatOpen && (
           <div className="pointer-events-none absolute inset-0 z-40 flex flex-col items-center justify-center gap-2 border-2 border-dashed border-sky-400 bg-sky-950/75 text-white backdrop-blur-xs">
             <UploadCloud className="h-10 w-10 text-sky-300" />
-            <div className="text-sm font-semibold">Thả tệp hoặc hình ảnh vào đây để gửi</div>
-            <div className="text-xs text-sky-200/80">Hỗ trợ thả 1 hoặc nhiều tệp (tối đa 100 MB/tệp)</div>
+            <div className="text-sm font-semibold">{t("dropFilesToAttachOverlay")}</div>
+            <div className="text-xs text-sky-200/80">{t("dropFilesToAttachHint")}</div>
           </div>
         )}
 
@@ -6402,6 +8463,14 @@ export default function App() {
             <RefreshCw className="h-3.5 w-3.5 animate-spin" />
             <span>Mất kết nối máy chủ — đang tự động kết nối lại...</span>
           </div>
+        )}
+
+        {showUpdateBanner && availableUpdate && (
+          <UpdateBanner
+            availableUpdate={availableUpdate}
+            onOpenUpdateModal={() => setUpdateModalOpen(true)}
+            onDismiss={handleDismissUpdateBanner}
+          />
         )}
 
         {aiChatOpen ? (
@@ -6418,12 +8487,21 @@ export default function App() {
           >
             <AiChatPanel
               config={aiConfig}
+              relayEnabled={Boolean(relayCfg?.enabled)}
               messages={aiMessages}
+              sessions={aiSessions}
+              activeSessionId={activeAiSessionId}
               streamingText={aiStreamingText}
               isStreaming={aiIsStreaming}
               error={aiError}
               onSend={(prompt) => void handleAiSend(prompt)}
+              onCancelStream={handleAiCancelStream}
               onClearHistory={() => void handleAiClearHistory()}
+              onSelectSession={(sessionId) => void handleAiSelectSession(sessionId)}
+              onCreateSession={handleAiCreateSession}
+              onRenameSession={handleAiRenameSession}
+              onDeleteSession={handleAiDeleteSession}
+              onRunCommand={handleAiRunZeroClawCommand}
               onOpenSettings={() => {
                 setSettingsInitialTab("ai");
                 setSettingsOpen(true);
@@ -6432,18 +8510,35 @@ export default function App() {
                 setAiChatOpen(false);
                 if (layout.mode === "single") setMobilePane("list");
               }}
+              onQuickSwitchConfig={handleAiQuickSwitchConfig}
+              onListModels={handleAiListModels}
+              onInstallZeroClaw={handleAiInstallZeroClaw}
+              onSubscribeInstallProgress={handleSubscribeZeroClawProgress}
             />
           </Suspense>
         ) : activeThread ? (
           activeThreadRootMsg ? (
+            <Suspense fallback={null}>
             <ReplyThreadPanel
               threadTitle={activeThread.title}
               rootMessage={activeThreadRootMsg}
               replies={replyGraph.repliesByRoot[activeThreadRootMsg.msg_id] ?? []}
               threadKind={activeThread.kind}
               peerReadTs={activeThread.peer_read_ts}
-              pendingAttachment={pendingAttachment}
-              onPendingAttachmentChange={updatePendingAttachment}
+              draft={draftsByThread[`${activeThread.id}:thread:${activeThreadRootMsg.msg_id}`] ?? ""}
+              onDraftChange={(val, key) =>
+                setDraftForThread(
+                  key ?? `${activeThread.id}:thread:${activeThreadRootMsg.msg_id}`,
+                  val,
+                )
+              }
+              globalPasteFallback={!effectiveLocked && !hasBlockingOverlay}
+              isLocked={effectiveLocked}
+              pendingAttachments={pendingAttachments}
+              onAddPendingAttachments={addPendingAttachments}
+              onRemovePendingAttachment={removePendingAttachment}
+              onClearPendingAttachments={clearPendingAttachments}
+              onEditPendingImage={(attId) => void handleEditPendingImage(attId)}
               translationsByMsg={translationsByMsg}
               replaceWithTranslation={Boolean(activeThreadLang)}
               drawerOpen={drawerOpen}
@@ -6458,11 +8553,13 @@ export default function App() {
               onBuzz={handleSendBuzz}
               buzzCooldownSec={buzzCooldownSec}
               sendOnEnter={sendOnEnter}
+              stickerSuggestEnabled={stickerSuggestEnabled}
               hasBlockingOverlay={hasBlockingOverlay}
               getSenderAvatar={(uid) => avatarByUserId.get(uid)}
               onSaveFile={handleSaveRemoteFile}
               onRetrySend={handleRetryFailedMessage}
               onDiscardFailed={handleDiscardFailedMessage}
+              activeUploadIds={activeAttachmentUploadIds}
               onReact={handleReactMessage}
               onRecall={handleRecallMessage}
               onDeleteLocal={handleDeleteLocalMessage}
@@ -6481,8 +8578,13 @@ export default function App() {
               displayMentionMembers={messageMentionCandidates}
               onSendSticker={handleSendSticker}
               onTogglePin={handleTogglePinMessage}
+              blockedStickerRules={blockedStickersCfg.rules}
+              blockedStickerMode={blockedStickersCfg.mode}
+              onBlockSticker={handleBlockSticker}
+              onUnblockSticker={handleUnblockSticker}
               onError={showError}
             />
+            </Suspense>
           ) : (
             <>
               <header
@@ -6497,7 +8599,7 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => setMobilePane("list")}
-                    title="Quay lại danh sách hội thoại"
+                    title={t("backToConversationList")}
                     className="hover-menu -ml-1.5 rounded-lg p-1.5 transition"
                     style={{ color: "var(--text-secondary)" }}
                   >
@@ -6508,7 +8610,7 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => setProfileUid(activeThread.id)}
-                    title="Tra cứu thông tin tài khoản"
+                    title={t("lookupProfile")}
                     className="shrink-0 rounded-full transition hover:opacity-85"
                   >
                     <ThreadAvatar
@@ -6591,7 +8693,7 @@ export default function App() {
                       </button>
                     </>
                   )}
-                {aiConfig?.enabled && (
+                {aiConfig?.enabled && !relayCfg?.enabled && (
                   <button
                     type="button"
                     disabled={Boolean(aiSummaryByThread[activeThread.id]?.loading)}
@@ -6673,6 +8775,7 @@ export default function App() {
 
             {currentPinned && (
               <div
+                ref={pinnedBarRef}
                 className="relative shrink-0 text-[13px]"
                 style={{
                   background: "var(--bg-surface)",
@@ -6715,7 +8818,7 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => setPinnedIdx((i) => (i + 1) % pinnedMessages.length)}
-                        title={t("forward")}
+                        title={t("pinnedNextTitle")}
                         className="hover-menu rounded-lg p-1.5"
                         style={{ color: "var(--text-secondary)" }}
                       >
@@ -6749,6 +8852,7 @@ export default function App() {
 
                 {pinnedListOpen && (
                   <div
+                    data-teza-floating-popup="true"
                     className="absolute inset-x-0 top-full z-30 max-h-64 overflow-y-auto px-3 py-2 shadow-2xl"
                     style={{
                       background: "var(--bg-sidebar)",
@@ -7138,6 +9242,10 @@ export default function App() {
                   void loadOlderMessages();
                 }
                 const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+                if (hasNewerHistoryRef.current && distFromBottom < 40 && selectedId) {
+                  void reloadLatestMessages(selectedId);
+                  return;
+                }
                 if (performance.now() - lastProgrammaticScrollAtRef.current > 120) {
                   if (distFromBottom > 120) {
                     stickToBottomRef.current = false;
@@ -7145,10 +9253,10 @@ export default function App() {
                     stickToBottomRef.current = true;
                   }
                 }
-                const farUp = distFromBottom > 220;
+                const farUp = distFromBottom > 220 || hasNewerHistoryRef.current;
                 setShowScrollDown(farUp);
                 if (!farUp) setUnreadBelow(0);
-                if (distFromBottom < 90 && selectedId) {
+                if (distFromBottom < 90 && selectedId && !hasNewerHistoryRef.current) {
                   tryAutoMarkReadActiveThread();
                 }
               }}
@@ -7179,9 +9287,9 @@ export default function App() {
                 </div>
               )}
               <div ref={messagesContentRef}>
-                {messages.map((m, idx) => {
-                  const prev = idx > 0 ? messages[idx - 1] : null;
-                  const next = idx < messages.length - 1 ? messages[idx + 1] : null;
+                {visibleMessages.map((m, idx) => {
+                  const prev = idx > 0 ? visibleMessages[idx - 1] : null;
+                  const next = idx < visibleMessages.length - 1 ? visibleMessages[idx + 1] : null;
                   const showDate = !prev || dayKey(prev.ts) !== dayKey(m.ts);
                   const showUnread = firstUnreadMsgId === m.msg_id && unreadDividerCount > 0;
                   const groupedWithPrev =
@@ -7206,7 +9314,7 @@ export default function App() {
                   return (
                     <div
                       key={m.msg_id}
-                      className={idx < messages.length - 20 ? "msg-row-perf" : undefined}
+                      className={idx < visibleMessages.length - 20 ? "msg-row-perf" : undefined}
                     >
                       {showDate && (
                         <div className="my-2.5 flex justify-center">
@@ -7227,7 +9335,7 @@ export default function App() {
                           >
                             {t("unreadDivider", { count: unreadDividerCount })}
                           </span>
-                          {aiConfig?.enabled && (
+                          {aiConfig?.enabled && !relayCfg?.enabled && (
                             <button
                               type="button"
                               disabled={Boolean(aiSummaryByThread[activeThread.id]?.loading)}
@@ -7286,6 +9394,7 @@ export default function App() {
                         onOpenThread={handleOpenReplyThread}
                         onRetrySend={handleRetryFailedMessage}
                         onDiscardFailed={handleDiscardFailedMessage}
+                        discardDisabled={activeAttachmentUploadIds.has(m.msg_id)}
                         onSaveFile={handleSaveRemoteFile}
                         onOpenExternal={handleOpenExternalUrl}
                         onCopyError={showError}
@@ -7293,8 +9402,15 @@ export default function App() {
                         onAddPollOption={handleAddPollOption}
                         onLockPoll={handleLockPoll}
                         onRefreshPoll={handleRefreshPoll}
+                        currentUserId={myProfile?.uid}
+                        canManagePolls={canManageActivePolls}
+                        connectionStatus={connStatus}
                         onStartVoiceCall={handleStartVoiceCall}
                         callDisabledReason={activeCallCheck.disabledReason}
+                        blockedStickerRule={matchBlockedStickerRule(m, blockedStickersCfg.rules)}
+                        blockedStickerMode={blockedStickersCfg.mode}
+                        onBlockSticker={handleBlockSticker}
+                        onUnblockSticker={handleUnblockSticker}
                       />
                     </div>
                   );
@@ -7303,10 +9419,14 @@ export default function App() {
               </div>
             </div>
 
-            {showScrollDown && (
+            {(showScrollDown || hasNewerHistory) && (
               <button
                 type="button"
                 onClick={() => {
+                  if (hasNewerHistory && selectedId) {
+                    void reloadLatestMessages(selectedId);
+                    return;
+                  }
                   stickToBottomRef.current = true;
                   bottomRef.current?.scrollIntoView({ behavior: "smooth" });
                   setUnreadBelow(0);
@@ -7394,8 +9514,10 @@ export default function App() {
                 focusSignal={replyFocusSeq}
                 draft={draftsByThread[activeThread.id] ?? ""}
                 onDraftChange={(val, tid) => setDraftForThread(tid ?? activeThread.id, val)}
-                pendingAttachment={pendingAttachment}
-                onPendingAttachmentChange={updatePendingAttachment}
+                pendingAttachments={pendingAttachments}
+                onAddPendingAttachments={addPendingAttachments}
+                onRemovePendingAttachment={removePendingAttachment}
+                onClearPendingAttachments={clearPendingAttachments}
                 mentionMembers={composerMentionMembers}
                 onSendSticker={handleSendSticker}
                 onCancelReply={() => setReplyTo(null)}
@@ -7414,14 +9536,12 @@ export default function App() {
                 }}
                 buzzCooldownSec={buzzCooldownSec}
                 sendOnEnter={sendOnEnter}
-                globalPasteFallback={!activeThreadRootId}
+                stickerSuggestEnabled={stickerSuggestEnabled}
+                isLocked={effectiveLocked}
+                globalPasteFallback={!activeThreadRootId && !effectiveLocked && !hasBlockingOverlay}
                 onCaptureScreen={() => void handleCaptureScreen()}
                 capturingScreen={capturingScreen}
-                onEditPendingImage={
-                  pendingAttachment?.kind === "raw" && pendingAttachment.isImage
-                    ? handleEditPendingImage
-                    : undefined
-                }
+                onEditPendingImage={(attId) => void handleEditPendingImage(attId)}
                 onError={showError}
               />
             )}
@@ -7429,10 +9549,20 @@ export default function App() {
           )
         ) : (
           <div
-            className="flex flex-1 items-center justify-center text-sm"
+            className="flex flex-1 flex-col items-center justify-center gap-3 px-4 text-center text-sm"
             style={{ color: "var(--text-secondary)" }}
           >
-            {t("selectConversationPrompt")}
+            <span>{t("selectConversationPrompt")}</span>
+            {layout.mode === "single" && (
+              <button
+                type="button"
+                onClick={() => setMobilePane("list")}
+                className="tf-btn inline-flex items-center gap-1.5 rounded-xl px-4 py-2 text-xs font-semibold"
+              >
+                <ArrowLeft className="h-3.5 w-3.5" />
+                <span>{t("backToConversationList")}</span>
+              </button>
+            )}
           </div>
         )}
       </main>
@@ -8028,12 +10158,17 @@ export default function App() {
         </>
       )}
 
-      {threadMenu && (
+      {threadMenu && (() => {
+        const clampedTop = Math.max(8, Math.min(threadMenu.y, window.innerHeight - 220));
+        const clampedMaxHeight = Math.max(160, window.innerHeight - clampedTop - 8);
+        return (
         <div
-          className="fixed z-50 max-h-[75vh] w-56 overflow-y-auto rounded-xl py-1 shadow-2xl"
+          ref={threadMenuRef}
+          className="fixed z-50 w-56 overflow-y-auto rounded-xl py-1 shadow-2xl"
           style={{
             left: Math.max(8, Math.min(threadMenu.x, window.innerWidth - 232)),
-            top: Math.max(8, Math.min(threadMenu.y, window.innerHeight - 330)),
+            top: clampedTop,
+            maxHeight: clampedMaxHeight,
             background: "var(--bg-sidebar)",
             border: "1px solid var(--border-subtle)",
           }}
@@ -8077,7 +10212,7 @@ export default function App() {
               </>
             )}
           </button>
-          {isThreadCurrentlyMuted(threadMenu.thread) ? (
+          {isThreadCurrentlyMuted(threadMenu.thread, muteTickNow) ? (
             <button
               type="button"
               onClick={() => {
@@ -8217,14 +10352,17 @@ export default function App() {
             </>
           )}
         </div>
-      )}
+        );
+      })()}
 
       {folderMenu && (
         <div
-          className="fixed z-50 w-52 rounded-xl py-1 shadow-2xl"
+          ref={folderMenuRef}
+          className="fixed z-50 w-52 overflow-y-auto rounded-xl py-1 shadow-2xl"
           style={{
             left: Math.max(8, Math.min(folderMenu.x, window.innerWidth - 220)),
             top: Math.max(8, Math.min(folderMenu.y, window.innerHeight - 150)),
+            maxHeight: Math.max(120, window.innerHeight - 16),
             background: "var(--bg-sidebar)",
             border: "1px solid var(--border-subtle)",
           }}
@@ -8274,6 +10412,7 @@ export default function App() {
         <Suspense fallback={null}>
           <QuickSearchModal
             open={quickSearchOpen}
+            isLocked={effectiveLocked}
             threads={threads}
             onClose={() => setQuickSearchOpen(false)}
             onSelectMessage={(hit) => void handleSelectSearchResult(hit)}
@@ -8290,6 +10429,7 @@ export default function App() {
         <Suspense fallback={null}>
           <AddGroupMembersModal
             open={addMembersOpen}
+            isLocked={effectiveLocked}
             threadId={activeThread.id}
             groupTitle={activeThread.title}
             threads={threads}
@@ -8308,6 +10448,7 @@ export default function App() {
         <Suspense fallback={null}>
           <CreateReminderModal
             open={createReminderOpen}
+            isLocked={effectiveLocked}
             threadTitle={activeThread.title}
             onClose={() => setCreateReminderOpen(false)}
             onSubmit={async (title, startTimeMs, repeat) => {
@@ -8329,6 +10470,7 @@ export default function App() {
         <Suspense fallback={null}>
           <CreatePollModal
             open={createPollOpen}
+            isLocked={effectiveLocked}
             groupTitle={activeThread.title}
             onClose={() => setCreatePollOpen(false)}
             onSubmit={async (payload) => {
@@ -8354,6 +10496,7 @@ export default function App() {
           <ForwardModal
             messages={forwardMessages}
             threads={threads}
+            isLocked={effectiveLocked}
             onClose={() => setForwardMessages([])}
             onForwardTo={async (targetThreadId, msgs) => {
               try {
@@ -8391,37 +10534,35 @@ export default function App() {
         </Suspense>
       )}
 
-      {lightboxState && (
-        <Suspense fallback={null}>
-          <MediaLightbox
-            items={lightboxState.items}
-            activeIndex={lightboxState.index}
-            onIndexChange={(idx) =>
-              setLightboxState((prev) => (prev ? { ...prev, index: idx } : null))
-            }
-            onClose={() => setLightboxState(null)}
-            onNotify={showError}
-          />
-        </Suspense>
-      )}
-
       {profileUid && (
         <Suspense fallback={null}>
           <UserProfileModal
             userId={profileUid}
+            isLocked={effectiveLocked}
             initialProfile={profileInitial}
             onClose={() => {
               setProfileUid(null);
               setProfileInitial(null);
             }}
             onOpenImage={openLightboxForUrl}
-            onOpenGroup={(gid) => {
-              leaveWebApps();
-              selectAndRevealThread(gid, { forceScroll: true });
-              setMobilePane("chat");
-            }}
+            onOpenGroup={handleOpenMutualGroup}
             onStartChat={handleStartChatFromProfile}
             onRelationshipChanged={handleRelationshipChanged}
+          />
+        </Suspense>
+      )}
+
+      {lightboxState && (
+        <Suspense fallback={null}>
+          <MediaLightbox
+            items={lightboxState.items}
+            activeIndex={lightboxState.index}
+            isLocked={effectiveLocked}
+            onIndexChange={(idx) =>
+              setLightboxState((prev) => (prev ? { ...prev, index: idx } : null))
+            }
+            onClose={() => setLightboxState(null)}
+            onNotify={showError}
           />
         </Suspense>
       )}
@@ -8542,6 +10683,7 @@ export default function App() {
         <Suspense fallback={null}>
           <ScreenshotEditorModal
             open
+            isLocked={effectiveLocked}
             sourceUrl={screenshotEditor.sourceUrl}
             initialMode={screenshotEditor.initialMode}
             monitors={screenshotEditor.monitors}
@@ -8565,15 +10707,54 @@ export default function App() {
             }}
             onClose={closeScreenshotEditor}
             onAttach={(att, cap) => {
-              updatePendingAttachment(att);
-              if (selectedId && cap) {
-                setDraftForThread(selectedId, cap);
+              const editId = screenshotEditor.editingAttachmentId;
+              const withId: PendingAttachment = {
+                ...att,
+                id:
+                  screenshotEditor.initialMode === "annotate" && editId
+                    ? editId
+                    : att.id ?? `raw-${Date.now()}-${++outboxSeqRef.current}`,
+              };
+              if (screenshotEditor.initialMode === "annotate") {
+                const cur = pendingAttachmentsRef.current;
+                const matchIdx = editId ? cur.findIndex((item) => item.id === editId) : -1;
+                if (matchIdx >= 0) {
+                  replacePendingAttachments(cur.map((item, i) => (i === matchIdx ? withId : item)));
+                } else if (!editId) {
+                  replacePendingAttachments([withId]);
+                } else {
+                  const added = addPendingAttachments([withId]);
+                  if (!added) return false;
+                }
+              } else {
+                const added = addPendingAttachments([withId]);
+                if (!added) return false;
               }
+              const draftKey =
+                selectedId && activeThreadRootIdRef.current
+                  ? `${selectedId}:thread:${activeThreadRootIdRef.current}`
+                  : selectedId;
+              if (draftKey && cap.trim()) {
+                const existing = draftsSnapshotRef.current[draftKey] ?? "";
+                const nextDraft = existing.trim() ? `${existing}\n${cap}` : cap;
+                setDraftForThread(draftKey, nextDraft);
+              }
+              return true;
             }}
             onSend={async (att, cap) => {
-              const sent = await handleSendAttachment(att, cap);
+              const sent = await handleSendAttachment(att, cap, {
+                rootMsgId: activeThreadRootIdRef.current ?? undefined,
+              });
               if (sent && screenshotEditor.initialMode === "annotate") {
-                updatePendingAttachment(null);
+                const editId = screenshotEditor.editingAttachmentId;
+                if (editId) {
+                  const idx = pendingAttachmentsRef.current.findIndex((item) => item.id === editId);
+                  if (idx >= 0) {
+                    removePendingAttachment(idx);
+                  }
+                } else {
+                  clearPendingAttachments();
+                }
               }
               return sent;
             }}
@@ -8582,8 +10763,9 @@ export default function App() {
         </Suspense>
       )}
 
-      {!isLocked && (
+      {!effectiveLocked && (
         <DownloadOverlay
+          isLocked={effectiveLocked}
           activeDownloads={activeDownloads}
           completedDownload={completedDownload}
           onDismissCompleted={() => setCompletedDownload(null)}
@@ -8596,23 +10778,19 @@ export default function App() {
       {webNotifyToast && !isLocked && (
         <div
           role="button"
-          tabIndex={0}
+          tabIndex={-1}
           onMouseEnter={() => setWebToastHovered(true)}
           onMouseLeave={() => setWebToastHovered(false)}
-          onClick={() => {
+          onMouseDown={(e) => {
+            if (isPrimaryMouseDown(e)) e.preventDefault();
+          }}
+          onClick={(e) => {
+            if (!isExplicitPointerClick(e)) return;
             const targetId = webNotifyToast.thread_id;
             dismissWebNotifyToast();
             openThreadById(targetId);
           }}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" || e.key === " ") {
-              e.preventDefault();
-              const targetId = webNotifyToast.thread_id;
-              dismissWebNotifyToast();
-              openThreadById(targetId);
-            }
-          }}
-          className={`fixed z-[75] flex w-[320px] max-w-[calc(100vw-2rem)] cursor-pointer items-center gap-2.5 overflow-hidden rounded-xl px-3 py-2 shadow-2xl transition hover:brightness-105 ${
+          className={`fixed z-[75] flex w-[320px] max-w-[calc(100vw-2rem)] cursor-pointer select-none items-center gap-2.5 overflow-hidden rounded-xl px-3 py-2 shadow-2xl transition hover:brightness-105 ${
             webNotifyToast.is_buzz && !webToastHovered ? "notify-buzz-shaking" : ""
           } ${
             webNotifyToast.position === "top-left"
@@ -8651,14 +10829,16 @@ export default function App() {
               </div>
               <button
                 type="button"
+                tabIndex={-1}
                 onMouseDown={(e) => {
-                  if (e.button !== 0) return;
+                  if (!isPrimaryMouseDown(e)) return;
                   e.preventDefault();
                   e.stopPropagation();
                   dismissWebNotifyToast();
                 }}
                 onClick={(e) => {
                   e.stopPropagation();
+                  if (!isExplicitPointerClick(e)) return;
                   dismissWebNotifyToast();
                 }}
                 onKeyDown={(e) => e.stopPropagation()}
@@ -8686,43 +10866,47 @@ export default function App() {
         </div>
       )}
 
+      {hasActiveVideoCall && callState.active && (
+        <Suspense fallback={null}>
+          <VideoCallOverlay
+            active={callState.active}
+            telemetry={callTelemetry}
+            devices={callDevices}
+            devicesLoading={callDevicesLoading}
+            cameraDevices={cameraDevices}
+            selectedCameraId={selectedCameraId}
+            localStream={localVideoStream}
+            localCameraStatus={localCameraStatus}
+            localCameraError={localCameraError}
+            hasRemoteVideoFrame={hasRemoteVideoFrame}
+            remoteVideoDims={remoteVideoDims}
+            busy={callActionBusy}
+            hangupBusy={callHangupBusy}
+            minimized={videoOverlayMode === "minimized"}
+            viewMode={videoOverlayMode === "minimized" ? "floating" : videoOverlayMode}
+            onViewModeChange={(mode) => setVideoOverlayMode(mode)}
+            onCollapseToBar={() => setVideoOverlayMode("minimized")}
+            onRemoteCanvasChange={handleRemoteCanvasChange}
+            onToggleMute={(nextMuted) => void handleToggleCallMute(nextMuted)}
+            onToggleCamera={(nextEnabled) => void handleToggleCallCamera(nextEnabled)}
+            onHangup={() => void handleHangupCall()}
+            onMinimize={() => setVideoOverlayMode("floating")}
+            onSelectThread={(partnerId) => openThreadById(partnerId)}
+            onRefreshDevices={refreshCallDevices}
+            onRefreshCameras={refreshCameraDevices}
+            onSelectDevices={(inp, out) => void handleSelectCallDevices(inp, out)}
+            onSelectCamera={handleSelectCameraDevice}
+          />
+        </Suspense>
+      )}
+
       {authed &&
         !isLocked &&
+        !webAppInlineTopActive &&
         callState.active &&
         callState.phase !== "idle" &&
         callState.phase !== "incoming_ringing" &&
-        (showVideoOverlay && videoOverlayMode !== "minimized" ? (
-          <Suspense fallback={null}>
-            <VideoCallOverlay
-              active={callState.active}
-              telemetry={callTelemetry}
-              devices={callDevices}
-              devicesLoading={callDevicesLoading}
-              cameraDevices={cameraDevices}
-              selectedCameraId={selectedCameraId}
-              localStream={localVideoStream}
-              localCameraStatus={localCameraStatus}
-              localCameraError={localCameraError}
-              hasRemoteVideoFrame={hasRemoteVideoFrame}
-              remoteVideoDims={remoteVideoDims}
-              busy={callActionBusy}
-              hangupBusy={callHangupBusy}
-              viewMode={videoOverlayMode}
-              onViewModeChange={(mode) => setVideoOverlayMode(mode)}
-              onCollapseToBar={() => setVideoOverlayMode("minimized")}
-              onRemoteCanvasChange={handleRemoteCanvasChange}
-              onToggleMute={(nextMuted) => void handleToggleCallMute(nextMuted)}
-              onToggleCamera={(nextEnabled) => void handleToggleCallCamera(nextEnabled)}
-              onHangup={() => void handleHangupCall()}
-              onMinimize={() => setVideoOverlayMode("floating")}
-              onSelectThread={(partnerId) => openThreadById(partnerId)}
-              onRefreshDevices={refreshCallDevices}
-              onRefreshCameras={refreshCameraDevices}
-              onSelectDevices={(inp, out) => void handleSelectCallDevices(inp, out)}
-              onSelectCamera={handleSelectCameraDevice}
-            />
-          </Suspense>
-        ) : (
+        !(showVideoOverlay && videoOverlayMode !== "minimized") && (
           <ActiveCallBar
             active={callState.active}
             telemetry={callTelemetry}
@@ -8733,14 +10917,18 @@ export default function App() {
             localCameraStatus={localCameraStatus}
             onToggleMute={(nextMuted) => void handleToggleCallMute(nextMuted)}
             onToggleCamera={(nextEnabled) => void handleToggleCallCamera(nextEnabled)}
-            onExpandVideo={() => setVideoOverlayMode("floating")}
+            onExpandVideo={() => {
+              setVideoOverlayMode("floating");
+              remoteVideoRendererRef.current?.repaintCachedFrame();
+              remoteVideoRendererRef.current?.requestKeyframe();
+            }}
             onHangup={() => void handleHangupCall()}
             onSelectThread={(partnerId) => openThreadById(partnerId)}
             onRefreshDevices={refreshCallDevices}
             onSelectDevices={(inp, out) => void handleSelectCallDevices(inp, out)}
             onDevicesPopoverChange={setActiveCallDevicesOpen}
           />
-        ))}
+        )}
 
       {authed &&
         !isLocked &&
@@ -8758,7 +10946,7 @@ export default function App() {
           />
         )}
 
-      {callNotice && !isLocked && (
+      {callNotice && !isLocked && !webAppInlineTopActive && (
         <div className="fixed right-4 top-20 z-[80] max-w-sm">
           <button
             type="button"
@@ -8795,7 +10983,7 @@ export default function App() {
         </div>
       )}
 
-      {socialNotice && !isLocked && (
+      {socialNotice && !isLocked && !webAppInlineTopActive && (
         <div
           className={`fixed right-4 z-[85] max-w-sm ${callNotice ? "top-32" : "top-20"}`}
         >
@@ -8842,7 +11030,54 @@ export default function App() {
         </div>
       )}
 
-      {toastError && (
+      {scheduleAlertNotice && !isLocked && !webAppInlineTopActive && (
+        <div
+          role="alert"
+          className="fixed bottom-4 right-4 z-[86] flex max-w-md items-center gap-2.5 rounded-xl px-3.5 py-2.5 text-xs font-medium shadow-2xl"
+          style={{
+            background:
+              scheduleAlertNotice.tone === "error"
+                ? "var(--danger-bg)"
+                : "var(--bg-sidebar)",
+            border:
+              scheduleAlertNotice.tone === "error"
+                ? "1px solid rgba(244, 63, 94, 0.5)"
+                : "1px solid rgba(245, 158, 11, 0.55)",
+            color:
+              scheduleAlertNotice.tone === "error"
+                ? "var(--danger-text)"
+                : "var(--text-primary)",
+          }}
+        >
+          <Clock
+            className="h-4 w-4 shrink-0"
+            style={{ color: scheduleAlertNotice.tone === "error" ? "var(--danger-text)" : "#f59e0b" }}
+          />
+          <span className="min-w-0 flex-1 break-words">{scheduleAlertNotice.text}</span>
+          <button
+            type="button"
+            onClick={() => {
+              dismissScheduleAlert();
+              setScheduledInitialThreadId(null);
+              setScheduledModalOpen(true);
+            }}
+            className="tf-btn shrink-0 rounded-lg px-2.5 py-1 text-[11px] font-semibold"
+          >
+            {t("schedReviewAttentionBtn")}
+          </button>
+          <button
+            type="button"
+            onClick={dismissScheduleAlert}
+            title={t("notifyCloseTitle")}
+            aria-label={t("notifyCloseTitle")}
+            className="hover-menu shrink-0 rounded-md p-0.5 opacity-75 hover:opacity-100"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
+
+      {toastError && !webAppInlineTopActive && (
         <div
           role="alert"
           onClick={dismissToastError}
@@ -8870,10 +11105,13 @@ export default function App() {
           </button>
         </div>
       )}
+      </div>
 
       <PasscodeLockScreen
-        open={authed && isLocked}
+        open={effectiveLocked}
         myName={myProfile?.display_name}
+        activeCallBanner={passcodeActiveCallBanner}
+        onLockoutChange={setPasscodeCfg}
         onUnlock={async (pin) => {
           const ok = await verifyPasscode(pin, passcodeCfg);
           if (ok) {
@@ -8883,13 +11121,16 @@ export default function App() {
           return ok;
         }}
         onLogout={() => {
-          savePasscodeConfig(DEFAULT_PASSCODE_CONFIG);
-          setPasscodeCfg(DEFAULT_PASSCODE_CONFIG);
-          void bridge.logout().then(() => {
-            setAuthed(false);
-            resetSessionUi();
-            void refreshQr();
-          });
+          void bridge
+            .logout()
+            .then(() => {
+              savePasscodeConfig(DEFAULT_PASSCODE_CONFIG);
+              setPasscodeCfg(DEFAULT_PASSCODE_CONFIG);
+              setAuthed(false);
+              resetSessionUi();
+              void refreshQr();
+            })
+            .catch(showError);
         }}
       />
     </div>

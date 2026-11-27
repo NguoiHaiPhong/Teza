@@ -1,5 +1,6 @@
-import { useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
+  AlertTriangle,
   Archive,
   ArrowDownToLine,
   Bookmark,
@@ -18,11 +19,23 @@ import {
 } from "lucide-react";
 import { useI18n } from "../i18n";
 import type { AccountProfile, AppUpdateInfo, ConnectionStatus, ThemeMode } from "../types";
+import { isImeComposingEvent } from "../utils/searchNormalize";
 import type { SettingsTab } from "./SettingsModal";
 import { ThreadAvatar } from "./ThreadAvatar";
 
+const FOCUSABLE_SELECTOR =
+  'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])';
+
+function getVisibleFocusables(root: HTMLElement | null): HTMLElement[] {
+  if (!root) return [];
+  return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+    (el) => el.getClientRects().length > 0,
+  );
+}
+
 export interface NavDrawerProps {
   open: boolean;
+  isLocked?: boolean;
   onClose: () => void;
   myProfile: AccountProfile | null;
   connStatus: ConnectionStatus;
@@ -34,6 +47,7 @@ export interface NavDrawerProps {
   pendingFriendRequestsCount?: number;
   aiEnabled?: boolean;
   pendingSchedulesCount?: number;
+  attentionScheduleCount?: number;
   onOpenMyProfile: () => void;
   onOpenSavedMessages: () => void;
   onOpenAiChat?: () => void;
@@ -51,6 +65,7 @@ export interface NavDrawerProps {
 
 export function NavDrawer({
   open,
+  isLocked = false,
   onClose,
   myProfile,
   connStatus,
@@ -62,6 +77,7 @@ export function NavDrawer({
   pendingFriendRequestsCount = 0,
   aiEnabled = false,
   pendingSchedulesCount = 0,
+  attentionScheduleCount = 0,
   onOpenMyProfile,
   onOpenSavedMessages,
   onOpenAiChat,
@@ -77,14 +93,85 @@ export function NavDrawer({
   onLogout,
 }: NavDrawerProps) {
   const { t } = useI18n();
+  const [confirmLogout, setConfirmLogout] = useState(false);
+  const drawerRef = useRef<HTMLElement | null>(null);
+  const prevFocusRef = useRef<HTMLElement | null>(null);
+  const logoutConfirmRef = useRef<HTMLDivElement | null>(null);
+
   useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      setConfirmLogout(false);
+      return;
+    }
+    prevFocusRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const focusTimer = window.setTimeout(() => {
+      const root = drawerRef.current;
+      if (!root) return;
+      const focusables = getVisibleFocusables(root);
+      (focusables[0] ?? root).focus();
+    }, 20);
+    return () => {
+      window.clearTimeout(focusTimer);
+      const prev = prevFocusRef.current;
+      prevFocusRef.current = null;
+      if (prev && prev.isConnected) {
+        prev.focus();
+      }
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (confirmLogout) {
+      logoutConfirmRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  }, [confirmLogout]);
+
+  useEffect(() => {
+    if (!open || isLocked) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (isLocked) return;
+      if (e.key === "Tab") {
+        const root = drawerRef.current;
+        if (!root) return;
+        const focusables = getVisibleFocusables(root);
+        if (focusables.length === 0) {
+          e.preventDefault();
+          root.focus();
+          return;
+        }
+        const first = focusables[0];
+        const last = focusables[focusables.length - 1];
+        const active = document.activeElement as HTMLElement | null;
+        if (!active || !root.contains(active)) {
+          e.preventDefault();
+          (e.shiftKey ? last : first).focus();
+          return;
+        }
+        if (e.shiftKey && active === first) {
+          e.preventDefault();
+          last.focus();
+        } else if (!e.shiftKey && active === last) {
+          e.preventDefault();
+          first.focus();
+        }
+        return;
+      }
+
+      if (isImeComposingEvent(e)) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        if (confirmLogout) {
+          setConfirmLogout(false);
+        } else {
+          onClose();
+        }
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, onClose]);
+  }, [open, isLocked, confirmLogout, onClose]);
 
   if (!open) return null;
 
@@ -114,7 +201,12 @@ export function NavDrawer({
       onClick={onClose}
     >
       <aside
-        className="flex h-full w-72 max-w-[85vw] flex-col shadow-2xl"
+        ref={drawerRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label={t("menuMainSettings")}
+        tabIndex={-1}
+        className="flex h-full w-72 max-w-[85vw] flex-col shadow-2xl outline-none"
         style={{
           background: "var(--bg-sidebar)",
           borderRight: "1px solid var(--border-subtle)",
@@ -231,12 +323,26 @@ export function NavDrawer({
                 <CalendarClock className="h-4 w-4 shrink-0" style={{ color: "var(--accent)" }} />
                 <span>{t("navScheduledMessagesMenu")}</span>
               </span>
-              {pendingSchedulesCount > 0 && (
-                <span
-                  className="rounded-full px-2 py-0.5 text-[11px] font-bold"
-                  style={{ background: "var(--accent)", color: "var(--text-on-accent)" }}
-                >
-                  {pendingSchedulesCount > 99 ? "99+" : pendingSchedulesCount}
+              {(attentionScheduleCount > 0 || pendingSchedulesCount > 0) && (
+                <span className="flex shrink-0 items-center gap-1">
+                  {attentionScheduleCount > 0 && (
+                    <span
+                      title={t("navSchedulesAttentionTitle", { count: attentionScheduleCount })}
+                      className="inline-flex items-center gap-1 rounded-full bg-amber-500/20 px-2 py-0.5 text-[11px] font-bold text-amber-400"
+                      style={{ border: "1px solid rgba(245, 158, 11, 0.45)" }}
+                    >
+                      <AlertTriangle className="h-3 w-3 shrink-0" />
+                      <span>{attentionScheduleCount > 99 ? "99+" : attentionScheduleCount}</span>
+                    </span>
+                  )}
+                  {pendingSchedulesCount > 0 && (
+                    <span
+                      className="rounded-full px-2 py-0.5 text-[11px] font-bold"
+                      style={{ background: "var(--accent)", color: "var(--text-on-accent)" }}
+                    >
+                      {pendingSchedulesCount > 99 ? "99+" : pendingSchedulesCount}
+                    </span>
+                  )}
                 </span>
               )}
             </button>
@@ -393,18 +499,55 @@ export function NavDrawer({
 
           <div className="my-2 h-px" style={{ background: "var(--border-subtle)" }} />
 
-          <button
-            type="button"
-            onClick={() => {
-              onClose();
-              onLogout();
-            }}
-            className="hover-menu flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left font-medium transition"
-            style={{ color: "var(--danger-text)" }}
-          >
-            <LogOut className="h-4 w-4 shrink-0" />
-            <span>{t("logoutMenu")}</span>
-          </button>
+          {!confirmLogout ? (
+            <button
+              type="button"
+              onClick={() => setConfirmLogout(true)}
+              className="hover-menu flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left font-medium transition"
+              style={{ color: "var(--danger-text)" }}
+            >
+              <LogOut className="h-4 w-4 shrink-0" />
+              <span>{t("logoutMenu")}</span>
+            </button>
+          ) : (
+            <div
+              ref={logoutConfirmRef}
+              className="space-y-2 rounded-xl p-3 text-xs"
+              style={{
+                background: "var(--danger-bg)",
+                border: "1px solid rgba(239, 68, 68, 0.35)",
+              }}
+            >
+              <div className="font-semibold" style={{ color: "var(--danger-text)" }}>
+                {t("lockScreenConfirmLogout")}
+              </div>
+              <div className="flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setConfirmLogout(false)}
+                  className="hover-menu rounded-lg px-2.5 py-1.5 font-medium"
+                  style={{
+                    background: "var(--bg-sidebar)",
+                    color: "var(--text-primary)",
+                  }}
+                >
+                  {t("cancel")}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setConfirmLogout(false);
+                    onClose();
+                    onLogout();
+                  }}
+                  className="inline-flex items-center gap-1 rounded-lg bg-rose-600 px-2.5 py-1.5 font-semibold text-white transition hover:bg-rose-500"
+                >
+                  <LogOut className="h-3.5 w-3.5" />
+                  <span>{t("logoutMenu")}</span>
+                </button>
+              </div>
+            </div>
+          )}
         </nav>
 
         {/* Version Footer */}

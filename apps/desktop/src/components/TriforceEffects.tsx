@@ -8,6 +8,7 @@ interface Props {
 const PRESS_SELECTOR = 'a[href], button, summary, [role="button"], .tf-row';
 const BLUE_RGB = "150,215,255";
 const GOLD_RGB = "255,212,120";
+const TORCH_HALF = 260;
 
 function createFairyWingBody(variant: 1 | 2, rgb: string): HTMLDivElement {
   const wrap = document.createElement("div");
@@ -80,6 +81,7 @@ function createFairyWingBody(variant: 1 | 2, rgb: string): HTMLDivElement {
 
 export function TriforceEffects({ enabled, dustEnabled }: Props) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const torchRef = useRef<HTMLDivElement | null>(null);
   const activeDust = dustEnabled ?? enabled;
 
   useEffect(() => {
@@ -95,7 +97,7 @@ export function TriforceEffects({ enabled, dustEnabled }: Props) {
       return;
     }
 
-    // 1. Fairy & sparkle trail
+    // 1. Fairy & sparkle trail (GPU transform-only, auto-sleeps when idle)
     const fay = document.createElement("div");
     fay.id = "triforceFay";
     fay.className = "fay";
@@ -115,62 +117,71 @@ export function TriforceEffects({ enabled, dustEnabled }: Props) {
     let vy = 0;
     let on = false;
     let running = false;
+    let litApplied = false;
     let lastFairy = 0;
     let moved = 0;
+    let lastHitTestAt = 0;
     let hot: Element | null = null;
+    let hotRect: DOMRect | null = null;
     let sparkAt = 0;
     let alive = 0;
     let fairyRaf = 0;
+    let torchRaf = 0;
+    let torchX = 0;
+    let torchY = 0;
+    let visible = !document.hidden;
 
     const spark = (sx: number, sy: number, burst: boolean) => {
-      if (alive >= 40) return;
+      if (alive >= 14) return;
       const s = document.createElement("i");
-      const d = 2 + Math.random() * 3;
+      const d = 2 + Math.random() * 2.5;
       const a = Math.random() * 6.283;
-      const r = burst ? 18 + Math.random() * 28 : 3 + Math.random() * 8;
+      const r = burst ? 16 + Math.random() * 24 : 3 + Math.random() * 7;
       s.style.cssText =
         `left:${sx.toFixed(1)}px;top:${sy.toFixed(1)}px;` +
         `width:${d.toFixed(1)}px;height:${d.toFixed(1)}px;` +
         `--dx:${(Math.cos(a) * r).toFixed(1)}px;` +
-        `--dy:${(Math.sin(a) * r + (burst ? 0 : 14 + Math.random() * 18)).toFixed(1)}px;` +
-        `--t:${(0.55 + Math.random() * 0.6).toFixed(2)}s;` +
+        `--dy:${(Math.sin(a) * r + (burst ? 0 : 12 + Math.random() * 14)).toFixed(1)}px;` +
+        `--t:${(0.5 + Math.random() * 0.45).toFixed(2)}s;` +
         `--c:${hot ? GOLD_RGB : BLUE_RGB}`;
       alive += 1;
-      s.addEventListener("animationend", () => {
-        s.remove();
-        alive = Math.max(0, alive - 1);
-      });
+      s.addEventListener(
+        "animationend",
+        () => {
+          s.remove();
+          alive = Math.max(0, alive - 1);
+        },
+        { once: true },
+      );
       trail.appendChild(s);
     };
 
     const aim = (target: Element | null) => {
       if (target !== hot) {
         hot = target;
+        hotRect = target && target.isConnected ? target.getBoundingClientRect() : null;
         fay.classList.toggle("hot", !!target);
       }
     };
 
     const stepFairy = (t: number) => {
-      if (!on) {
+      if (!on || !visible) {
         running = false;
         return;
       }
       const dt = lastFairy ? Math.min(0.034, (t - lastFairy) / 1000) : 0.016;
       lastFairy = t;
+      const idleMs = t - moved;
       const a = t * 0.0021;
       let gx: number;
       let gy: number;
 
-      if (hot && hot.isConnected) {
-        const r = hot.getBoundingClientRect();
-        gx = Math.max(r.left + 6, Math.min(r.right - 6, px)) + Math.cos(a * 1.6) * 12;
-        gy = (r.top < 40 ? r.bottom + 13 : r.top - 13) + Math.sin(a * 3.2) * 4;
-      } else if (t - moved > 900) {
-        gx = px + Math.cos(a) * 36;
-        gy = py - 6 + Math.sin(a) * 22;
+      if (hot && hot.isConnected && hotRect) {
+        gx = Math.max(hotRect.left + 6, Math.min(hotRect.right - 6, px));
+        gy = hotRect.top < 40 ? hotRect.bottom + 13 : hotRect.top - 13;
       } else {
-        gx = px + 26 + Math.cos(a * 1.3) * 5;
-        gy = py - 28 + Math.sin(a * 2.1) * 6;
+        gx = px + 26 + (idleMs < 1800 ? Math.cos(a * 1.3) * 4 : 0);
+        gy = py - 28 + (idleMs < 1800 ? Math.sin(a * 2.1) * 4 : 0);
       }
 
       vx += ((gx - x) * 120 - vx * 15) * dt;
@@ -183,24 +194,56 @@ export function TriforceEffects({ enabled, dustEnabled }: Props) {
         Math.min(24, vx * 0.035),
       ).toFixed(1)}deg)`;
 
-      if (Math.hypot(vx, vy) > 150 && t - sparkAt > 42) {
+      const speed = Math.hypot(vx, vy);
+      if (speed > 170 && t - sparkAt > 80) {
         sparkAt = t;
         spark(x + (Math.random() - 0.5) * 8, y + (Math.random() - 0.5) * 8, false);
+      }
+
+      // Stop rAF completely once settled after mouse stops moving (0% idle CPU/GPU)
+      if (idleMs > 2200 && speed < 8 && Math.hypot(gx - x, gy - y) < 3) {
+        running = false;
+        lastFairy = 0;
+        return;
       }
       fairyRaf = requestAnimationFrame(stepFairy);
     };
 
+    const flushTorch = () => {
+      torchRaf = 0;
+      const torchEl = torchRef.current;
+      if (torchEl) {
+        torchEl.style.transform = `translate3d(${(torchX - TORCH_HALF).toFixed(1)}px,${(
+          torchY - TORCH_HALF
+        ).toFixed(1)}px,0)`;
+      }
+    };
+
     const onPointerMove = (e: PointerEvent) => {
-      document.body.classList.add("lit");
-      document.body.style.setProperty("--mx", `${e.clientX}px`);
-      document.body.style.setProperty("--my", `${e.clientY}px`);
+      if (!litApplied) {
+        litApplied = true;
+        document.body.classList.add("lit");
+      }
+      if (torchRef.current) {
+        torchX = e.clientX;
+        torchY = e.clientY;
+        if (!torchRaf) {
+          torchRaf = requestAnimationFrame(flushTorch);
+        }
+      }
 
       if (e.pointerType && e.pointerType !== "mouse") return;
       px = e.clientX;
       py = e.clientY;
-      moved = performance.now();
-      const target = e.target instanceof Element ? e.target.closest(PRESS_SELECTOR) : null;
-      aim(target);
+      const now = performance.now();
+      moved = now;
+
+      if (now - lastHitTestAt >= 50) {
+        lastHitTestAt = now;
+        const target = e.target instanceof Element ? e.target.closest(PRESS_SELECTOR) : null;
+        aim(target);
+      }
+
       if (!on) {
         on = true;
         x = px - 90;
@@ -210,15 +253,16 @@ export function TriforceEffects({ enabled, dustEnabled }: Props) {
         lastFairy = 0;
         fay.classList.add("on");
       }
-      if (!running) {
+      if (!running && visible) {
         running = true;
+        lastFairy = 0;
         fairyRaf = requestAnimationFrame(stepFairy);
       }
     };
 
     const onPointerDown = (e: PointerEvent) => {
       if (on && (!e.pointerType || e.pointerType === "mouse")) {
-        for (let i = 0; i < 8; i += 1) {
+        for (let i = 0; i < 5; i += 1) {
           spark(x, y, true);
         }
       }
@@ -226,31 +270,40 @@ export function TriforceEffects({ enabled, dustEnabled }: Props) {
 
     const onMouseLeave = () => {
       on = false;
+      running = false;
       fay.classList.remove("on");
+    };
+
+    const invalidateHotRect = () => {
+      if (hot && hot.isConnected) {
+        hotRect = hot.getBoundingClientRect();
+      } else {
+        hotRect = null;
+      }
     };
 
     window.addEventListener("pointermove", onPointerMove, { passive: true });
     window.addEventListener("pointerdown", onPointerDown, { passive: true });
+    window.addEventListener("scroll", invalidateHotRect, { passive: true, capture: true });
     document.documentElement.addEventListener("mouseleave", onMouseLeave);
 
-    // 2. Floating ambient gold dust on canvas (paused briefly during active typing)
+    // 2. Floating ambient gold dust on canvas (paused during active typing & hidden tab)
     const canvas = canvasRef.current;
     const ctx = runDust ? canvas?.getContext("2d") ?? null : null;
     let w = 0;
     let h = 0;
     let lastDust = 0;
-    let visible = !document.hidden;
     let typingUntil = 0;
     let dustRaf = 0;
 
-    const count = Math.max(18, Math.min(36, Math.round(window.innerWidth / 40)));
+    const count = Math.max(14, Math.min(26, Math.round(window.innerWidth / 56)));
     const particles = Array.from({ length: count }, () => ({
       x: Math.random(),
       y: Math.random(),
       z: 0.25 + Math.random() * 0.75,
       r: 0.7 + Math.random() * 1.9,
-      a: 0.08 + Math.random() * 0.26,
-      v: 0.006 + Math.random() * 0.015,
+      a: 0.08 + Math.random() * 0.24,
+      v: 0.006 + Math.random() * 0.014,
       s: Math.random() * 6.283,
     }));
 
@@ -258,10 +311,10 @@ export function TriforceEffects({ enabled, dustEnabled }: Props) {
       if (!canvas) return;
       w = canvas.width = Math.max(1, Math.round(window.innerWidth));
       h = canvas.height = Math.max(1, Math.round(window.innerHeight));
+      invalidateHotRect();
     };
     fit();
 
-    // Pre-render one reusable radial dust sprite instead of recreating gradients every frame
     const sprite = document.createElement("canvas");
     sprite.width = 32;
     sprite.height = 32;
@@ -278,21 +331,21 @@ export function TriforceEffects({ enabled, dustEnabled }: Props) {
     const onTypingKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
       if (target && (target.tagName === "TEXTAREA" || target.tagName === "INPUT")) {
-        typingUntil = performance.now() + 700;
+        typingUntil = performance.now() + 900;
       }
     };
     if (runDust) {
       window.addEventListener("keydown", onTypingKey, { passive: true });
     }
 
-    const MIN_FRAME_MS = 45;
+    const MIN_FRAME_MS = 60;
     const stepDust = (t: number) => {
       if (!ctx || !visible) return;
       if (t < typingUntil || (lastDust && t - lastDust < MIN_FRAME_MS)) {
         dustRaf = requestAnimationFrame(stepDust);
         return;
       }
-      const dt = lastDust ? Math.min(80, t - lastDust) : 45;
+      const dt = lastDust ? Math.min(90, t - lastDust) : 60;
       lastDust = t;
       ctx.clearRect(0, 0, w, h);
       for (const p of particles) {
@@ -315,7 +368,13 @@ export function TriforceEffects({ enabled, dustEnabled }: Props) {
 
     const onVisibilityChange = () => {
       visible = !document.hidden;
-      if (visible && ctx) {
+      if (!visible) {
+        running = false;
+        cancelAnimationFrame(fairyRaf);
+        cancelAnimationFrame(dustRaf);
+        return;
+      }
+      if (ctx) {
         lastDust = 0;
         dustRaf = requestAnimationFrame(stepDust);
       }
@@ -331,10 +390,13 @@ export function TriforceEffects({ enabled, dustEnabled }: Props) {
 
     return () => {
       on = false;
+      running = false;
       cancelAnimationFrame(fairyRaf);
       cancelAnimationFrame(dustRaf);
+      cancelAnimationFrame(torchRaf);
       window.removeEventListener("pointermove", onPointerMove);
       window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("scroll", invalidateHotRect, true);
       if (runDust) {
         window.removeEventListener("keydown", onTypingKey);
       }
@@ -352,7 +414,7 @@ export function TriforceEffects({ enabled, dustEnabled }: Props) {
   return (
     <>
       {activeDust && <canvas ref={canvasRef} id="dust" aria-hidden="true" />}
-      {activeDust && <div className="torch" aria-hidden="true" />}
+      {activeDust && <div ref={torchRef} className="torch" aria-hidden="true" />}
     </>
   );
 }

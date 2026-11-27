@@ -2,7 +2,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, Info, LocateFixed, MessagesSquare } from "lucide-react";
 import { useI18n } from "../i18n";
 import type { MessageDto, PendingAttachment, StickerItem, ThreadKind, ThreadMemberDto } from "../types";
+import {
+  matchBlockedStickerRule,
+  type BlockedStickerDisplayMode,
+  type BlockedStickerKind,
+  type BlockedStickerRule,
+} from "../utils/blockedStickers";
 import type { MentionCandidate } from "../utils/mentions";
+import { isImeComposingEvent } from "../utils/searchNormalize";
 import { formatDayLabel } from "../utils/threadState";
 import { Composer } from "./Composer";
 import { MessageBubble, type MessageTranslationState } from "./MessageBubble";
@@ -19,8 +26,15 @@ interface Props {
   replies: MessageDto[];
   threadKind: ThreadKind;
   peerReadTs?: number;
-  pendingAttachment: PendingAttachment | null;
-  onPendingAttachmentChange: (att: PendingAttachment | null) => void;
+  pendingAttachments: PendingAttachment[];
+  onAddPendingAttachments: (atts: PendingAttachment[]) => void;
+  onRemovePendingAttachment: (index: number) => void;
+  onClearPendingAttachments: () => void;
+  onEditPendingImage?: (attachmentId?: string) => void;
+  draft?: string;
+  onDraftChange?: (val: string, threadKey?: string) => void;
+  globalPasteFallback?: boolean;
+  isLocked?: boolean;
   translationsByMsg: Record<string, MessageTranslationState>;
   replaceWithTranslation: boolean;
   drawerOpen: boolean;
@@ -32,11 +46,13 @@ interface Props {
   onBuzz: () => Promise<void>;
   buzzCooldownSec: number;
   sendOnEnter?: boolean;
+  stickerSuggestEnabled?: boolean;
   hasBlockingOverlay?: boolean;
   getSenderAvatar?: (senderId: string) => string | undefined;
   onSaveFile?: (url: string, name: string, opts?: { threadId?: string; msgId?: string }) => void;
   onRetrySend?: (msg: MessageDto) => void;
   onDiscardFailed?: (msgId: string) => void;
+  activeUploadIds?: ReadonlySet<string>;
   onReact: (msg: MessageDto, emoji: string) => void;
   onRecall: (msg: MessageDto) => void;
   onDeleteLocal: (msg: MessageDto) => void;
@@ -49,6 +65,13 @@ interface Props {
   displayMentionMembers?: MentionCandidate[];
   onSendSticker?: (sticker: StickerItem) => Promise<void>;
   onTogglePin?: (msg: MessageDto) => void;
+  blockedStickerRules?: readonly BlockedStickerRule[];
+  blockedStickerMode?: BlockedStickerDisplayMode;
+  onBlockSticker?: (
+    msg: MessageDto,
+    opts: { kind: BlockedStickerKind; global: boolean },
+  ) => void;
+  onUnblockSticker?: (ruleId: string) => void;
   onError: (err: unknown) => void;
 }
 
@@ -58,8 +81,15 @@ export function ReplyThreadPanel({
   replies,
   threadKind,
   peerReadTs,
-  pendingAttachment,
-  onPendingAttachmentChange,
+  pendingAttachments,
+  onAddPendingAttachments,
+  onRemovePendingAttachment,
+  onClearPendingAttachments,
+  onEditPendingImage,
+  draft,
+  onDraftChange,
+  globalPasteFallback = true,
+  isLocked = false,
   translationsByMsg,
   replaceWithTranslation,
   drawerOpen,
@@ -71,11 +101,13 @@ export function ReplyThreadPanel({
   onBuzz,
   buzzCooldownSec,
   sendOnEnter = true,
+  stickerSuggestEnabled = true,
   hasBlockingOverlay = false,
   getSenderAvatar,
   onSaveFile,
   onRetrySend,
   onDiscardFailed,
+  activeUploadIds,
   onReact,
   onRecall,
   onDeleteLocal,
@@ -88,6 +120,10 @@ export function ReplyThreadPanel({
   displayMentionMembers,
   onSendSticker,
   onTogglePin,
+  blockedStickerRules,
+  blockedStickerMode = "collapse",
+  onBlockSticker,
+  onUnblockSticker,
   onError,
 }: Props) {
   const { lang, t } = useI18n();
@@ -98,6 +134,22 @@ export function ReplyThreadPanel({
   const listBottomRef = useRef<HTMLDivElement | null>(null);
   const prevCountRef = useRef(replies.length);
   const highlightTimerRef = useRef<number | null>(null);
+
+  const visibleReplies = useMemo(() => {
+    if (
+      blockedStickerMode !== "hide" ||
+      !blockedStickerRules ||
+      blockedStickerRules.length === 0
+    ) {
+      return replies;
+    }
+    return replies.filter(
+      (m) =>
+        m.is_outgoing ||
+        m.is_recalled ||
+        matchBlockedStickerRule(m, blockedStickerRules) === null,
+    );
+  }, [replies, blockedStickerMode, blockedStickerRules]);
 
   useEffect(() => {
     return () => {
@@ -127,24 +179,42 @@ export function ReplyThreadPanel({
     onJumpToMsgInMainChat(msgId);
   };
 
+  const rootMessageRef = useRef(rootMessage);
+  rootMessageRef.current = rootMessage;
+
   useEffect(() => {
-    setReplyTarget(rootMessage);
-  }, [rootMessage]);
+    setReplyTarget(rootMessageRef.current);
+  }, [rootMessage.msg_id]);
+
+  const effectiveReplyTarget = useMemo(() => {
+    if (replyTarget.msg_id === rootMessage.msg_id) {
+      return rootMessage;
+    }
+    return replies.find((r) => r.msg_id === replyTarget.msg_id) ?? replyTarget;
+  }, [replyTarget, rootMessage, replies]);
 
   useEffect(() => {
     setReplyFocusSeq((n) => n + 1);
   }, [rootMessage.msg_id]);
 
   useEffect(() => {
+    if (isLocked) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== "Escape" || e.defaultPrevented || hasBlockingOverlay) return;
+      if (
+        e.key !== "Escape" ||
+        e.defaultPrevented ||
+        hasBlockingOverlay ||
+        isImeComposingEvent(e)
+      ) {
+        return;
+      }
       if (document.querySelector("[data-teza-floating-popup]")) return;
       e.preventDefault();
       onClose();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose, hasBlockingOverlay]);
+  }, [onClose, hasBlockingOverlay, isLocked]);
 
   useEffect(() => {
     if (replies.length > prevCountRef.current) {
@@ -296,7 +366,7 @@ export function ReplyThreadPanel({
 
       {/* Thread Replies Stream */}
       <div ref={listContainerRef} className="relative flex-1 overflow-y-auto px-5 py-2.5">
-        {replies.length === 0 ? (
+        {visibleReplies.length === 0 ? (
           <div
             className="flex h-full flex-col items-center justify-center px-6 text-center text-[14px]"
             style={{ color: "var(--text-secondary)" }}
@@ -304,9 +374,9 @@ export function ReplyThreadPanel({
             {t("noRepliesYetHint")}
           </div>
         ) : (
-          replies.map((m, idx) => {
-            const prev = idx > 0 ? replies[idx - 1] : null;
-            const next = idx < replies.length - 1 ? replies[idx + 1] : null;
+          visibleReplies.map((m, idx) => {
+            const prev = idx > 0 ? visibleReplies[idx - 1] : null;
+            const next = idx < visibleReplies.length - 1 ? visibleReplies[idx + 1] : null;
             const showDate = !prev || dayKey(prev.ts) !== dayKey(m.ts);
             const grouped =
               !!prev &&
@@ -367,7 +437,14 @@ export function ReplyThreadPanel({
                   onSaveFile={onSaveFile}
                   onRetrySend={onRetrySend}
                   onDiscardFailed={onDiscardFailed}
+                  discardDisabled={activeUploadIds?.has(m.msg_id) ?? false}
                   onCopyError={onError}
+                  blockedStickerRule={
+                    blockedStickerRules ? matchBlockedStickerRule(m, blockedStickerRules) : null
+                  }
+                  blockedStickerMode={blockedStickerMode}
+                  onBlockSticker={onBlockSticker}
+                  onUnblockSticker={onUnblockSticker}
                 />
               </div>
             );
@@ -378,16 +455,23 @@ export function ReplyThreadPanel({
 
       {/* Full Composer inside Thread (text + emoji/stickers + images/files + @mention + buzz) */}
       <Composer
-        threadKey={rootMessage.msg_id}
-        replyTo={replyTarget.msg_id !== rootMessage.msg_id ? replyTarget : null}
+        threadKey={`${rootMessage.thread_id}:thread:${rootMessage.msg_id}`}
+        replyTo={
+          effectiveReplyTarget.msg_id !== rootMessage.msg_id ? effectiveReplyTarget : null
+        }
         focusSignal={replyFocusSeq}
-        pendingAttachment={pendingAttachment}
-        onPendingAttachmentChange={onPendingAttachmentChange}
+        draft={draft}
+        onDraftChange={onDraftChange}
+        pendingAttachments={pendingAttachments}
+        onAddPendingAttachments={onAddPendingAttachments}
+        onRemovePendingAttachment={onRemovePendingAttachment}
+        onClearPendingAttachments={onClearPendingAttachments}
+        onEditPendingImage={onEditPendingImage}
         mentionMembers={mentionMembers}
         onSendSticker={onSendSticker}
         onCancelReply={() => setReplyTarget(rootMessage)}
         onSendText={async (text) => {
-          const ok = await onSendThreadReply(text, replyTarget);
+          const ok = await onSendThreadReply(text, effectiveReplyTarget);
           if (ok !== false) {
             setReplyTarget(rootMessage);
           }
@@ -399,7 +483,10 @@ export function ReplyThreadPanel({
         onBuzz={onBuzz}
         buzzCooldownSec={buzzCooldownSec}
         sendOnEnter={sendOnEnter}
-        placeholder={t("replyInThreadPlaceholder", { name: replyTarget.sender_name })}
+        stickerSuggestEnabled={stickerSuggestEnabled}
+        globalPasteFallback={globalPasteFallback && !isLocked && !hasBlockingOverlay}
+        isLocked={isLocked}
+        placeholder={t("replyInThreadPlaceholder", { name: effectiveReplyTarget.sender_name })}
         onError={onError}
       />
     </div>

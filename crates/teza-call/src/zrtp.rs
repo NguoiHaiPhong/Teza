@@ -692,9 +692,6 @@ impl ZrtpRelaySession {
             let has_unresolved_rtp = servers
                 .iter()
                 .any(|s| !s.rtp.is_empty() && s.rtp.parse::<SocketAddr>().is_err());
-            let has_unresolved_rtcp = servers
-                .iter()
-                .any(|s| s.has_distinct_rtcp() && s.rtcp.parse::<SocketAddr>().is_err());
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep_until(deadline) => break,
@@ -740,16 +737,18 @@ impl ZrtpRelaySession {
                     res = rtcp_sock.recv_from(&mut rtcp_buf), if distinct_rtcp_exists => {
                         let Ok((n, peer)) = res else { continue; };
                         let peer_str = peer.to_string();
+                        let is_known_rtcp = is_known_relay_rtcp_peer(&servers, peer);
+                        if !is_known_rtcp {
+                            continue;
+                        }
                         if let Some(init_resp) = parse_zrtp_init_response(&rtcp_buf[..n]) {
-                            let is_known_rtcp = has_unresolved_rtcp
-                                || servers.iter().any(|s| s.has_distinct_rtcp() && s.rtcp == peer_str);
                             emit_trace(trace.as_ref(), || {
                                 format!(
                                     "[ZRTP RTCP INIT RX] peer={peer_str} known={is_known_rtcp} res={} token=0x{:08x}",
                                     init_resp.res, init_resp.token
                                 )
                             });
-                            if init_resp.res == 0 && is_known_rtcp {
+                            if init_resp.res == 0 {
                                 probe.rtcp_acked = true;
                                 server_tokens.entry(peer_str.clone()).or_insert(init_resp.token);
                                 let pkt_ping =
@@ -930,6 +929,13 @@ impl ZrtpRelaySession {
                     }
                     res = rtcp_loop.recv_from(&mut buf_rtcp), if distinct_rtcp_exists => {
                         if let Ok((n, peer)) = res {
+                            let is_known_peer = servers_loop
+                                .lock()
+                                .map(|srvs| is_known_relay_rtcp_peer(&srvs, peer))
+                                .unwrap_or(false);
+                            if !is_known_peer {
+                                continue;
+                            }
                             if let Some(init_resp) = parse_zrtp_init_response(&buf_rtcp[..n]) {
                                 if init_resp.res == 0 && init_resp.token != 0 {
                                     emit_trace(trace_loop.as_ref(), || {
@@ -1174,6 +1180,20 @@ fn load_server_token(
     } else {
         0
     }
+}
+
+fn is_known_relay_rtcp_peer(servers: &[RelayServer], peer: SocketAddr) -> bool {
+    let peer_str = peer.to_string();
+    let has_unresolved_rtcp = servers.iter().any(|s| {
+        s.has_distinct_rtcp() && canonical_addr_key(&s.rtcp).parse::<SocketAddr>().is_err()
+    });
+    if has_unresolved_rtcp {
+        return true;
+    }
+    servers.iter().any(|s| {
+        canonical_addr_key(&s.rtp) == peer_str
+            || (s.has_distinct_rtcp() && canonical_addr_key(&s.rtcp) == peer_str)
+    })
 }
 
 fn push_rtcp_inbox(inbox: &Arc<Mutex<VecDeque<Vec<u8>>>>, pkt: &[u8]) {
@@ -2212,6 +2232,68 @@ mod tests {
 
         attached.store(false, Ordering::Release);
         notify.notify_one();
+        session.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn rtcp_inbox_drops_datagrams_from_unregistered_udp_peers() {
+        let relay_rtp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let relay_rtcp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let rogue = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let rtp_addr = relay_rtp.local_addr().unwrap();
+        let rtcp_addr = relay_rtcp.local_addr().unwrap();
+
+        let session = ZrtpRelaySession::start_with_config(
+            vec![RelayServer::new(rtp_addr.to_string(), rtcp_addr.to_string())],
+            10,
+            20,
+            888,
+            true,
+            "rtcp_peer_filter_sess",
+            ZrtpProbeConfig {
+                echo_bursts: 1,
+                echoes_per_burst: 0,
+                burst_gap: Duration::ZERO,
+                probe_timeout: Duration::from_millis(40),
+                keepalive_interval: Duration::from_secs(10),
+                sub_cmd: ZRTP_SUB_INIT_V3,
+                trace: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let client_rtcp_addr: SocketAddr =
+            format!("127.0.0.1:{}", session.probe().local_rtcp_port)
+                .parse()
+                .unwrap();
+
+        // 1. Spoofed RTCP packet from unregistered rogue peer MUST be dropped before rtcp_inbox
+        let rogue_rtcp = wrap_relay_audio_rtcp(
+            0xBAD0_0001,
+            &[0x80, 201, 0x00, 0x01, 0xDE, 0xAD, 0xBE, 0xEF],
+        );
+        rogue.send_to(&rogue_rtcp, client_rtcp_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            session.drain_rtcp_inbox().is_empty(),
+            "rtcp_inbox must drop RTCP datagrams from unregistered UDP peers"
+        );
+
+        // 2. Legitimate RTCP packet from registered relay RTCP peer MUST be enqueued
+        let valid_rtcp = wrap_relay_audio_rtcp(
+            0x1234_5678,
+            &[0x80, 201, 0x00, 0x01, 0xAA, 0xBB, 0xCC, 0xDD],
+        );
+        relay_rtcp
+            .send_to(&valid_rtcp, client_rtcp_addr)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let drained = session.drain_rtcp_inbox();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0], valid_rtcp);
+
         session.shutdown().await;
     }
 }

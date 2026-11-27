@@ -1326,3 +1326,71 @@ test("applyPollUpdateToMessages updates all matching rows and dedupes stray dupl
   // Unrelated poll untouched
   assert.equal(parsePollPayload(result[2])!.question, "Khác");
 });
+
+test("filterThreadsByFolder and countFolderUnread stop treating expired temporary mutes as muted", () => {
+  const now = 1_700_005_000_000;
+  const threads = [
+    makeThread({
+      id: "forever-muted",
+      kind: "group",
+      unread_count: 4,
+      is_muted: true,
+      muted_until_ts: 0,
+    }),
+    makeThread({
+      id: "still-muted",
+      kind: "group",
+      unread_count: 3,
+      is_muted: true,
+      muted_until_ts: now + 60_000,
+    }),
+    makeThread({
+      id: "expired-mute",
+      kind: "group",
+      unread_count: 2,
+      is_muted: true,
+      muted_until_ts: now - 1_000,
+    }),
+    makeThread({
+      id: "unmuted",
+      kind: "direct",
+      unread_count: 1,
+      is_muted: false,
+    }),
+  ];
+
+  const folders: ChatFolderDto[] = [
+    {
+      id: "no-muted",
+      name: "Active Only",
+      icon: "bell",
+      color: "",
+      thread_ids: [],
+      excluded_thread_ids: [],
+      include_kinds: ["group", "direct"],
+      only_unread: false,
+      exclude_muted: true,
+      position: 1,
+      remote_label_id: null,
+    },
+  ];
+
+  // Expired timed mute appears in exclude_muted folder while active & forever mutes stay hidden
+  assert.deepEqual(
+    filterThreadsByFolder(threads, "custom:no-muted", folders, now).map((t) => t.id),
+    ["expired-mute", "unmuted"],
+  );
+
+  // Unread badge counts expired-mute (2) + unmuted (1) = 3, excluding still-muted (3) and forever-muted (4)
+  assert.equal(countFolderUnread(threads, "all", folders, now), 3);
+  assert.equal(countFolderUnread(threads, "group", folders, now), 2);
+  assert.equal(countFolderUnread(threads, "custom:no-muted", folders, now), 3);
+
+  // Once the 1-minute timed mute also expires, both timed mutes immediately count
+  const later = now + 120_000;
+  assert.deepEqual(
+    filterThreadsByFolder(threads, "custom:no-muted", folders, later).map((t) => t.id),
+    ["still-muted", "expired-mute", "unmuted"],
+  );
+  assert.equal(countFolderUnread(threads, "group", folders, later), 5);
+});

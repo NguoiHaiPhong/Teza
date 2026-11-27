@@ -14,12 +14,14 @@ import { useI18n, type TranslationKey, type UiLanguage } from "../i18n";
 import type { MessageDto, ThreadDto } from "../types";
 import { isExternalLinkMessageType } from "../utils/mediaCache";
 import { CALL_PREFIX, POLL_PREFIX, REMINDER_PREFIX } from "../utils/richMessage";
+import { filterThreadsBySearchQuery, isImeComposingEvent } from "../utils/searchNormalize";
 import { getDisplayBodyText } from "../utils/threadState";
 import { ThreadAvatar } from "./ThreadAvatar";
 
 interface Props {
   messages: MessageDto[];
   threads: ThreadDto[];
+  isLocked?: boolean;
   onClose: () => void;
   onForwardTo: (targetThreadId: string, messages: MessageDto[]) => Promise<void>;
 }
@@ -161,7 +163,7 @@ function renderForwardKindIcon(kind: ForwardMediaKind) {
   }
 }
 
-export function ForwardModal({ messages, threads, onClose, onForwardTo }: Props) {
+export function ForwardModal({ messages, threads, isLocked = false, onClose, onForwardTo }: Props) {
   const { t, lang } = useI18n();
   const [query, setQuery] = useState("");
   const [sendingId, setSendingId] = useState<string | null>(null);
@@ -177,19 +179,23 @@ export function ForwardModal({ messages, threads, onClose, onForwardTo }: Props)
       sendingRef.current = false;
       return;
     }
+    if (isLocked) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !sendingRef.current) onClose();
+      if (isImeComposingEvent(e) || e.defaultPrevented) return;
+      if (e.key === "Escape" && !sendingRef.current) {
+        e.preventDefault();
+        e.stopPropagation();
+        onClose();
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [active, onClose]);
+  }, [active, isLocked, onClose]);
 
-  const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return threads
-      .filter((t) => !q || t.title.toLowerCase().includes(q))
-      .slice(0, 40);
-  }, [threads, query]);
+  const filtered = useMemo(
+    () => filterThreadsBySearchQuery(threads, query, 40),
+    [threads, query],
+  );
 
   if (!active) return null;
 

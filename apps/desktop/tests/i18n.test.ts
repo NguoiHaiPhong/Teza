@@ -50,3 +50,24 @@ test("translateKey interpolates variables and language mapping matches translati
   assert.equal(uiLanguageToLocale("en"), "en-US");
   assert.equal(uiLanguageToLocale("ko"), "ko-KR");
 });
+
+test("Round-2 UX workflow keys exist and interpolate cleanly across vi, en, and ko", () => {
+  for (const lang of ["vi", "en", "ko"] as const) {
+    assert.ok(translateKey(lang, "lockScreenLockoutError", { seconds: 30 }).includes("30"));
+    assert.ok(translateKey(lang, "lockScreenAttemptsHint", { remaining: 2 }).includes("2"));
+    assert.ok(translateKey(lang, "screenshotDiscardDesc", { count: 4 }).includes("4"));
+    assert.ok(translateKey(lang, "qrExpiresIn", { time: "02:59" }).includes("02:59"));
+    assert.ok(translateKey(lang, "navSchedulesAttentionTitle", { count: 3 }).includes("3"));
+    assert.ok(translateKey(lang, "schedMissedToast", { title: "Team" }).includes("Team"));
+    assert.ok(
+      translateKey(lang, "schedFailedToast", { title: "Team", error: "Timeout" }).includes(
+        "Timeout",
+      ),
+    );
+    assert.ok(translateKey(lang, "localApiAuditLoadMoreBtn", { limit: 250 }).includes("250"));
+    assert.ok(translateKey(lang, "localApiUnsavedTokenConfirm").length > 10);
+    assert.ok(translateKey(lang, "pinnedNextTitle").length > 3);
+    assert.ok(translateKey(lang, "backToConversationList").length > 3);
+    assert.ok(translateKey(lang, "gdriveLockVaultBtn").length > 2);
+  }
+});

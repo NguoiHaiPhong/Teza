@@ -1,5 +1,5 @@
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { BarChart3, CalendarClock, Clock, CornerUpLeft, FileText, Image as ImageIcon, Loader2, Paperclip, Pencil, Scissors, Search, Send, Smile, Users, X, Zap } from "lucide-react";
+import { BarChart3, CalendarClock, Clock, CornerUpLeft, FileText, Image as ImageIcon, Loader2, Paperclip, Pencil, Scissors, Search, Send, Smile, Sparkles, Users, X, Zap } from "lucide-react";
 import { bridge, isTauri, MAX_ATTACHMENT_BYTES } from "../bridge";
 import { useI18n, type TranslationKey } from "../i18n";
 import type { MessageDto, PendingAttachment, StickerItem, ThreadMemberDto } from "../types";
@@ -8,17 +8,26 @@ import { shouldFocusComposerOnReply } from "../utils/downloadState";
 import { EMOJI_CATEGORIES, searchEmojis } from "../utils/emojiCatalog";
 import { useEmojiStyle } from "../utils/emojiStyleContext";
 import {
+  extractCompletedMentionSpans,
   filterMentionCandidates,
   findActiveMentionQuery,
   isMentionAllMember,
   reconcileCompletedMentions,
   type CompletedMentionSpan,
 } from "../utils/mentions";
+import { isImeComposingEvent } from "../utils/searchNormalize";
 import {
   convertRetroShortcutsToEmoji,
   RETRO_EMOTICONS,
   searchRetroEmoticons,
 } from "../utils/retroEmoticons";
+import {
+  extractStickerSuggestQuery,
+  sharedStickerSuggestCache,
+  STICKER_SUGGEST_DEBOUNCE_MS,
+  STICKER_SUGGEST_LIMIT,
+} from "../utils/stickerSuggest";
+import { buildAttachmentSendBatch } from "../utils/outboxState";
 import { RelayImage } from "./RelayImage";
 import { EmojiGlyph, RetroEmoticon } from "./RetroEmoticon";
 import { ThreadAvatar } from "./ThreadAvatar";
@@ -70,8 +79,10 @@ interface Props {
   focusSignal?: number;
   draft?: string;
   onDraftChange?: (val: string, threadKey?: string) => void;
-  pendingAttachment?: PendingAttachment | null;
-  onPendingAttachmentChange?: (att: PendingAttachment | null) => void;
+  pendingAttachments?: PendingAttachment[];
+  onAddPendingAttachments?: (atts: PendingAttachment[]) => void;
+  onRemovePendingAttachment?: (index: number) => void;
+  onClearPendingAttachments?: () => void;
   mentionMembers?: ThreadMemberDto[];
   onSendSticker?: (sticker: StickerItem) => Promise<unknown>;
   onCancelReply: () => void;
@@ -83,13 +94,17 @@ interface Props {
   onOpenSchedule?: () => void;
   onCaptureScreen?: () => void;
   capturingScreen?: boolean;
-  onEditPendingImage?: () => void;
+  onEditPendingImage?: (attachmentId?: string) => void;
   buzzCooldownSec?: number;
   placeholder?: string;
   sendOnEnter?: boolean;
+  stickerSuggestEnabled?: boolean;
   globalPasteFallback?: boolean;
+  isLocked?: boolean;
   onError: (err: unknown) => void;
 }
+
+const EMPTY_ATTACHMENTS: PendingAttachment[] = [];
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -103,8 +118,10 @@ export function Composer({
   focusSignal = 0,
   draft: controlledDraft,
   onDraftChange,
-  pendingAttachment = null,
-  onPendingAttachmentChange,
+  pendingAttachments = EMPTY_ATTACHMENTS,
+  onAddPendingAttachments,
+  onRemovePendingAttachment,
+  onClearPendingAttachments,
   mentionMembers = [],
   onSendSticker,
   onCancelReply,
@@ -120,13 +137,18 @@ export function Composer({
   buzzCooldownSec = 0,
   placeholder,
   sendOnEnter = true,
+  stickerSuggestEnabled = true,
   globalPasteFallback = false,
+  isLocked = false,
   onError,
 }: Props) {
   const [draft, setLocalDraft] = useState(controlledDraft ?? "");
   const draftRef = useRef(draft);
   draftRef.current = draft;
   const threadKeyRef = useRef(threadKey);
+  const mentionMembersRef = useRef(mentionMembers);
+  mentionMembersRef.current = mentionMembers;
+  const restoredDraftSeedRef = useRef<string | null>(controlledDraft ? controlledDraft : null);
   const onDraftChangeRef = useRef(onDraftChange);
   onDraftChangeRef.current = onDraftChange;
   const draftTimerRef = useRef<number | null>(null);
@@ -148,11 +170,21 @@ export function Composer({
       }
       threadKeyRef.current = threadKey;
       lastHeightRef.current = 0;
+      if (textareaRef.current) {
+        textareaRef.current.style.height = "";
+      }
       const nextDraft = controlledDraft ?? "";
+      restoredDraftSeedRef.current = nextDraft || null;
       setLocalDraft(nextDraft);
       setCursorPos(0);
+      setEmojiOpen(false);
       setMentionDismissedAt(null);
-      setCompletedMentions([]);
+      setCompletedMentions(
+        extractCompletedMentionSpans(nextDraft, mentionMembersRef.current),
+      );
+      setSuggestedStickers([]);
+      setSuggestedForQuery(null);
+      setSuggestDismissedFor(null);
       return;
     }
     if (
@@ -163,13 +195,19 @@ export function Composer({
       const prevVal = draftRef.current;
       setLocalDraft(controlledDraft);
       if (!controlledDraft) {
+        restoredDraftSeedRef.current = null;
         setCursorPos(0);
         setMentionDismissedAt(null);
         setCompletedMentions([]);
       } else {
-        setCompletedMentions((prev) =>
-          reconcileCompletedMentions(prev, prevVal, controlledDraft),
-        );
+        if (!prevVal) {
+          restoredDraftSeedRef.current = controlledDraft;
+        }
+        setCompletedMentions((prev) => {
+          const reconciled = reconcileCompletedMentions(prev, prevVal, controlledDraft);
+          if (reconciled.length > 0 || prevVal) return reconciled;
+          return extractCompletedMentionSpans(controlledDraft, mentionMembersRef.current);
+        });
       }
     }
   }, [threadKey, controlledDraft]);
@@ -187,6 +225,7 @@ export function Composer({
   const setDraft = (next: string | ((prev: string) => string)) => {
     const prevVal = draftRef.current;
     const val = typeof next === "function" ? next(prevVal) : next;
+    restoredDraftSeedRef.current = null;
     setLocalDraft(val);
     draftRef.current = val;
     setCompletedMentions((prev) => reconcileCompletedMentions(prev, prevVal, val));
@@ -203,7 +242,7 @@ export function Composer({
     draftTimerRef.current = window.setTimeout(() => {
       draftTimerRef.current = null;
       onDraftChangeRef.current?.(val, scheduledKey);
-    }, 350);
+    }, 700);
   };
   const { t } = useI18n();
   const { emojiStyle } = useEmojiStyle();
@@ -235,16 +274,46 @@ export function Composer({
   const [stickerCategory, setStickerCategory] = useState<(typeof STICKER_CATEGORY_TABS)[number]>("Tất cả");
   const [searchedStickers, setSearchedStickers] = useState<StickerItem[] | null>(null);
   const [stickersSearching, setStickersSearching] = useState(false);
+  const [suggestedStickers, setSuggestedStickers] = useState<StickerItem[]>([]);
+  const [suggestedForQuery, setSuggestedForQuery] = useState<string | null>(null);
+  const [suggestDismissedFor, setSuggestDismissedFor] = useState<string | null>(null);
+  const suggestStripRef = useRef<HTMLDivElement | null>(null);
   const [cursorPos, setCursorPos] = useState(0);
   const [mentionIndex, setMentionIndex] = useState(0);
   const [mentionDismissedAt, setMentionDismissedAt] = useState<number | null>(null);
-  const [completedMentions, setCompletedMentions] = useState<CompletedMentionSpan[]>([]);
+  const [completedMentions, setCompletedMentions] = useState<CompletedMentionSpan[]>(() =>
+    extractCompletedMentionSpans(controlledDraft ?? "", mentionMembers),
+  );
   const isComposingRef = useRef(false);
+  const mentionListboxRef = useRef<HTMLDivElement | null>(null);
+  const emojiPickerRef = useRef<HTMLDivElement | null>(null);
+  const emojiButtonRef = useRef<HTMLButtonElement | null>(null);
   const mentionItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const prevReplyIdRef = useRef<string | null>(replyTo?.msg_id ?? null);
   const prevFocusSignalRef = useRef<number>(focusSignal);
+
+  useEffect(() => {
+    const seedDraft = restoredDraftSeedRef.current;
+    if (!seedDraft || draftRef.current !== seedDraft || mentionMembers.length === 0) {
+      return;
+    }
+    const seeded = extractCompletedMentionSpans(seedDraft, mentionMembers);
+    if (seeded.length === 0) return;
+    setCompletedMentions((prev) => {
+      if (
+        prev.length === seeded.length &&
+        prev.every((s, idx) => s.start === seeded[idx].start && s.text === seeded[idx].text)
+      ) {
+        return prev;
+      }
+      const byKey = new Map<string, CompletedMentionSpan>();
+      for (const s of prev) byKey.set(`${s.start}:${s.text}`, s);
+      for (const s of seeded) byKey.set(`${s.start}:${s.text}`, s);
+      return Array.from(byKey.values());
+    });
+  }, [mentionMembers]);
 
   useEffect(() => {
     const nextReplyId = replyTo?.msg_id ?? null;
@@ -269,16 +338,34 @@ export function Composer({
   }, [replyTo?.msg_id, focusSignal]);
 
   useEffect(() => {
-    if (!emojiOpen) return;
+    if (!emojiOpen || isLocked) return;
+    const onOutsidePointer = (event: MouseEvent | PointerEvent) => {
+      const target = event.target instanceof Node ? event.target : null;
+      if (!target) return;
+      if (emojiPickerRef.current?.contains(target)) return;
+      if (emojiButtonRef.current?.contains(target)) return;
+      setEmojiOpen(false);
+    };
     const onWindowKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !event.defaultPrevented) {
+      if (
+        event.key === "Escape" &&
+        !event.defaultPrevented &&
+        !isImeComposingEvent(event)
+      ) {
         event.preventDefault();
+        event.stopPropagation();
         setEmojiOpen(false);
       }
     };
-    window.addEventListener("keydown", onWindowKeyDown);
-    return () => window.removeEventListener("keydown", onWindowKeyDown);
-  }, [emojiOpen]);
+    window.addEventListener("pointerdown", onOutsidePointer, true);
+    window.addEventListener("mousedown", onOutsidePointer, true);
+    window.addEventListener("keydown", onWindowKeyDown, true);
+    return () => {
+      window.removeEventListener("pointerdown", onOutsidePointer, true);
+      window.removeEventListener("mousedown", onOutsidePointer, true);
+      window.removeEventListener("keydown", onWindowKeyDown, true);
+    };
+  }, [emojiOpen, isLocked]);
 
   useEffect(() => {
     if (!emojiOpen || pickerMode !== "sticker" || stickers !== null || !onSendSticker) return;
@@ -414,6 +501,103 @@ export function Composer({
   const activeMentionOptionId =
     safeMentionIndex >= 0 ? `${mentionListboxId}-opt-${safeMentionIndex}` : undefined;
 
+  const hasPendingAttachments = pendingAttachments.length > 0;
+  const singlePendingAttachment =
+    pendingAttachments.length === 1 ? pendingAttachments[0] : null;
+  const totalStagedBytes = useMemo(
+    () => pendingAttachments.reduce((acc, att) => acc + att.sizeBytes, 0),
+    [pendingAttachments],
+  );
+  const submittingAttachmentsRef = useRef(false);
+
+  const activeSuggestQuery = useMemo(
+    () =>
+      extractStickerSuggestQuery(draft, {
+        enabled: stickerSuggestEnabled && Boolean(onSendSticker),
+        hasPendingAttachment: hasPendingAttachments,
+        mentionOpen,
+        emojiOpen,
+      }),
+    [draft, stickerSuggestEnabled, onSendSticker, hasPendingAttachments, mentionOpen, emojiOpen],
+  );
+
+  useEffect(() => {
+    if (suggestDismissedFor !== null && activeSuggestQuery !== suggestDismissedFor) {
+      setSuggestDismissedFor(null);
+    }
+  }, [activeSuggestQuery, suggestDismissedFor]);
+
+  useEffect(() => {
+    if (!activeSuggestQuery || activeSuggestQuery === suggestDismissedFor || !onSendSticker) {
+      setSuggestedStickers([]);
+      setSuggestedForQuery(null);
+      return;
+    }
+    const cached = sharedStickerSuggestCache.get(activeSuggestQuery);
+    if (cached !== undefined) {
+      setSuggestedStickers(cached);
+      setSuggestedForQuery(activeSuggestQuery);
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void bridge
+        .suggestStickers(activeSuggestQuery, STICKER_SUGGEST_LIMIT)
+        .then((items) => {
+          sharedStickerSuggestCache.set(activeSuggestQuery, items);
+          if (!cancelled) {
+            setSuggestedStickers(items);
+            setSuggestedForQuery(activeSuggestQuery);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setSuggestedStickers([]);
+            setSuggestedForQuery(null);
+          }
+        });
+    }, STICKER_SUGGEST_DEBOUNCE_MS);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [activeSuggestQuery, suggestDismissedFor, onSendSticker]);
+
+  const visibleSuggestedStickers = useMemo(() => {
+    if (
+      !activeSuggestQuery ||
+      activeSuggestQuery === suggestDismissedFor ||
+      suggestedForQuery !== activeSuggestQuery ||
+      mentionOpen ||
+      emojiOpen
+    ) {
+      return [];
+    }
+    return suggestedStickers;
+  }, [activeSuggestQuery, suggestDismissedFor, suggestedForQuery, mentionOpen, emojiOpen, suggestedStickers]);
+
+  const handleSendSuggestedSticker = (sticker: StickerItem) => {
+    setStickers((prev) =>
+      prev
+        ? [
+            { ...sticker, category: "Gần đây" },
+            ...prev.filter((item) => !(item.id === sticker.id && item.cate_id === sticker.cate_id)),
+          ]
+        : prev,
+    );
+    setDraft("");
+    setCursorPos(0);
+    setMentionDismissedAt(null);
+    setCompletedMentions([]);
+    setSuggestedStickers([]);
+    setSuggestedForQuery(null);
+    setSuggestDismissedFor(null);
+    void onSendSticker?.(sticker);
+    requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+    });
+  };
+
   useEffect(() => {
     if (mentionMatch && mentionMatches.length > 0) {
       setEmojiOpen(false);
@@ -431,14 +615,46 @@ export function Composer({
   }, [rawMentionMatch, mentionDismissedAt]);
 
   useEffect(() => {
+    if (!mentionOpen || !mentionMatch || isLocked) return;
+    const startAt = mentionMatch.start;
+    const onOutsidePointer = (event: MouseEvent | PointerEvent) => {
+      const target = event.target instanceof Node ? event.target : null;
+      if (!target) return;
+      if (mentionListboxRef.current?.contains(target)) return;
+      if (textareaRef.current?.contains(target)) return;
+      setMentionDismissedAt(startAt);
+    };
+    const onWindowKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.key !== "Escape" ||
+        event.defaultPrevented ||
+        isImeComposingEvent(event)
+      ) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      setMentionDismissedAt(startAt);
+    };
+    window.addEventListener("pointerdown", onOutsidePointer, true);
+    window.addEventListener("mousedown", onOutsidePointer, true);
+    window.addEventListener("keydown", onWindowKeyDown, true);
+    return () => {
+      window.removeEventListener("pointerdown", onOutsidePointer, true);
+      window.removeEventListener("mousedown", onOutsidePointer, true);
+      window.removeEventListener("keydown", onWindowKeyDown, true);
+    };
+  }, [mentionOpen, mentionMatch, isLocked]);
+
+  useEffect(() => {
     setMentionIndex(0);
   }, [mentionMatch?.start, mentionMatch?.query, mentionMatches.length]);
 
   useEffect(() => {
-    if (!mentionMatch || mentionMatches.length === 0) return;
-    const activeEl = mentionItemRefs.current[mentionIndex];
+    if (!mentionMatch || mentionMatches.length === 0 || safeMentionIndex < 0) return;
+    const activeEl = mentionItemRefs.current[safeMentionIndex];
     activeEl?.scrollIntoView({ block: "nearest" });
-  }, [mentionIndex, mentionMatch, mentionMatches.length]);
+  }, [safeMentionIndex, mentionMatch, mentionMatches.length]);
 
   const syncCursorFromEl = (el: HTMLTextAreaElement) => {
     const pos = typeof el.selectionStart === "number" ? el.selectionStart : el.value.length;
@@ -478,13 +694,16 @@ export function Composer({
     if (!el) return;
     const val = el.value;
     if (!val) {
-      if (lastHeightRef.current !== 0) {
+      if (lastHeightRef.current !== 0 || el.style.height !== "") {
         el.style.height = "";
         lastHeightRef.current = 0;
       }
       return;
     }
     if (!forceMeasure && lastHeightRef.current === 0 && !val.includes("\n") && val.length < 28) {
+      if (el.style.height !== "") {
+        el.style.height = "";
+      }
       return;
     }
     el.style.height = "auto";
@@ -499,59 +718,78 @@ export function Composer({
 
   useLayoutEffect(() => {
     syncTextareaHeight();
-  }, [draft, placeholder, pendingAttachment]);
+  }, [draft, placeholder, pendingAttachments.length]);
 
   useEffect(() => {
     const el = textareaRef.current;
     if (!el || typeof ResizeObserver === "undefined") return;
+    let lastWidth = el.clientWidth;
     const ro = new ResizeObserver(() => {
+      const nextWidth = el.clientWidth;
+      if (nextWidth === lastWidth) return;
+      lastWidth = nextWidth;
       syncTextareaHeight(true);
     });
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
 
-  const attachRawFile = (file: File) => {
-    if (!onPendingAttachmentChange || !onSendAttachment) return;
-    if (file.size === 0) {
-      onError(new Error("Tệp đính kèm rỗng (0 byte)"));
-      return;
+  const attachRawFiles = (files: File[]) => {
+    if (!onAddPendingAttachments || !onSendAttachment || files.length === 0) return;
+    const staged: PendingAttachment[] = [];
+    let firstError: Error | null = null;
+    for (const file of files) {
+      if (file.size === 0) {
+        if (!firstError) {
+          firstError = new Error(t("composerAttachmentEmptyError"));
+        }
+        continue;
+      }
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        if (!firstError) {
+          firstError = new Error(
+            t("composerAttachmentTooLargeError", {
+              name: file.name,
+              size: formatBytes(file.size),
+              maxMb: MAX_ATTACHMENT_BYTES / (1024 * 1024),
+            }),
+          );
+        }
+        continue;
+      }
+      const rawName = (file.name || "").trim();
+      const hasExt = /\.[A-Za-z0-9]{1,10}$/.test(rawName);
+      const fileName = !rawName
+        ? `clipboard-${Date.now()}.${extFromMime(file.type)}`
+        : !hasExt && file.type.startsWith("image/")
+          ? `${rawName}.${extFromMime(file.type)}`
+          : rawName;
+      const isImage =
+        file.type.startsWith("image/") || /\.(png|jpe?g|webp|gif|bmp)$/i.test(fileName);
+      const previewUrl = isImage ? URL.createObjectURL(file) : null;
+      staged.push({
+        id: `raw-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        kind: "raw",
+        file,
+        fileName,
+        sizeBytes: file.size,
+        isImage,
+        previewUrl,
+      });
     }
-    if (file.size > MAX_ATTACHMENT_BYTES) {
-      onError(
-        new Error(
-          `Tệp "${file.name}" quá lớn (${formatBytes(file.size)}, tối đa ${
-            MAX_ATTACHMENT_BYTES / (1024 * 1024)
-          } MB)`,
-        ),
-      );
-      return;
+    if (staged.length > 0) {
+      onAddPendingAttachments(staged);
     }
-    const rawName = (file.name || "").trim();
-    const hasExt = /\.[A-Za-z0-9]{1,10}$/.test(rawName);
-    const fileName = !rawName
-      ? `clipboard-${Date.now()}.${extFromMime(file.type)}`
-      : !hasExt && file.type.startsWith("image/")
-        ? `${rawName}.${extFromMime(file.type)}`
-        : rawName;
-    const isImage =
-      file.type.startsWith("image/") || /\.(png|jpe?g|webp|gif|bmp)$/i.test(fileName);
-    const previewUrl = isImage ? URL.createObjectURL(file) : null;
-    onPendingAttachmentChange({
-      kind: "raw",
-      file,
-      fileName,
-      sizeBytes: file.size,
-      isImage,
-      previewUrl,
-    });
+    if (firstError) {
+      onError(firstError);
+    }
   };
 
-  const attachRawFileRef = useRef(attachRawFile);
-  attachRawFileRef.current = attachRawFile;
+  const attachRawFilesRef = useRef(attachRawFiles);
+  attachRawFilesRef.current = attachRawFiles;
 
   useEffect(() => {
-    if (!globalPasteFallback) return;
+    if (!globalPasteFallback || isLocked) return;
     const onWindowPaste = (e: ClipboardEvent) => {
       if (e.defaultPrevented) return;
       const active = document.activeElement;
@@ -570,26 +808,29 @@ export function Composer({
       const file = extractAttachmentFromClipboard(e.clipboardData);
       if (file) {
         e.preventDefault();
-        attachRawFileRef.current(file);
+        attachRawFilesRef.current([file]);
       }
     };
     window.addEventListener("paste", onWindowPaste);
     return () => window.removeEventListener("paste", onWindowPaste);
-  }, [globalPasteFallback]);
+  }, [globalPasteFallback, isLocked]);
 
   const handleAttachClick = async () => {
-    if (!onPendingAttachmentChange || !onSendAttachment) return;
+    if (!onAddPendingAttachments || !onSendAttachment) return;
     if (isTauri()) {
       try {
         const meta = await bridge.pickAttachmentFile();
         if (!meta) return;
-        onPendingAttachmentChange({
-          kind: "path",
-          path: meta.path,
-          fileName: meta.file_name,
-          sizeBytes: meta.size_bytes,
-          isImage: meta.is_image,
-        });
+        onAddPendingAttachments([
+          {
+            id: `path-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            kind: "path",
+            path: meta.path,
+            fileName: meta.file_name,
+            sizeBytes: meta.size_bytes,
+            isImage: meta.is_image,
+          },
+        ]);
       } catch (err) {
         onError(err);
       }
@@ -599,29 +840,52 @@ export function Composer({
   };
 
   const handleSubmit = async () => {
-    if (sending) return;
-    if (pendingAttachment && onSendAttachment) {
-      setSending(true);
-      const att = pendingAttachment;
+    const submitThreadKey = threadKeyRef.current;
+    if (hasPendingAttachments && onSendAttachment) {
+      if (submittingAttachmentsRef.current) return;
+      submittingAttachmentsRef.current = true;
       const rawCap = draft;
       const cap = emojiStyle === "retro" ? convertRetroShortcutsToEmoji(rawCap) : rawCap;
+      const batch = buildAttachmentSendBatch(pendingAttachments, cap);
+      const enqueuedIndices: number[] = [];
       try {
-        const ok = await onSendAttachment(att, cap);
-        if (ok !== false && ok !== null) {
-          onPendingAttachmentChange?.(null);
-          setDraft("");
-          setCursorPos(0);
-          setMentionDismissedAt(null);
-          setCompletedMentions([]);
+        for (let i = 0; i < batch.length; i++) {
+          const { att, caption } = batch[i];
+          try {
+            const ok = await onSendAttachment(att, caption);
+            if (ok !== false && ok !== null) {
+              enqueuedIndices.push(i);
+            }
+          } catch {
+            // Keep un-enqueued attachments intact if optimistic enqueue fails
+          }
         }
-      } catch {
-        // Keep pendingAttachment and draft intact so user can retry cleanly
+        if (threadKeyRef.current === submitThreadKey) {
+          if (enqueuedIndices.length === batch.length) {
+            onClearPendingAttachments?.();
+            setDraft("");
+            setCursorPos(0);
+            setMentionDismissedAt(null);
+            setCompletedMentions([]);
+          } else if (enqueuedIndices.length > 0) {
+            for (let k = enqueuedIndices.length - 1; k >= 0; k--) {
+              onRemovePendingAttachment?.(enqueuedIndices[k]);
+            }
+            if (enqueuedIndices[0] === 0) {
+              setDraft("");
+              setCursorPos(0);
+              setMentionDismissedAt(null);
+              setCompletedMentions([]);
+            }
+          }
+        }
       } finally {
-        setSending(false);
+        submittingAttachmentsRef.current = false;
       }
       return;
     }
 
+    if (sending) return;
     if (!draft.trim()) return;
     setSending(true);
     const rawText = draft;
@@ -632,11 +896,13 @@ export function Composer({
     setCompletedMentions([]);
     try {
       const ok = await onSendText(text);
-      if (ok === false) {
+      if (ok === false && threadKeyRef.current === submitThreadKey) {
         setDraft((cur) => (cur ? cur : rawText));
       }
     } catch {
-      setDraft((cur) => (cur ? cur : rawText));
+      if (threadKeyRef.current === submitThreadKey) {
+        setDraft((cur) => (cur ? cur : rawText));
+      }
     } finally {
       setSending(false);
     }
@@ -669,16 +935,16 @@ export function Composer({
         </div>
       )}
 
-      {pendingAttachment && (
+      {singlePendingAttachment ? (
         <div
           className="flex items-center justify-between gap-3 px-4 py-2"
           style={{ borderBottom: "1px solid var(--border-subtle)" }}
         >
           <div className="flex min-w-0 items-center gap-3">
-            {pendingAttachment.kind === "raw" && pendingAttachment.previewUrl ? (
+            {singlePendingAttachment.kind === "raw" && singlePendingAttachment.previewUrl ? (
               <img
-                src={pendingAttachment.previewUrl}
-                alt={pendingAttachment.fileName}
+                src={singlePendingAttachment.previewUrl}
+                alt={singlePendingAttachment.fileName}
                 className="h-12 w-12 shrink-0 rounded-lg object-cover"
               />
             ) : (
@@ -686,7 +952,7 @@ export function Composer({
                 className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg"
                 style={{ background: "var(--bg-surface)" }}
               >
-                {pendingAttachment.isImage ? (
+                {singlePendingAttachment.isImage ? (
                   <ImageIcon className="h-5 w-5" style={{ color: "var(--accent)" }} />
                 ) : (
                   <FileText className="h-5 w-5" style={{ color: "var(--accent)" }} />
@@ -695,14 +961,14 @@ export function Composer({
             )}
             <div className="min-w-0 text-xs">
               <div className="flex items-center gap-1.5 font-medium">
-                {pendingAttachment.isImage ? (
+                {singlePendingAttachment.isImage ? (
                   <ImageIcon className="h-3.5 w-3.5 shrink-0" style={{ color: "var(--accent)" }} />
                 ) : (
                   <FileText className="h-3.5 w-3.5 shrink-0" style={{ color: "var(--accent)" }} />
                 )}
-                <span className="truncate">{pendingAttachment.fileName}</span>
+                <span className="truncate">{singlePendingAttachment.fileName}</span>
                 <span className="shrink-0" style={{ color: "var(--text-secondary)" }}>
-                  ({formatBytes(pendingAttachment.sizeBytes)})
+                  ({formatBytes(singlePendingAttachment.sizeBytes)})
                 </span>
               </div>
               <div style={{ color: "var(--text-secondary)" }}>
@@ -711,11 +977,12 @@ export function Composer({
             </div>
           </div>
           <div className="flex items-center gap-1">
-            {pendingAttachment.isImage && onEditPendingImage && (
+            {singlePendingAttachment.isImage && onEditPendingImage && (
               <button
                 type="button"
-                onClick={onEditPendingImage}
+                onClick={() => onEditPendingImage(singlePendingAttachment.id)}
                 title={t("editImageBtn")}
+                aria-label={t("editImageBtn")}
                 className="hover-surface rounded-lg p-1.5 transition"
                 style={{ color: "var(--accent)" }}
               >
@@ -724,18 +991,193 @@ export function Composer({
             )}
             <button
               type="button"
-              onClick={() => onPendingAttachmentChange?.(null)}
+              onClick={() =>
+                onRemovePendingAttachment
+                  ? onRemovePendingAttachment(0)
+                  : onClearPendingAttachments?.()
+              }
+              title={t("removeStagedAttachmentTitle")}
+              aria-label={t("removeStagedAttachmentTitle")}
               className="rounded-lg p-1 hover:opacity-80"
             >
               <X className="h-4 w-4" />
             </button>
           </div>
         </div>
-      )}
+      ) : hasPendingAttachments ? (
+        <div
+          className="px-4 py-2"
+          style={{ borderBottom: "1px solid var(--border-subtle)" }}
+        >
+          <div className="flex items-center justify-between gap-2 text-xs">
+            <div className="flex min-w-0 items-center gap-2">
+              <span
+                className="shrink-0 rounded-full px-2 py-0.5 text-[11px] font-semibold"
+                style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
+              >
+                {t("stagedAttachmentsCount", { count: pendingAttachments.length })}
+              </span>
+              <span className="shrink-0 text-[11.5px]" style={{ color: "var(--text-secondary)" }}>
+                ({formatBytes(totalStagedBytes)})
+              </span>
+              <span
+                className="hidden truncate text-[11.5px] sm:inline"
+                style={{ color: "var(--text-secondary)" }}
+              >
+                · {t("stagedAttachmentsCaptionHint")}
+              </span>
+            </div>
+            {onClearPendingAttachments && (
+              <button
+                type="button"
+                onClick={onClearPendingAttachments}
+                className="hover-surface shrink-0 rounded-lg px-2 py-1 text-[11.5px] font-medium transition"
+                style={{ color: "var(--danger-text)" }}
+              >
+                {t("clearAllStagedAttachments")}
+              </button>
+            )}
+          </div>
+          <div className="mt-2 flex max-h-36 flex-wrap gap-2 overflow-y-auto pr-0.5">
+            {pendingAttachments.map((att, idx) => {
+              const itemKey =
+                att.id ??
+                (att.kind === "path"
+                  ? `path-${att.path}`
+                  : `raw-${att.previewUrl ?? att.fileName}-${idx}`);
+              return (
+                <div
+                  key={itemKey}
+                  className="flex max-w-[250px] items-center gap-2 rounded-xl px-2 py-1.5"
+                  style={{
+                    background: "var(--bg-surface)",
+                    border: "1px solid var(--border-subtle)",
+                  }}
+                >
+                  {att.kind === "raw" && att.previewUrl ? (
+                    <img
+                      src={att.previewUrl}
+                      alt={att.fileName}
+                      className="h-10 w-10 shrink-0 rounded-lg object-cover"
+                    />
+                  ) : (
+                    <div
+                      className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg"
+                      style={{ background: "var(--bg-hover)" }}
+                    >
+                      {att.isImage ? (
+                        <ImageIcon className="h-4 w-4" style={{ color: "var(--accent)" }} />
+                      ) : (
+                        <FileText className="h-4 w-4" style={{ color: "var(--accent)" }} />
+                      )}
+                    </div>
+                  )}
+                  <div className="min-w-0 flex-1 text-xs">
+                    <div className="truncate font-medium" title={att.fileName}>
+                      {att.fileName}
+                    </div>
+                    <div className="text-[11px]" style={{ color: "var(--text-secondary)" }}>
+                      {formatBytes(att.sizeBytes)}
+                    </div>
+                  </div>
+                  {att.isImage && onEditPendingImage && (
+                    <button
+                      type="button"
+                      onClick={() => onEditPendingImage(att.id)}
+                      title={t("editImageBtn")}
+                      aria-label={t("editImageBtn")}
+                      className="hover-menu shrink-0 rounded-md p-1 transition hover:opacity-80"
+                      style={{ color: "var(--accent)" }}
+                    >
+                      <Pencil className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => onRemovePendingAttachment?.(idx)}
+                    title={t("removeStagedAttachmentTitle")}
+                    aria-label={t("removeStagedAttachmentTitle")}
+                    className="hover-menu shrink-0 rounded-md p-1 transition hover:opacity-80"
+                    style={{ color: "var(--text-secondary)" }}
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ) : null}
 
       <div className="relative flex items-end gap-2 px-4 py-3">
+        {visibleSuggestedStickers.length > 0 && (
+          <div
+            data-teza-floating-popup="true"
+            role="region"
+            aria-label={t("stickerSuggestHeader")}
+            className="absolute bottom-full left-4 right-4 z-20 mb-2 flex items-center gap-2 rounded-2xl px-2.5 py-1.5 shadow-2xl"
+            style={{ background: "var(--bg-sidebar)", border: "1px solid var(--border-subtle)" }}
+          >
+            <div
+              className="flex shrink-0 items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-semibold"
+              style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
+              title={t("stickerSuggestHeader")}
+            >
+              <Sparkles className="h-3.5 w-3.5 shrink-0" />
+              <span className="hidden sm:inline">{t("stickerSuggestHeader")}</span>
+            </div>
+            <div
+              ref={suggestStripRef}
+              onWheel={(e) => {
+                const el = suggestStripRef.current;
+                if (el && Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+                  el.scrollLeft += e.deltaY;
+                }
+              }}
+              className="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto py-0.5"
+            >
+              {visibleSuggestedStickers.map((s, idx) => (
+                <button
+                  key={`sugg-${s.cate_id}-${s.id}-${idx}`}
+                  type="button"
+                  title={t("stickerSuggestSendTitle")}
+                  onMouseDown={(e) => {
+                    if (e.button === 0) e.preventDefault();
+                  }}
+                  onClick={() => handleSendSuggestedSticker(s)}
+                  className="hover-surface flex h-14 w-14 shrink-0 items-center justify-center rounded-xl p-1 transition hover:scale-110"
+                >
+                  <RelayImage
+                    src={s.url}
+                    alt={`Sticker ${s.id}`}
+                    loading="lazy"
+                    decoding="async"
+                    referrerPolicy="no-referrer"
+                    className="h-12 w-12 object-contain"
+                  />
+                </button>
+              ))}
+            </div>
+            <button
+              type="button"
+              onMouseDown={(e) => {
+                if (e.button === 0) e.preventDefault();
+              }}
+              onClick={() => setSuggestDismissedFor(activeSuggestQuery)}
+              title={t("stickerSuggestDismiss")}
+              aria-label={t("stickerSuggestDismiss")}
+              className="hover-menu shrink-0 rounded-lg p-1.5 transition"
+              style={{ color: "var(--text-secondary)" }}
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        )}
+
         {mentionOpen && (
           <div
+            ref={mentionListboxRef}
+            data-teza-floating-popup="true"
             id={mentionListboxId}
             role="listbox"
             aria-label={t("mentionMembersHeader")}
@@ -805,6 +1247,7 @@ export function Composer({
 
         {emojiOpen && (
           <div
+            ref={emojiPickerRef}
             data-teza-floating-popup="true"
             className="absolute bottom-full left-4 z-30 mb-2 w-[360px] max-w-[calc(100vw-2rem)] rounded-2xl p-3 shadow-2xl"
             style={{ background: "var(--bg-sidebar)", border: "1px solid var(--border-subtle)" }}
@@ -1146,35 +1589,15 @@ export function Composer({
           type="file"
           multiple
           className="hidden"
-          onChange={async (e) => {
+          onChange={(e) => {
             const files = Array.from(e.target.files ?? []);
             e.target.value = "";
-            if (files.length === 1) {
-              attachRawFile(files[0]);
-            } else if (files.length > 1) {
-              for (const f of files) {
-                if (f.size === 0 || f.size > MAX_ATTACHMENT_BYTES) {
-                  attachRawFile(f);
-                  continue;
-                }
-                const isImage =
-                  f.type.startsWith("image/") || /\.(png|jpe?g|webp|gif|bmp)$/i.test(f.name);
-                await onSendAttachment?.(
-                  {
-                    kind: "raw",
-                    file: f,
-                    fileName: f.name,
-                    sizeBytes: f.size,
-                    isImage,
-                    previewUrl: null,
-                  },
-                  "",
-                );
-              }
+            if (files.length > 0) {
+              attachRawFiles(files);
             }
           }}
         />
-        {onSendAttachment && onPendingAttachmentChange && (
+        {onSendAttachment && onAddPendingAttachments && (
           <button
             type="button"
             onClick={() => void handleAttachClick()}
@@ -1207,6 +1630,7 @@ export function Composer({
         )}
 
         <button
+          ref={emojiButtonRef}
           type="button"
           onClick={() =>
             setEmojiOpen((v) => {
@@ -1311,7 +1735,7 @@ export function Composer({
             const pastedFile = extractAttachmentFromClipboard(e.clipboardData);
             if (pastedFile) {
               e.preventDefault();
-              attachRawFile(pastedFile);
+              attachRawFiles([pastedFile]);
             }
           }}
           onCompositionStart={() => {
@@ -1338,12 +1762,17 @@ export function Composer({
             if (mentionMatches.length > 0 && mentionMatch) {
               if (e.key === "ArrowDown") {
                 e.preventDefault();
-                setMentionIndex((i) => (i + 1) % mentionMatches.length);
+                setMentionIndex(
+                  ((safeMentionIndex >= 0 ? safeMentionIndex : 0) + 1) % mentionMatches.length,
+                );
                 return;
               }
               if (e.key === "ArrowUp") {
                 e.preventDefault();
-                setMentionIndex((i) => (i - 1 + mentionMatches.length) % mentionMatches.length);
+                setMentionIndex(
+                  ((safeMentionIndex >= 0 ? safeMentionIndex : 0) - 1 + mentionMatches.length) %
+                    mentionMatches.length,
+                );
                 return;
               }
               if (
@@ -1351,7 +1780,7 @@ export function Composer({
                 (e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey)
               ) {
                 e.preventDefault();
-                insertMention(mentionMatches[mentionIndex] ?? mentionMatches[0]);
+                insertMention(mentionMatches[safeMentionIndex] ?? mentionMatches[0]);
                 return;
               }
               if (e.key === "Escape") {
@@ -1360,6 +1789,12 @@ export function Composer({
                 setMentionDismissedAt(mentionMatch.start);
                 return;
               }
+            }
+            if (visibleSuggestedStickers.length > 0 && e.key === "Escape") {
+              e.preventDefault();
+              e.stopPropagation();
+              setSuggestDismissedFor(activeSuggestQuery);
+              return;
             }
             const shouldSubmit = sendOnEnter
               ? e.key === "Enter" && !e.shiftKey && !e.ctrlKey && !e.metaKey
@@ -1371,7 +1806,7 @@ export function Composer({
             }
           }}
           placeholder={
-            pendingAttachment
+            hasPendingAttachments
               ? t("composerCaptionPlaceholder")
               : placeholder || t("composerPlaceholder")
           }
@@ -1400,7 +1835,7 @@ export function Composer({
             setEmojiOpen(false);
             void handleSubmit();
           }}
-          disabled={sending || (!draft.trim() && !pendingAttachment)}
+          disabled={sending || (!draft.trim() && !hasPendingAttachments)}
           title={t("composerSendTitle")}
           className="tf-btn rounded-xl p-2.5 disabled:cursor-not-allowed disabled:opacity-40"
         >

@@ -1449,9 +1449,11 @@ fn rtcp_sr_sender_and_middle_ntp(rtcp: &[u8]) -> Option<(u32, u32)> {
 }
 
 /// Process a single raw UDP datagram from either the RTP socket or RTCP inbox:
-/// captures late `InitZRTP` tokens (only from `rtp_target` or `rtcp_target`, routing distinct
-/// RTCP tokens into `live_rtcp_relay_token` without clobbering `live_relay_token`), tracks RTCP
-/// SR LSR timestamps, handles mid-call SSRC resets, and pushes Opus audio payloads into the jitter buffer.
+/// rejects datagrams whose UDP source `peer` does not match `rtp_target` or `rtcp_target`
+/// (`None` is reserved for already peer-filtered `rtcp_inbox` entries), captures late `InitZRTP`
+/// tokens (routing distinct RTCP tokens into `live_rtcp_relay_token` without clobbering
+/// `live_relay_token`), tracks RTCP SR LSR timestamps, handles mid-call SSRC resets, and pushes
+/// Opus audio payloads into the jitter buffer.
 #[allow(clippy::too_many_arguments)]
 fn ingest_udp_datagram(
     raw: &[u8],
@@ -1467,6 +1469,11 @@ fn ingest_udp_datagram(
     controls: &AudioControls,
     aux_session: Option<&Arc<dyn AuxiliaryMediaSession>>,
 ) {
+    if let Some(p) = peer {
+        if p != rtp_target && rtcp_target != Some(p) {
+            return;
+        }
+    }
     let Some(inner) = unwrap_relay_media(raw) else {
         if let Some(init_resp) = parse_zrtp_init_response(raw) {
             if init_resp.res == 0 && init_resp.token != 0 {
@@ -1660,7 +1667,7 @@ fn run_udp_audio_loop(
     let mut last_real_capture = Instant::now();
     let mut last_tx = Instant::now();
     let mut next_playout = Instant::now() + FRAME_STEP;
-    let mut last_rtcp = Instant::now() - Duration::from_secs(2);
+    let mut last_rtcp: Option<Instant> = None;
     let mut rx_buf = [0u8; 4096];
 
     while !stop.load(Ordering::Relaxed) {
@@ -1750,8 +1757,8 @@ fn run_udp_audio_loop(
         }
 
         // 4. Periodic RTCP Receiver Report (every 2 seconds)
-        if last_rtcp.elapsed() >= Duration::from_secs(2) {
-            last_rtcp = Instant::now();
+        if last_rtcp.is_none_or(|t| t.elapsed() >= Duration::from_secs(2)) {
+            last_rtcp = Some(Instant::now());
             let (lsr, dlsr) = match last_peer_sr {
                 Some((m, at)) => (m, (at.elapsed().as_secs_f64() * 65536.0) as u32),
                 None => (0, 0),
@@ -2705,5 +2712,128 @@ mod tests {
             h.join()
                 .expect("concurrent audio device enumeration thread must not panic");
         }
+    }
+
+    #[test]
+    fn ingest_udp_datagram_drops_rtp_and_rtcp_from_unvalidated_peers() {
+        struct CountingAux {
+            rtp_hits: AtomicU32,
+            rtcp_hits: AtomicU32,
+        }
+        impl AuxiliaryMediaSession for CountingAux {
+            fn on_incoming_rtp(&self, _outer_type: u8, _rtp_bytes: &[u8]) {
+                self.rtp_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            fn on_incoming_rtcp(&self, _outer_type: u8, _rtcp_bytes: &[u8]) {
+                self.rtcp_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            fn set_cam_enabled(&self, _enabled: bool) {}
+            fn stop(&self) {}
+        }
+
+        let rtp_target: SocketAddr = "127.0.0.1:10490".parse().unwrap();
+        let rtcp_target: SocketAddr = "127.0.0.1:12490".parse().unwrap();
+        let rogue_peer: SocketAddr = "127.0.0.1:59999".parse().unwrap();
+
+        let live_rtp_tok = Arc::new(AtomicU32::new(0));
+        let live_rtcp_tok = Arc::new(AtomicU32::new(0));
+        let mut peer_ssrc: u32 = 0x1111_2222;
+        let mut rx_stats = RtpRxStats::default();
+        let mut jitter = JitterBuffer::voip_default();
+        let mut last_sr: Option<(u32, Instant)> = None;
+        let controls = AudioControls::default();
+        let aux_concrete = Arc::new(CountingAux {
+            rtp_hits: AtomicU32::new(0),
+            rtcp_hits: AtomicU32::new(0),
+        });
+        let aux: Arc<dyn AuxiliaryMediaSession> = aux_concrete.clone();
+
+        // Build Opus RTP (PT=112), Video RTP (PT=96), and Audio RTCP SR packets
+        let opus_rtp = build_rtp_packet(OPUS_AUDIO_PT, false, 1, 320, 0xDEAD_BEEF, &[0xF8, 0x01, 0x02]);
+        let mut opus_wire = vec![0x04];
+        opus_wire.extend_from_slice(&opus_rtp);
+
+        let video_rtp = build_rtp_packet(96, true, 1, 90000, 0xCAFE_BABE, &[0x01, 0x02, 0x03]);
+        let mut video_wire = vec![crate::zrtp::RELAY_INCOMING_VIDEO_RTP];
+        video_wire.extend_from_slice(&video_rtp);
+
+        let mut sr = Vec::with_capacity(28);
+        sr.extend_from_slice(&[0x80, 200, 0x00, 0x06]);
+        sr.extend_from_slice(&0x1111_2222u32.to_be_bytes());
+        sr.extend_from_slice(&0x1234_AAAAu32.to_be_bytes());
+        sr.extend_from_slice(&0xBBBB_5678u32.to_be_bytes());
+        sr.extend_from_slice(&[0u8; 12]);
+        let rtcp_wire = wrap_relay_audio_rtcp(0xCAFE_0001, &sr);
+
+        // 1. Rogue peer MUST be rejected across Opus RTP, Video RTP, and RTCP SR
+        for pkt in [&opus_wire, &video_wire, &rtcp_wire] {
+            ingest_udp_datagram(
+                pkt,
+                Some(rogue_peer),
+                rtp_target,
+                Some(rtcp_target),
+                Some(&live_rtp_tok),
+                Some(&live_rtcp_tok),
+                &mut peer_ssrc,
+                &mut rx_stats,
+                &mut jitter,
+                &mut last_sr,
+                &controls,
+                Some(&aux),
+            );
+        }
+        assert_eq!(controls.snapshot().rx_packets, 0);
+        assert_eq!(peer_ssrc, 0x1111_2222, "rogue peer must not hijack peer_ssrc");
+        assert_eq!(last_sr, None, "rogue peer must not poison last_peer_sr");
+        assert_eq!(aux_concrete.rtp_hits.load(Ordering::Relaxed), 0);
+        assert_eq!(aux_concrete.rtcp_hits.load(Ordering::Relaxed), 0);
+
+        // 2. Validated rtp_target / rtcp_target peers MUST be accepted
+        ingest_udp_datagram(
+            &opus_wire,
+            Some(rtp_target),
+            rtp_target,
+            Some(rtcp_target),
+            Some(&live_rtp_tok),
+            Some(&live_rtcp_tok),
+            &mut peer_ssrc,
+            &mut rx_stats,
+            &mut jitter,
+            &mut last_sr,
+            &controls,
+            Some(&aux),
+        );
+        ingest_udp_datagram(
+            &video_wire,
+            Some(rtp_target),
+            rtp_target,
+            Some(rtcp_target),
+            Some(&live_rtp_tok),
+            Some(&live_rtcp_tok),
+            &mut peer_ssrc,
+            &mut rx_stats,
+            &mut jitter,
+            &mut last_sr,
+            &controls,
+            Some(&aux),
+        );
+        ingest_udp_datagram(
+            &rtcp_wire,
+            Some(rtcp_target),
+            rtp_target,
+            Some(rtcp_target),
+            Some(&live_rtp_tok),
+            Some(&live_rtcp_tok),
+            &mut peer_ssrc,
+            &mut rx_stats,
+            &mut jitter,
+            &mut last_sr,
+            &controls,
+            Some(&aux),
+        );
+        assert_eq!(controls.snapshot().rx_packets, 1);
+        assert_eq!(peer_ssrc, 0xDEAD_BEEF);
+        assert_eq!(aux_concrete.rtp_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(aux_concrete.rtcp_hits.load(Ordering::Relaxed), 1);
     }
 }

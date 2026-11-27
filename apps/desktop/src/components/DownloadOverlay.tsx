@@ -7,10 +7,12 @@ import {
   formatDownloadBytes,
   type DownloadProgressItem,
 } from "../utils/downloadState";
+import { isImeComposingEvent } from "../utils/searchNormalize";
 
 interface Props {
   activeDownloads: DownloadProgressItem[];
   completedDownload: SavedFileResultDto | null;
+  isLocked?: boolean;
   onDismissCompleted: () => void;
   onOpenFile: (path: string) => Promise<void>;
   onRevealFile: (path: string) => Promise<void>;
@@ -20,6 +22,7 @@ interface Props {
 export function DownloadOverlay({
   activeDownloads,
   completedDownload,
+  isLocked = false,
   onDismissCompleted,
   onOpenFile,
   onRevealFile,
@@ -33,15 +36,18 @@ export function DownloadOverlay({
   }, [completedDownload?.path]);
 
   useEffect(() => {
-    if (!completedDownload) return;
+    if (!completedDownload || isLocked) return;
     const onKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || isImeComposingEvent(e)) return;
       if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
         onDismissCompleted();
       }
     };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [completedDownload, onDismissCompleted]);
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [completedDownload, isLocked, onDismissCompleted]);
 
   const handleOpen = async () => {
     if (!completedDownload || busyAction) return;
@@ -144,6 +150,7 @@ export function DownloadOverlay({
 
       {completedDownload && (
         <div
+          data-teza-download-dialog="true"
           className="fixed inset-0 z-[72] flex items-center justify-center bg-black/45 p-4"
           onClick={onDismissCompleted}
         >

@@ -26,6 +26,7 @@ import {
   isRemoteMediaUrl,
   normalizeMediaRequestUrl,
 } from "../utils/mediaCache";
+import { isImeComposingEvent } from "../utils/searchNormalize";
 import { RelayImage } from "./RelayImage";
 
 async function blobUrlToDataUrl(blobUrl: string): Promise<string> {
@@ -81,6 +82,7 @@ export interface LightboxItem {
 interface Props {
   items: LightboxItem[];
   activeIndex: number | null;
+  isLocked?: boolean;
   onIndexChange: (index: number) => void;
   onClose: () => void;
   onNotify?: (msg: string) => void;
@@ -89,6 +91,7 @@ interface Props {
 export function MediaLightbox({
   items,
   activeIndex,
+  isLocked = false,
   onIndexChange,
   onClose,
   onNotify,
@@ -263,23 +266,43 @@ export function MediaLightbox({
   }, [dragging, getMetrics]);
 
   useEffect(() => {
-    if (!valid) return;
+    if (!valid || isLocked) return;
     const onKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || isImeComposingEvent(e)) return;
+      if (document.querySelector("[data-teza-download-dialog]")) return;
       if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
         if (contextMenu) {
           setContextMenu(null);
         } else {
           onClose();
         }
-      } else if (e.key === "ArrowLeft") goPrev();
-      else if (e.key === "ArrowRight") goNext();
-      else if (e.key === "+" || e.key === "=") applyZoom(zoomRef.current + 0.25);
-      else if (e.key === "-") applyZoom(zoomRef.current - 0.25);
-      else if (e.key === "0") applyZoom(1);
+      } else if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        e.stopPropagation();
+        goPrev();
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        e.stopPropagation();
+        goNext();
+      } else if (e.key === "+" || e.key === "=") {
+        e.preventDefault();
+        e.stopPropagation();
+        applyZoom(zoomRef.current + 0.25);
+      } else if (e.key === "-") {
+        e.preventDefault();
+        e.stopPropagation();
+        applyZoom(zoomRef.current - 0.25);
+      } else if (e.key === "0") {
+        e.preventDefault();
+        e.stopPropagation();
+        applyZoom(1);
+      }
     };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [valid, contextMenu, onClose, goPrev, goNext, applyZoom]);
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [valid, isLocked, contextMenu, onClose, goPrev, goNext, applyZoom]);
 
   if (!current) return null;
 
@@ -320,7 +343,10 @@ export function MediaLightbox({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex flex-col bg-black/90 backdrop-blur-sm"
+      role="dialog"
+      aria-modal="true"
+      data-teza-lightbox="true"
+      className="fixed inset-0 z-[65] flex flex-col bg-black/90 backdrop-blur-sm"
       onClick={() => {
         if (contextMenu) {
           setContextMenu(null);
@@ -495,7 +521,7 @@ export function MediaLightbox({
             data-teza-floating-popup="true"
             onClick={(e) => e.stopPropagation()}
             onContextMenu={(e) => e.preventDefault()}
-            className="fixed z-[60] w-48 rounded-xl py-1 shadow-2xl"
+            className="fixed z-[70] w-48 rounded-xl py-1 shadow-2xl"
             style={{
               left: `${contextMenu.x}px`,
               top: `${contextMenu.y}px`,

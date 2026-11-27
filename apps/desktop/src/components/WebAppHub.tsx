@@ -11,6 +11,7 @@ import {
   X,
 } from "lucide-react";
 import { useI18n } from "../i18n";
+import { matchesSearchQuery } from "../utils/searchNormalize";
 import {
   extractWebAppDomain,
   normalizeWebUrl,
@@ -121,13 +122,10 @@ export function WebAppHub({
   };
 
   const filteredItems = useMemo(() => {
-    const q = query.trim().toLowerCase();
+    const q = query.trim();
     if (!q) return config.items;
-    return config.items.filter(
-      (item) =>
-        item.name.toLowerCase().includes(q) ||
-        item.url.toLowerCase().includes(q) ||
-        extractWebAppDomain(item.url).toLowerCase().includes(q),
+    return config.items.filter((item) =>
+      matchesSearchQuery(`${item.name}\n${item.url}\n${extractWebAppDomain(item.url)}`, q),
     );
   }, [config.items, query]);
 

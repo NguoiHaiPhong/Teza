@@ -20,6 +20,7 @@ function inferInitialCountryCode(raw: string, lang: UiLanguage): string {
 
 export interface FindUserModalProps {
   open: boolean;
+  isLocked?: boolean;
   initialPhone?: string;
   onClose: () => void;
   onOpenProfile: (profile: UserProfileDto) => void;
@@ -29,6 +30,7 @@ export interface FindUserModalProps {
 
 export function FindUserModal({
   open,
+  isLocked = false,
   initialPhone = "",
   onClose,
   onOpenProfile,
@@ -48,8 +50,16 @@ export function FindUserModal({
   const [actionNotice, setActionNotice] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const searchSeqRef = useRef(0);
+  const mountedRef = useRef(true);
   const tRef = useRef(t);
   tRef.current = t;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const resetState = useCallback(() => {
     searchSeqRef.current += 1;
@@ -88,13 +98,13 @@ export function FindUserModal({
     try {
       const effectiveCountry = query.startsWith("+") ? undefined : selectedCode;
       const found = await bridge.findUserByPhone(query, effectiveCountry);
-      if (searchSeqRef.current !== seq) return;
+      if (!mountedRef.current || searchSeqRef.current !== seq) return;
       setResult(found);
     } catch (err) {
-      if (searchSeqRef.current !== seq) return;
+      if (!mountedRef.current || searchSeqRef.current !== seq) return;
       setError(String(err).replace(/^Error:\s*/i, ""));
     } finally {
-      if (searchSeqRef.current === seq) {
+      if (mountedRef.current && searchSeqRef.current === seq) {
         setSearching(false);
       }
     }
@@ -128,33 +138,40 @@ export function FindUserModal({
   }, [open, initialPhone, lang, resetState, runSearch]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || isLocked) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (isImeComposingEvent(e)) return;
-      if (e.key === "Escape") handleClose();
+      if (isLocked || isImeComposingEvent(e)) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        handleClose();
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, handleClose]);
+  }, [open, isLocked, handleClose]);
 
   if (!open) return null;
 
   const handleQuickAddFriend = async () => {
     if (!result || result.is_self || result.is_friend || sendingRequest || requestSent) return;
+    const targetUid = result.uid;
+    const seq = searchSeqRef.current;
     setSendingRequest(true);
     setActionError(null);
     setActionNotice(null);
     try {
-      const res = await bridge.friendSendRequest(result.uid, t("friendRequestDefaultGreeting"));
+      const res = await bridge.friendSendRequest(targetUid, t("friendRequestDefaultGreeting"));
+      if (!mountedRef.current || searchSeqRef.current !== seq) return;
       if (!res.ok) {
         setActionError(res.message || t("friendAddBtn"));
         return;
       }
       if (res.already_friends) {
-        setResult((prev) => (prev ? { ...prev, is_friend: true } : prev));
+        setResult((prev) => (prev && prev.uid === targetUid ? { ...prev, is_friend: true } : prev));
         setActionNotice(t("friendAlreadyFriends"));
       } else if (res.auto_accepted) {
-        setResult((prev) => (prev ? { ...prev, is_friend: true } : prev));
+        setResult((prev) => (prev && prev.uid === targetUid ? { ...prev, is_friend: true } : prev));
         setActionNotice(t("friendRequestAutoAccepted"));
       } else {
         setRequestSent(true);
@@ -162,9 +179,12 @@ export function FindUserModal({
       }
       onRelationshipChanged?.();
     } catch (err) {
+      if (!mountedRef.current || searchSeqRef.current !== seq) return;
       setActionError(String(err).replace(/^Error:\s*/i, ""));
     } finally {
-      setSendingRequest(false);
+      if (mountedRef.current && searchSeqRef.current === seq) {
+        setSendingRequest(false);
+      }
     }
   };
 

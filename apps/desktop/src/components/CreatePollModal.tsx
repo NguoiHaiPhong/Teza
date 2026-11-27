@@ -1,10 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { BarChart3, Loader2, Plus, Trash2, X } from "lucide-react";
 import { useI18n } from "../i18n";
 import { isImeComposingEvent } from "../utils/searchNormalize";
 
 interface Props {
   open: boolean;
+  isLocked?: boolean;
   groupTitle: string;
   onClose: () => void;
   onSubmit: (payload: {
@@ -17,7 +18,13 @@ interface Props {
   }) => Promise<void>;
 }
 
-export function CreatePollModal({ open, groupTitle, onClose, onSubmit }: Props) {
+export function CreatePollModal({
+  open,
+  isLocked = false,
+  groupTitle,
+  onClose,
+  onSubmit,
+}: Props) {
   const { t } = useI18n();
   const [question, setQuestion] = useState("");
   const [options, setOptions] = useState<string[]>(["", ""]);
@@ -27,9 +34,24 @@ export function CreatePollModal({ open, groupTitle, onClose, onSubmit }: Props) 
   const [expiryHours, setExpiryHours] = useState<number>(0);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const savingRef = useRef(false);
+  const mountedRef = useRef(true);
 
   useEffect(() => {
-    if (!open) return;
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!open) {
+      savingRef.current = false;
+      setSaving(false);
+      return;
+    }
+    savingRef.current = false;
+    setSaving(false);
     setQuestion("");
     setOptions(["", ""]);
     setAllowMulti(true);
@@ -40,21 +62,33 @@ export function CreatePollModal({ open, groupTitle, onClose, onSubmit }: Props) 
   }, [open]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || isLocked) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (isImeComposingEvent(e)) return;
-      if (e.key === "Escape") onClose();
+      if (isLocked || isImeComposingEvent(e)) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!saving && !savingRef.current) {
+          onClose();
+        }
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, onClose]);
+  }, [open, isLocked, saving, onClose]);
 
   if (!open) return null;
 
   const cleanOptions = options.map((o) => o.trim()).filter(Boolean);
 
+  const handleRequestClose = () => {
+    if (saving || savingRef.current) return;
+    onClose();
+  };
+
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (saving || savingRef.current) return;
     if (!question.trim()) {
       setError(t("pollErrorEmptyQuestion"));
       return;
@@ -63,6 +97,16 @@ export function CreatePollModal({ open, groupTitle, onClose, onSubmit }: Props) 
       setError(t("pollErrorMinOptions"));
       return;
     }
+    const seen = new Set<string>();
+    for (const opt of cleanOptions) {
+      const norm = opt.toLocaleLowerCase();
+      if (seen.has(norm)) {
+        setError(t("pollErrorDuplicateOptions"));
+        return;
+      }
+      seen.add(norm);
+    }
+    savingRef.current = true;
     setSaving(true);
     setError(null);
     try {
@@ -75,18 +119,25 @@ export function CreatePollModal({ open, groupTitle, onClose, onSubmit }: Props) 
         allowAddOption,
         isAnonymous,
       });
-      onClose();
+      if (mountedRef.current) {
+        onClose();
+      }
     } catch (err) {
-      setError(String(err).replace(/^Error:\s*/i, ""));
+      if (mountedRef.current) {
+        setError(String(err).replace(/^Error:\s*/i, ""));
+      }
     } finally {
-      setSaving(false);
+      savingRef.current = false;
+      if (mountedRef.current) {
+        setSaving(false);
+      }
     }
   };
 
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-xs"
-      onClick={onClose}
+      onClick={handleRequestClose}
     >
       <form
         onSubmit={(e) => void handleSave(e)}
@@ -111,7 +162,12 @@ export function CreatePollModal({ open, groupTitle, onClose, onSubmit }: Props) 
             <BarChart3 className="h-5 w-5 shrink-0" style={{ color: "var(--accent)" }} />
             <span className="truncate text-[15.5px]">{t("createPollModalTitle", { title: groupTitle })}</span>
           </div>
-          <button type="button" onClick={onClose} className="hover-menu rounded-lg p-1.5">
+          <button
+            type="button"
+            disabled={saving}
+            onClick={handleRequestClose}
+            className="hover-menu rounded-lg p-1.5 disabled:cursor-not-allowed disabled:opacity-40"
+          >
             <X className="h-4 w-4" style={{ color: "var(--text-secondary)" }} />
           </button>
         </div>
@@ -242,8 +298,9 @@ export function CreatePollModal({ open, groupTitle, onClose, onSubmit }: Props) 
         >
           <button
             type="button"
-            onClick={onClose}
-            className="hover-menu rounded-xl px-4 py-2 text-xs font-medium"
+            disabled={saving}
+            onClick={handleRequestClose}
+            className="hover-menu rounded-xl px-4 py-2 text-xs font-medium disabled:cursor-not-allowed disabled:opacity-50"
             style={{ background: "var(--bg-surface)" }}
           >
             {t("cancel")}

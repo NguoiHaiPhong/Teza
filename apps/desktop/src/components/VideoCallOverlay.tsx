@@ -61,6 +61,7 @@ export interface VideoCallOverlayProps {
   remoteVideoDims: { width: number; height: number } | null;
   busy: boolean;
   hangupBusy?: boolean;
+  minimized?: boolean;
   viewMode?: VideoCallViewMode;
   onViewModeChange?: (mode: VideoCallViewMode) => void;
   onCollapseToBar?: () => void;
@@ -287,6 +288,7 @@ export function VideoCallOverlay({
   remoteVideoDims,
   busy,
   hangupBusy,
+  minimized = false,
   viewMode,
   onViewModeChange,
   onCollapseToBar,
@@ -379,16 +381,21 @@ export function VideoCallOverlay({
     }
   }, []);
 
+  const matchedTelemetry =
+    telemetry && telemetry.call_id === active.call_id ? telemetry : null;
+
   const isConnected = active.phase === "connected";
   const isCancellingStage = active.phase === "dialing" || active.phase === "ringing_outgoing";
-  const effectiveMuted = telemetry?.mic_muted ?? active.mic_muted;
+  const effectiveMuted = matchedTelemetry?.mic_muted ?? active.mic_muted;
   const effectiveCamEnabled = active.cam_enabled;
-  const remoteSpeaking = Boolean(isConnected && telemetry?.remote_speaking);
-  const missingMic = Boolean(isConnected && telemetry && !telemetry.has_input_device);
+  const remoteSpeaking = Boolean(isConnected && matchedTelemetry?.remote_speaking);
+  const missingMic = Boolean(
+    isConnected && matchedTelemetry && !matchedTelemetry.has_input_device,
+  );
   const usingVirtualAudio = Boolean(
     isConnected &&
-      telemetry &&
-      (telemetry.input_is_virtual || telemetry.output_is_virtual),
+      matchedTelemetry &&
+      (matchedTelemetry.input_is_virtual || matchedTelemetry.output_is_virtual),
   );
   const effectiveDevices = resolveEffectiveCallDevices(devices);
   const cameraHasIssue = isCameraFailureStatus(localCameraStatus);
@@ -429,7 +436,7 @@ export function VideoCallOverlay({
       setLocalElapsed(0);
       return;
     }
-    const baseSecs = Math.max(active.duration_secs, telemetry?.duration_secs ?? 0);
+    const baseSecs = Math.max(active.duration_secs, matchedTelemetry?.duration_secs ?? 0);
     setLocalElapsed(baseSecs);
     const startedAt = Date.now() - baseSecs * 1000;
     const timer = window.setInterval(() => {
@@ -438,6 +445,13 @@ export function VideoCallOverlay({
     return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isConnected, active.call_id]);
+
+  // Close devices popover when minimized to call bar
+  useEffect(() => {
+    if (minimized) {
+      setDevicesOpen(false);
+    }
+  }, [minimized]);
 
   // Auto-reclamp floating PiP rectangle when browser/window resizes
   useEffect(() => {
@@ -449,32 +463,35 @@ export function VideoCallOverlay({
     return () => window.removeEventListener("resize", onWindowResize);
   }, []);
 
-  // Re-clamp when switching into floating mode so frame is guaranteed visible
+  // Re-clamp when switching into floating mode or restoring from minimized so frame is guaranteed visible
   useEffect(() => {
-    if (!isExpanded) {
+    if (!isExpanded && !minimized) {
       const vp = readViewportSize();
       setPipRect((prev) => clampPipRect(prev, vp.width, vp.height));
     }
-  }, [isExpanded]);
+  }, [isExpanded, minimized]);
 
   // Escape key: close devices popover; or exit expanded -> floating.
-  // Never steal Escape from the underlying chat UI while in floating mode!
+  // Never steal Escape from the underlying chat UI while in floating or minimized mode!
   useEffect(() => {
+    if (minimized) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.defaultPrevented || e.key !== "Escape") return;
       if (devicesOpen) {
         e.preventDefault();
+        e.stopPropagation();
         setDevicesOpen(false);
         return;
       }
       if (isExpanded) {
         e.preventDefault();
+        e.stopPropagation();
         changeViewMode("floating");
       }
     };
     window.addEventListener("keydown", onKeyDown, true);
     return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, [devicesOpen, isExpanded, changeViewMode]);
+  }, [minimized, devicesOpen, isExpanded, changeViewMode]);
 
   // Listen to System Picture-in-Picture lifecycle events on the hidden bridge video
   useEffect(() => {
@@ -532,7 +549,7 @@ export function VideoCallOverlay({
 
   const effectiveDuration = Math.max(
     active.duration_secs,
-    telemetry?.duration_secs ?? 0,
+    matchedTelemetry?.duration_secs ?? 0,
     localElapsed,
   );
 
@@ -572,9 +589,9 @@ export function VideoCallOverlay({
                 ? t("callVideoCameraErrorShort")
                 : t("callVideoCameraOffShort");
 
-  const videoTxFrames = telemetry?.video_tx_frames ?? 0;
-  const videoRxFrames = telemetry?.video_rx_frames ?? 0;
-  const videoDropped = telemetry?.video_rx_dropped_incomplete ?? 0;
+  const videoTxFrames = matchedTelemetry?.video_tx_frames ?? 0;
+  const videoRxFrames = matchedTelemetry?.video_rx_frames ?? 0;
+  const videoDropped = matchedTelemetry?.video_rx_dropped_incomplete ?? 0;
   const partnerDisplayName = active.partner_name || active.partner_id;
 
   const placeholderSubtitle = !isConnected
@@ -863,7 +880,7 @@ export function VideoCallOverlay({
         </button>
       </div>
 
-      {isConnected && telemetry && (
+      {isConnected && matchedTelemetry && (
         <div
           className="space-y-1 rounded-lg px-2.5 py-2 text-[11px]"
           style={{
@@ -876,13 +893,13 @@ export function VideoCallOverlay({
         >
           <div className="break-words font-medium" style={{ color: "var(--text-primary)" }}>
             {t("callActiveDevicesLabel", {
-              mic: telemetry.active_input_device || "-",
-              speaker: telemetry.active_output_device || "-",
+              mic: matchedTelemetry.active_input_device || "-",
+              speaker: matchedTelemetry.active_output_device || "-",
             })}
           </div>
           <div className="tabular-nums">
-            Audio TX: {telemetry.tx_packets} · RX: {telemetry.rx_packets}
-            {telemetry.tx_errors > 0 ? ` · TX err: ${telemetry.tx_errors}` : ""}
+            Audio TX: {matchedTelemetry.tx_packets} · RX: {matchedTelemetry.rx_packets}
+            {matchedTelemetry.tx_errors > 0 ? ` · TX err: ${matchedTelemetry.tx_errors}` : ""}
           </div>
           <div className="tabular-nums">
             Video TX: {videoTxFrames} · RX: {videoRxFrames}
@@ -892,7 +909,7 @@ export function VideoCallOverlay({
               : ""}
           </div>
           {usingVirtualAudio && <div>{t("callVirtualAudioWarningShort")}</div>}
-          {effectiveDuration >= 4 && telemetry.rx_packets === 0 && (
+          {effectiveDuration >= 4 && matchedTelemetry.rx_packets === 0 && (
             <div style={{ color: "#fbbf24" }}>{t("callNoRemotePacketsHint")}</div>
           )}
         </div>
@@ -1010,18 +1027,22 @@ export function VideoCallOverlay({
         className="pointer-events-none fixed -left-[9999px] h-1 w-1 opacity-0"
       />
 
-      {/* Unified container — never remounts <canvas> or <video> across expanded <-> floating */}
+      {/* Unified container — never remounts <canvas> or <video> across expanded <-> floating <-> minimized */}
       <div
-        role={isExpanded ? "dialog" : "region"}
-        aria-modal={isExpanded ? "true" : undefined}
+        role={minimized ? undefined : isExpanded ? "dialog" : "region"}
+        aria-modal={minimized ? undefined : isExpanded ? "true" : undefined}
+        aria-hidden={minimized ? "true" : undefined}
         aria-label={t("callVideoTitle")}
+        inert={minimized || undefined}
         className={
-          isExpanded
-            ? "fixed inset-0 z-[75] flex items-center justify-center bg-black/75 p-2 backdrop-blur-sm sm:p-4"
-            : "fixed z-[75] select-none"
+          minimized
+            ? "pointer-events-none fixed -left-[9999px] top-0 h-[360px] w-[640px] overflow-hidden opacity-0 select-none"
+            : isExpanded
+              ? "fixed inset-0 z-[75] flex items-center justify-center bg-black/75 p-2 backdrop-blur-sm sm:p-4"
+              : "fixed z-[75] select-none"
         }
         style={
-          isExpanded
+          minimized || isExpanded
             ? undefined
             : {
                 left: `${pipRect.x}px`,
@@ -1159,7 +1180,7 @@ export function VideoCallOverlay({
             </div>
 
             <div data-no-drag="true" className="flex shrink-0 items-center gap-1 sm:gap-1.5">
-              {isExpanded && isConnected && telemetry && (
+              {isExpanded && isConnected && matchedTelemetry && (
                 <div
                   title={t("callVideoStatsTooltip", {
                     tx: videoTxFrames,

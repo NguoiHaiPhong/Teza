@@ -30,9 +30,14 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 
 use zalo_core::ai::{
-    ai_chat_stream_with_relay, ai_config_file, ai_summarize_unread_with_relay,
-    ai_translate_text_with_relay, probe_gemini_cli, AiChatTurn, AiCliProbeDto, AiConfig,
-    AiConfigPublic, AiConfigUpdate, AiSummaryDto, AiSummaryInputMsg, MAX_CHAT_HISTORY_TURNS,
+    ai_chat_stream_session_with_acp, ai_config_file, ai_summarize_unread_with_relay,
+    ai_translate_text_with_relay, check_ai_relay_policy, clear_zeroclaw_session_memory,
+    delete_zeroclaw_session_dir, fetch_cloud_models_with_relay, install_zeroclaw_latest,
+    is_same_cloud_api_host, probe_zeroclaw_in_dir, run_zeroclaw_command,
+    scrub_stale_zeroclaw_ephemeral_and_secrets, validate_strict_ai_session_id, AiBackend,
+    AiCancelToken, AiChatTurn, AiCliProbeDto, AiCommandResultDto, AiConfig, AiConfigPublic,
+    AiConfigUpdate, AiModelInfoDto, AiOperation, AiSummaryDto, AiSummaryInputMsg,
+    ZeroClawAcpManager, ZeroClawInstallResultDto, MAX_CHAT_HISTORY_TURNS,
 };
 use zalo_core::chat::messaging;
 use zalo_core::chat::parser::{
@@ -64,17 +69,17 @@ use zalo_core::session::{
 };
 use zalo_core::socket::{self, WsSignal};
 use zalo_core::store::{
-    AiStoredMessageDto, ApiAuditLogDto, ApiClientDto, CloudMediaBreakdown, CreatedApiClientDto,
-    MediaObjectRecord, MediaVaultStatsDto, MessageMediaRecord, MessageStore,
+    AiSessionDto, AiStoredMessageDto, ApiAuditLogDto, ApiClientDto, CloudMediaBreakdown,
+    CreatedApiClientDto, MediaObjectRecord, MediaVaultStatsDto, MessageMediaRecord, MessageStore,
     NewScheduledMessageInput, ScheduledMessageDto, UpdateScheduledMessageInput,
     MEDIA_CDN_STATUS_EXPIRED, MEDIA_CDN_STATUS_OK, MEDIA_LOCAL_STATE_LOCAL,
     MEDIA_LOCAL_STATE_MISSING,
 };
 use zalo_core::translate::{
-    classify_skip_reason, classify_skip_reason_for_mode, is_static_non_translatable,
-    normalize_lang_base_code, provider_name, translate_api_only_with_relay, TranslateConfig,
-    TranslateConfigSummary, TranslateConfigUpdate, TranslateDetectMode, TranslateInputItem,
-    TranslateProvider, TranslationResult,
+    check_translate_relay_policy, classify_skip_reason, classify_skip_reason_for_mode,
+    is_static_non_translatable, normalize_lang_base_code, provider_name,
+    translate_api_only_with_relay, TranslateConfig, TranslateConfigSummary, TranslateConfigUpdate,
+    TranslateDetectMode, TranslateInputItem, TranslateProvider, TranslationResult,
 };
 
 const MAX_STAGED_RAW_UPLOADS: usize = 16;
@@ -97,12 +102,14 @@ pub struct AppState {
     pub gdrive: Arc<GDriveRuntime>,
     pub ws_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     pub qr_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    pub qr_generation: Arc<AtomicU64>,
     pub active_thread_id: Arc<Mutex<Option<String>>>,
     pub translate_cfg: Arc<Mutex<TranslateConfig>>,
     pub relay_cfg: Arc<Mutex<RelayConfig>>,
     pub pending_update: Arc<Mutex<Option<tauri_plugin_updater::Update>>>,
     pub close_to_tray: Arc<AtomicBool>,
     pub allow_exit: Arc<AtomicBool>,
+    pub passcode_locked: Arc<AtomicBool>,
     pub notify_popup: notify_popup::NotifyPopupController,
     pub webapp_op_lock: Arc<Mutex<()>>,
     pub webapp_epoch: Arc<AtomicU64>,
@@ -114,6 +121,11 @@ pub struct AppState {
     pub staged_raw_uploads: Arc<std::sync::Mutex<HashMap<String, StagedRawUpload>>>,
     pub call_mgr: Arc<call::CallManager>,
     pub ai_config: Arc<Mutex<AiConfig>>,
+    pub zeroclaw_acp: ZeroClawAcpManager,
+    pub zeroclaw_install_lock: Arc<Mutex<()>>,
+    pub zeroclaw_installing: Arc<AtomicBool>,
+    pub ai_cancel_tokens: Arc<Mutex<HashMap<String, AiCancelToken>>>,
+    pub ai_session_epochs: Arc<Mutex<HashMap<String, u64>>>,
     pub scheduler: scheduler::SchedulerHandle,
     pub local_api: Arc<local_api::LocalApiManager>,
 }
@@ -230,6 +242,13 @@ pub struct MessagesPageDto {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct MessagesAroundResult {
+    pub messages: Vec<MessageDto>,
+    pub has_more: bool,
+    pub has_newer: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ThreadMessagesSyncedPayload {
     pub thread_id: String,
     pub messages: Vec<MessageDto>,
@@ -259,7 +278,7 @@ fn expired_code(err: &anyhow::Error) -> Option<i64> {
     }
 }
 
-async fn clear_expired_session(
+pub(crate) async fn clear_expired_session(
     app: &AppHandle,
     sess_arc: &Arc<Mutex<Session>>,
     ws_task_arc: Option<&Arc<Mutex<Option<JoinHandle<()>>>>>,
@@ -269,6 +288,10 @@ async fn clear_expired_session(
 ) {
     if let Some(ws_arc) = ws_task_arc {
         if let Some(handle) = ws_arc.lock().await.take() {
+            handle.abort();
+        }
+    } else if let Some(st) = app.try_state::<AppState>() {
+        if let Some(handle) = st.ws_task.lock().await.take() {
             handle.abort();
         }
     }
@@ -282,7 +305,24 @@ async fn clear_expired_session(
         }
     }
     if let Some(st) = app.try_state::<AppState>() {
+        *st.active_thread_id.lock().await = None;
+        bump_all_ai_session_epochs(&st.ai_session_epochs).await;
+        cancel_all_ai_tokens(&st.ai_cancel_tokens).await;
+        st.zeroclaw_acp.shutdown_all().await;
         st.call_mgr.teardown_for_session(Some(app), sess_arc).await;
+        {
+            let prev_vault = st.media_vault.read().await.clone();
+            prev_vault.flush_access_touches(&st.store).await;
+        }
+        // #4: Swap store to anonymous `history.db` (matching `auth_logout`) so
+        // expired sessions never leave the previous account's SQLite DB mounted.
+        let fallback_db = st.paths.history_db(None);
+        if let Ok(anon_store) = MessageStore::open(&fallback_db) {
+            let mut store = st.store.lock().await;
+            *store = anon_store;
+        }
+        st.scheduler.notify_changed();
+        rebind_media_vault_unlocked(&st.media_vault, &st.paths, None).await;
         st.gdrive
             .clear_for_logout_and_emit(app, &st.relay_cfg, &st.store)
             .await;
@@ -293,6 +333,24 @@ async fn clear_expired_session(
     }
     if emit_event {
         let _ = app.emit("core://auth-expired", reason);
+    }
+}
+
+pub(crate) async fn clear_expired_session_for_app(
+    app: &AppHandle,
+    reason: String,
+    emit_event: bool,
+) {
+    if let Some(st) = app.try_state::<AppState>() {
+        clear_expired_session(
+            app,
+            &st.session,
+            Some(&st.ws_task),
+            &st.paths,
+            reason,
+            emit_event,
+        )
+        .await;
     }
 }
 
@@ -465,6 +523,30 @@ fn is_raw_numeric_uid_like(s: &str) -> bool {
     false
 }
 
+fn classify_ws_message_is_live(
+    cmd: u16,
+    already_in_store: bool,
+    already_cleared: bool,
+    is_recalled: bool,
+) -> Option<bool> {
+    if already_in_store || already_cleared || is_recalled {
+        return Some(false);
+    }
+    let is_live_push = matches!(
+        cmd,
+        socket::CMD_PUSH_MSG_1_1
+            | socket::CMD_PUSH_MSG_GROUP
+            | socket::CMD_PUSH_MSG_E2EE_1_1
+            | socket::CMD_PUSH_MSG_E2EE_GROUP
+            | socket::CMD_GET_MSG
+    );
+    if is_live_push {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 fn ws_message_fallback_title(msg: &MessageDto) -> Option<&str> {
     if msg.is_outgoing {
         return None;
@@ -587,6 +669,7 @@ async fn restart_ws_worker(
                     let mut poll_detail_refresh_jobs: Vec<(String, i64)> = Vec::new();
                     let mut self_removed_thread_ids: Vec<String> = Vec::new();
                     let mut threads_touched = false;
+                    let mut gdrive_mutation_touched = false;
                     {
                         let mut store = store_arc.lock().await;
                         let mut unresolved_direct_cache: Option<
@@ -595,6 +678,19 @@ async fn restart_ws_worker(
                         for act in actions {
                             match act {
                                 WsParsedAction::Message(mut msg) => {
+                                    let existing_msg = if !msg.msg_id.is_empty() {
+                                        store
+                                            .get_message(&msg.thread_id, &msg.msg_id)
+                                            .ok()
+                                            .flatten()
+                                    } else {
+                                        None
+                                    };
+                                    let already_in_store = existing_msg.is_some();
+                                    let transitioned_to_recalled = msg.is_recalled
+                                        && existing_msg
+                                            .as_ref()
+                                            .is_some_and(|prev| !prev.is_recalled);
                                     let is_group = store
                                         .get_thread_kind(&msg.thread_id)
                                         .ok()
@@ -609,9 +705,15 @@ async fn restart_ws_worker(
                                                     &p.question,
                                                 )
                                         });
-                                    let was_updated_existing_poll =
-                                        upsert_incoming_message(&mut store, &mut msg)
-                                            .unwrap_or(false);
+                                    let (was_updated_existing_poll, msg_orphans) =
+                                        upsert_incoming_message_with_orphans(&mut store, &mut msg)
+                                            .unwrap_or((false, Vec::new()));
+                                    if !msg_orphans.is_empty() {
+                                        orphaned_media_paths.extend(msg_orphans);
+                                        gdrive_mutation_touched = true;
+                                    } else if transitioned_to_recalled {
+                                        gdrive_mutation_touched = true;
+                                    }
                                     if was_updated_existing_poll {
                                         let _ = app.emit("core://message-updated", &*msg);
                                         if let Some(poll) = parse_message_poll_dto(&msg)
@@ -708,7 +810,25 @@ async fn restart_ws_worker(
                                             }
                                         }
                                     }
-                                    let _ = app.emit("core://message-new", &*msg);
+                                    let is_live_flag = classify_ws_message_is_live(
+                                        ev.cmd,
+                                        already_in_store,
+                                        already_cleared,
+                                        msg.is_recalled,
+                                    );
+                                    if let Ok(mut emitted) = serde_json::to_value(&*msg) {
+                                        if let (Some(obj), Some(flag)) =
+                                            (emitted.as_object_mut(), is_live_flag)
+                                        {
+                                            obj.insert(
+                                                "is_live".into(),
+                                                serde_json::Value::Bool(flag),
+                                            );
+                                        }
+                                        let _ = app.emit("core://message-new", emitted);
+                                    } else {
+                                        let _ = app.emit("core://message-new", &*msg);
+                                    }
                                     if !missing_uids.is_empty()
                                         && missing_uids.iter().any(|u| u == &msg.sender_id)
                                     {
@@ -761,6 +881,7 @@ async fn restart_ws_worker(
                                     if let Ok(Some(updated)) =
                                         store.mark_recalled(&thread_id, &msg_id)
                                     {
+                                        gdrive_mutation_touched = true;
                                         let _ = app.emit("core://message-updated", &updated);
                                     }
                                 }
@@ -801,6 +922,7 @@ async fn restart_ws_worker(
                                                 }
                                                 self_removed_thread_ids.push(trimmed.to_string());
                                                 threads_touched = true;
+                                                gdrive_mutation_touched = true;
                                             }
                                         }
                                     }
@@ -830,6 +952,11 @@ async fn restart_ws_worker(
                         orphaned_media_paths.dedup();
                         let vault = media_vault_arc.read().await.clone();
                         vault.unlink_rel_paths(&orphaned_media_paths).await;
+                    }
+                    if gdrive_mutation_touched {
+                        if let Some(st) = app.try_state::<AppState>() {
+                            st.gdrive.notify_sync();
+                        }
                     }
                     if !auto_cache_jobs.is_empty() {
                         let vault = media_vault_arc.read().await.clone();
@@ -1117,6 +1244,9 @@ async fn auth_start_qr(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<QrStartDto, String> {
+    // #50b: Monotonic generation prevents concurrent `auth_start_qr` calls from leaking
+    // an older polling task or emitting stale `core://auth-error` / `core://auth-authenticated`.
+    let my_gen = state.qr_generation.fetch_add(1, Ordering::SeqCst) + 1;
     if let Some(prev) = state.qr_task.lock().await.take() {
         prev.abort();
     }
@@ -1145,18 +1275,37 @@ async fn auth_start_qr(
     let active_thread_arc = state.active_thread_id.clone();
     let call_mgr_arc = state.call_mgr.clone();
     let scheduler_for_qr = state.scheduler.clone();
+    let qr_gen_arc = state.qr_generation.clone();
     let paths = state.paths.clone();
 
+    let mut qr_guard = state.qr_task.lock().await;
+    if qr_gen_arc.load(Ordering::SeqCst) != my_gen {
+        // Superseded by a newer `auth_start_qr` or `auth_logout` while `request_qr().await` ran.
+        return Ok(dto);
+    }
+    if let Some(prev) = qr_guard.take() {
+        prev.abort();
+    }
+
     let handle = tokio::spawn(async move {
+        let is_current = || qr_gen_arc.load(Ordering::SeqCst) == my_gen;
         match qr::wait_for_scan(&sess_snapshot, &ticket).await {
             Ok(scanned_name) => {
+                if !is_current() {
+                    return;
+                }
                 let _ = app.emit("core://qr-scanned", scanned_name);
                 let _ = app.emit(
                     "core://auth-stage",
                     "Đã quét mã — vui lòng bấm Xác nhận trên điện thoại...",
                 );
                 if let Err(e) = qr::wait_for_confirm(&mut sess_snapshot, &ticket).await {
-                    let _ = app.emit("core://auth-error", e.to_string());
+                    if is_current() {
+                        let _ = app.emit("core://auth-error", e.to_string());
+                    }
+                    return;
+                }
+                if !is_current() {
                     return;
                 }
                 let _ = app.emit(
@@ -1164,12 +1313,20 @@ async fn auth_start_qr(
                     "Đã xác nhận! Đang hoàn tất phiên đăng nhập...",
                 );
                 if let Err(e) = sess_snapshot.save_to_file(&paths.session_file()) {
-                    let _ = app.emit("core://auth-error", format!("Lỗi lưu phiên: {e}"));
+                    if is_current() {
+                        let _ = app.emit("core://auth-error", format!("Lỗi lưu phiên: {e}"));
+                    }
+                    return;
+                }
+                if !is_current() {
                     return;
                 }
                 let profile = sess_snapshot.profile.clone();
                 {
                     let mut guard = sess_arc.lock().await;
+                    if !is_current() {
+                        return;
+                    }
                     let latest_relay = guard.relay.clone();
                     if sess_snapshot.relay != latest_relay {
                         let _ = sess_snapshot.set_relay(latest_relay);
@@ -1198,6 +1355,9 @@ async fn auth_start_qr(
                         .await;
                 }
 
+                if !is_current() {
+                    return;
+                }
                 let _ = app.emit("core://auth-authenticated", &profile);
                 restart_ws_worker(
                     app.clone(),
@@ -1215,17 +1375,20 @@ async fn auth_start_qr(
                     .await;
             }
             Err(e) => {
-                let _ = app.emit("core://auth-error", e.to_string());
+                if is_current() {
+                    let _ = app.emit("core://auth-error", e.to_string());
+                }
             }
         }
     });
 
-    *state.qr_task.lock().await = Some(handle);
+    *qr_guard = Some(handle);
     Ok(dto)
 }
 
 #[tauri::command]
 async fn auth_logout(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    state.qr_generation.fetch_add(1, Ordering::SeqCst);
     if let Some(handle) = state.qr_task.lock().await.take() {
         handle.abort();
     }
@@ -1237,6 +1400,9 @@ async fn auth_logout(app: AppHandle, state: State<'_, AppState>) -> Result<(), S
         let mut sess = state.session.lock().await;
         *sess = Session::new_with_relay(sess.relay.clone()).map_err(|e| e.to_string())?;
     }
+    bump_all_ai_session_epochs(&state.ai_session_epochs).await;
+    cancel_all_ai_tokens(&state.ai_cancel_tokens).await;
+    state.zeroclaw_acp.shutdown_all().await;
     state
         .call_mgr
         .teardown_for_session(Some(&app), &state.session)
@@ -2228,6 +2394,7 @@ async fn group_leave(
             },
         );
         let _ = app.emit("core://threads-updated", ());
+        state.gdrive.notify_sync();
     }
     Ok(res)
 }
@@ -2275,6 +2442,13 @@ async fn reminder_create(
     if clean_title.is_empty() {
         return Err("Nội dung nhắc hẹn không được để trống".into());
     }
+    let now_ms = chrono_now_ms();
+    let start_time_ms = threads::validate_reminder_start_time(
+        start_time_ms,
+        now_ms,
+        threads::REMINDER_MIN_LEAD_MS,
+    )
+    .map_err(|e| e.to_string())?;
     let kind = {
         let store = state.store.lock().await;
         store
@@ -2545,20 +2719,29 @@ fn candidate_thread_ids(thread_id: Option<&str>) -> Vec<String> {
     out
 }
 
-fn upsert_incoming_message(
+fn upsert_incoming_message_with_orphans(
     store: &mut MessageStore,
     msg: &mut MessageDto,
-) -> Result<bool, String> {
+) -> Result<(bool, Vec<String>), String> {
     if let Some(poll_id) = real_poll_id_for_dedupe(msg) {
         let (merged, was_updated_existing) = store
             .upsert_or_merge_poll_message(&msg.thread_id, poll_id, msg)
             .map_err(|e| e.to_string())?;
         *msg = merged;
-        Ok(was_updated_existing)
+        Ok((was_updated_existing, Vec::new()))
     } else {
-        store.upsert_message(msg).map_err(|e| e.to_string())?;
-        Ok(false)
+        let orphans = store
+            .upsert_message_returning_orphans(msg)
+            .map_err(|e| e.to_string())?;
+        Ok((false, orphans))
     }
+}
+
+fn upsert_incoming_message(
+    store: &mut MessageStore,
+    msg: &mut MessageDto,
+) -> Result<bool, String> {
+    upsert_incoming_message_with_orphans(store, msg).map(|(updated, _)| updated)
 }
 
 fn find_local_poll_message(
@@ -2941,52 +3124,85 @@ async fn resolve_and_upsert_remote_messages(
         }
     }
 
-    let mut store = store_arc.lock().await;
-    for m in remote_msgs.iter_mut() {
-        if !m.is_outgoing && (m.sender_name == m.sender_id || is_raw_numeric_id(&m.sender_name)) {
-            if let Some(name) = known_titles.get(&m.sender_id) {
-                m.sender_name = name.clone();
+    let mut orphaned_media_paths: Vec<String> = Vec::new();
+    let mut newly_recalled = false;
+    {
+        let mut store = store_arc.lock().await;
+        for m in remote_msgs.iter_mut() {
+            if !m.is_outgoing && (m.sender_name == m.sender_id || is_raw_numeric_id(&m.sender_name))
+            {
+                if let Some(name) = known_titles.get(&m.sender_id) {
+                    m.sender_name = name.clone();
+                }
+            }
+            if m.is_recalled
+                && !m.msg_id.is_empty()
+                && store
+                    .get_message(&m.thread_id, &m.msg_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|prev| !prev.is_recalled)
+            {
+                newly_recalled = true;
+            }
+            if let Ok((_, orphans)) = upsert_incoming_message_with_orphans(&mut store, m) {
+                if !orphans.is_empty() {
+                    orphaned_media_paths.extend(orphans);
+                }
             }
         }
-        let _ = upsert_incoming_message(&mut store, m);
-    }
-    if kind == ThreadKind::Group || thread_id.starts_with('g') {
-        let _ = store.dedupe_duplicate_poll_messages_in_thread(thread_id);
-    }
-    if let Some(max_out_ts) = remote_msgs.iter().filter(|m| m.is_outgoing).map(|m| m.ts).max() {
-        if max_out_ts > 0 {
-            let _ = store.advance_last_read_in_ts(thread_id, max_out_ts);
+        if kind == ThreadKind::Group || thread_id.starts_with('g') {
+            let _ = store.dedupe_duplicate_poll_messages_in_thread(thread_id);
         }
-    }
-    if update_preview {
-        if let Some(newest) = remote_msgs.iter().max_by_key(|m| m.ts) {
-            let raw_text = if newest.text.is_empty() {
-                newest
-                    .attachment_name
-                    .as_deref()
-                    .map(|n| format!("[Tệp: {n}]"))
-                    .unwrap_or_else(|| format!("[{}]", newest.msg_type))
-            } else {
-                newest.text.clone()
-            };
-            let preview = format_thread_preview(
-                &raw_text,
-                newest.is_outgoing,
-                &newest.sender_name,
-                kind == ThreadKind::Group,
-            );
-            let created = store
-                .update_thread_preview_returning_created(
-                    thread_id,
-                    &preview,
-                    newest.ts,
-                    false,
+        if let Some(max_out_ts) = remote_msgs.iter().filter(|m| m.is_outgoing).map(|m| m.ts).max()
+        {
+            if max_out_ts > 0 {
+                let _ = store.advance_last_read_in_ts(thread_id, max_out_ts);
+            }
+        }
+        if update_preview {
+            if let Some(newest) = remote_msgs.iter().max_by_key(|m| m.ts) {
+                let raw_text = if newest.text.is_empty() {
+                    newest
+                        .attachment_name
+                        .as_deref()
+                        .map(|n| format!("[Tệp: {n}]"))
+                        .unwrap_or_else(|| format!("[{}]", newest.msg_type))
+                } else {
+                    newest.text.clone()
+                };
+                let preview = format_thread_preview(
+                    &raw_text,
                     newest.is_outgoing,
-                )
-                .unwrap_or(false);
-            if created {
-                let _ = app.emit("core://threads-updated", ());
+                    &newest.sender_name,
+                    kind == ThreadKind::Group,
+                );
+                let created = store
+                    .update_thread_preview_returning_created(
+                        thread_id,
+                        &preview,
+                        newest.ts,
+                        false,
+                        newest.is_outgoing,
+                    )
+                    .unwrap_or(false);
+                if created {
+                    let _ = app.emit("core://threads-updated", ());
+                }
             }
+        }
+    }
+    if !orphaned_media_paths.is_empty() {
+        orphaned_media_paths.sort();
+        orphaned_media_paths.dedup();
+        if let Some(st) = app.try_state::<AppState>() {
+            let vault = st.media_vault.read().await.clone();
+            vault.unlink_rel_paths(&orphaned_media_paths).await;
+            st.gdrive.notify_sync();
+        }
+    } else if newly_recalled {
+        if let Some(st) = app.try_state::<AppState>() {
+            st.gdrive.notify_sync();
         }
     }
 }
@@ -3249,15 +3465,15 @@ async fn messages_load_around(
     state: State<'_, AppState>,
     thread_id: String,
     target_ts: i64,
-) -> Result<MessagesPageDto, String> {
+) -> Result<MessagesAroundResult, String> {
     let store = state.store.lock().await;
     if thread_id.starts_with('g')
         || store.get_thread_kind(&thread_id).ok().flatten() == Some(ThreadKind::Group)
     {
         let _ = store.dedupe_duplicate_poll_messages_in_thread(&thread_id);
     }
-    let msgs = store
-        .load_messages_around(&thread_id, target_ts, 25, 1000)
+    let (msgs, has_newer) = store
+        .load_messages_around_with_meta(&thread_id, target_ts, 25, 1000)
         .map_err(|e| e.to_string())?;
     let has_more = if let Some(first) = msgs.first() {
         !store
@@ -3267,9 +3483,10 @@ async fn messages_load_around(
     } else {
         false
     };
-    Ok(MessagesPageDto {
+    Ok(MessagesAroundResult {
         messages: msgs,
         has_more,
+        has_newer,
     })
 }
 
@@ -4137,6 +4354,7 @@ async fn message_recall(
         vault.unlink_rel_paths(&orphaned_paths).await;
     }
     let _ = app.emit("core://message-updated", &updated);
+    state.gdrive.notify_sync();
     Ok(updated)
 }
 
@@ -4165,6 +4383,7 @@ async fn message_delete_local(
         "core://message-deleted",
         serde_json::json!({ "thread_id": thread_id, "msg_id": msg_id }),
     );
+    state.gdrive.notify_sync();
     Ok(())
 }
 
@@ -4176,12 +4395,15 @@ async fn message_toggle_pin(
     msg_id: String,
     pinned: bool,
 ) -> Result<MessageDto, String> {
-    let store = state.store.lock().await;
-    let updated = store
-        .set_message_pinned(&thread_id, &msg_id, pinned)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "Không tìm thấy tin nhắn để ghim".to_string())?;
+    let updated = {
+        let store = state.store.lock().await;
+        store
+            .set_message_pinned(&thread_id, &msg_id, pinned)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Không tìm thấy tin nhắn để ghim".to_string())?
+    };
     let _ = app.emit("core://message-updated", &updated);
+    state.gdrive.notify_sync();
     Ok(updated)
 }
 
@@ -4221,6 +4443,21 @@ async fn stickers_search(
         sess.clone_shallow()
     };
     messaging::search_stickers(&sess_snapshot, &keyword)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn stickers_suggest(
+    state: State<'_, AppState>,
+    keyword: String,
+    limit: Option<usize>,
+) -> Result<Vec<messaging::StickerItem>, String> {
+    let sess_snapshot = {
+        let sess = state.session.lock().await;
+        sess.clone_shallow()
+    };
+    messaging::suggest_stickers(&sess_snapshot, &keyword, limit.unwrap_or(16))
         .await
         .map_err(|e| e.to_string())
 }
@@ -5056,6 +5293,68 @@ async fn fetch_image_data_url(
     Ok(data_url)
 }
 
+const MAX_ATTACHMENT_IMAGE_DATA_URL_BYTES: u64 = 25 * 1024 * 1024;
+
+fn read_raster_image_file_as_data_url(path: &Path) -> Result<String, String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if ext == "svg" || ext == "svgz" {
+        return Err("Không hỗ trợ định dạng SVG".into());
+    }
+    let meta = std::fs::metadata(path).map_err(|e| format!("Không đọc được tệp ảnh: {e}"))?;
+    if !meta.is_file() {
+        return Err("Đường dẫn không phải tệp hợp lệ".into());
+    }
+    if meta.len() == 0 {
+        return Err("Tệp ảnh trống".into());
+    }
+    if meta.len() > MAX_ATTACHMENT_IMAGE_DATA_URL_BYTES {
+        return Err("Tệp ảnh vượt quá giới hạn tối đa 25 MB".into());
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("Không đọc được dữ liệu ảnh: {e}"))?;
+    if bytes.is_empty() {
+        return Err("Tệp ảnh trống".into());
+    }
+    if (bytes.len() as u64) > MAX_ATTACHMENT_IMAGE_DATA_URL_BYTES {
+        return Err("Tệp ảnh vượt quá giới hạn tối đa 25 MB".into());
+    }
+    let sniffed = zalo_core::media_vault::sniff_mime_from_bytes(&bytes);
+    let mime = match sniffed {
+        Some("image/png" | "image/jpeg" | "image/webp" | "image/gif" | "image/bmp") => {
+            sniffed.unwrap()
+        }
+        _ => {
+            return Err(
+                "Chỉ hỗ trợ định dạng ảnh raster hợp lệ (PNG, JPEG, WebP, GIF, BMP)".into(),
+            );
+        }
+    };
+    Ok(format!("data:{mime};base64,{}", B64_STANDARD.encode(&bytes)))
+}
+
+#[tauri::command]
+async fn read_attachment_image_data_url(
+    state: State<'_, AppState>,
+    file_path: String,
+) -> Result<String, String> {
+    if file_path.trim().is_empty() {
+        return Err("Đường dẫn tệp trống".into());
+    }
+    let canonical = {
+        let approved = state
+            .approved_attachment_paths
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        validate_approved_attachment_path(&approved, Path::new(&file_path))?
+    };
+    tokio::task::spawn_blocking(move || read_raster_image_file_as_data_url(&canonical))
+        .await
+        .map_err(|e| format!("Lỗi tác vụ đọc tệp ảnh: {e}"))?
+}
+
 #[tauri::command]
 async fn inspect_attachment_path(
     state: State<'_, AppState>,
@@ -5710,6 +6009,7 @@ async fn translate_messages(
     let cfg = state.translate_cfg.lock().await.clone();
     let relay = state.relay_cfg.lock().await.clone();
     let eff_provider = provider.unwrap_or(cfg.provider);
+    check_translate_relay_policy(eff_provider, &relay).map_err(|e| e.to_string())?;
     let eff_target = target_lang
         .as_deref()
         .map(str::trim)
@@ -5891,6 +6191,12 @@ async fn relay_save_config(
         *cfg = next_cfg;
         cfg.summary()
     };
+
+    // Cancel any active AI streams and shut down resident ZeroClaw ACP subprocesses
+    // whenever Relay configuration changes (especially when enabling Corporate Relay so
+    // direct AI requests cease immediately and no API keys remain resident in RAM).
+    cancel_all_ai_tokens(&state.ai_cancel_tokens).await;
+    state.zeroclaw_acp.shutdown_all().await;
 
     if is_authed {
         restart_ws_worker(
@@ -6186,15 +6492,43 @@ async fn call_request_video_keyframe(
         .await)
 }
 
+/// Shared idempotent graceful shutdown routine invoked consistently on Tray Quit,
+/// `RunEvent::Exit`, and before Windows updater process termination.
+async fn graceful_shutdown_services(state: &AppState) {
+    cancel_all_ai_tokens(&state.ai_cancel_tokens).await;
+    state.zeroclaw_acp.shutdown_all().await;
+    let _ = state.local_api.stop().await;
+    state.gdrive.shutdown().await;
+    let vault = state.media_vault.read().await.clone();
+    vault.flush_access_touches(&state.store).await;
+    state.call_mgr.teardown_for_session(None, &state.session).await;
+}
+
 #[tauri::command]
 async fn app_check_update(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Option<AppUpdateDto>, String> {
     let relay_cfg = state.relay_cfg.lock().await.clone();
+    let app_before_exit = app.clone();
     let mut builder = app
         .updater_builder()
-        .timeout(std::time::Duration::from_secs(20));
+        .timeout(std::time::Duration::from_secs(20))
+        .on_before_exit(move || {
+            if let Some(st) = app_before_exit.try_state::<AppState>() {
+                st.allow_exit.store(true, Ordering::SeqCst);
+                notify_popup::force_destroy_sync(&app_before_exit, &st.notify_popup);
+                // Belt-and-suspenders shutdown right before `std::process::exit(0)` on Windows.
+                // Run on a fresh OS thread so `block_on` never panics inside a Tokio worker.
+                let app_cleanup = app_before_exit.clone();
+                let _ = std::thread::spawn(move || {
+                    if let Some(st_inner) = app_cleanup.try_state::<AppState>() {
+                        tauri::async_runtime::block_on(graceful_shutdown_services(&st_inner));
+                    }
+                })
+                .join();
+            }
+        });
 
     if relay_cfg.enabled {
         let mut http_relay = relay_cfg;
@@ -6235,35 +6569,68 @@ async fn app_install_update(app: AppHandle, state: State<'_, AppState>) -> Resul
     let app_c = app.clone();
     let app_d = app.clone();
     let mut started = false;
-    upd.download_and_install(
-        move |chunk_len, content_len| {
-            if !started {
-                started = true;
+    let bytes = match upd
+        .download(
+            move |chunk_len, content_len| {
+                if !started {
+                    started = true;
+                    let _ = app_c.emit(
+                        "core://update-progress",
+                        serde_json::json!({ "event": "started", "total": content_len }),
+                    );
+                }
                 let _ = app_c.emit(
                     "core://update-progress",
-                    serde_json::json!({ "event": "started", "total": content_len }),
+                    serde_json::json!({ "event": "progress", "chunk": chunk_len }),
                 );
+            },
+            move || {
+                let _ = app_d.emit(
+                    "core://update-progress",
+                    serde_json::json!({ "event": "finished" }),
+                );
+            },
+        )
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            // #18a: Restore pending update so Retry succeeds without requiring a fresh check.
+            let mut pending = state.pending_update.lock().await;
+            if pending.is_none() {
+                *pending = Some(upd);
             }
-            let _ = app_c.emit(
-                "core://update-progress",
-                serde_json::json!({ "event": "progress", "chunk": chunk_len }),
-            );
-        },
-        move || {
-            let _ = app_d.emit(
-                "core://update-progress",
-                serde_json::json!({ "event": "finished" }),
-            );
-        },
-    )
-    .await
-    .map_err(|e| e.to_string())
+            return Err(e.to_string());
+        }
+    };
+
+    // Download & signature verification succeeded. Gracefully tear down all background
+    // services (ZeroClaw ACP, local API, GDrive, media vault, calls, notify popup)
+    // BEFORE `upd.install(&bytes)` launches the Windows installer and calls `process::exit(0)`.
+    state.allow_exit.store(true, Ordering::SeqCst);
+    notify_popup::force_hide_or_destroy(&app, &state.notify_popup).await;
+    graceful_shutdown_services(&state).await;
+
+    let res = upd.install(&bytes).map_err(|e| e.to_string());
+    if res.is_err() {
+        state.allow_exit.store(false, Ordering::SeqCst);
+        let mut pending = state.pending_update.lock().await;
+        if pending.is_none() {
+            *pending = Some(upd);
+        }
+    }
+    res
 }
 
 #[tauri::command]
 async fn app_set_close_to_tray(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
     state.close_to_tray.store(enabled, Ordering::SeqCst);
     Ok(())
+}
+
+#[tauri::command]
+fn app_set_passcode_locked(state: State<'_, AppState>, locked: bool) {
+    state.passcode_locked.store(locked, Ordering::Relaxed);
 }
 
 #[tauri::command]
@@ -6959,7 +7326,7 @@ fn infer_media_kind_for_download(suggested_name: &str, url: &str) -> &'static st
     "file"
 }
 
-fn infer_media_kind_for_attachment(file_name: &str, msg_type: &str) -> &'static str {
+pub(crate) fn infer_media_kind_for_attachment(file_name: &str, msg_type: &str) -> &'static str {
     if let Some(kind) = classify_ws_auto_cache_kind(msg_type) {
         if kind != "file" {
             return kind;
@@ -6971,7 +7338,10 @@ fn infer_media_kind_for_attachment(file_name: &str, msg_type: &str) -> &'static 
     "file"
 }
 
-fn infer_mime_from_filename_and_bytes(file_name: &str, bytes_opt: Option<&[u8]>) -> &'static str {
+pub(crate) fn infer_mime_from_filename_and_bytes(
+    file_name: &str,
+    bytes_opt: Option<&[u8]>,
+) -> &'static str {
     let ext = bytes_opt
         .and_then(file_dialog::sniff_extension_from_bytes)
         .map(str::to_string)
@@ -7857,7 +8227,9 @@ async fn media_open_vault_dir(state: State<'_, AppState>) -> Result<(), String> 
 }
 
 const GDRIVE_MEDIA_SYNC_BATCH_LIMIT: usize = 50;
+const GDRIVE_CLOUD_DELETE_BATCH_LIMIT: usize = 100;
 const GDRIVE_SYNC_WAKE_COALESCE_SECS: u64 = 2;
+const GDRIVE_STARTUP_SYNC_DELAY_SECS: u64 = 5;
 
 struct TempFileGuard(PathBuf);
 
@@ -7972,6 +8344,7 @@ fn build_gdrive_status_snapshot(
         connected,
         account_email: inner.tokens.as_ref().and_then(|t| t.account_email.clone()),
         account_name: inner.tokens.as_ref().and_then(|t| t.account_name.clone()),
+        root_folder_id: inner.tokens.as_ref().and_then(|t| t.root_folder_id.clone()),
         vault_unlocked,
         has_remote_manifest,
         sync_enabled: inner.config.sync_enabled,
@@ -8066,7 +8439,7 @@ impl GDriveRuntime {
         }
     }
 
-    fn notify_sync(&self) {
+    pub(crate) fn notify_sync(&self) {
         self.sync_notify.notify_one();
     }
 
@@ -8301,37 +8674,22 @@ impl GDriveRuntime {
         uid_opt: Option<&str>,
     ) -> Result<VaultFolderIds, GDriveError> {
         ensure_relay_disabled(relay_enabled)?;
-        if let (Some(root), Some(uid_dir), Some(blobs), Some(history)) = (
-            tokens.root_folder_id.clone(),
-            tokens.uid_folder_id.clone(),
-            tokens.blobs_folder_id.clone(),
-            tokens.history_folder_id.clone(),
-        ) {
-            return Ok(VaultFolderIds {
-                root_folder_id: root,
-                uid_folder_id: uid_dir,
-                blobs_folder_id: blobs,
-                history_folder_id: history,
-                manifest_file_id: tokens.manifest_file_id.clone(),
-            });
-        }
         let access_token = tokens.access_token.clone();
-        let folders = self
+        let (folders, updated) = self
             .client
-            .ensure_vault_folders(
+            .verify_or_recover_vault_folders(
                 relay_enabled,
                 &access_token,
                 effective_gdrive_uid(uid_opt),
                 tokens,
             )
             .await?;
-        {
+        if updated {
             let mut inner = self.inner.lock().await;
             if inner.uid.as_deref() == uid_opt && inner.tokens.is_some() {
                 let _ = tokens.save_to_file(&self.paths.gdrive_tokens_file(uid_opt));
                 inner.tokens = Some(tokens.clone());
-                inner.has_remote_manifest =
-                    inner.has_remote_manifest || folders.manifest_file_id.is_some();
+                inner.has_remote_manifest = folders.manifest_file_id.is_some();
             }
         }
         Ok(folders)
@@ -8347,8 +8705,15 @@ fn spawn_gdrive_background_sync_loop(
 ) {
     let gdrive_bg = gdrive.clone();
     let handle = tauri::async_runtime::spawn(async move {
+        let mut first_tick = true;
         loop {
-            let interval_secs = gdrive_bg.auto_sync_interval_secs().await;
+            let interval_secs = if first_tick && gdrive_bg.can_background_sync().await {
+                first_tick = false;
+                GDRIVE_STARTUP_SYNC_DELAY_SECS
+            } else {
+                first_tick = false;
+                gdrive_bg.auto_sync_interval_secs().await
+            };
             let woke_by_notify = tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(interval_secs)) => false,
                 _ = gdrive_bg.sync_notify.notified() => true,
@@ -8493,150 +8858,200 @@ async fn run_gdrive_sync_cycle(
     let _ = gdrive.emit_status(app, false, store).await;
 
     let sync_body = async {
+        let relay_tokens = relay_cfg.lock().await.enabled;
         let (mut tokens, _) = gdrive
-            .ensure_fresh_tokens(relay_cfg.lock().await.enabled)
+            .ensure_fresh_tokens(relay_tokens)
             .await
             .map_err(|e| e.to_string())?;
+        let relay_folders = relay_cfg.lock().await.enabled;
         let folders = gdrive
-            .ensure_folders_cached(relay_cfg.lock().await.enabled, &mut tokens, uid_opt.as_deref())
+            .ensure_folders_cached(relay_folders, &mut tokens, uid_opt.as_deref())
             .await
             .map_err(|e| e.to_string())?;
 
-        // 1. Upload pending local media blobs first so history delta immediately carries new cloud_file_ids
-        if sync_media {
-            let vault = media_vault.read().await.clone();
-            let initial_pending = {
+        if let Some((reset_blobs, reset_history)) = gdrive
+            .client
+            .take_pending_store_recovery_reset(effective_gdrive_uid(uid_opt.as_deref()))
+        {
+            {
                 let guard = store.lock().await;
                 guard
-                    .compute_cloud_media_breakdown()
-                    .map(|b| b.pending_count)
-                    .unwrap_or(0)
-            };
-            if initial_pending > 0 {
-                {
-                    let mut inner = gdrive.inner.lock().await;
-                    inner.phase = GDRIVE_PHASE_UPLOADING_MEDIA.to_string();
-                    inner.progress_done = 0;
-                    inner.progress_total = initial_pending;
-                }
-                let _ = gdrive.emit_status(app, false, store).await;
-
-                let mut attempted = std::collections::HashSet::<String>::new();
-                let mut uploaded_count: u64 = 0;
-                loop {
-                    let batch = {
-                        let guard = store.lock().await;
-                        guard
-                            .list_pending_cloud_uploads(GDRIVE_MEDIA_SYNC_BATCH_LIMIT)
-                            .map_err(|e| format!("SQLite pending cloud uploads failed: {e}"))?
-                    };
-                    let next_items: Vec<MediaObjectRecord> = batch
-                        .into_iter()
-                        .filter(|obj| attempted.insert(obj.sha256.clone()))
-                        .collect();
-                    if next_items.is_empty() {
-                        break;
-                    }
-
-                    for obj in next_items {
-                        let relay_step = relay_cfg.lock().await.enabled;
-                        check_gdrive_relay_gate(relay_step)?;
-
-                        let (fresh_tokens, _) = gdrive
-                            .ensure_fresh_tokens(relay_step)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        tokens = fresh_tokens;
-
-                        let blob_name = format!("{}.tzmb", obj.sha256);
-                        let existing_id = gdrive
-                            .client
-                            .find_file_in_folder(
-                                relay_step,
-                                &tokens.access_token,
-                                &folders.blobs_folder_id,
-                                &blob_name,
-                                None,
-                            )
-                            .await
-                            .map_err(|e| e.to_string())?
-                            .map(|f| f.id);
-
-                        let cloud_file_id = if let Some(fid) = existing_id {
-                            fid
-                        } else {
-                            let tmp_guard =
-                                TempFileGuard::new(vault.next_cloud_tmp_path("gdrive-up", "tzmb"));
-                            if let Err(prep_err) = vault
-                                .prepare_cloud_encrypted_temp(
-                                    &obj,
-                                    master_key.as_bytes(),
-                                    tmp_guard.path(),
-                                )
-                                .await
-                            {
-                                let missing_on_disk = obj
-                                    .local_rel_path
-                                    .as_deref()
-                                    .and_then(|rel| vault.resolve_blob_path(rel).ok())
-                                    .is_some_and(|p| !p.exists());
-                                if missing_on_disk {
-                                    let guard = store.lock().await;
-                                    let _ = guard.mark_media_evicted(&obj.sha256);
-                                    continue;
-                                }
-                                return Err(format!(
-                                    "Không chuẩn bị được tệp mã hóa đám mây: {prep_err}"
-                                ));
-                            }
-
-                            let relay_upload = relay_cfg.lock().await.enabled;
-                            check_gdrive_relay_gate(relay_upload)?;
-
-                            let fid = gdrive
-                                .client
-                                .upload_file_resumable(
-                                    relay_upload,
-                                    &tokens.access_token,
-                                    &folders.blobs_folder_id,
-                                    &blob_name,
-                                    "application/octet-stream",
-                                    tmp_guard.path(),
-                                )
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            drop(tmp_guard);
-                            fid
-                        };
-
-                        let synced_ts = chrono_now_ms();
-                        {
-                            let guard = store.lock().await;
-                            guard
-                                .mark_media_cloud_synced(
-                                    &obj.sha256,
-                                    GDRIVE_PROVIDER_NAME,
-                                    &cloud_file_id,
-                                    1,
-                                    synced_ts,
-                                )
-                                .map_err(|e| format!("SQLite mark_media_cloud_synced: {e}"))?;
-                        }
-                        uploaded_count = uploaded_count.saturating_add(1);
-                        {
-                            let mut inner = gdrive.inner.lock().await;
-                            inner.progress_done = uploaded_count;
-                            if inner.progress_total < uploaded_count {
-                                inner.progress_total = uploaded_count;
-                            }
-                        }
-                        let _ = gdrive.emit_status(app, false, store).await;
-                    }
-                }
+                    .reset_gdrive_sync_state_for_vault_recovery(reset_blobs, reset_history)
+                    .map_err(|e| e.to_string())?;
+            }
+            if reset_history {
+                let mut inner = gdrive.inner.lock().await;
+                inner.last_history_sync_ts = None;
             }
         }
 
-        // 2. Sync encrypted delta message history (pull unseen remote deltas + push local changes)
+        // 1. Upload pending local media blobs first so history delta immediately carries new cloud_file_ids.
+        //    Non-relay media errors are captured so history/recall/tombstone sync and cloud orphan pruning
+        //    still complete in this cycle instead of being blocked by a single failing blob.
+        let mut media_err: Option<String> = None;
+        if sync_media {
+            let media_res: Result<(), GDriveError> = async {
+                let vault = media_vault.read().await.clone();
+                let initial_pending = {
+                    let guard = store.lock().await;
+                    guard
+                        .compute_cloud_media_breakdown()
+                        .map(|b| b.pending_count)
+                        .unwrap_or(0)
+                };
+                if initial_pending > 0 {
+                    {
+                        let mut inner = gdrive.inner.lock().await;
+                        inner.phase = GDRIVE_PHASE_UPLOADING_MEDIA.to_string();
+                        inner.progress_done = 0;
+                        inner.progress_total = initial_pending;
+                    }
+                    let _ = gdrive.emit_status(app, false, store).await;
+
+                    let mut attempted = std::collections::HashSet::<String>::new();
+                    let mut uploaded_count: u64 = 0;
+                    let mut first_blob_err: Option<String> = None;
+                    loop {
+                        let batch = {
+                            let guard = store.lock().await;
+                            guard
+                                .list_pending_cloud_uploads(GDRIVE_MEDIA_SYNC_BATCH_LIMIT)
+                                .map_err(|e| {
+                                    GDriveError::Other(format!(
+                                        "SQLite pending cloud uploads failed: {e}"
+                                    ))
+                                })?
+                        };
+                        let next_items: Vec<MediaObjectRecord> = batch
+                            .into_iter()
+                            .filter(|obj| attempted.insert(obj.sha256.clone()))
+                            .collect();
+                        if next_items.is_empty() {
+                            break;
+                        }
+
+                        for obj in next_items {
+                            let relay_step = relay_cfg.lock().await.enabled;
+                            ensure_relay_disabled(relay_step)?;
+
+                            let (fresh_tokens, _) = gdrive.ensure_fresh_tokens(relay_step).await?;
+                            tokens = fresh_tokens;
+
+                            let blob_name = format!("{}.tzmb", obj.sha256);
+                            let existing_id = gdrive
+                                .client
+                                .find_file_in_folder(
+                                    relay_step,
+                                    &tokens.access_token,
+                                    &folders.blobs_folder_id,
+                                    &blob_name,
+                                    None,
+                                )
+                                .await?
+                                .map(|f| f.id);
+
+                            let cloud_file_id = if let Some(fid) = existing_id {
+                                fid
+                            } else {
+                                let tmp_guard = TempFileGuard::new(
+                                    vault.next_cloud_tmp_path("gdrive-up", "tzmb"),
+                                );
+                                if let Err(prep_err) = vault
+                                    .prepare_cloud_encrypted_temp(
+                                        &obj,
+                                        master_key.as_bytes(),
+                                        tmp_guard.path(),
+                                    )
+                                    .await
+                                {
+                                    let missing_on_disk = obj
+                                        .local_rel_path
+                                        .as_deref()
+                                        .and_then(|rel| vault.resolve_blob_path(rel).ok())
+                                        .is_some_and(|p| !p.exists());
+                                    if missing_on_disk {
+                                        let guard = store.lock().await;
+                                        let _ = guard.mark_media_evicted(&obj.sha256);
+                                        continue;
+                                    }
+                                    {
+                                        let guard = store.lock().await;
+                                        let _ = guard.record_media_cloud_upload_failure(
+                                            &obj.sha256,
+                                            chrono_now_ms(),
+                                        );
+                                    }
+                                    if first_blob_err.is_none() {
+                                        first_blob_err = Some(format!(
+                                            "Không chuẩn bị được tệp mã hóa đám mây: {prep_err}"
+                                        ));
+                                    }
+                                    continue;
+                                }
+
+                                let relay_upload = relay_cfg.lock().await.enabled;
+                                ensure_relay_disabled(relay_upload)?;
+
+                                let fid = gdrive
+                                    .client
+                                    .upload_file_resumable(
+                                        relay_upload,
+                                        &tokens.access_token,
+                                        &folders.blobs_folder_id,
+                                        &blob_name,
+                                        "application/octet-stream",
+                                        tmp_guard.path(),
+                                    )
+                                    .await?;
+                                drop(tmp_guard);
+                                fid
+                            };
+
+                            let synced_ts = chrono_now_ms();
+                            {
+                                let guard = store.lock().await;
+                                guard
+                                    .mark_media_cloud_synced(
+                                        &obj.sha256,
+                                        GDRIVE_PROVIDER_NAME,
+                                        &cloud_file_id,
+                                        1,
+                                        synced_ts,
+                                    )
+                                    .map_err(|e| {
+                                        GDriveError::Other(format!(
+                                            "SQLite mark_media_cloud_synced: {e}"
+                                        ))
+                                    })?;
+                            }
+                            uploaded_count = uploaded_count.saturating_add(1);
+                            {
+                                let mut inner = gdrive.inner.lock().await;
+                                inner.progress_done = uploaded_count;
+                                if inner.progress_total < uploaded_count {
+                                    inner.progress_total = uploaded_count;
+                                }
+                            }
+                            let _ = gdrive.emit_status(app, false, store).await;
+                        }
+                    }
+                    if let Some(err_msg) = first_blob_err {
+                        return Err(GDriveError::Other(err_msg));
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(err) = media_res {
+                if matches!(err, GDriveError::RelayBlocked) {
+                    return Err(err.to_string());
+                }
+                media_err = Some(err.to_string());
+            }
+        }
+
+        // 2. Sync encrypted delta message history (pull unseen remote deltas + push local changes,
+        //    recalls/mutations via updated_ts, and message/thread deletion tombstones)
         if sync_history {
             let relay_hist = relay_cfg.lock().await.enabled;
             check_gdrive_relay_gate(relay_hist)?;
@@ -8691,8 +9106,55 @@ async fn run_gdrive_sync_cycle(
                     inner.last_history_sync_ts = Some(report.new_last_history_sync_ts);
                 }
             }
-            if report.downloaded_deltas > 0 || report.applied_messages > 0 {
+            if !report.orphaned_local_paths.is_empty() {
+                let vault = media_vault.read().await.clone();
+                vault.unlink_rel_paths(&report.orphaned_local_paths).await;
+            }
+            if report.downloaded_deltas > 0
+                || report.applied_messages > 0
+                || report.deleted_messages > 0
+                || report.deleted_threads > 0
+            {
                 let _ = app.emit("core://threads-updated", ());
+            }
+        }
+
+        // 3. Prune unreferenced cloud media blobs queued by recall / local delete / thread delete.
+        //    Runs AFTER sync_history so remote deltas are merged before verifying zero references.
+        {
+            let relay_prune = relay_cfg.lock().await.enabled;
+            check_gdrive_relay_gate(relay_prune)?;
+            let has_pending_deletes = {
+                let guard = store.lock().await;
+                guard
+                    .list_pending_cloud_deletes(1)
+                    .map(|rows| !rows.is_empty())
+                    .unwrap_or(false)
+            };
+            if has_pending_deletes {
+                let (fresh_tokens, _) = gdrive
+                    .ensure_fresh_tokens(relay_prune)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                tokens = fresh_tokens;
+                match gdrive
+                    .client
+                    .drain_pending_cloud_deletes(
+                        relay_prune,
+                        &tokens.access_token,
+                        store,
+                        GDRIVE_CLOUD_DELETE_BATCH_LIMIT,
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(GDriveError::RelayBlocked) => {
+                        return Err(GDriveError::RelayBlocked.to_string());
+                    }
+                    Err(_) => {
+                        // Best-effort cleanup; failed entries remain queued in SQLite for retry.
+                    }
+                }
             }
         }
 
@@ -8704,6 +9166,9 @@ async fn run_gdrive_sync_cycle(
         {
             let mut inner = gdrive.inner.lock().await;
             inner.last_sync_ts = Some(now_ms);
+        }
+        if let Some(err) = media_err {
+            return Err(err);
         }
         Ok::<SyncCycleOutcome, String>(SyncCycleOutcome::Finished)
     };
@@ -8983,11 +9448,12 @@ async fn rehydrate_cloud_object<R: tauri::Runtime>(
 
                     let tmp_guard =
                         TempFileGuard::new(vault.next_cloud_tmp_path("gdrive-dl", "tzmb"));
+                    let relay_dl = relay_cfg.lock().await.enabled;
                     let dl_res = tokio::select! {
                         biased;
                         _ = cancel_rx.changed() => Err(GDriveError::RelayBlocked),
                         res = gdrive.client.download_file_to_path(
-                            relay_cfg.lock().await.enabled,
+                            relay_dl,
                             &tokens.access_token,
                             &cloud_file_id,
                             tmp_guard.path(),
@@ -9371,20 +9837,22 @@ async fn gdrive_connect_start(
             )
             .await?;
 
+        let relay_quota = state.relay_cfg.lock().await.enabled;
         let (quota, email, name) = state
             .gdrive
             .client
-            .fetch_drive_quota(state.relay_cfg.lock().await.enabled, &tokens.access_token)
+            .fetch_drive_quota(relay_quota, &tokens.access_token)
             .await?;
         tokens.account_email = email;
         tokens.account_name = name;
 
         let access_token = tokens.access_token.clone();
+        let relay_folders = state.relay_cfg.lock().await.enabled;
         let (has_manifest, mut connect_warning) = match state
             .gdrive
             .client
             .ensure_vault_folders(
-                state.relay_cfg.lock().await.enabled,
+                relay_folders,
                 &access_token,
                 effective_gdrive_uid(uid_opt.as_deref()),
                 &mut tokens,
@@ -9535,11 +10003,12 @@ async fn gdrive_unlock_vault(
         .map_err(|e| e.to_string())?;
 
     let access_token = tokens.access_token.clone();
+    let relay_unlock = state.relay_cfg.lock().await.enabled;
     let (master_key, _created_new) = state
         .gdrive
         .client
         .unlock_or_init_vault(
-            state.relay_cfg.lock().await.enabled,
+            relay_unlock,
             &access_token,
             effective_gdrive_uid(uid_opt.as_deref()),
             &passphrase,
@@ -9579,6 +10048,40 @@ async fn gdrive_unlock_vault(
 }
 
 #[tauri::command]
+async fn gdrive_lock_vault(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    // #52b: Cancel active operations, clear `master_key` in RAM and delete cached master key
+    // file on disk WITHOUT disconnecting Google Drive OAuth tokens.
+    state.gdrive.cancel_active_operations();
+    let session_uid = {
+        let sess = state.session.lock().await;
+        let u = sess.profile.uid.trim();
+        (!u.is_empty()).then(|| u.to_string())
+    };
+    let stored_uid = {
+        let mut inner = state.gdrive.inner.lock().await;
+        let prev_uid = inner.uid.clone();
+        inner.master_key = None;
+        inner.syncing = false;
+        inner.progress_done = 0;
+        inner.progress_total = 0;
+        if inner.phase != GDRIVE_PHASE_PAUSED_RELAY {
+            inner.phase = GDRIVE_PHASE_IDLE.to_string();
+        }
+        prev_uid
+    };
+    CloudMasterKey::delete_file(&state.paths.gdrive_master_key_file(stored_uid.as_deref()));
+    if session_uid != stored_uid {
+        CloudMasterKey::delete_file(&state.paths.gdrive_master_key_file(session_uid.as_deref()));
+    }
+    let relay_enabled = state.relay_cfg.lock().await.enabled;
+    let _ = state
+        .gdrive
+        .emit_status(&app, relay_enabled, &state.store)
+        .await;
+    Ok(())
+}
+
+#[tauri::command]
 async fn gdrive_sync_now(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -9610,10 +10113,11 @@ async fn gdrive_get_storage_overview(
         .await
         .map_err(|e| e.to_string())?;
 
+    let relay_quota = state.relay_cfg.lock().await.enabled;
     let (quota, email, name) = state
         .gdrive
         .client
-        .fetch_drive_quota(state.relay_cfg.lock().await.enabled, &tokens.access_token)
+        .fetch_drive_quota(relay_quota, &tokens.access_token)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -9636,21 +10140,19 @@ async fn gdrive_get_storage_overview(
         }
     }
 
+    let relay_folders = state.relay_cfg.lock().await.enabled;
     let folders = state
         .gdrive
-        .ensure_folders_cached(
-            state.relay_cfg.lock().await.enabled,
-            &mut tokens,
-            uid_opt.as_deref(),
-        )
+        .ensure_folders_cached(relay_folders, &mut tokens, uid_opt.as_deref())
         .await
         .map_err(|e| e.to_string())?;
 
+    let relay_list = state.relay_cfg.lock().await.enabled;
     let history_files = state
         .gdrive
         .client
         .list_folder_files(
-            state.relay_cfg.lock().await.enabled,
+            relay_list,
             &tokens.access_token,
             &folders.history_folder_id,
         )
@@ -9665,7 +10167,8 @@ async fn gdrive_get_storage_overview(
         }
     }
 
-    check_gdrive_relay_gate(state.relay_cfg.lock().await.enabled)?;
+    let relay_after_list = state.relay_cfg.lock().await.enabled;
+    check_gdrive_relay_gate(relay_after_list)?;
 
     let clamped_limit = limit.unwrap_or(50).clamp(1, 500);
     let (breakdown, by_thread, largest_items) = {
@@ -9706,11 +10209,15 @@ async fn execute_gdrive_prune_targets(
     check_gdrive_relay_gate(relay_enabled)?;
 
     let _sync_guard = state.gdrive.sync_lock.lock().await;
-    check_gdrive_relay_gate(state.relay_cfg.lock().await.enabled)?;
+    let mut cancel_rx = state.gdrive.cancel_tx.subscribe();
+    let _ = cancel_rx.borrow_and_update();
 
-    let (mut tokens, _) = state
+    let relay_tokens = state.relay_cfg.lock().await.enabled;
+    check_gdrive_relay_gate(relay_tokens)?;
+
+    let (mut tokens, initial_uid) = state
         .gdrive
-        .ensure_fresh_tokens(state.relay_cfg.lock().await.enabled)
+        .ensure_fresh_tokens(relay_tokens)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -9722,6 +10229,9 @@ async fn execute_gdrive_prune_targets(
     let total = targets.len() as u64;
     {
         let mut inner = state.gdrive.inner.lock().await;
+        if inner.tokens.is_none() || inner.uid != initial_uid {
+            return Err(GDriveError::NotConnected.to_string());
+        }
         inner.syncing = true;
         inner.phase = GDRIVE_PHASE_PRUNING.to_string();
         inner.progress_done = 0;
@@ -9735,22 +10245,70 @@ async fn execute_gdrive_prune_targets(
     let mut freed_bytes: u64 = 0;
     let mut failed_count: u64 = 0;
     let mut relay_interrupted = false;
+    let mut disconnected_interrupted = false;
+    let mut cancelled_interrupted = false;
 
     for (idx, (sha, cloud_file_id, size_bytes)) in targets.into_iter().enumerate() {
+        // #24a: Immediately abort prune on cancel signal, Relay toggle, or Google Drive disconnect.
+        if cancel_rx.has_changed().unwrap_or(false) {
+            cancelled_interrupted = true;
+            break;
+        }
         let relay_step = state.relay_cfg.lock().await.enabled;
         if relay_step {
             relay_interrupted = true;
             break;
         }
-        if let Ok((fresh_tokens, _)) = state.gdrive.ensure_fresh_tokens(relay_step).await {
-            tokens = fresh_tokens;
-        }
-        match state
-            .gdrive
-            .client
-            .delete_drive_file(relay_step, &tokens.access_token, &cloud_file_id)
-            .await
         {
+            let inner = state.gdrive.inner.lock().await;
+            if inner.tokens.is_none() || inner.uid != initial_uid {
+                disconnected_interrupted = true;
+                break;
+            }
+        }
+        let refresh_res = tokio::select! {
+            biased;
+            _ = cancel_rx.changed() => {
+                cancelled_interrupted = true;
+                break;
+            }
+            res = state.gdrive.ensure_fresh_tokens(relay_step) => res,
+        };
+        match refresh_res {
+            Ok((fresh_tokens, uid_now)) => {
+                if uid_now != initial_uid {
+                    disconnected_interrupted = true;
+                    break;
+                }
+                tokens = fresh_tokens;
+            }
+            Err(GDriveError::NotConnected) => {
+                disconnected_interrupted = true;
+                break;
+            }
+            Err(GDriveError::RelayBlocked) => {
+                relay_interrupted = true;
+                break;
+            }
+            Err(_) => {
+                if state.gdrive.inner.lock().await.tokens.is_none() {
+                    disconnected_interrupted = true;
+                    break;
+                }
+            }
+        }
+        let delete_res = tokio::select! {
+            biased;
+            _ = cancel_rx.changed() => {
+                cancelled_interrupted = true;
+                break;
+            }
+            res = state
+                .gdrive
+                .client
+                .delete_drive_file(relay_step, &tokens.access_token, &cloud_file_id) => res,
+        };
+        match delete_res {
             Ok(()) => {
                 deleted_shas.push(sha);
                 deleted_count = deleted_count.saturating_add(1);
@@ -9766,18 +10324,26 @@ async fn execute_gdrive_prune_targets(
         }
         {
             let mut inner = state.gdrive.inner.lock().await;
+            if inner.tokens.is_none() || inner.uid != initial_uid {
+                disconnected_interrupted = true;
+                break;
+            }
             inner.progress_done = (idx as u64).saturating_add(1);
         }
         let _ = state.gdrive.emit_status(app, false, &state.store).await;
     }
 
-    if !deleted_shas.is_empty() {
+    let same_uid_after = {
+        let inner = state.gdrive.inner.lock().await;
+        inner.uid == initial_uid
+    };
+    if !deleted_shas.is_empty() && same_uid_after {
         let guard = state.store.lock().await;
         let _ = guard.mark_media_cloud_pruned(&deleted_shas);
     }
 
     let relay_after = relay_interrupted || state.relay_cfg.lock().await.enabled;
-    {
+    let disconnected_now = {
         let mut inner = state.gdrive.inner.lock().await;
         inner.syncing = false;
         inner.phase = if relay_after {
@@ -9787,7 +10353,8 @@ async fn execute_gdrive_prune_targets(
         };
         inner.progress_done = 0;
         inner.progress_total = 0;
-    }
+        inner.tokens.is_none() || inner.uid != initial_uid
+    };
     let _ = state
         .gdrive
         .emit_status(app, relay_after, &state.store)
@@ -9795,6 +10362,12 @@ async fn execute_gdrive_prune_targets(
 
     if relay_interrupted {
         return Err(GDriveError::RelayBlocked.to_string());
+    }
+    if disconnected_interrupted || (cancelled_interrupted && disconnected_now) {
+        return Err(GDriveError::NotConnected.to_string());
+    }
+    if cancelled_interrupted {
+        return Err("Đã hủy tiến trình dọn dẹp dữ liệu đám mây".to_string());
     }
     Ok(GDrivePruneResultDto {
         deleted_count,
@@ -9861,28 +10434,135 @@ async fn gdrive_prune_cloud_older_than(
 
 static AI_MSG_SEQ: AtomicU64 = AtomicU64::new(1);
 
-fn normalize_ai_session_id(session_id: Option<&str>) -> String {
-    match session_id.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(s) => s.to_string(),
-        None => "default".to_string(),
+struct AtomicBoolResetGuard(Arc<AtomicBool>);
+
+impl Drop for AtomicBoolResetGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
-async fn translate_fallback_gemini_key(state: &AppState) -> Option<String> {
-    let cfg = state.translate_cfg.lock().await;
-    let trimmed = cfg.gemini_key.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
+fn normalize_ai_session_id(session_id: Option<&str>) -> Result<String, String> {
+    validate_strict_ai_session_id(session_id.unwrap_or(""), true).map_err(|e| e.to_string())
+}
+
+fn validate_required_ai_session_id(session_id: &str) -> Result<String, String> {
+    validate_strict_ai_session_id(session_id, false).map_err(|e| e.to_string())
+}
+
+async fn read_ai_session_epoch(
+    epochs: &Arc<Mutex<HashMap<String, u64>>>,
+    session_id: &str,
+) -> u64 {
+    epochs.lock().await.get(session_id).copied().unwrap_or(0)
+}
+
+async fn capture_ai_session_epoch(
+    epochs: &Arc<Mutex<HashMap<String, u64>>>,
+    session_id: &str,
+) -> u64 {
+    let mut guard = epochs.lock().await;
+    *guard.entry(session_id.to_string()).or_insert(0)
+}
+
+async fn bump_ai_session_epoch(
+    epochs: &Arc<Mutex<HashMap<String, u64>>>,
+    session_id: &str,
+) -> u64 {
+    let mut guard = epochs.lock().await;
+    let entry = guard.entry(session_id.to_string()).or_insert(0);
+    *entry = entry.saturating_add(1);
+    *entry
+}
+
+async fn bump_all_ai_session_epochs(epochs: &Arc<Mutex<HashMap<String, u64>>>) {
+    let mut guard = epochs.lock().await;
+    for val in guard.values_mut() {
+        *val = val.saturating_add(1);
     }
+}
+
+/// Atomically verify that `session_id`'s mutation epoch did not advance during
+/// streaming (e.g. from `ai_delete_session`, `ai_clear_messages`, or logout)
+/// and persist BOTH `user_msg` and `model_msg` under the same `store` lock.
+///
+/// Lock ordering is strictly `store` -> `epochs` (matching delete/clear) so
+/// deadlocks and TOCTOU resurrection races are impossible.
+async fn persist_ai_turn_if_epoch_unchanged(
+    store: &Arc<Mutex<MessageStore>>,
+    epochs: &Arc<Mutex<HashMap<String, u64>>>,
+    session_id: &str,
+    start_epoch: u64,
+    user_msg: &AiStoredMessageDto,
+    model_msg: &AiStoredMessageDto,
+) -> Result<bool, String> {
+    let store_guard = store.lock().await;
+    let current_epoch = read_ai_session_epoch(epochs, session_id).await;
+    if current_epoch != start_epoch {
+        return Ok(false);
+    }
+    store_guard
+        .insert_ai_message(user_msg)
+        .map_err(|e| e.to_string())?;
+    store_guard
+        .insert_ai_message(model_msg)
+        .map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+async fn register_ai_cancel_token(
+    tokens: &Arc<Mutex<HashMap<String, AiCancelToken>>>,
+    session_id: &str,
+) -> AiCancelToken {
+    let token = AiCancelToken::new();
+    let mut guard = tokens.lock().await;
+    if let Some(prev) = guard.insert(session_id.to_string(), token.clone()) {
+        prev.cancel();
+    }
+    token
+}
+
+async fn unregister_ai_cancel_token(
+    tokens: &Arc<Mutex<HashMap<String, AiCancelToken>>>,
+    session_id: &str,
+    token: &AiCancelToken,
+) {
+    let mut guard = tokens.lock().await;
+    if !token.is_cancelled() {
+        guard.remove(session_id);
+    }
+}
+
+async fn cancel_ai_token_for_session(
+    tokens: &Arc<Mutex<HashMap<String, AiCancelToken>>>,
+    session_id: &str,
+) -> bool {
+    let mut guard = tokens.lock().await;
+    if let Some(tok) = guard.remove(session_id) {
+        tok.cancel();
+        true
+    } else {
+        false
+    }
+}
+
+async fn cancel_all_ai_tokens(tokens: &Arc<Mutex<HashMap<String, AiCancelToken>>>) {
+    let mut guard = tokens.lock().await;
+    for (_, tok) in guard.drain() {
+        tok.cancel();
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AiInstallZeroClawResponse {
+    install: ZeroClawInstallResultDto,
+    config: AiConfigPublic,
 }
 
 #[tauri::command]
 async fn ai_get_config(state: State<'_, AppState>) -> Result<AiConfigPublic, String> {
-    let fallback_key = translate_fallback_gemini_key(&state).await;
     let cfg = state.ai_config.lock().await;
-    Ok(cfg.to_public(fallback_key.as_deref()))
+    Ok(cfg.to_public())
 }
 
 #[tauri::command]
@@ -9902,24 +10582,183 @@ async fn ai_update_config(
         let mut cfg = state.ai_config.lock().await;
         *cfg = staged.clone();
     }
-    let fallback_key = translate_fallback_gemini_key(&state).await;
-    Ok(staged.to_public(fallback_key.as_deref()))
+    cancel_all_ai_tokens(&state.ai_cancel_tokens).await;
+    state.zeroclaw_acp.shutdown_all().await;
+    Ok(staged.to_public())
 }
 
 #[tauri::command]
 async fn ai_probe_cli(
     state: State<'_, AppState>,
     cli_path: Option<String>,
+    gateway_url: Option<String>,
 ) -> Result<AiCliProbeDto, String> {
-    let target = match cli_path
+    let (cfg_cli, cfg_gw) = {
+        let cfg = state.ai_config.lock().await;
+        (cfg.zeroclaw_path.clone(), cfg.zeroclaw_gateway_url.clone())
+    };
+    let target_cli = match cli_path
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
         Some(p) => p.to_string(),
-        None => state.ai_config.lock().await.cli_path.clone(),
+        None => cfg_cli,
     };
-    Ok(probe_gemini_cli(&target).await)
+    let target_gw = match gateway_url {
+        Some(g) => g.trim().to_string(),
+        None => cfg_gw,
+    };
+    Ok(probe_zeroclaw_in_dir(&target_cli, &target_gw, Some(&state.paths.root)).await)
+}
+
+#[tauri::command]
+async fn ai_list_models(
+    state: State<'_, AppState>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+) -> Result<Vec<AiModelInfoDto>, String> {
+    let (cfg_url, cfg_key) = {
+        let cfg = state.ai_config.lock().await;
+        (cfg.api_base_url.clone(), cfg.api_key.clone())
+    };
+    let target_url = base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| cfg_url.clone());
+    let target_key = match api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(override_key) => override_key.to_string(),
+        None if is_same_cloud_api_host(&target_url, &cfg_url) => cfg_key,
+        None => String::new(),
+    };
+    let relay = state.relay_cfg.lock().await.clone();
+    let policy_cfg = AiConfig {
+        backend: AiBackend::CloudApi,
+        ..AiConfig::default()
+    };
+    check_ai_relay_policy(&policy_cfg, &relay, AiOperation::ListModels)
+        .map_err(|e| e.to_string())?;
+    fetch_cloud_models_with_relay(&target_url, &target_key, &relay)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn ai_install_zeroclaw(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<AiInstallZeroClawResponse, String> {
+    let Ok(_install_guard) = state.zeroclaw_install_lock.try_lock() else {
+        return Err("Đang tải và cài đặt ZeroClaw, vui lòng đợi hoàn tất.".into());
+    };
+    state.zeroclaw_installing.store(true, Ordering::SeqCst);
+    let _installing_reset = AtomicBoolResetGuard(state.zeroclaw_installing.clone());
+
+    // Cancel all active AI turns and terminate resident `zeroclaw.exe` ACP
+    // processes BEFORE replacing the executable on Windows (avoids `os error 5`
+    // sharing/access violations on `zeroclaw.exe`).
+    cancel_all_ai_tokens(&state.ai_cancel_tokens).await;
+    state.zeroclaw_acp.shutdown_all().await;
+
+    let relay = state.relay_cfg.lock().await.clone();
+    let app_for_emit = app.clone();
+    let install = install_zeroclaw_latest(&state.paths.root, &relay, move |progress| {
+        let _ = app_for_emit.emit("core://zeroclaw-install-progress", &progress);
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Belt-and-suspenders shutdown before updating live config in case anything
+    // started concurrently right before `zeroclaw_installing` became visible.
+    cancel_all_ai_tokens(&state.ai_cancel_tokens).await;
+    state.zeroclaw_acp.shutdown_all().await;
+
+    let staged = {
+        let cfg = state.ai_config.lock().await;
+        let mut next = cfg.clone();
+        next.backend = AiBackend::Zeroclaw;
+        next.zeroclaw_path = install.installed_path.clone();
+        next
+    };
+    let cfg_path = ai_config_file(&state.paths.root);
+    staged
+        .save_to_file(&cfg_path)
+        .map_err(|e| format!("Đã cài ZeroClaw nhưng chưa lưu được cấu hình: {e}"))?;
+    {
+        let mut cfg = state.ai_config.lock().await;
+        *cfg = staged.clone();
+    }
+    Ok(AiInstallZeroClawResponse {
+        install,
+        config: staged.to_public(),
+    })
+}
+
+#[tauri::command]
+async fn ai_list_sessions(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<AiSessionDto>, String> {
+    let capped = limit.unwrap_or(100).clamp(1, 500);
+    let store = state.store.lock().await;
+    store.list_ai_sessions(capped).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn ai_create_session(
+    state: State<'_, AppState>,
+    title: Option<String>,
+) -> Result<AiSessionDto, String> {
+    let now = chrono_now_ms();
+    let seq = AI_MSG_SEQ.fetch_add(1, Ordering::Relaxed);
+    let id = format!("s-{now}-{seq}");
+    let store = state.store.lock().await;
+    store
+        .create_ai_session(&id, title.as_deref().unwrap_or(""), now)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn ai_rename_session(
+    state: State<'_, AppState>,
+    session_id: String,
+    title: String,
+) -> Result<AiSessionDto, String> {
+    let sid = validate_required_ai_session_id(&session_id)?;
+    let store = state.store.lock().await;
+    store
+        .rename_ai_session(&sid, &title)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn ai_delete_session(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<usize, String> {
+    let sid = validate_required_ai_session_id(&session_id)?;
+    bump_ai_session_epoch(&state.ai_session_epochs, &sid).await;
+    cancel_ai_token_for_session(&state.ai_cancel_tokens, &sid).await;
+    state.zeroclaw_acp.shutdown_session(&sid).await;
+    delete_zeroclaw_session_dir(&state.paths.root, &sid);
+    let (deleted, cancelled_late_turn) = {
+        let store = state.store.lock().await;
+        bump_ai_session_epoch(&state.ai_session_epochs, &sid).await;
+        let had_late = cancel_ai_token_for_session(&state.ai_cancel_tokens, &sid).await;
+        let deleted = store.delete_ai_session(&sid).map_err(|e| e.to_string())?;
+        (deleted, had_late)
+    };
+    if cancelled_late_turn {
+        state.zeroclaw_acp.shutdown_session(&sid).await;
+        delete_zeroclaw_session_dir(&state.paths.root, &sid);
+    }
+    Ok(deleted)
 }
 
 #[tauri::command]
@@ -9928,7 +10767,7 @@ async fn ai_list_messages(
     session_id: Option<String>,
     limit: Option<usize>,
 ) -> Result<Vec<AiStoredMessageDto>, String> {
-    let sid = normalize_ai_session_id(session_id.as_deref());
+    let sid = normalize_ai_session_id(session_id.as_deref())?;
     let capped = limit.unwrap_or(100).clamp(1, 500);
     let store = state.store.lock().await;
     store
@@ -9941,9 +10780,23 @@ async fn ai_clear_messages(
     state: State<'_, AppState>,
     session_id: Option<String>,
 ) -> Result<usize, String> {
-    let sid = normalize_ai_session_id(session_id.as_deref());
-    let store = state.store.lock().await;
-    store.clear_ai_messages(&sid).map_err(|e| e.to_string())
+    let sid = normalize_ai_session_id(session_id.as_deref())?;
+    bump_ai_session_epoch(&state.ai_session_epochs, &sid).await;
+    cancel_ai_token_for_session(&state.ai_cancel_tokens, &sid).await;
+    state.zeroclaw_acp.shutdown_session(&sid).await;
+    clear_zeroclaw_session_memory(&state.paths.root, &sid);
+    let (deleted, cancelled_late_turn) = {
+        let store = state.store.lock().await;
+        bump_ai_session_epoch(&state.ai_session_epochs, &sid).await;
+        let had_late = cancel_ai_token_for_session(&state.ai_cancel_tokens, &sid).await;
+        let deleted = store.clear_ai_messages(&sid).map_err(|e| e.to_string())?;
+        (deleted, had_late)
+    };
+    if cancelled_late_turn {
+        state.zeroclaw_acp.shutdown_session(&sid).await;
+        clear_zeroclaw_session_memory(&state.paths.root, &sid);
+    }
+    Ok(deleted)
 }
 
 #[tauri::command]
@@ -9963,10 +10816,13 @@ async fn ai_chat_send(
             "Trợ lý AI đang tắt. Hãy bật Trợ lý AI trong Cài đặt trước khi sử dụng.".into(),
         );
     }
+    if cfg.backend == AiBackend::Zeroclaw && state.zeroclaw_installing.load(Ordering::SeqCst) {
+        return Err("Đang tải và cài đặt ZeroClaw, vui lòng đợi hoàn tất trước khi tiếp tục.".into());
+    }
 
-    let sid = normalize_ai_session_id(session_id.as_deref());
+    let sid = normalize_ai_session_id(session_id.as_deref())?;
     let relay = state.relay_cfg.lock().await.clone();
-    let fallback_key = translate_fallback_gemini_key(&state).await;
+    check_ai_relay_policy(&cfg, &relay, AiOperation::Chat).map_err(|e| e.to_string())?;
 
     let user_ts = chrono_now_ms();
     let user_seq = AI_MSG_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -9980,30 +10836,40 @@ async fn ai_chat_send(
         ts: user_ts,
     };
 
-    let history: Vec<AiChatTurn> = {
+    // Register cancel token and snapshot mutation epoch + prior history BEFORE
+    // streaming, WITHOUT inserting `user_msg` yet so failed turns, pre-token
+    // cancels, or concurrent session deletes/clears leave zero orphaned rows.
+    let cancel_token = register_ai_cancel_token(&state.ai_cancel_tokens, &sid).await;
+    let (start_epoch, history): (u64, Vec<AiChatTurn>) = {
         let store = state.store.lock().await;
+        let epoch = capture_ai_session_epoch(&state.ai_session_epochs, &sid).await;
         let prior = store
             .list_ai_messages(&sid, MAX_CHAT_HISTORY_TURNS)
             .map_err(|e| e.to_string())?;
-        store
-            .insert_ai_message(&user_msg)
-            .map_err(|e| e.to_string())?;
-        prior
+        let turns = prior
             .into_iter()
             .map(|m| AiChatTurn {
                 role: m.role,
                 content: m.content,
             })
-            .collect()
+            .collect();
+        (epoch, turns)
     };
+    if cancel_token.is_cancelled() {
+        unregister_ai_cancel_token(&state.ai_cancel_tokens, &sid, &cancel_token).await;
+        return Err("Đã dừng tạo phản hồi.".into());
+    }
 
     let sid_for_emit = sid.clone();
-    let reply = ai_chat_stream_with_relay(
+    let stream_res = ai_chat_stream_session_with_acp(
         &cfg,
         &relay,
-        fallback_key.as_deref(),
+        Some(&state.paths.root),
+        Some(&state.zeroclaw_acp),
+        &sid,
         &history,
         prompt_clean,
+        Some(&cancel_token),
         |delta| {
             let _ = app.emit(
                 "core://ai-stream-delta",
@@ -10014,27 +10880,79 @@ async fn ai_chat_send(
             );
         },
     )
-    .await
-    .map_err(|e| e.to_string())?;
+    .await;
+    unregister_ai_cancel_token(&state.ai_cancel_tokens, &sid, &cancel_token).await;
+
+    let reply = stream_res.map_err(|e| e.to_string())?;
+    if reply.text.trim().is_empty() {
+        return Err(if cancel_token.is_cancelled() {
+            "Đã dừng tạo phản hồi.".into()
+        } else {
+            "Trợ lý AI không trả về nội dung.".into()
+        });
+    }
 
     let model_ts = chrono_now_ms().max(user_ts.saturating_add(1));
     let model_seq = AI_MSG_SEQ.fetch_add(1, Ordering::Relaxed);
     let model_msg = AiStoredMessageDto {
         id: format!("ai-m-{model_ts}-{model_seq}"),
-        session_id: sid,
+        session_id: sid.clone(),
         role: "model".to_string(),
         content: reply.text,
         model: reply.model,
         backend: reply.backend.as_str().to_string(),
         ts: model_ts,
     };
-    {
-        let store = state.store.lock().await;
-        store
-            .insert_ai_message(&model_msg)
-            .map_err(|e| e.to_string())?;
+    let persisted = persist_ai_turn_if_epoch_unchanged(
+        &state.store,
+        &state.ai_session_epochs,
+        &sid,
+        start_epoch,
+        &user_msg,
+        &model_msg,
+    )
+    .await?;
+    if !persisted {
+        return Err("Phiên trò chuyện AI đã bị xóa hoặc dọn sạch trong lúc tạo phản hồi.".into());
     }
     Ok(model_msg)
+}
+
+#[tauri::command]
+async fn ai_chat_cancel(
+    state: State<'_, AppState>,
+    session_id: Option<String>,
+) -> Result<bool, String> {
+    let sid = normalize_ai_session_id(session_id.as_deref())?;
+    let had_token = cancel_ai_token_for_session(&state.ai_cancel_tokens, &sid).await;
+    let acp_cancelled = state.zeroclaw_acp.cancel_session(&sid).await;
+    Ok(had_token || acp_cancelled)
+}
+
+#[tauri::command]
+async fn ai_run_zeroclaw_command(
+    state: State<'_, AppState>,
+    command: String,
+    session_id: Option<String>,
+) -> Result<AiCommandResultDto, String> {
+    if state.zeroclaw_installing.load(Ordering::SeqCst) {
+        return Err("Đang tải và cài đặt ZeroClaw, vui lòng đợi hoàn tất trước khi tiếp tục.".into());
+    }
+    let sid = normalize_ai_session_id(session_id.as_deref())?;
+    let cfg = state.ai_config.lock().await.clone();
+    let relay = state.relay_cfg.lock().await.clone();
+    let is_memory_clear = command.trim().eq_ignore_ascii_case("memory_clear");
+    if is_memory_clear {
+        cancel_ai_token_for_session(&state.ai_cancel_tokens, &sid).await;
+        state.zeroclaw_acp.shutdown_session(&sid).await;
+    }
+    let result = run_zeroclaw_command(&cfg, &relay, &state.paths.root, &sid, &command)
+        .await
+        .map_err(|e| e.to_string())?;
+    if is_memory_clear {
+        state.zeroclaw_acp.shutdown_session(&sid).await;
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -10053,8 +10971,11 @@ async fn ai_summarize_unread(
             "Trợ lý AI đang tắt. Hãy bật Trợ lý AI trong Cài đặt trước khi sử dụng.".into(),
         );
     }
+    if cfg.backend == AiBackend::Zeroclaw && state.zeroclaw_installing.load(Ordering::SeqCst) {
+        return Err("Đang tải và cài đặt ZeroClaw, vui lòng đợi hoàn tất trước khi tiếp tục.".into());
+    }
     let relay = state.relay_cfg.lock().await.clone();
-    let fallback_key = translate_fallback_gemini_key(&state).await;
+    check_ai_relay_policy(&cfg, &relay, AiOperation::SummarizeUnread).map_err(|e| e.to_string())?;
 
     let (thread_title, is_group, unread_msgs) = {
         let store = state.store.lock().await;
@@ -10092,7 +11013,7 @@ async fn ai_summarize_unread(
     ai_summarize_unread_with_relay(
         &cfg,
         &relay,
-        fallback_key.as_deref(),
+        Some(&state.paths.root),
         &thread_title,
         is_group,
         &input_msgs,
@@ -10122,9 +11043,12 @@ async fn ai_translate_text(
             "Trợ lý AI đang tắt. Hãy bật Trợ lý AI trong Cài đặt trước khi sử dụng.".into(),
         );
     }
+    if cfg.backend == AiBackend::Zeroclaw && state.zeroclaw_installing.load(Ordering::SeqCst) {
+        return Err("Đang tải và cài đặt ZeroClaw, vui lòng đợi hoàn tất trước khi tiếp tục.".into());
+    }
     let relay = state.relay_cfg.lock().await.clone();
-    let fallback_key = translate_fallback_gemini_key(&state).await;
-    ai_translate_text_with_relay(&cfg, &relay, fallback_key.as_deref(), &text, &target_lang)
+    check_ai_relay_policy(&cfg, &relay, AiOperation::Translate).map_err(|e| e.to_string())?;
+    ai_translate_text_with_relay(&cfg, &relay, Some(&state.paths.root), &text, &target_lang)
         .await
         .map_err(|e| e.to_string())
 }
@@ -10480,6 +11404,7 @@ fn open_message_store_with_recovery(db_path: &Path) -> MessageStore {
 
 pub fn run() {
     let paths = StoragePaths::resolve_default(None).expect("Failed to resolve storage directory");
+    scrub_stale_zeroclaw_ephemeral_and_secrets(&paths.root);
     let loaded_relay_cfg = RelayConfig::load_from_file(&paths.relay_file());
     let session_path = paths.session_file();
     let (session, relay_cfg) = init_session_with_relay_fallback(&session_path, loaded_relay_cfg);
@@ -10516,13 +11441,19 @@ pub fn run() {
 
     let close_to_tray = Arc::new(AtomicBool::new(true));
     let allow_exit = Arc::new(AtomicBool::new(false));
-    let call_mgr = Arc::new(call::CallManager::new(paths.clone()));
+    let passcode_locked = Arc::new(AtomicBool::new(false));
+    let call_mgr = Arc::new(call::CallManager::new_with_passcode_lock(
+        paths.clone(),
+        passcode_locked.clone(),
+    ));
     let webapp_accounts =
         webapp_accounts::WebAppAccountStore::load(paths.root.join("webapp_accounts.json"));
     let gdrive_for_setup = gdrive.clone();
+    let gdrive_for_sched = gdrive.clone();
     let relay_for_setup = relay_cfg_arc.clone();
     let store_for_setup = store_arc.clone();
     let media_vault_for_setup = media_vault_arc.clone();
+    let media_vault_for_sched = media_vault_arc.clone();
     let session_for_setup = sess_arc.clone();
     let store_for_automation = store_arc.clone();
     let scheduler_for_setup = scheduler.clone();
@@ -10536,12 +11467,14 @@ pub fn run() {
         gdrive,
         ws_task: ws_task_arc,
         qr_task: qr_task_arc,
+        qr_generation: Arc::new(AtomicU64::new(0)),
         active_thread_id: Arc::new(Mutex::new(None)),
         translate_cfg: Arc::new(Mutex::new(translate_cfg)),
         relay_cfg: relay_cfg_arc,
         pending_update: Arc::new(Mutex::new(None)),
         close_to_tray: close_to_tray.clone(),
         allow_exit: allow_exit.clone(),
+        passcode_locked,
         notify_popup: notify_popup::NotifyPopupController::new(),
         webapp_op_lock: Arc::new(Mutex::new(())),
         webapp_epoch: Arc::new(AtomicU64::new(0)),
@@ -10553,6 +11486,11 @@ pub fn run() {
         staged_raw_uploads: Arc::new(std::sync::Mutex::new(HashMap::new())),
         call_mgr,
         ai_config: Arc::new(Mutex::new(ai_cfg)),
+        zeroclaw_acp: ZeroClawAcpManager::new(),
+        zeroclaw_install_lock: Arc::new(Mutex::new(())),
+        zeroclaw_installing: Arc::new(AtomicBool::new(false)),
+        ai_cancel_tokens: Arc::new(Mutex::new(HashMap::new())),
+        ai_session_epochs: Arc::new(Mutex::new(HashMap::new())),
         scheduler,
         local_api,
     };
@@ -10624,12 +11562,14 @@ pub fn run() {
             message_toggle_pin,
             stickers_list,
             stickers_search,
+            stickers_suggest,
             message_send_sticker,
             pick_attachment_file,
             save_remote_file,
             open_saved_file,
             reveal_saved_file,
             fetch_image_data_url,
+            read_attachment_image_data_url,
             inspect_attachment_path,
             message_send_attachment_path,
             message_send_raw_attachment,
@@ -10667,6 +11607,7 @@ pub fn run() {
             app_check_update,
             app_install_update,
             app_set_close_to_tray,
+            app_set_passcode_locked,
             clipboard_copy_text,
             clipboard_copy_rgba_image,
             clipboard_copy_rgba_image_b64,
@@ -10696,6 +11637,7 @@ pub fn run() {
             gdrive_connect_cancel,
             gdrive_disconnect,
             gdrive_unlock_vault,
+            gdrive_lock_vault,
             gdrive_sync_now,
             gdrive_get_storage_overview,
             gdrive_delete_cloud_items,
@@ -10704,9 +11646,17 @@ pub fn run() {
             ai_get_config,
             ai_update_config,
             ai_probe_cli,
+            ai_list_models,
+            ai_install_zeroclaw,
+            ai_list_sessions,
+            ai_create_session,
+            ai_rename_session,
+            ai_delete_session,
             ai_list_messages,
             ai_clear_messages,
             ai_chat_send,
+            ai_chat_cancel,
+            ai_run_zeroclaw_command,
             ai_summarize_unread,
             ai_translate_text,
             schedule_list,
@@ -10745,6 +11695,8 @@ pub fn run() {
                         app_sched,
                         sess_sched,
                         store_sched,
+                        media_vault_for_sched,
+                        gdrive_for_sched,
                         notify_sched,
                     ));
                 });
@@ -10787,11 +11739,7 @@ pub fn run() {
                             if let Some(st) = quit_app.try_state::<AppState>() {
                                 notify_popup::force_hide_or_destroy(&quit_app, &st.notify_popup)
                                     .await;
-                                let _ = st.local_api.stop().await;
-                                st.gdrive.shutdown().await;
-                                let vault = st.media_vault.read().await.clone();
-                                vault.flush_access_touches(&st.store).await;
-                                st.call_mgr.teardown_for_session(None, &st.session).await;
+                                graceful_shutdown_services(&st).await;
                             }
                             quit_app.exit(0);
                         });
@@ -10862,8 +11810,16 @@ pub fn run() {
                 }
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Teza");
+        .build(tauri::generate_context!())
+        .expect("error while building Teza")
+        .run(|app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                if let Some(st) = app_handle.try_state::<AppState>() {
+                    notify_popup::force_destroy_sync(app_handle, &st.notify_popup);
+                    tauri::async_runtime::block_on(graceful_shutdown_services(&st));
+                }
+            }
+        });
 }
 
 #[cfg(test)]
@@ -11907,9 +12863,11 @@ mod tests {
         assert!(paused.connected);
         assert!(paused.vault_unlocked);
         assert_eq!(paused.account_email.as_deref(), Some("alice@example.com"));
+        assert_eq!(paused.root_folder_id.as_deref(), Some("r1"));
 
         let active = super::build_gdrive_status_snapshot(false, &inner, &breakdown);
         assert!(!active.relay_blocked);
+        assert_eq!(active.root_folder_id.as_deref(), Some("r1"));
         assert_eq!(active.phase, GDRIVE_PHASE_UPLOADING_MEDIA);
         assert!(active.syncing);
         assert_eq!(active.progress_done, 3);
@@ -12271,9 +13229,12 @@ mod tests {
             );
         }
 
-        assert_eq!(super::normalize_ai_session_id(None), "default");
-        assert_eq!(super::normalize_ai_session_id(Some("   ")), "default");
-        assert_eq!(super::normalize_ai_session_id(Some(" work ")), "work");
+        assert_eq!(super::normalize_ai_session_id(None).unwrap(), "default");
+        assert_eq!(
+            super::normalize_ai_session_id(Some("   ")).unwrap(),
+            "default"
+        );
+        assert_eq!(super::normalize_ai_session_id(Some(" work ")).unwrap(), "work");
     }
 
     #[test]
@@ -13158,5 +14119,368 @@ mod tests {
             super::ws_message_fallback_title(&mk("777001", "777001_0", "Nguyễn Văn A", false)),
             Some("Nguyễn Văn A")
         );
+    }
+
+    #[test]
+    fn classify_ws_message_is_live_separates_live_push_catchup_pull_and_duplicates() {
+        use zalo_core::socket;
+        // Brand-new real-time push messages always notify regardless of PC clock drift
+        assert_eq!(
+            super::classify_ws_message_is_live(socket::CMD_PUSH_MSG_1_1, false, false, false),
+            Some(true)
+        );
+        assert_eq!(
+            super::classify_ws_message_is_live(socket::CMD_PUSH_MSG_GROUP, false, false, false),
+            Some(true)
+        );
+        assert_eq!(
+            super::classify_ws_message_is_live(
+                socket::CMD_PUSH_MSG_E2EE_1_1,
+                false,
+                false,
+                false
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            super::classify_ws_message_is_live(
+                socket::CMD_PUSH_MSG_E2EE_GROUP,
+                false,
+                false,
+                false
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            super::classify_ws_message_is_live(socket::CMD_GET_MSG, false, false, false),
+            Some(true)
+        );
+
+        // Offline missed-message push (CMD_PUSH_MISS_MSG = 534), pull catchup, auth,
+        // and fallback unknown commands must NEVER be forced to `is_live: true`.
+        assert_eq!(
+            super::classify_ws_message_is_live(socket::CMD_PUSH_MISS_MSG, false, false, false),
+            None
+        );
+        assert_eq!(
+            super::classify_ws_message_is_live(socket::CMD_PULL_MSG_1_1, false, false, false),
+            None
+        );
+        assert_eq!(
+            super::classify_ws_message_is_live(socket::CMD_PULL_MSG_GROUP, false, false, false),
+            None
+        );
+        assert_eq!(
+            super::classify_ws_message_is_live(socket::CMD_AUTHEN, false, false, false),
+            None
+        );
+        assert_eq!(
+            super::classify_ws_message_is_live(599, false, false, false),
+            None
+        );
+
+        // Already-stored, already-read-on-phone, or recalled frames are always suppressed
+        assert_eq!(
+            super::classify_ws_message_is_live(socket::CMD_PUSH_MSG_1_1, true, false, false),
+            Some(false)
+        );
+        assert_eq!(
+            super::classify_ws_message_is_live(socket::CMD_PUSH_MSG_GROUP, false, true, false),
+            Some(false)
+        );
+        assert_eq!(
+            super::classify_ws_message_is_live(socket::CMD_PUSH_MSG_1_1, false, false, true),
+            Some(false)
+        );
+        assert_eq!(
+            super::classify_ws_message_is_live(socket::CMD_PUSH_MISS_MSG, false, false, true),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn ai_session_id_and_cancel_token_registry_lifecycle() {
+        assert_eq!(super::normalize_ai_session_id(None).unwrap(), "default");
+        assert_eq!(
+            super::normalize_ai_session_id(Some("  ")).unwrap(),
+            "default"
+        );
+        assert_eq!(
+            super::normalize_ai_session_id(Some(" s-1700000000000-7 ")).unwrap(),
+            "s-1700000000000-7"
+        );
+        assert_eq!(
+            zalo_core::ai::sanitize_ai_session_slug("s-1700000000000-7"),
+            "s-1700000000000-7"
+        );
+
+        // Strict required validator (used by ai_delete_session / ai_rename_session)
+        // must explicitly reject empty/whitespace input instead of targeting "default".
+        assert!(super::validate_required_ai_session_id("").is_err());
+        assert!(super::validate_required_ai_session_id("   ").is_err());
+        assert_eq!(
+            super::validate_required_ai_session_id(" s-1700000000000-7 ").unwrap(),
+            "s-1700000000000-7"
+        );
+
+        // Both validators must reject non-canonical IDs that would collide with or
+        // collapse into "default" inside `sanitize_ai_session_slug`.
+        let long_id = "a".repeat(49);
+        for bad in [
+            "Session-1",
+            "a.1",
+            "foo/bar",
+            "foo\\bar",
+            "../default",
+            "con",
+            "nul",
+            "com1",
+            "lpt9",
+            long_id.as_str(),
+        ] {
+            assert!(
+                super::normalize_ai_session_id(Some(bad)).is_err(),
+                "normalize_ai_session_id must reject invalid session id `{bad}`"
+            );
+            assert!(
+                super::validate_required_ai_session_id(bad).is_err(),
+                "validate_required_ai_session_id must reject invalid session id `{bad}`"
+            );
+        }
+
+        // Canonical IDs at the 48-char boundary must pass and match sanitize_ai_session_slug 1:1.
+        let max_valid = "a".repeat(48);
+        assert_eq!(
+            super::normalize_ai_session_id(Some(&max_valid)).unwrap(),
+            max_valid
+        );
+        assert_eq!(
+            zalo_core::ai::sanitize_ai_session_slug(&max_valid),
+            max_valid
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let tokens = std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::<String, zalo_core::ai::AiCancelToken>::new(),
+            ));
+
+            // Normal register -> unregister removes entry cleanly.
+            let t1 = super::register_ai_cancel_token(&tokens, "s-1").await;
+            assert!(!t1.is_cancelled());
+            super::unregister_ai_cancel_token(&tokens, "s-1", &t1).await;
+            assert!(!super::cancel_ai_token_for_session(&tokens, "s-1").await);
+
+            // Replacing an active token cancels the stale token and keeps the new token intact
+            // even when the stale turn later runs unregister.
+            let stale = super::register_ai_cancel_token(&tokens, "s-2").await;
+            let current = super::register_ai_cancel_token(&tokens, "s-2").await;
+            assert!(stale.is_cancelled());
+            assert!(!current.is_cancelled());
+            super::unregister_ai_cancel_token(&tokens, "s-2", &stale).await;
+            assert!(super::cancel_ai_token_for_session(&tokens, "s-2").await);
+            assert!(current.is_cancelled());
+            assert!(!super::cancel_ai_token_for_session(&tokens, "s-2").await);
+
+            // Independent sessions and cancel_all_ai_tokens.
+            let ta = super::register_ai_cancel_token(&tokens, "default").await;
+            let tb = super::register_ai_cancel_token(&tokens, "s-3").await;
+            assert!(super::cancel_ai_token_for_session(&tokens, "default").await);
+            assert!(ta.is_cancelled());
+            assert!(!tb.is_cancelled());
+            super::cancel_all_ai_tokens(&tokens).await;
+            assert!(tb.is_cancelled());
+            assert!(tokens.lock().await.is_empty());
+        });
+    }
+
+    #[test]
+    fn ai_session_epoch_guard_prevents_resurrection_and_orphaned_turns() {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tokio::sync::Mutex;
+        use zalo_core::data_dir::StoragePaths;
+        use zalo_core::store::{AiStoredMessageDto, MessageStore};
+
+        // Verify AtomicBoolResetGuard always clears installing flag on drop.
+        let installing = Arc::new(AtomicBool::new(true));
+        {
+            let _guard = super::AtomicBoolResetGuard(installing.clone());
+            assert!(installing.load(Ordering::SeqCst));
+        }
+        assert!(!installing.load(Ordering::SeqCst));
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("teza_tauri_ai_epoch_{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = StoragePaths::from_dir(&dir).unwrap();
+        let store = Arc::new(Mutex::new(
+            MessageStore::open(&paths.history_db(Some("u-ai-epoch"))).unwrap(),
+        ));
+        let epochs = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
+
+        let mk_msg = |id: &str, sid: &str, role: &str, content: &str, ts: i64| AiStoredMessageDto {
+            id: id.to_string(),
+            session_id: sid.to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+            model: if role == "model" {
+                "gpt-4o-mini".to_string()
+            } else {
+                String::new()
+            },
+            backend: if role == "model" {
+                "zeroclaw".to_string()
+            } else {
+                String::new()
+            },
+            ts,
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // 1. Normal turn with unchanged epoch persists both user_msg and model_msg together.
+            {
+                let s = store.lock().await;
+                s.create_ai_session("s-alpha", "Alpha", 1_000).unwrap();
+                s.create_ai_session("s-beta", "Beta", 1_000).unwrap();
+            }
+            let alpha_ep = super::capture_ai_session_epoch(&epochs, "s-alpha").await;
+            let beta_ep = super::capture_ai_session_epoch(&epochs, "s-beta").await;
+
+            let u1 = mk_msg("u-1", "s-alpha", "user", "Xin chào", 2_000);
+            let m1 = mk_msg("m-1", "s-alpha", "model", "Chào bạn!", 2_001);
+            assert!(super::persist_ai_turn_if_epoch_unchanged(
+                &store, &epochs, "s-alpha", alpha_ep, &u1, &m1
+            )
+            .await
+            .unwrap());
+            {
+                let s = store.lock().await;
+                let msgs = s.list_ai_messages("s-alpha", 10).unwrap();
+                assert_eq!(msgs.len(), 2);
+                assert_eq!(msgs[0].id, "u-1");
+                assert_eq!(msgs[1].id, "m-1");
+            }
+
+            // 2. Concurrent ai_delete_session mid-stream bumps epoch and deletes session;
+            //    finishing stream with partial text MUST NOT resurrect the deleted session!
+            let alpha_ep2 = super::capture_ai_session_epoch(&epochs, "s-alpha").await;
+            {
+                let s = store.lock().await;
+                super::bump_ai_session_epoch(&epochs, "s-alpha").await;
+                s.delete_ai_session("s-alpha").unwrap();
+            }
+            let u2 = mk_msg("u-2", "s-alpha", "user", "Câu hỏi dở", 3_000);
+            let m2 = mk_msg("m-2", "s-alpha", "model", "Trả lời dở...", 3_001);
+            let persisted = super::persist_ai_turn_if_epoch_unchanged(
+                &store, &epochs, "s-alpha", alpha_ep2, &u2, &m2,
+            )
+            .await
+            .unwrap();
+            assert!(!persisted, "deleted session must not be resurrected");
+            {
+                let s = store.lock().await;
+                let sessions = s.list_ai_sessions(50).unwrap();
+                assert!(
+                    !sessions.iter().any(|sess| sess.id == "s-alpha"),
+                    "s-alpha must remain deleted in ai_sessions"
+                );
+                assert!(s.list_ai_messages("s-alpha", 10).unwrap().is_empty());
+            }
+
+            // 3. Deleting s-alpha must NOT interfere with unrelated s-beta's epoch.
+            let ub = mk_msg("u-b1", "s-beta", "user", "Beta?", 4_000);
+            let mb = mk_msg("m-b1", "s-beta", "model", "Beta!", 4_001);
+            assert!(super::persist_ai_turn_if_epoch_unchanged(
+                &store, &epochs, "s-beta", beta_ep, &ub, &mb
+            )
+            .await
+            .unwrap());
+
+            // 4. Concurrent ai_clear_messages mid-stream prevents stale reply pollution.
+            let beta_ep2 = super::capture_ai_session_epoch(&epochs, "s-beta").await;
+            {
+                let s = store.lock().await;
+                super::bump_ai_session_epoch(&epochs, "s-beta").await;
+                s.clear_ai_messages("s-beta").unwrap();
+            }
+            let ub2 = mk_msg("u-b2", "s-beta", "user", "Bị clear", 5_000);
+            let mb2 = mk_msg("m-b2", "s-beta", "model", "Partial sau clear", 5_001);
+            assert!(!super::persist_ai_turn_if_epoch_unchanged(
+                &store, &epochs, "s-beta", beta_ep2, &ub2, &mb2
+            )
+            .await
+            .unwrap());
+            {
+                let s = store.lock().await;
+                assert!(s.list_ai_messages("s-beta", 10).unwrap().is_empty());
+            }
+
+            // 5. Global bump (logout/session-expiry) invalidates all active captured epochs.
+            let beta_ep3 = super::capture_ai_session_epoch(&epochs, "s-beta").await;
+            super::bump_all_ai_session_epochs(&epochs).await;
+            let ub3 = mk_msg("u-b3", "s-beta", "user", "Sau logout", 6_000);
+            let mb3 = mk_msg("m-b3", "s-beta", "model", "Không được lưu", 6_001);
+            assert!(!super::persist_ai_turn_if_epoch_unchanged(
+                &store, &epochs, "s-beta", beta_ep3, &ub3, &mb3
+            )
+            .await
+            .unwrap());
+        });
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_raster_image_file_as_data_url_validates_raster_and_rejects_svg() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("teza-raster-data-url-test-{ts}"));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Valid PNG magic header
+        let png_path = dir.join("sample.png");
+        let png_bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        std::fs::write(&png_path, png_bytes).unwrap();
+        let png_url = super::read_raster_image_file_as_data_url(&png_path).unwrap();
+        assert!(png_url.starts_with("data:image/png;base64,"));
+
+        // Valid JPEG magic header
+        let jpg_path = dir.join("sample.jpg");
+        std::fs::write(&jpg_path, [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]).unwrap();
+        let jpg_url = super::read_raster_image_file_as_data_url(&jpg_path).unwrap();
+        assert!(jpg_url.starts_with("data:image/jpeg;base64,"));
+
+        // SVG file must be rejected
+        let svg_path = dir.join("evil.svg");
+        std::fs::write(&svg_path, b"<svg xmlns='http://www.w3.org/2000/svg'></svg>").unwrap();
+        assert!(super::read_raster_image_file_as_data_url(&svg_path).is_err());
+
+        // SVG disguised with .png extension must ALSO be rejected via magic-byte sniffing
+        let fake_png_path = dir.join("disguised.png");
+        std::fs::write(&fake_png_path, b"<svg><script>alert(1)</script></svg>").unwrap();
+        assert!(super::read_raster_image_file_as_data_url(&fake_png_path).is_err());
+
+        // Plain text file must be rejected
+        let txt_path = dir.join("notes.txt");
+        std::fs::write(&txt_path, b"hello world").unwrap();
+        assert!(super::read_raster_image_file_as_data_url(&txt_path).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

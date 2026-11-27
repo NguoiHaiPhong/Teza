@@ -6,6 +6,7 @@ import type {
   AiCliProbeDto,
   AiConfigDto,
   AiConfigUpdateDto,
+  AiInstallZeroClawResponseDto,
   AiStoredMessageDto,
   AiStreamDeltaEvent,
   AiSummaryDeltaEvent,
@@ -39,6 +40,7 @@ import type {
   MediaVaultConfigDto,
   MediaVaultStatsDto,
   MessageDto,
+  MessagesAroundResult,
   NotifyToastPayload,
   PollDto,
   RelayConfigSummary,
@@ -61,11 +63,33 @@ import type {
   UserProfileDto,
   WebAppAccountDto,
   WebAppAccountInput,
+  ZeroClawInstallProgressDto,
 } from "./types";
 import {
   DEFAULT_AI_SYSTEM_PROMPT,
+  DEFAULT_CLOUD_API_BASE_URL,
+  DEFAULT_CLOUD_API_MODEL,
   DEFAULT_LOCAL_API_MIN_INTERVAL_MS,
   DEFAULT_LOCAL_API_PORT,
+  DEFAULT_ZEROCLAW_MODEL,
+  DEFAULT_ZEROCLAW_PATH,
+  detectAiCloudProvider,
+  getAiCloudProviderPreset,
+  type AiCommandResultDto,
+  type AiModelInfoDto,
+  type AiSessionDto,
+} from "./utils/automationHelpers.ts";
+
+export type {
+  AiCliProbeDto,
+  AiCommandResultDto,
+  AiConfigDto,
+  AiConfigUpdateDto,
+  AiInstallZeroClawResponseDto,
+  AiModelInfoDto,
+  AiSessionDto,
+  AiStoredMessageDto,
+  AiSummaryDto,
 } from "./utils/automationHelpers.ts";
 import { matchesSearchQuery } from "./utils/searchNormalize.ts";
 import { filterDemoWebAppAccounts, upsertDemoWebAppAccount } from "./utils/webappAccounts.ts";
@@ -115,21 +139,84 @@ function ensureDownloadFileName(suggestedName: string, targetUrl: string): strin
 
 let DEMO_AI_CONFIG: AiConfigDto = {
   enabled: false,
-  backend: "gemini_api",
-  gemini_model: "gemini-2.5-flash",
-  cli_path: "gemini",
-  cli_model: "",
+  backend: "zeroclaw",
+  model: DEFAULT_ZEROCLAW_MODEL,
+  api_base_url: DEFAULT_CLOUD_API_BASE_URL,
+  has_api_key: false,
+  api_key_preview: "",
+  zeroclaw_path: DEFAULT_ZEROCLAW_PATH,
+  zeroclaw_gateway_url: "",
+  has_zeroclaw_token: false,
+  zeroclaw_token_preview: "",
+  zeroclaw_safe_tools: false,
   system_prompt: DEFAULT_AI_SYSTEM_PROMPT,
   summary_language: "vi",
   max_summary_messages: 40,
-  has_api_key: false,
-  api_key_preview: "",
-  has_translate_fallback_key: false,
-  translate_fallback_preview: "",
 };
+const DEMO_AI_INIT_TS = Date.now();
+let DEMO_AI_SESSIONS: AiSessionDto[] = [
+  {
+    id: "default",
+    title: "Cuộc trò chuyện AI",
+    created_ts: DEMO_AI_INIT_TS,
+    updated_ts: DEMO_AI_INIT_TS,
+    message_count: 0,
+    last_preview: "",
+  },
+];
 let DEMO_AI_MESSAGES: AiStoredMessageDto[] = [];
 const DEMO_AI_STREAM_LISTENERS = new Set<(ev: AiStreamDeltaEvent) => void>();
 const DEMO_AI_SUMMARY_LISTENERS = new Set<(ev: AiSummaryDeltaEvent) => void>();
+
+function normalizeDemoAiPreview(raw: string, maxLen = 96): string {
+  const collapsed = (raw || "").replace(/\s+/g, " ").trim();
+  if (!collapsed) return "";
+  return collapsed.length > maxLen ? `${collapsed.slice(0, maxLen - 1)}…` : collapsed;
+}
+
+function deriveDemoAiSessionTitle(raw: string): string {
+  const collapsed = (raw || "").replace(/\s+/g, " ").trim();
+  if (!collapsed) return "Cuộc trò chuyện mới";
+  return collapsed.length > 48 ? `${collapsed.slice(0, 47)}…` : collapsed;
+}
+
+function hydrateDemoAiSession(session: AiSessionDto): AiSessionDto {
+  const msgs = DEMO_AI_MESSAGES.filter((m) => m.session_id === session.id);
+  const lastMsg = msgs.length > 0 ? msgs[msgs.length - 1] : null;
+  return {
+    ...session,
+    message_count: msgs.length,
+    last_preview: lastMsg ? normalizeDemoAiPreview(lastMsg.content) : "",
+  };
+}
+
+function touchDemoAiSessionOnMessage(msg: AiStoredMessageDto): void {
+  const idx = DEMO_AI_SESSIONS.findIndex((s) => s.id === msg.session_id);
+  if (idx < 0) {
+    const created: AiSessionDto = {
+      id: msg.session_id,
+      title: msg.role === "user" ? deriveDemoAiSessionTitle(msg.content) : "Cuộc trò chuyện mới",
+      created_ts: msg.ts,
+      updated_ts: msg.ts,
+      message_count: 1,
+      last_preview: normalizeDemoAiPreview(msg.content),
+    };
+    DEMO_AI_SESSIONS = [created, ...DEMO_AI_SESSIONS];
+    return;
+  }
+  const existing = DEMO_AI_SESSIONS[idx];
+  const shouldAutoTitle =
+    msg.role === "user" &&
+    (!existing.title.trim() || existing.title.trim() === "Cuộc trò chuyện mới");
+  const updated: AiSessionDto = {
+    ...existing,
+    title: shouldAutoTitle ? deriveDemoAiSessionTitle(msg.content) : existing.title,
+    updated_ts: Math.max(existing.updated_ts, msg.ts),
+  };
+  DEMO_AI_SESSIONS = DEMO_AI_SESSIONS.map((s) =>
+    s.id === msg.session_id ? hydrateDemoAiSession(updated) : s,
+  );
+}
 
 let DEMO_SCHEDULES: ScheduledMessageDto[] = [];
 const DEMO_SCHEDULE_LISTENERS = new Set<(ev: ScheduledMessageDto | null) => void>();
@@ -317,6 +404,14 @@ let DEMO_MEDIA_VAULT_STATS: MediaVaultStatsDto = {
   cloud_total_bytes: 0,
 };
 
+let DEMO_TRANSLATE_CONFIG: TranslateConfigSummary = {
+  provider: "deepl",
+  detect_mode: "api_cache",
+  target_lang: "VI",
+  has_deepl_key: false,
+  deepl_preview: "",
+};
+
 let DEMO_GDRIVE_CONFIG: GDriveConfigDto = {
   client_id: "",
   has_client_secret: false,
@@ -336,6 +431,7 @@ let DEMO_GDRIVE_STATUS: GDriveStatusDto = {
   connected: false,
   account_email: null,
   account_name: null,
+  root_folder_id: null,
   vault_unlocked: false,
   has_remote_manifest: false,
   sync_enabled: true,
@@ -840,11 +936,33 @@ export const bridge = {
       syncRemote,
     });
   },
-  async loadMessagesAround(threadId: string, targetTs: number): Promise<MessagesPage> {
+  async loadMessagesAround(threadId: string, targetTs: number): Promise<MessagesAroundResult> {
     if (!isTauri()) {
-      return { messages: DEMO_MESSAGES[threadId] ?? [], has_more: false };
+      const all = DEMO_MESSAGES[threadId] ?? [];
+      const sorted = [...all].sort((a, b) => a.ts - b.ts);
+      let idx = sorted.findIndex((m) => m.ts >= targetTs);
+      if (idx < 0) idx = Math.max(0, sorted.length - 1);
+      const start = Math.max(0, idx - 25);
+      const end = Math.min(sorted.length, idx + 1001);
+      return {
+        messages: sorted.slice(start, end),
+        has_more: start > 0,
+        has_newer: end < sorted.length,
+      };
     }
-    return invoke<MessagesPage>("messages_load_around", { threadId, targetTs });
+    const res = await invoke<
+      | (MessagesAroundResult & { has_more?: boolean })
+      | (MessagesPage & { has_newer?: boolean })
+      | MessageDto[]
+    >("messages_load_around", { threadId, targetTs });
+    if (Array.isArray(res)) {
+      return { messages: res, has_more: false, has_newer: false };
+    }
+    return {
+      messages: Array.isArray(res.messages) ? res.messages : [],
+      has_more: Boolean(res.has_more),
+      has_newer: Boolean(res.has_newer),
+    };
   },
   async getMessageById(threadId: string, msgId: string): Promise<MessageDto | null> {
     if (!isTauri()) {
@@ -1038,6 +1156,16 @@ export const bridge = {
     }
     return invoke<AttachmentMeta>("inspect_attachment_path", { filePath });
   },
+  async readAttachmentImageDataUrl(filePath: string): Promise<string> {
+    const trimmed = filePath.trim();
+    if (!isTauri()) {
+      if (/^data:image\//i.test(trimmed) || /^blob:/i.test(trimmed)) {
+        return trimmed;
+      }
+      throw new Error("Local file preview is only available in the desktop app.");
+    }
+    return invoke<string>("read_attachment_image_data_url", { filePath: trimmed });
+  },
   async sendAttachmentPath(
     threadId: string,
     filePath: string,
@@ -1116,6 +1244,7 @@ export const bridge = {
       return msg;
     }
     if (bytes.byteLength <= RAW_IPC_SINGLE_SHOT_MAX_BYTES) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
       return invoke<MessageDto>("message_send_base64_attachment", {
         threadId,
         fileName,
@@ -1126,6 +1255,7 @@ export const bridge = {
     const uploadId = await invoke<string>("raw_attachment_stage_begin", { fileName });
     try {
       for (let offset = 0; offset < bytes.byteLength; offset += RAW_IPC_CHUNK_BYTES) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
         const slice = bytes.subarray(
           offset,
           Math.min(offset + RAW_IPC_CHUNK_BYTES, bytes.byteLength),
@@ -1157,37 +1287,28 @@ export const bridge = {
   },
   async getTranslateConfig(): Promise<TranslateConfigSummary> {
     if (!isTauri()) {
-      return {
-        provider: "deepl",
-        detect_mode: "api_cache",
-        target_lang: "VI",
-        gemini_model: "gemini-2.0-flash",
-        azure_region: "eastasia",
-        has_deepl_key: false,
-        has_gemini_key: false,
-        has_azure_key: false,
-        deepl_preview: "",
-        gemini_preview: "",
-        azure_preview: "",
-      };
+      return { ...DEMO_TRANSLATE_CONFIG };
     }
     return invoke<TranslateConfigSummary>("translate_get_config");
   },
   async saveTranslateConfig(update: TranslateConfigUpdate): Promise<TranslateConfigSummary> {
     if (!isTauri()) {
-      return {
-        provider: update.provider,
-        detect_mode: update.detect_mode ?? "api_cache",
+      const clearKey = update.clear_deepl_key === true;
+      const newKey = (update.deepl_key ?? "").trim();
+      const hasKey = clearKey ? false : newKey ? true : DEMO_TRANSLATE_CONFIG.has_deepl_key;
+      const preview = clearKey
+        ? ""
+        : newKey
+          ? `${newKey.slice(0, 4)}****`
+          : DEMO_TRANSLATE_CONFIG.deepl_preview;
+      DEMO_TRANSLATE_CONFIG = {
+        provider: update.provider ?? "deepl",
+        detect_mode: update.detect_mode ?? DEMO_TRANSLATE_CONFIG.detect_mode,
         target_lang: update.target_lang,
-        gemini_model: update.gemini_model || "gemini-2.0-flash",
-        azure_region: update.azure_region || "eastasia",
-        has_deepl_key: !!update.deepl_key,
-        has_gemini_key: !!update.gemini_key,
-        has_azure_key: !!update.azure_key,
-        deepl_preview: update.deepl_key ? "****" : "",
-        gemini_preview: update.gemini_key ? "****" : "",
-        azure_preview: update.azure_key ? "****" : "",
+        has_deepl_key: hasKey,
+        deepl_preview: preview,
       };
+      return { ...DEMO_TRANSLATE_CONFIG };
     }
     return invoke<TranslateConfigSummary>("translate_save_config", { update });
   },
@@ -1305,6 +1426,15 @@ export const bridge = {
     }
     return invoke<StickerItem[]>("stickers_search", { keyword });
   },
+  async suggestStickers(keyword: string, limit = 16): Promise<StickerItem[]> {
+    const trimmed = keyword.trim();
+    if (!trimmed) return [];
+    if (!isTauri()) {
+      const all = await this.listStickers();
+      return all.slice(0, Math.max(1, Math.min(limit, 8)));
+    }
+    return invoke<StickerItem[]>("stickers_suggest", { keyword: trimmed, limit });
+  },
   async sendSticker(threadId: string, sticker: StickerItem): Promise<MessageDto> {
     if (!isTauri()) {
       const msg: MessageDto = {
@@ -1381,6 +1511,10 @@ export const bridge = {
   async setCloseToTray(enabled: boolean): Promise<void> {
     if (!isTauri()) return;
     return invoke("app_set_close_to_tray", { enabled });
+  },
+  async appSetPasscodeLocked(locked: boolean): Promise<void> {
+    if (!isTauri()) return;
+    return invoke("app_set_passcode_locked", { locked });
   },
   async webappOpen(
     id: string,
@@ -2032,6 +2166,7 @@ export const bridge = {
         connected: true,
         account_email: "demo@teza.app",
         account_name: "Teza Preview",
+        root_folder_id: "demo-teza-vault-root",
         phase: "idle",
         last_error: null,
       };
@@ -2057,6 +2192,7 @@ export const bridge = {
         connected: false,
         account_email: null,
         account_name: null,
+        root_folder_id: null,
         vault_unlocked: false,
         syncing: false,
         phase: "idle",
@@ -2083,6 +2219,18 @@ export const bridge = {
       return emitDemoGDriveStatus();
     }
     return invoke<GDriveStatusDto>("gdrive_unlock_vault", { passphrase });
+  },
+  async gdriveLockVault(): Promise<void> {
+    if (!isTauri()) {
+      DEMO_GDRIVE_STATUS = {
+        ...DEMO_GDRIVE_STATUS,
+        vault_unlocked: false,
+        last_error: null,
+      };
+      emitDemoGDriveStatus();
+      return;
+    }
+    await invoke<void>("gdrive_lock_vault");
   },
   async gdriveSyncNow(): Promise<GDriveStatusDto> {
     if (!isTauri()) {
@@ -2528,15 +2676,36 @@ export const bridge = {
     if (!isTauri()) {
       const next: AiConfigDto = { ...DEMO_AI_CONFIG };
       if (typeof update.enabled === "boolean") next.enabled = update.enabled;
-      if (update.backend) next.backend = update.backend;
-      if (typeof update.gemini_model === "string") {
-        next.gemini_model = update.gemini_model.trim() || "gemini-2.5-flash";
+      if (update.backend === "cloud_api" || update.backend === "zeroclaw") {
+        next.backend = update.backend;
       }
-      if (typeof update.cli_path === "string") {
-        next.cli_path = update.cli_path.trim() || "gemini";
+      if (typeof update.api_base_url === "string") {
+        next.api_base_url = update.api_base_url.trim() || DEFAULT_CLOUD_API_BASE_URL;
       }
-      if (typeof update.cli_model === "string") {
-        next.cli_model = update.cli_model.trim();
+      if (update.clear_api_key) {
+        next.has_api_key = false;
+        next.api_key_preview = "";
+      } else if (typeof update.api_key === "string" && update.api_key.trim()) {
+        const cleanKey = update.api_key.trim();
+        next.has_api_key = true;
+        next.api_key_preview =
+          cleanKey.length > 8 ? `${cleanKey.slice(0, 4)}...${cleanKey.slice(-4)}` : "••••";
+      }
+      if (typeof update.model === "string") {
+        next.model =
+          update.model.trim() ||
+          (next.backend === "cloud_api" ? DEFAULT_CLOUD_API_MODEL : DEFAULT_ZEROCLAW_MODEL);
+      } else if (next.backend === "cloud_api" && next.model === DEFAULT_ZEROCLAW_MODEL) {
+        next.model = DEFAULT_CLOUD_API_MODEL;
+      }
+      if (typeof update.zeroclaw_path === "string") {
+        next.zeroclaw_path = update.zeroclaw_path.trim() || DEFAULT_ZEROCLAW_PATH;
+      }
+      if (typeof update.zeroclaw_gateway_url === "string") {
+        next.zeroclaw_gateway_url = update.zeroclaw_gateway_url.trim();
+      }
+      if (typeof update.zeroclaw_safe_tools === "boolean") {
+        next.zeroclaw_safe_tools = update.zeroclaw_safe_tools;
       }
       if (typeof update.system_prompt === "string") {
         next.system_prompt = update.system_prompt;
@@ -2547,14 +2716,14 @@ export const bridge = {
       if (typeof update.max_summary_messages === "number") {
         next.max_summary_messages = update.max_summary_messages;
       }
-      if (update.clear_api_key) {
-        next.has_api_key = false;
-        next.api_key_preview = "";
-      } else if (typeof update.api_key === "string" && update.api_key.trim()) {
-        const cleanKey = update.api_key.trim();
-        next.has_api_key = true;
-        next.api_key_preview =
-          cleanKey.length > 8 ? `${cleanKey.slice(0, 4)}••••${cleanKey.slice(-4)}` : "••••";
+      if (update.clear_zeroclaw_token) {
+        next.has_zeroclaw_token = false;
+        next.zeroclaw_token_preview = "";
+      } else if (typeof update.zeroclaw_token === "string" && update.zeroclaw_token.trim()) {
+        const cleanTok = update.zeroclaw_token.trim();
+        next.has_zeroclaw_token = true;
+        next.zeroclaw_token_preview =
+          cleanTok.length > 8 ? `${cleanTok.slice(0, 4)}••••${cleanTok.slice(-4)}` : "••••";
       }
       DEMO_AI_CONFIG = next;
       return { ...next };
@@ -2563,20 +2732,129 @@ export const bridge = {
       update: {
         ...update,
         clear_api_key: Boolean(update.clear_api_key),
+        clear_zeroclaw_token: Boolean(update.clear_zeroclaw_token),
       },
     });
   },
-  async aiProbeCli(cliPath?: string): Promise<AiCliProbeDto> {
+  async aiListModels(baseUrl?: string, apiKey?: string): Promise<AiModelInfoDto[]> {
+    if (!isTauri()) {
+      const targetUrl = baseUrl?.trim() || DEMO_AI_CONFIG.api_base_url;
+      const preset = getAiCloudProviderPreset(detectAiCloudProvider(targetUrl));
+      return (preset?.recommendedModels ?? []).map((m) => ({
+        id: m.id,
+        is_free: Boolean(m.isFree),
+        owned_by: preset?.name ?? null,
+      }));
+    }
+    return invoke<AiModelInfoDto[]>("ai_list_models", {
+      baseUrl: baseUrl?.trim() ? baseUrl.trim() : null,
+      apiKey: apiKey?.trim() ? apiKey.trim() : null,
+    });
+  },
+  async aiProbeCli(cliPath?: string, gatewayUrl?: string): Promise<AiCliProbeDto> {
     if (!isTauri()) {
       return {
         available: false,
         resolved_path: null,
         version: null,
-        error: "Gemini CLI chỉ khả dụng trong ứng dụng desktop Tauri.",
+        mode: gatewayUrl?.trim() ? "gateway" : "cli",
+        error: "ZeroClaw chỉ chạy trên ứng dụng Teza cài đặt cho máy tính.",
       };
     }
     return invoke<AiCliProbeDto>("ai_probe_cli", {
       cliPath: cliPath ?? null,
+      gatewayUrl: gatewayUrl ?? null,
+    });
+  },
+  async aiInstallZeroClaw(): Promise<AiInstallZeroClawResponseDto> {
+    if (!isTauri()) {
+      throw new Error("Tải và cài đặt ZeroClaw chỉ hỗ trợ trên ứng dụng máy tính.");
+    }
+    return invoke<AiInstallZeroClawResponseDto>("ai_install_zeroclaw");
+  },
+  async onZeroClawInstallProgress(
+    handler: (ev: ZeroClawInstallProgressDto) => void,
+  ): Promise<() => void> {
+    if (!isTauri()) {
+      return () => {};
+    }
+    return listen<ZeroClawInstallProgressDto>("core://zeroclaw-install-progress", (event) => {
+      handler(event.payload);
+    });
+  },
+  async aiListSessions(limit?: number): Promise<AiSessionDto[]> {
+    if (!isTauri()) {
+      const knownIds = new Set(DEMO_AI_SESSIONS.map((s) => s.id));
+      for (const msg of DEMO_AI_MESSAGES) {
+        if (!knownIds.has(msg.session_id)) {
+          knownIds.add(msg.session_id);
+          touchDemoAiSessionOnMessage(msg);
+        }
+      }
+      const hydrated = DEMO_AI_SESSIONS.map((s) => hydrateDemoAiSession(s)).sort(
+        (a, b) => b.updated_ts - a.updated_ts || b.id.localeCompare(a.id),
+      );
+      return limit && limit > 0 ? hydrated.slice(0, limit) : hydrated;
+    }
+    return invoke<AiSessionDto[]>("ai_list_sessions", {
+      limit: limit ?? null,
+    });
+  },
+  async aiCreateSession(title?: string): Promise<AiSessionDto> {
+    if (!isTauri()) {
+      const now = Date.now();
+      const cleanTitle = (title ?? "").trim().slice(0, 120) || "Cuộc trò chuyện mới";
+      const created: AiSessionDto = {
+        id: `ai-${now}-${Math.random().toString(36).slice(2, 6)}`,
+        title: cleanTitle,
+        created_ts: now,
+        updated_ts: now,
+        message_count: 0,
+        last_preview: "",
+      };
+      DEMO_AI_SESSIONS = [created, ...DEMO_AI_SESSIONS];
+      return { ...created };
+    }
+    return invoke<AiSessionDto>("ai_create_session", {
+      title: title ?? null,
+    });
+  },
+  async aiRenameSession(sessionId: string, title: string): Promise<AiSessionDto> {
+    if (!isTauri()) {
+      const sid = (sessionId || "").trim();
+      const cleanTitle = (title || "").trim().slice(0, 120);
+      if (!sid) {
+        throw new Error("Mã cuộc trò chuyện AI không hợp lệ.");
+      }
+      if (!cleanTitle) {
+        throw new Error("Tiêu đề cuộc trò chuyện AI không được để trống.");
+      }
+      const existing = DEMO_AI_SESSIONS.find((s) => s.id === sid);
+      if (!existing) {
+        throw new Error("Không tìm thấy cuộc trò chuyện AI.");
+      }
+      const updated: AiSessionDto = {
+        ...existing,
+        title: cleanTitle,
+      };
+      DEMO_AI_SESSIONS = DEMO_AI_SESSIONS.map((s) => (s.id === sid ? updated : s));
+      return hydrateDemoAiSession(updated);
+    }
+    return invoke<AiSessionDto>("ai_rename_session", {
+      sessionId,
+      title,
+    });
+  },
+  async aiDeleteSession(sessionId: string): Promise<number> {
+    if (!isTauri()) {
+      const sid = (sessionId || "").trim();
+      const before = DEMO_AI_MESSAGES.length;
+      DEMO_AI_MESSAGES = DEMO_AI_MESSAGES.filter((m) => m.session_id !== sid);
+      DEMO_AI_SESSIONS = DEMO_AI_SESSIONS.filter((s) => s.id !== sid);
+      return before - DEMO_AI_MESSAGES.length;
+    }
+    return invoke<number>("ai_delete_session", {
+      sessionId,
     });
   },
   async aiListMessages(sessionId?: string, limit?: number): Promise<AiStoredMessageDto[]> {
@@ -2595,6 +2873,9 @@ export const bridge = {
       const sid = sessionId || "default";
       const before = DEMO_AI_MESSAGES.length;
       DEMO_AI_MESSAGES = DEMO_AI_MESSAGES.filter((m) => m.session_id !== sid);
+      DEMO_AI_SESSIONS = DEMO_AI_SESSIONS.map((s) =>
+        s.id === sid ? { ...s, message_count: 0, last_preview: "" } : s,
+      );
       return before - DEMO_AI_MESSAGES.length;
     }
     return invoke<number>("ai_clear_messages", {
@@ -2613,12 +2894,15 @@ export const bridge = {
         session_id: sid,
         role: "user",
         content: prompt,
-        model: DEMO_AI_CONFIG.gemini_model,
+        model: DEMO_AI_CONFIG.model,
         backend: DEMO_AI_CONFIG.backend,
         ts: now,
       };
       DEMO_AI_MESSAGES = [...DEMO_AI_MESSAGES, userMsg];
-      const replyText = `[Chế độ demo] Đã nhận câu hỏi: "${prompt.trim().slice(0, 140)}".\n\n- Đây là phản hồi mô phỏng cục bộ khi chạy ngoài Tauri.\n- Khi chạy trên ứng dụng desktop, Trợ lý AI sẽ gọi trực tiếp **${DEMO_AI_CONFIG.backend === "gemini_cli" ? "Gemini CLI" : DEMO_AI_CONFIG.gemini_model}**.`;
+      touchDemoAiSessionOnMessage(userMsg);
+      const backendNote =
+        DEMO_AI_CONFIG.backend === "cloud_api" ? "khóa API đã cấu hình" : "ZeroClaw";
+      const replyText = `[Chế độ demo] Đã nhận câu hỏi: "${prompt.trim().slice(0, 140)}".\n\n- Đây là phản hồi mô phỏng cục bộ khi chạy ngoài Tauri.\n- Khi chạy trên ứng dụng máy tính, Trợ lý AI sẽ xử lý trực tiếp bằng **${backendNote}**.`;
       for (const fn of DEMO_AI_STREAM_LISTENERS) {
         try {
           fn({ session_id: sid, delta: replyText });
@@ -2631,15 +2915,75 @@ export const bridge = {
         session_id: sid,
         role: "model",
         content: replyText,
-        model: DEMO_AI_CONFIG.gemini_model,
+        model: DEMO_AI_CONFIG.model,
         backend: DEMO_AI_CONFIG.backend,
         ts: now + 1,
       };
       DEMO_AI_MESSAGES = [...DEMO_AI_MESSAGES, modelMsg];
+      touchDemoAiSessionOnMessage(modelMsg);
       return { ...modelMsg };
     }
     return invoke<AiStoredMessageDto>("ai_chat_send", {
       prompt,
+      sessionId: sessionId ?? null,
+    });
+  },
+  async aiChatCancel(sessionId?: string): Promise<boolean> {
+    if (!isTauri()) {
+      return false;
+    }
+    return invoke<boolean>("ai_chat_cancel", {
+      sessionId: sessionId ?? null,
+    });
+  },
+  async aiRunZeroClawCommand(
+    command: string,
+    sessionId?: string,
+  ): Promise<AiCommandResultDto> {
+    if (!isTauri()) {
+      const norm = (command || "").trim().toLowerCase();
+      const sid = (sessionId || "default").trim() || "default";
+      switch (norm) {
+        case "memory":
+        case "memory_list":
+        case "memory_stats": {
+          const msgCount = DEMO_AI_MESSAGES.filter((m) => m.session_id === sid).length;
+          return {
+            command: norm,
+            title: "Trí nhớ ZeroClaw",
+            output: `Chế độ xem trước — phiên "${sid}" hiện có ${msgCount} tin nhắn cục bộ. Trí nhớ ZeroClaw thật chỉ hoạt động trên ứng dụng Teza máy tính.`,
+            ok: true,
+          };
+        }
+        case "memory_clear":
+          return {
+            command: "memory_clear",
+            title: "Xóa trí nhớ ZeroClaw",
+            output: `Đã xóa trí nhớ mô phỏng của phiên "${sid}" (chế độ xem trước).`,
+            ok: true,
+          };
+        case "skills":
+        case "skills_list":
+          return {
+            command: "skills",
+            title: "Kỹ năng ZeroClaw",
+            output:
+              "Chưa có kỹ năng nào được cài trong chế độ xem trước. Mở Teza trên máy tính để xem danh sách kỹ năng ZeroClaw.",
+            ok: true,
+          };
+        case "status":
+          return {
+            command: "status",
+            title: "Trạng thái ZeroClaw",
+            output: `Chế độ xem trước (ngoài Tauri) — công cụ an toàn: ${DEMO_AI_CONFIG.zeroclaw_safe_tools ? "Đang bật" : "Đang tắt"}.`,
+            ok: true,
+          };
+        default:
+          throw new Error(`Lệnh ZeroClaw không được hỗ trợ: ${command}`);
+      }
+    }
+    return invoke<AiCommandResultDto>("ai_run_zeroclaw_command", {
+      command,
       sessionId: sessionId ?? null,
     });
   },
@@ -2668,7 +3012,7 @@ export const bridge = {
         action_items: list.length > 0 ? ["Xem lại tin nhắn mới nhất và phản hồi khi thuận tiện."] : [],
         message_count: list.length,
         backend: DEMO_AI_CONFIG.backend,
-        model: DEMO_AI_CONFIG.gemini_model,
+        model: DEMO_AI_CONFIG.model,
       };
     }
     return invoke<AiSummaryDto>("ai_summarize_unread", { threadId });

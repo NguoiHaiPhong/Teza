@@ -24,6 +24,7 @@ import {
 } from "lucide-react";
 import { useI18n } from "../i18n";
 import type { ChatFolderDto, ThreadDto, ThreadKind } from "../types";
+import { filterThreadsBySearchQuery, isImeComposingEvent } from "../utils/searchNormalize";
 import { moveArrayItem } from "../utils/threadState";
 import { ThreadAvatar } from "./ThreadAvatar";
 
@@ -48,6 +49,7 @@ export function renderFolderIcon(iconId: string, className = "h-5 w-5") {
 
 interface Props {
   open: boolean;
+  isLocked?: boolean;
   folders: ChatFolderDto[];
   threads: ThreadDto[];
   initialEditingFolder?: ChatFolderDto | null;
@@ -76,6 +78,7 @@ function emptyDraft(position: number): ChatFolderDto {
 
 export function FolderEditorModal({
   open,
+  isLocked = false,
   folders,
   threads,
   initialEditingFolder = null,
@@ -114,19 +117,23 @@ export function FolderEditorModal({
   }, [open, initialEditingFolder, folders.length]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || isLocked) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (isImeComposingEvent(e) || e.defaultPrevented) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!saving) onClose();
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, onClose]);
+  }, [open, isLocked, saving, onClose]);
 
-  const filteredThreads = useMemo(() => {
-    const q = threadSearch.trim().toLowerCase();
-    const list = q ? threads.filter((t) => t.title.toLowerCase().includes(q)) : threads;
-    return list.slice(0, 120);
-  }, [threads, threadSearch]);
+  const filteredThreads = useMemo(
+    () => filterThreadsBySearchQuery(threads, threadSearch, 120),
+    [threads, threadSearch],
+  );
 
   if (!open) return null;
 

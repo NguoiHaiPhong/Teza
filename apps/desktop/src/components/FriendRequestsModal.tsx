@@ -12,11 +12,13 @@ import {
 import { bridge } from "../bridge";
 import { useI18n } from "../i18n";
 import type { FriendRequestItemDto } from "../types";
+import { isImeComposingEvent } from "../utils/searchNormalize";
 import { formatThreadTime } from "../utils/threadState";
 import { RelayImage } from "./RelayImage";
 
 export interface FriendRequestsModalProps {
   open: boolean;
+  isLocked?: boolean;
   onClose: () => void;
   onOpenProfile: (uid: string) => void;
   onStartChat: (uid: string, name: string, avatar: string) => void;
@@ -24,6 +26,7 @@ export interface FriendRequestsModalProps {
 }
 
 type RequestsTab = "received" | "sent";
+type BusyAction = { uid: string; kind: "accept" | "reject" | "undo" } | null;
 
 const AVATAR_PALETTE = ["#3b82f6", "#8b5cf6", "#10b981", "#f59e0b", "#ec4899", "#06b6d4"];
 
@@ -73,6 +76,7 @@ function RequestAvatar({ avatar, name }: { avatar: string; name: string }) {
 
 export function FriendRequestsModal({
   open,
+  isLocked = false,
   onClose,
   onOpenProfile,
   onStartChat,
@@ -83,7 +87,7 @@ export function FriendRequestsModal({
   const [received, setReceived] = useState<FriendRequestItemDto[]>([]);
   const [sent, setSent] = useState<FriendRequestItemDto[]>([]);
   const [loading, setLoading] = useState(false);
-  const [busyUid, setBusyUid] = useState<string | null>(null);
+  const [busyAction, setBusyAction] = useState<BusyAction>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [lastAccepted, setLastAccepted] = useState<{
@@ -95,6 +99,17 @@ export function FriendRequestsModal({
   const onChangedRef = useRef(onChanged);
   onChangedRef.current = onChanged;
   const fetchSeqRef = useRef(0);
+  const receivedRef = useRef<FriendRequestItemDto[]>([]);
+  const mountedRef = useRef(true);
+  const openRef = useRef(open);
+  openRef.current = open;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const loadRequests = useCallback(async (notifyCount = true) => {
     const seq = ++fetchSeqRef.current;
@@ -102,19 +117,20 @@ export function FriendRequestsModal({
     setError(null);
     try {
       const res = await bridge.friendListRequests();
-      if (seq !== fetchSeqRef.current) return;
+      if (!mountedRef.current || seq !== fetchSeqRef.current) return;
       const nextReceived = Array.isArray(res.received) ? res.received : [];
       const nextSent = Array.isArray(res.sent) ? res.sent : [];
+      receivedRef.current = nextReceived;
       setReceived(nextReceived);
       setSent(nextSent);
       if (notifyCount) {
         onChangedRef.current(nextReceived.length);
       }
     } catch (err) {
-      if (seq !== fetchSeqRef.current) return;
+      if (!mountedRef.current || seq !== fetchSeqRef.current) return;
       setError(cleanError(err));
     } finally {
-      if (seq === fetchSeqRef.current) {
+      if (mountedRef.current && seq === fetchSeqRef.current) {
         setLoading(false);
       }
     }
@@ -123,7 +139,7 @@ export function FriendRequestsModal({
   useEffect(() => {
     if (!open) {
       fetchSeqRef.current += 1;
-      setBusyUid(null);
+      setBusyAction(null);
       setError(null);
       setNotice(null);
       setLastAccepted(null);
@@ -135,13 +151,18 @@ export function FriendRequestsModal({
   }, [open, loadRequests]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || isLocked) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (isLocked || isImeComposingEvent(e)) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        onClose();
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, onClose]);
+  }, [open, isLocked, onClose]);
 
   if (!open) return null;
 
@@ -149,73 +170,87 @@ export function FriendRequestsModal({
     item.display_name?.trim() || item.account_name?.trim() || item.user_id;
 
   const handleAccept = async (item: FriendRequestItemDto) => {
-    if (busyUid) return;
+    if (busyAction) return;
     const displayName = getDisplayName(item);
-    setBusyUid(item.user_id);
+    setBusyAction({ uid: item.user_id, kind: "accept" });
     setError(null);
     setNotice(null);
     setLastAccepted(null);
     try {
       const res = await bridge.friendAcceptRequest(item.user_id);
+      if (!mountedRef.current || !openRef.current) return;
       if (!res.ok) {
         setError(res.message || t("friendRequestAcceptBtn"));
         return;
       }
-      const nextReceived = received.filter((r) => r.user_id !== item.user_id);
-      setReceived(nextReceived);
+      const nextReceived = receivedRef.current.filter((r) => r.user_id !== item.user_id);
+      receivedRef.current = nextReceived;
+      setReceived((prev) => prev.filter((r) => r.user_id !== item.user_id));
       setSent((prev) => prev.filter((r) => r.user_id !== item.user_id));
       onChangedRef.current(nextReceived.length);
       setNotice(t("friendAcceptedSuccess", { name: displayName }));
       setLastAccepted({ uid: item.user_id, name: displayName, avatar: item.avatar || "" });
     } catch (err) {
+      if (!mountedRef.current || !openRef.current) return;
       setError(cleanError(err));
     } finally {
-      setBusyUid(null);
+      if (mountedRef.current) {
+        setBusyAction(null);
+      }
     }
   };
 
   const handleReject = async (item: FriendRequestItemDto) => {
-    if (busyUid) return;
-    setBusyUid(item.user_id);
+    if (busyAction) return;
+    setBusyAction({ uid: item.user_id, kind: "reject" });
     setError(null);
     setNotice(null);
     setLastAccepted(null);
     try {
       const res = await bridge.friendRejectRequest(item.user_id);
+      if (!mountedRef.current || !openRef.current) return;
       if (!res.ok) {
         setError(res.message || t("friendRequestRejectBtn"));
         return;
       }
-      const nextReceived = received.filter((r) => r.user_id !== item.user_id);
-      setReceived(nextReceived);
+      const nextReceived = receivedRef.current.filter((r) => r.user_id !== item.user_id);
+      receivedRef.current = nextReceived;
+      setReceived((prev) => prev.filter((r) => r.user_id !== item.user_id));
       onChangedRef.current(nextReceived.length);
       setNotice(t("friendRejectedSuccess"));
     } catch (err) {
+      if (!mountedRef.current || !openRef.current) return;
       setError(cleanError(err));
     } finally {
-      setBusyUid(null);
+      if (mountedRef.current) {
+        setBusyAction(null);
+      }
     }
   };
 
   const handleUndo = async (item: FriendRequestItemDto) => {
-    if (busyUid) return;
-    setBusyUid(item.user_id);
+    if (busyAction) return;
+    setBusyAction({ uid: item.user_id, kind: "undo" });
     setError(null);
     setNotice(null);
     setLastAccepted(null);
     try {
       const res = await bridge.friendUndoRequest(item.user_id);
+      if (!mountedRef.current || !openRef.current) return;
       if (!res.ok) {
         setError(res.message || t("friendRequestUndoBtn"));
         return;
       }
       setSent((prev) => prev.filter((r) => r.user_id !== item.user_id));
-      onChangedRef.current(received.length);
+      onChangedRef.current(receivedRef.current.length);
       setNotice(t("friendUndoneSuccess"));
     } catch (err) {
+      if (!mountedRef.current || !openRef.current) return;
       setError(cleanError(err));
     } finally {
-      setBusyUid(null);
+      if (mountedRef.current) {
+        setBusyAction(null);
+      }
     }
   };
 
@@ -403,7 +438,13 @@ export function FriendRequestsModal({
             <div className="space-y-2.5">
               {activeItems.map((item) => {
                 const displayName = getDisplayName(item);
-                const isBusy = busyUid === item.user_id;
+                const isAccepting =
+                  busyAction?.uid === item.user_id && busyAction.kind === "accept";
+                const isRejecting =
+                  busyAction?.uid === item.user_id && busyAction.kind === "reject";
+                const isUndoing =
+                  busyAction?.uid === item.user_id && busyAction.kind === "undo";
+                const anyBusy = Boolean(busyAction);
                 const timeText = item.created_ts > 0 ? formatThreadTime(item.created_ts, lang) : "";
 
                 return (
@@ -468,11 +509,11 @@ export function FriendRequestsModal({
                             <>
                               <button
                                 type="button"
-                                disabled={Boolean(busyUid)}
+                                disabled={anyBusy}
                                 onClick={() => void handleAccept(item)}
                                 className="tf-btn flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-semibold disabled:opacity-50"
                               >
-                                {isBusy ? (
+                                {isAccepting ? (
                                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
                                 ) : (
                                   <Check className="h-3.5 w-3.5" />
@@ -481,7 +522,7 @@ export function FriendRequestsModal({
                               </button>
                               <button
                                 type="button"
-                                disabled={Boolean(busyUid)}
+                                disabled={anyBusy}
                                 onClick={() => void handleReject(item)}
                                 className="hover-menu flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-medium transition disabled:opacity-50"
                                 style={{
@@ -490,14 +531,18 @@ export function FriendRequestsModal({
                                   color: "var(--danger-text)",
                                 }}
                               >
-                                <X className="h-3.5 w-3.5" />
+                                {isRejecting ? (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  <X className="h-3.5 w-3.5" />
+                                )}
                                 <span>{t("friendRequestRejectBtn")}</span>
                               </button>
                             </>
                           ) : (
                             <button
                               type="button"
-                              disabled={Boolean(busyUid)}
+                              disabled={anyBusy}
                               onClick={() => void handleUndo(item)}
                               className="hover-menu flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-medium transition disabled:opacity-50"
                               style={{
@@ -506,7 +551,7 @@ export function FriendRequestsModal({
                                 color: "var(--text-primary)",
                               }}
                             >
-                              {isBusy ? (
+                              {isUndoing ? (
                                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
                               ) : (
                                 <Undo2 className="h-3.5 w-3.5" />

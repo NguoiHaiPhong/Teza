@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { Search, UserPlus, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Loader2, Search, UserPlus, X } from "lucide-react";
 import { bridge } from "../bridge";
 import { useI18n } from "../i18n";
 import type { MessageDto, ThreadDto } from "../types";
@@ -9,6 +9,7 @@ import { ThreadAvatar } from "./ThreadAvatar";
 
 interface Props {
   open: boolean;
+  isLocked?: boolean;
   threads: ThreadDto[];
   onClose: () => void;
   onSelectMessage: (msg: MessageDto) => void;
@@ -29,6 +30,7 @@ function formatResultTime(ts: number, locale: string): string {
 
 export function QuickSearchModal({
   open,
+  isLocked = false,
   threads,
   onClose,
   onSelectMessage,
@@ -38,7 +40,14 @@ export function QuickSearchModal({
   const { locale, t } = useI18n();
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<MessageDto[]>([]);
+  const [resultsQuery, setResultsQuery] = useState("");
+  const [searching, setSearching] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
+  const itemRefs = useRef<(HTMLButtonElement | null)[]>([]);
+
+  const trimmedQuery = query.trim();
+  const resultsAreFresh = Boolean(trimmedQuery) && resultsQuery === trimmedQuery;
+  const freshResults = resultsAreFresh ? results : [];
 
   const threadTitleMap = useMemo(() => {
     const map = new Map<string, string>();
@@ -48,20 +57,25 @@ export function QuickSearchModal({
     return map;
   }, [threads]);
 
-  const matchedThreads = useMemo(() => {
-    const trimmed = query.trim();
-    if (!trimmed || !onSelectThread) return [];
-    return threads
-      .filter((th) => matchesSearchQuery(`${th.title}\n${th.last_preview}\n${th.id}`, trimmed))
-      .slice(0, 6);
-  }, [threads, query, onSelectThread]);
+  const showPhoneLookup = Boolean(onFindPhone && looksLikePhoneQuery(trimmedQuery));
 
-  const totalItems = matchedThreads.length + results.length;
+  const matchedThreads = useMemo(() => {
+    if (!trimmedQuery || !onSelectThread) return [];
+    return threads
+      .filter((th) => matchesSearchQuery(`${th.title}\n${th.last_preview}\n${th.id}`, trimmedQuery))
+      .slice(0, 6);
+  }, [threads, trimmedQuery, onSelectThread]);
+
+  const phoneOffset = showPhoneLookup ? 1 : 0;
+  const msgOffset = phoneOffset + matchedThreads.length;
+  const totalItems = msgOffset + freshResults.length;
   const safeActiveIndex = totalItems > 0 ? Math.min(activeIndex, totalItems - 1) : 0;
 
   const resetState = useCallback(() => {
     setQuery("");
     setResults([]);
+    setResultsQuery("");
+    setSearching(false);
     setActiveIndex(0);
   }, []);
 
@@ -89,48 +103,74 @@ export function QuickSearchModal({
     [onClose, onSelectThread, resetState],
   );
 
+  const handleSelectPhoneLookup = useCallback(() => {
+    if (!onFindPhone || !trimmedQuery) return;
+    const phone = trimmedQuery;
+    resetState();
+    onClose();
+    onFindPhone(phone);
+  }, [onFindPhone, trimmedQuery, resetState, onClose]);
+
   useEffect(() => {
     if (!open) {
       resetState();
       return;
     }
     let cancelled = false;
-    const trimmed = query.trim();
     setActiveIndex(0);
-    if (!trimmed) {
+    if (!trimmedQuery) {
       setResults([]);
+      setResultsQuery("");
+      setSearching(false);
       return;
     }
+    setSearching(true);
     const timer = window.setTimeout(() => {
       void bridge
-        .searchGlobal(trimmed)
+        .searchGlobal(trimmedQuery)
         .then((hits) => {
           if (cancelled) return;
           setResults(hits);
+          setResultsQuery(trimmedQuery);
+          setSearching(false);
           setActiveIndex(0);
         })
         .catch(() => {
           if (cancelled) return;
           setResults([]);
+          setResultsQuery(trimmedQuery);
+          setSearching(false);
         });
     }, 120);
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [open, query, resetState]);
+  }, [open, trimmedQuery, resetState]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || totalItems === 0) return;
+    const el = itemRefs.current[safeActiveIndex];
+    el?.scrollIntoView({ block: "nearest" });
+  }, [open, safeActiveIndex, totalItems]);
+
+  useEffect(() => {
+    if (!open || isLocked) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (isImeComposingEvent(e)) return;
-      if (e.key === "Escape") handleClose();
+      if (isLocked || isImeComposingEvent(e)) return;
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        handleClose();
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, handleClose]);
+  }, [open, isLocked, handleClose]);
 
   if (!open) return null;
+
+  itemRefs.current.length = totalItems;
 
   return (
     <div
@@ -138,6 +178,9 @@ export function QuickSearchModal({
       onClick={handleClose}
     >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={t("globalSearchTitle")}
         className="w-full max-w-xl overflow-hidden rounded-2xl shadow-2xl"
         style={{ background: "var(--bg-sidebar)", border: "1px solid var(--border-subtle)" }}
         onClick={(e) => e.stopPropagation()}
@@ -146,15 +189,20 @@ export function QuickSearchModal({
           className="flex items-center gap-3 border-b px-4 py-3"
           style={{ borderColor: "var(--border-subtle)" }}
         >
-          <Search className="h-4 w-4 shrink-0" style={{ color: "var(--text-secondary)" }} />
+          {searching ? (
+            <Loader2 className="h-4 w-4 shrink-0 animate-spin" style={{ color: "var(--accent)" }} />
+          ) : (
+            <Search className="h-4 w-4 shrink-0" style={{ color: "var(--text-secondary)" }} />
+          )}
           <input
             autoFocus
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => {
-              if (isImeComposingEvent(e)) return;
+              if (isLocked || isImeComposingEvent(e)) return;
               if (e.key === "Escape") {
                 e.preventDefault();
+                e.stopPropagation();
                 handleClose();
               } else if (e.key === "ArrowDown" && totalItems > 0) {
                 e.preventDefault();
@@ -164,11 +212,13 @@ export function QuickSearchModal({
                 setActiveIndex((i) => (i - 1 + totalItems) % totalItems);
               } else if (e.key === "Enter" && totalItems > 0) {
                 e.preventDefault();
-                if (safeActiveIndex < matchedThreads.length) {
-                  const chosenThread = matchedThreads[safeActiveIndex];
+                if (showPhoneLookup && safeActiveIndex === 0) {
+                  handleSelectPhoneLookup();
+                } else if (safeActiveIndex < msgOffset) {
+                  const chosenThread = matchedThreads[safeActiveIndex - phoneOffset];
                   if (chosenThread) handleSelectMatchedThread(chosenThread.id);
-                } else {
-                  const chosenMsg = results[safeActiveIndex - matchedThreads.length];
+                } else if (resultsAreFresh) {
+                  const chosenMsg = freshResults[safeActiveIndex - msgOffset];
                   if (chosenMsg) handleSelectHit(chosenMsg);
                 }
               }
@@ -187,23 +237,23 @@ export function QuickSearchModal({
         </div>
 
         <div className="max-h-96 overflow-y-auto p-2">
-          {onFindPhone && looksLikePhoneQuery(query) && (
+          {showPhoneLookup && (
             <button
-              type="button"
-              onClick={() => {
-                const phone = query.trim();
-                resetState();
-                onClose();
-                onFindPhone(phone);
+              ref={(el) => {
+                itemRefs.current[0] = el;
               }}
+              type="button"
+              onMouseEnter={() => setActiveIndex(0)}
+              onClick={handleSelectPhoneLookup}
               className="hover-menu mb-1.5 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-[13.5px] font-medium transition"
               style={{
                 background: "var(--accent-soft)",
                 color: "var(--accent)",
+                outline: safeActiveIndex === 0 ? "1px solid var(--accent)" : "none",
               }}
             >
               <UserPlus className="h-4 w-4 shrink-0" />
-              <span>{t("findFriendByPhonePrompt", { query: query.trim() })}</span>
+              <span>{t("findFriendByPhonePrompt", { query: trimmedQuery })}</span>
             </button>
           )}
           {matchedThreads.length > 0 && (
@@ -215,12 +265,16 @@ export function QuickSearchModal({
                 {t("quickSearchThreadsSection")}
               </div>
               {matchedThreads.map((th, idx) => {
-                const selected = idx === safeActiveIndex;
+                const combinedIdx = phoneOffset + idx;
+                const selected = combinedIdx === safeActiveIndex;
                 return (
                   <button
                     key={th.id}
+                    ref={(el) => {
+                      itemRefs.current[combinedIdx] = el;
+                    }}
                     type="button"
-                    onMouseEnter={() => setActiveIndex(idx)}
+                    onMouseEnter={() => setActiveIndex(combinedIdx)}
                     onClick={() => handleSelectMatchedThread(th.id)}
                     className="hover-menu flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left transition"
                     style={{
@@ -244,13 +298,25 @@ export function QuickSearchModal({
               })}
             </div>
           )}
-          {matchedThreads.length === 0 && results.length === 0 ? (
+          {!trimmedQuery ? (
             <p className="py-8 text-center text-[13px]" style={{ color: "var(--text-secondary)" }}>
-              {query.trim()
-                ? t("quickSearchNoResults")
-                : t("quickSearchHint")}
+              {t("quickSearchHint")}
             </p>
-          ) : results.length > 0 ? (
+          ) : searching || !resultsAreFresh ? (
+            matchedThreads.length === 0 && !showPhoneLookup ? (
+              <div
+                className="flex items-center justify-center gap-2 py-8 text-[13px]"
+                style={{ color: "var(--text-secondary)" }}
+              >
+                <Loader2 className="h-4 w-4 animate-spin" style={{ color: "var(--accent)" }} />
+                <span>{t("loading")}</span>
+              </div>
+            ) : null
+          ) : matchedThreads.length === 0 && freshResults.length === 0 && !showPhoneLookup ? (
+            <p className="py-8 text-center text-[13px]" style={{ color: "var(--text-secondary)" }}>
+              {t("quickSearchNoResults")}
+            </p>
+          ) : freshResults.length > 0 ? (
             <div>
               {matchedThreads.length > 0 && (
                 <div
@@ -260,13 +326,16 @@ export function QuickSearchModal({
                   {t("quickSearchMessagesSection")}
                 </div>
               )}
-              {results.map((m, idx) => {
-                const combinedIdx = matchedThreads.length + idx;
+              {freshResults.map((m, idx) => {
+                const combinedIdx = msgOffset + idx;
                 const threadTitle = threadTitleMap.get(m.thread_id) || m.thread_id;
                 const selected = combinedIdx === safeActiveIndex;
                 return (
                   <button
                     key={`${m.thread_id}-${m.msg_id}`}
+                    ref={(el) => {
+                      itemRefs.current[combinedIdx] = el;
+                    }}
                     type="button"
                     onMouseEnter={() => setActiveIndex(combinedIdx)}
                     onClick={() => handleSelectHit(m)}
