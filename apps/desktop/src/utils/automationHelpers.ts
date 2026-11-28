@@ -1,4 +1,5 @@
 import type { ThreadKind } from "../types.ts";
+import type { SystemAccessLevel, TezaAccessLevel } from "./aiPermissions.ts";
 
 // ==================== Item #1: Optional AI Assistant DTOs ====================
 
@@ -105,6 +106,10 @@ export interface AiConfigDto {
   has_zeroclaw_token: boolean;
   zeroclaw_token_preview: string;
   zeroclaw_safe_tools?: boolean;
+  teza_access_level?: TezaAccessLevel;
+  system_access_level?: SystemAccessLevel;
+  zeroclaw_allowed_roots?: string[];
+  zeroclaw_allowed_thread_ids?: string[];
   system_prompt: string;
   summary_language: string;
   max_summary_messages: number;
@@ -122,6 +127,10 @@ export interface AiConfigUpdateDto {
   zeroclaw_token?: string;
   clear_zeroclaw_token?: boolean;
   zeroclaw_safe_tools?: boolean;
+  teza_access_level?: TezaAccessLevel;
+  system_access_level?: SystemAccessLevel;
+  zeroclaw_allowed_roots?: string[];
+  zeroclaw_allowed_thread_ids?: string[];
   system_prompt?: string;
   summary_language?: string;
   max_summary_messages?: number;

@@ -697,6 +697,16 @@ export type {
   ZeroClawInstallResultDto,
 } from "./utils/automationHelpers";
 
+export type {
+  AiApprovalDecision,
+  AiMcpStatusDto,
+  AiToolActivityEvent,
+  AiToolApprovalRequest,
+  AiToolAuditEntry,
+  SystemAccessLevel,
+  TezaAccessLevel,
+} from "./utils/aiPermissions";
+
 export interface AiStreamDeltaEvent {
   session_id: string;
   delta: string;
@@ -705,4 +715,25 @@ export interface AiStreamDeltaEvent {
 export interface AiSummaryDeltaEvent {
   thread_id: string;
   delta: string;
+}
+
+export interface AiToolApprovalResolvedEvent {
+  approval_id: string;
+  session_id?: string;
+  decision?: "allow_once" | "allow_session" | "deny" | "timeout" | "cancelled" | "blocked" | string;
+}
+
+export interface AiComposeDraftEvent {
+  thread_id: string;
+  text: string;
+  open_thread?: boolean;
+}
+
+export interface AiOpenThreadEvent {
+  thread_id: string;
+}
+
+export interface AiEmergencyStopResult {
+  cancelled_approvals: number;
+  killed_processes: number;
 }

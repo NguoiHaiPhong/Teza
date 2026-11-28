@@ -71,3 +71,27 @@ test("Round-2 UX workflow keys exist and interpolate cleanly across vi, en, and 
     assert.ok(translateKey(lang, "gdriveLockVaultBtn").length > 2);
   }
 });
+
+test("ZeroClaw Teza MCP 2-axis permission and approval keys interpolate cleanly across vi, en, and ko", () => {
+  for (const lang of ["vi", "en", "ko"] as const) {
+    assert.ok(translateKey(lang, "aiPermSectionTitle").includes("ZeroClaw"));
+    assert.ok(translateKey(lang, "aiMcpStatusRunning", { count: 26 }).includes("26"));
+    assert.ok(translateKey(lang, "aiMcpPendingApprovalsBadge", { count: 2 }).includes("2"));
+    assert.ok(translateKey(lang, "aiMcpActivePsBadge", { count: 1 }).includes("1"));
+    assert.ok(translateKey(lang, "aiAuditLogToggleTitle", { count: 15 }).includes("15"));
+    assert.ok(translateKey(lang, "aiApprovalCountdown", { secs: 45 }).includes("45"));
+    const otherNotice = translateKey(lang, "aiApprovalOtherSessionNotice", {
+      count: 3,
+      session: "Work",
+    });
+    assert.ok(otherNotice.includes("3") && otherNotice.includes("Work"));
+    const estopDone = translateKey(lang, "aiEstopDoneToast", {
+      approvals: 2,
+      processes: 1,
+    });
+    assert.ok(estopDone.includes("2") && estopDone.includes("1"));
+    assert.ok(translateKey(lang, "aiApprovalResolveFailed", { error: "IPC" }).includes("IPC"));
+    assert.ok(translateKey(lang, "aiRailPendingApprovalTooltip", { count: 4 }).includes("4"));
+    assert.ok(translateKey(lang, "aiComposeDraftToast", { title: "Team" }).includes("Team"));
+  }
+});

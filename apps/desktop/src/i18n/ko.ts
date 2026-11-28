@@ -1102,4 +1102,98 @@ export const ko: Record<TranslationKey, string> = {
     "Google Drive 연결을 해제하지 않고 E2EE 금고를 잠그고 캐시된 마스터 키를 지웁니다",
   gdriveVaultLockedNotice: "E2EE 금고가 잠기고 캐시된 키가 지워졌습니다.",
   navSchedulesAttentionTitle: "확인이 필요한 예약 메시지 {count}건",
+
+  // ZeroClaw Teza MCP Bridge & 2-Axis Permissions
+  aiPermSectionTitle: "ZeroClaw 2축 권한 설정 (Teza MCP)",
+  aiPermSectionSubtitle:
+    "Teza 대화 권한과 Windows 시스템 도구 권한을 분리하여 제어합니다. 설정을 저장해야 적용됩니다.",
+  aiPermTezaAxisLabel: "축 1 — Teza 접근 권한",
+  aiPermSystemAxisLabel: "축 2 — Windows 및 ZeroClaw 시스템 권한",
+  aiPermBadgeDefault: "기본값",
+  aiPermBadgeRecommended: "권장",
+  aiPermBadgeSystemRecommended: "권장 — PowerShell, Excel, Word",
+  aiPermBadgeAutoExec: "자동 실행",
+  aiPermBadgeAdvancedRisk: "고급 · 고위험",
+  aiPermTezaT0Title: "T0 — 격리",
+  aiPermTezaT0Desc: "Teza MCP 도구를 연결하지 않습니다. ZeroClaw는 독립적으로만 대화합니다.",
+  aiPermTezaT1Title: "T1 — 읽기 및 초안",
+  aiPermTezaT1Desc:
+    "계정, 친구/그룹, 대화 기록, FTS5 검색, 첨부 파일 내보내기 및 입력창 초안 작성을 지원합니다.",
+  aiPermTezaT2Title: "T2 — 승인 후 전체 제어",
+  aiPermTezaT2Desc:
+    "T1 전체 + 메시지/파일 전송, 예약, 투표, 알림, 친구/그룹 관리. 모든 전송/변경 작업에 원클릭 승인 카드가 표시됩니다.",
+  aiPermTezaT3Title: "T3 — 완전 자동",
+  aiPermTezaT3Desc:
+    "개별 승인 없이 Teza 제어 명령을 자동 실행합니다(대화 범위 제한 지원, 그룹 나가기/내보내기는 계속 확인).",
+  aiPermSysS0Title: "S0 — 안전",
+  aiPermSysS0Desc:
+    "Shell/PowerShell 및 Windows 파일 접근이 차단되며, 안전한 웹/계산/메모리 도구만 사용합니다.",
+  aiPermSysS1Title: "S1 — 승인 기반 Windows 및 Office",
+  aiPermSysS1Desc:
+    "허용된 폴더 내에서 PowerShell, Python, Excel, Word, PDF 도구를 활성화합니다. 모든 PowerShell·파일 쓰기·열기 작업에 원문 승인 카드가 표시됩니다.",
+  aiPermSysS2Title: "S2 — Windows 전체 권한",
+  aiPermSysS2Desc:
+    "ZeroClaw 기본 도구 전체(powershell, python, node, git 등)와 무제한 파일 시스템을 열고 win_*를 자동 승인합니다(OS 핵심 경로 및 Teza 키는 계속 차단).",
+  aiPermHighRiskTitle: "보안 경고: 프롬프트 인젝션 및 자동 실행 위험",
+  aiPermHighRiskBody:
+    "AI가 Teza 대화를 읽으면서 Windows 전체 권한(S2) 또는 자동 실행(T3)을 가지면, 외부 메시지에 숨겨진 지시로 원치 않는 전송이나 시스템 명령이 실행될 수 있습니다. 아래에서 허용 범위를 제한하고 필요 시 AI 채팅의 빨간 E-Stop 버튼으로 즉시 중지하세요.",
+  aiPermAllowedRootsTitle: "허용된 Windows 작업 폴더",
+  aiPermAllowedRootsEmpty:
+    "비워 두면 안전한 기본 폴더(바탕 화면, 문서, 다운로드 및 AI 작업 폴더)가 사용됩니다.",
+  aiPermAllowedRootsPlaceholder:
+    "Windows 폴더 경로 입력 (예: C:\\Users\\User\\Documents\\Reports)...",
+  aiPermPickFolderBtn: "폴더 선택...",
+  aiPermWorkspaceDirLabel: "AI 작업 폴더 (ai_workspace):",
+  aiPermProtectedPathsLabel: "항상 강제 차단(보호 경로):",
+  aiPermAllowedThreadsTitle: "자동 모드(T3) 허용 대화 범위",
+  aiPermAllowedThreadsHint:
+    "비워 두면 모든 대화에 적용됩니다. 특정 대화를 추가하면 해당 채팅에서만 자동 실행을 허용합니다.",
+  aiPermSelectThreadPlaceholder: "허용할 대화 선택...",
+  aiPermManualThreadIdPlaceholder: "또는 대화 ID 입력...",
+  aiPermClearAllThreads: "제한 해제 (모든 대화)",
+  aiMcpStatusRunning: "MCP 브리지 실행 중 · 도구 {count}개 준비됨",
+  aiMcpStatusIdle: "MCP 브리지 대기 중 (활성 도구 없음)",
+  aiMcpStatusReadyHint: "T1~T3 또는 S1~S2 권한을 켜면 MCP 브리지가 자동으로 시작됩니다.",
+  aiMcpPendingApprovalsBadge: "승인 대기 {count}건",
+  aiMcpActivePsBadge: "실행 중 PowerShell {count}개",
+  aiAuditLogToggleTitle: "AI 작업 감사 로그 ({count})",
+  aiAuditLogEmpty: "아직 기록된 AI 도구 작업이 없습니다.",
+  aiAuditColTime: "시간",
+  aiAuditColTool: "도구",
+  aiAuditColDecision: "결정",
+  aiAuditColSummary: "요약",
+  aiPermPillTooltip: "클릭하여 ZeroClaw 2축 권한 설정 열기",
+  aiEstopBtn: "E-Stop",
+  aiEstopStopping: "긴급 중지 중...",
+  aiEstopTooltip:
+    "긴급 중지: 실행 중인 AI 응답 중단, 대기 승인 거부 및 모든 하위 PowerShell 프로세스 강제 종료",
+  aiToolActivityTitle: "도구 실행 상태",
+  aiApprovalCategoryTeza: "Teza",
+  aiApprovalCategorySystem: "Windows / PowerShell",
+  aiApprovalRiskMedium: "확인 필요",
+  aiApprovalRiskHigh: "고위험",
+  aiApprovalExpired: "만료됨",
+  aiApprovalCountdown: "{secs}초 남음",
+  aiApprovalAllowOnce: "이번만 허용",
+  aiApprovalAllowSession: "이 세션에서 항상 허용",
+  aiApprovalDeny: "거부",
+  aiApprovalDetailCwd: "작업 디렉터리:",
+  aiApprovalDetailCommand: "실행할 PowerShell 명령:",
+  aiApprovalDetailTargetPath: "대상 파일 경로:",
+  aiApprovalDetailContentPreview: "내용 미리보기:",
+  aiApprovalDetailRecipient: "수신자 / 대화:",
+  aiApprovalDetailMessage: "메시지 내용:",
+  aiApprovalDetailAttachment: "첨부 파일:",
+  aiApprovalDetailScheduleTime: "예약 시간:",
+  aiApprovalOtherSessionNotice:
+    "다른 AI 대화({session})에서 {count}건의 승인이 대기 중입니다.",
+  aiApprovalSwitchSessionBtn: "해당 대화 열기",
+  aiApprovalHighRiskNoSessionHint: "고위험 작업은 매번 개별 확인이 필요합니다.",
+  aiEstopDoneToast:
+    "AI 긴급 중지 완료 (대기 승인 {approvals}건 취소, 프로세스 {processes}개 종료).",
+  aiApprovalResolveFailed: "AI 작업 승인 결정을 처리하지 못했습니다: {error}",
+  aiApprovalAlreadyExpired: "이 승인 요청은 이미 만료되었거나 처리되었습니다.",
+  aiRailPendingApprovalTooltip: "Teza AI · 승인 대기 중인 작업 {count}건",
+  aiComposeDraftToast:
+    "Teza AI가 {title} 대화에 초안을 작성했습니다 — 확인 후 Enter를 눌러 전송하세요.",
 };

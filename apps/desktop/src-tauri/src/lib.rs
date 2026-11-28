@@ -4,6 +4,7 @@ mod call;
 mod clipboard;
 mod file_dialog;
 mod local_api;
+mod mcp_bridge;
 mod notify_popup;
 mod scheduler;
 mod screen_shake;
@@ -30,13 +31,13 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 
 use zalo_core::ai::{
-    ai_chat_stream_session_with_acp, ai_config_file, ai_summarize_unread_with_relay,
+    ai_chat_stream_session_with_acp_and_mcp, ai_config_file, ai_summarize_unread_with_relay,
     ai_translate_text_with_relay, check_ai_relay_policy, clear_zeroclaw_session_memory,
     delete_zeroclaw_session_dir, fetch_cloud_models_with_relay, install_zeroclaw_latest,
     is_same_cloud_api_host, probe_zeroclaw_in_dir, run_zeroclaw_command,
     scrub_stale_zeroclaw_ephemeral_and_secrets, validate_strict_ai_session_id, AiBackend,
     AiCancelToken, AiChatTurn, AiCliProbeDto, AiCommandResultDto, AiConfig, AiConfigPublic,
-    AiConfigUpdate, AiModelInfoDto, AiOperation, AiSummaryDto, AiSummaryInputMsg,
+    AiConfigUpdate, AiModelInfoDto, AiOperation, AiStreamEvent, AiSummaryDto, AiSummaryInputMsg,
     ZeroClawAcpManager, ZeroClawInstallResultDto, MAX_CHAT_HISTORY_TURNS,
 };
 use zalo_core::chat::messaging;
@@ -128,6 +129,7 @@ pub struct AppState {
     pub ai_session_epochs: Arc<Mutex<HashMap<String, u64>>>,
     pub scheduler: scheduler::SchedulerHandle,
     pub local_api: Arc<local_api::LocalApiManager>,
+    pub mcp_bridge: Arc<mcp_bridge::TezaMcpBridge>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,6 +310,7 @@ pub(crate) async fn clear_expired_session(
         *st.active_thread_id.lock().await = None;
         bump_all_ai_session_epochs(&st.ai_session_epochs).await;
         cancel_all_ai_tokens(&st.ai_cancel_tokens).await;
+        st.mcp_bridge.reset_for_logout().await;
         st.zeroclaw_acp.shutdown_all().await;
         st.call_mgr.teardown_for_session(Some(app), sess_arc).await;
         {
@@ -1402,6 +1405,7 @@ async fn auth_logout(app: AppHandle, state: State<'_, AppState>) -> Result<(), S
     }
     bump_all_ai_session_epochs(&state.ai_session_epochs).await;
     cancel_all_ai_tokens(&state.ai_cancel_tokens).await;
+    state.mcp_bridge.reset_for_logout().await;
     state.zeroclaw_acp.shutdown_all().await;
     state
         .call_mgr
@@ -6496,6 +6500,7 @@ async fn call_request_video_keyframe(
 /// `RunEvent::Exit`, and before Windows updater process termination.
 async fn graceful_shutdown_services(state: &AppState) {
     cancel_all_ai_tokens(&state.ai_cancel_tokens).await;
+    state.mcp_bridge.stop().await;
     state.zeroclaw_acp.shutdown_all().await;
     let _ = state.local_api.stop().await;
     state.gdrive.shutdown().await;
@@ -10570,9 +10575,10 @@ async fn ai_update_config(
     state: State<'_, AppState>,
     update: AiConfigUpdate,
 ) -> Result<AiConfigPublic, String> {
-    let staged = {
+    let (prev, staged) = {
         let cfg = state.ai_config.lock().await;
-        cfg.with_update(update).map_err(|e| e.to_string())?
+        let next = cfg.with_update(update).map_err(|e| e.to_string())?;
+        (cfg.clone(), next)
     };
     let path = ai_config_file(&state.paths.root);
     staged
@@ -10581,6 +10587,15 @@ async fn ai_update_config(
     {
         let mut cfg = state.ai_config.lock().await;
         *cfg = staged.clone();
+    }
+    let permissions_changed = prev.teza_access_level != staged.teza_access_level
+        || prev.system_access_level != staged.system_access_level
+        || prev.zeroclaw_allowed_roots != staged.zeroclaw_allowed_roots
+        || prev.zeroclaw_allowed_thread_ids != staged.zeroclaw_allowed_thread_ids
+        || prev.enabled != staged.enabled
+        || prev.backend != staged.backend;
+    if permissions_changed {
+        let _ = state.mcp_bridge.emergency_stop().await;
     }
     cancel_all_ai_tokens(&state.ai_cancel_tokens).await;
     state.zeroclaw_acp.shutdown_all().await;
@@ -10745,6 +10760,7 @@ async fn ai_delete_session(
     let sid = validate_required_ai_session_id(&session_id)?;
     bump_ai_session_epoch(&state.ai_session_epochs, &sid).await;
     cancel_ai_token_for_session(&state.ai_cancel_tokens, &sid).await;
+    state.mcp_bridge.cancel_session_approvals(&sid, true).await;
     state.zeroclaw_acp.shutdown_session(&sid).await;
     delete_zeroclaw_session_dir(&state.paths.root, &sid);
     let (deleted, cancelled_late_turn) = {
@@ -10755,6 +10771,7 @@ async fn ai_delete_session(
         (deleted, had_late)
     };
     if cancelled_late_turn {
+        state.mcp_bridge.cancel_session_approvals(&sid, true).await;
         state.zeroclaw_acp.shutdown_session(&sid).await;
         delete_zeroclaw_session_dir(&state.paths.root, &sid);
     }
@@ -10783,6 +10800,7 @@ async fn ai_clear_messages(
     let sid = normalize_ai_session_id(session_id.as_deref())?;
     bump_ai_session_epoch(&state.ai_session_epochs, &sid).await;
     cancel_ai_token_for_session(&state.ai_cancel_tokens, &sid).await;
+    state.mcp_bridge.cancel_session_approvals(&sid, true).await;
     state.zeroclaw_acp.shutdown_session(&sid).await;
     clear_zeroclaw_session_memory(&state.paths.root, &sid);
     let (deleted, cancelled_late_turn) = {
@@ -10793,6 +10811,7 @@ async fn ai_clear_messages(
         (deleted, had_late)
     };
     if cancelled_late_turn {
+        state.mcp_bridge.cancel_session_approvals(&sid, true).await;
         state.zeroclaw_acp.shutdown_session(&sid).await;
         clear_zeroclaw_session_memory(&state.paths.root, &sid);
     }
@@ -10860,8 +10879,15 @@ async fn ai_chat_send(
         return Err("Đã dừng tạo phản hồi.".into());
     }
 
+    state.mcp_bridge.set_active_session_id(&sid);
+    let mcp_bridge_cfg = if cfg.backend == AiBackend::Zeroclaw {
+        state.mcp_bridge.endpoint_config_for(&cfg).await
+    } else {
+        None
+    };
+
     let sid_for_emit = sid.clone();
-    let stream_res = ai_chat_stream_session_with_acp(
+    let stream_res = ai_chat_stream_session_with_acp_and_mcp(
         &cfg,
         &relay,
         Some(&state.paths.root),
@@ -10870,14 +10896,34 @@ async fn ai_chat_send(
         &history,
         prompt_clean,
         Some(&cancel_token),
-        |delta| {
-            let _ = app.emit(
-                "core://ai-stream-delta",
-                serde_json::json!({
-                    "session_id": sid_for_emit,
-                    "delta": delta,
-                }),
-            );
+        mcp_bridge_cfg.as_ref(),
+        |ev| match ev {
+            AiStreamEvent::Delta { text } => {
+                let _ = app.emit(
+                    "core://ai-stream-delta",
+                    serde_json::json!({
+                        "session_id": sid_for_emit,
+                        "delta": text,
+                    }),
+                );
+            }
+            AiStreamEvent::ToolCall {
+                tool_call_id,
+                tool_name,
+                status,
+                summary,
+            } => {
+                let _ = app.emit(
+                    "core://ai-tool-activity",
+                    serde_json::json!({
+                        "session_id": sid_for_emit,
+                        "tool_call_id": tool_call_id,
+                        "tool_name": tool_name,
+                        "status": status,
+                        "summary": summary,
+                    }),
+                );
+            }
         },
     )
     .await;
@@ -10925,8 +10971,9 @@ async fn ai_chat_cancel(
 ) -> Result<bool, String> {
     let sid = normalize_ai_session_id(session_id.as_deref())?;
     let had_token = cancel_ai_token_for_session(&state.ai_cancel_tokens, &sid).await;
+    let mcp_cancelled = state.mcp_bridge.cancel_session_approvals(&sid, false).await > 0;
     let acp_cancelled = state.zeroclaw_acp.cancel_session(&sid).await;
-    Ok(had_token || acp_cancelled)
+    Ok(had_token || mcp_cancelled || acp_cancelled)
 }
 
 #[tauri::command]
@@ -11051,6 +11098,62 @@ async fn ai_translate_text(
     ai_translate_text_with_relay(&cfg, &relay, Some(&state.paths.root), &text, &target_lang)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn ai_resolve_tool_approval(
+    state: State<'_, AppState>,
+    approval_id: String,
+    decision: String,
+) -> Result<bool, String> {
+    Ok(state
+        .mcp_bridge
+        .resolve_approval(&approval_id, &decision)
+        .await)
+}
+
+#[tauri::command]
+async fn ai_emergency_stop(
+    state: State<'_, AppState>,
+) -> Result<mcp_bridge::AiEmergencyStopResult, String> {
+    let res = state.mcp_bridge.emergency_stop().await;
+    cancel_all_ai_tokens(&state.ai_cancel_tokens).await;
+    state.zeroclaw_acp.shutdown_all().await;
+    Ok(res)
+}
+
+#[tauri::command]
+async fn ai_list_tool_audit_logs(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<mcp_bridge::AiToolAuditEntry>, String> {
+    Ok(state.mcp_bridge.list_audit_logs(limit))
+}
+
+#[tauri::command]
+async fn ai_mcp_status(
+    state: State<'_, AppState>,
+) -> Result<mcp_bridge::AiMcpStatusDto, String> {
+    let cfg = state.ai_config.lock().await.clone();
+    Ok(state.mcp_bridge.status(&cfg).await)
+}
+
+#[tauri::command]
+async fn ai_pick_allowed_root_dir(app: AppHandle) -> Result<Option<String>, String> {
+    let owner_hwnd = main_window_hwnd(&app);
+    let picked = tokio::task::spawn_blocking(move || {
+        file_dialog::pick_directory_with_title(
+            owner_hwnd,
+            "Chọn thư mục Windows được phép cho AI (ZeroClaw)",
+        )
+    })
+    .await
+    .map_err(|e| format!("Lỗi tác vụ chọn thư mục: {e}"))??;
+    Ok(picked.map(|p| {
+        file_dialog::normalize_os_display_path(&p)
+            .to_string_lossy()
+            .into_owned()
+    }))
 }
 
 #[tauri::command]
@@ -11430,8 +11533,11 @@ pub fn run() {
 
     let translate_cfg = TranslateConfig::load_from_file(&paths.translate_file());
     let ai_cfg = AiConfig::load_from_file(&ai_config_file(&paths.root));
+    let ai_cfg_arc = Arc::new(Mutex::new(ai_cfg));
+    let active_thread_id_arc = Arc::new(Mutex::new(None));
     let scheduler = scheduler::SchedulerHandle::new();
     let local_api = Arc::new(local_api::LocalApiManager::new(&paths));
+    let mcp_bridge = Arc::new(mcp_bridge::TezaMcpBridge::new(paths.clone()));
     let sess_arc = Arc::new(Mutex::new(session));
     let store_arc = Arc::new(Mutex::new(store));
     let media_vault_arc = Arc::new(RwLock::new(Arc::new(media_vault)));
@@ -11450,14 +11556,22 @@ pub fn run() {
         webapp_accounts::WebAppAccountStore::load(paths.root.join("webapp_accounts.json"));
     let gdrive_for_setup = gdrive.clone();
     let gdrive_for_sched = gdrive.clone();
+    let gdrive_for_mcp = gdrive.clone();
     let relay_for_setup = relay_cfg_arc.clone();
     let store_for_setup = store_arc.clone();
     let media_vault_for_setup = media_vault_arc.clone();
     let media_vault_for_sched = media_vault_arc.clone();
+    let media_vault_for_mcp = media_vault_arc.clone();
     let session_for_setup = sess_arc.clone();
+    let session_for_mcp = sess_arc.clone();
     let store_for_automation = store_arc.clone();
+    let store_for_mcp = store_arc.clone();
     let scheduler_for_setup = scheduler.clone();
+    let scheduler_for_mcp = scheduler.clone();
     let local_api_for_setup = local_api.clone();
+    let mcp_bridge_for_setup = mcp_bridge.clone();
+    let ai_cfg_for_mcp = ai_cfg_arc.clone();
+    let active_thread_for_mcp = active_thread_id_arc.clone();
     let state = AppState {
         paths,
         session: sess_arc,
@@ -11468,7 +11582,7 @@ pub fn run() {
         ws_task: ws_task_arc,
         qr_task: qr_task_arc,
         qr_generation: Arc::new(AtomicU64::new(0)),
-        active_thread_id: Arc::new(Mutex::new(None)),
+        active_thread_id: active_thread_id_arc,
         translate_cfg: Arc::new(Mutex::new(translate_cfg)),
         relay_cfg: relay_cfg_arc,
         pending_update: Arc::new(Mutex::new(None)),
@@ -11485,7 +11599,7 @@ pub fn run() {
         approved_attachment_paths: Arc::new(std::sync::Mutex::new(VecDeque::new())),
         staged_raw_uploads: Arc::new(std::sync::Mutex::new(HashMap::new())),
         call_mgr,
-        ai_config: Arc::new(Mutex::new(ai_cfg)),
+        ai_config: ai_cfg_arc,
         zeroclaw_acp: ZeroClawAcpManager::new(),
         zeroclaw_install_lock: Arc::new(Mutex::new(())),
         zeroclaw_installing: Arc::new(AtomicBool::new(false)),
@@ -11493,6 +11607,7 @@ pub fn run() {
         ai_session_epochs: Arc::new(Mutex::new(HashMap::new())),
         scheduler,
         local_api,
+        mcp_bridge,
     };
 
     let builder = tauri::Builder::default();
@@ -11659,6 +11774,11 @@ pub fn run() {
             ai_run_zeroclaw_command,
             ai_summarize_unread,
             ai_translate_text,
+            ai_resolve_tool_approval,
+            ai_emergency_stop,
+            ai_list_tool_audit_logs,
+            ai_mcp_status,
+            ai_pick_allowed_root_dir,
             schedule_list,
             schedule_create,
             schedule_update,
@@ -11714,6 +11834,28 @@ pub fn run() {
                         .await
                     {
                         eprintln!("[teza][local-api] failed to start on boot: {err}");
+                    }
+                });
+            }
+            {
+                let app_mcp = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let gdrive_notify = Arc::new(move || {
+                        gdrive_for_mcp.notify_sync();
+                    });
+                    let deps = mcp_bridge::McpBridgeDeps {
+                        session: session_for_mcp,
+                        store: store_for_mcp,
+                        media_vault: media_vault_for_mcp,
+                        ai_config: ai_cfg_for_mcp,
+                        active_thread_id: active_thread_for_mcp,
+                        scheduler: scheduler_for_mcp,
+                    };
+                    if let Err(err) = mcp_bridge_for_setup
+                        .start_with_app(app_mcp, gdrive_notify, deps)
+                        .await
+                    {
+                        eprintln!("[teza][mcp-bridge] failed to start on boot: {err}");
                     }
                 });
             }

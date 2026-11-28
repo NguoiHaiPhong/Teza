@@ -170,13 +170,9 @@ import {
   isSameLangCode,
   normalizeLangBase,
 } from "./utils/translateFilter";
-import { ActiveCallBar } from "./components/ActiveCallBar";
 import { Composer } from "./components/Composer";
-import { DownloadOverlay } from "./components/DownloadOverlay";
-import { IncomingCallModal } from "./components/IncomingCallModal";
 import type { LightboxItem } from "./components/MediaLightbox";
 import { MessageBubble, type MessageTranslationState } from "./components/MessageBubble";
-import { NavDrawer } from "./components/NavDrawer";
 import {
   PasscodeLockScreen,
   type PasscodeActiveCallBanner,
@@ -232,12 +228,16 @@ import {
   type WebAppItem,
   type WebAppsConfig,
 } from "./utils/webApps";
+import { mergeToolActivities } from "./utils/aiPermissions";
 import type {
   AccountProfile,
+  AiApprovalDecision,
   AiConfigDto,
   AiConfigUpdateDto,
   AiStoredMessageDto,
   AiSummaryDto,
+  AiToolActivityEvent,
+  AiToolApprovalRequest,
   ZeroClawInstallProgressDto,
   AppUpdateInfo,
   BuiltInRailFolderId,
@@ -272,6 +272,7 @@ import type {
 } from "./types";
 
 const AI_AUTO_PROBE_COMPLETED_KEY = "teza.aiAutoProbeCompleted";
+const EMPTY_AI_TOOL_ACTIVITIES: AiToolActivityEvent[] = [];
 
 function hasCompletedAiAutoProbe(): boolean {
   try {
@@ -289,6 +290,9 @@ function markAiAutoProbeCompleted(): void {
   }
 }
 
+const ActiveCallBar = lazy(() =>
+  import("./components/ActiveCallBar").then((m) => ({ default: m.ActiveCallBar })),
+);
 const AddGroupMembersModal = lazy(() =>
   import("./components/AddGroupMembersModal").then((m) => ({ default: m.AddGroupMembersModal })),
 );
@@ -298,6 +302,9 @@ const CreatePollModal = lazy(() =>
 );
 const CreateReminderModal = lazy(() =>
   import("./components/CreateReminderModal").then((m) => ({ default: m.CreateReminderModal })),
+);
+const DownloadOverlay = lazy(() =>
+  import("./components/DownloadOverlay").then((m) => ({ default: m.DownloadOverlay })),
 );
 const FindUserModal = lazy(() =>
   import("./components/FindUserModal").then((m) => ({ default: m.FindUserModal })),
@@ -309,8 +316,14 @@ const ForwardModal = lazy(() =>
   import("./components/ForwardModal").then((m) => ({ default: m.ForwardModal })),
 );
 const FriendRequestsModal = lazy(() => import("./components/FriendRequestsModal"));
+const IncomingCallModal = lazy(() =>
+  import("./components/IncomingCallModal").then((m) => ({ default: m.IncomingCallModal })),
+);
 const MediaLightbox = lazy(() =>
   import("./components/MediaLightbox").then((m) => ({ default: m.MediaLightbox })),
+);
+const NavDrawer = lazy(() =>
+  import("./components/NavDrawer").then((m) => ({ default: m.NavDrawer })),
 );
 const QuickSearchModal = lazy(() =>
   import("./components/QuickSearchModal").then((m) => ({ default: m.QuickSearchModal })),
@@ -553,6 +566,11 @@ export default function App() {
   const [aiStreamingText, setAiStreamingText] = useState("");
   const [aiIsStreaming, setAiIsStreaming] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
+  const [aiToolActivitiesBySession, setAiToolActivitiesBySession] = useState<
+    Record<string, AiToolActivityEvent[]>
+  >({});
+  const [pendingAiApprovals, setPendingAiApprovals] = useState<AiToolApprovalRequest[]>([]);
+  const [aiEmergencyStopping, setAiEmergencyStopping] = useState(false);
   const [activeAttachmentUploadIds, setActiveAttachmentUploadIds] = useState<Set<string>>(
     () => new Set(),
   );
@@ -758,6 +776,9 @@ export default function App() {
   const lastOptimisticTsRef = useRef(0);
   const aiChatOpenRef = useRef(aiChatOpen);
   const aiConfigRef = useRef<AiConfigDto | null>(aiConfig);
+  const aiEmergencyStoppingRef = useRef(false);
+  const effectiveLockedRef = useRef(false);
+  const openThreadByIdRef = useRef<(tid: string) => void>(() => undefined);
   const aiAutoProbeDoneRef = useRef(false);
   const aiMsgFetchSeqRef = useRef(0);
   const aiSessionsReqSeqRef = useRef(0);
@@ -856,6 +877,7 @@ export default function App() {
   quickSearchOpenRef.current = quickSearchOpen;
   webAppHubOpenRef.current = Boolean(webAppsCfg.enabled && webAppHubOpen);
   const effectiveLocked = Boolean(authed && isLocked);
+  effectiveLockedRef.current = effectiveLocked;
   const hasActiveVideoCall = Boolean(
     authed &&
       !isLocked &&
@@ -2160,6 +2182,10 @@ export default function App() {
     setAiStreamingText("");
     setAiIsStreaming(false);
     setAiError(null);
+    setAiToolActivitiesBySession({});
+    setPendingAiApprovals([]);
+    aiEmergencyStoppingRef.current = false;
+    setAiEmergencyStopping(false);
     setAiSummaryByThread({});
     setSchedules([]);
     setScheduledModalOpen(false);
@@ -2262,6 +2288,16 @@ export default function App() {
     return list;
   }, []);
 
+  const clearAiToolActivitiesForSession = useCallback((sessionId: string) => {
+    const sid = (sessionId || "").trim() || "default";
+    setAiToolActivitiesBySession((prev) => {
+      if (!prev[sid]) return prev;
+      const next = { ...prev };
+      delete next[sid];
+      return next;
+    });
+  }, []);
+
   const handleAiSend = useCallback(
     async (rawPrompt: string) => {
       const trimmed = rawPrompt.trim();
@@ -2280,6 +2316,7 @@ export default function App() {
       };
       aiCancelRequestedRef.current = false;
       aiMsgFetchSeqRef.current += 1;
+      clearAiToolActivitiesForSession(targetSid);
       setAiError(null);
       setAiStreamingText("");
       setAiIsStreaming(true);
@@ -2333,7 +2370,7 @@ export default function App() {
         setAiIsStreaming(false);
       }
     },
-    [refreshAiSessions],
+    [refreshAiSessions, clearAiToolActivitiesForSession],
   );
 
   const handleAiSelectSession = useCallback(
@@ -2341,6 +2378,9 @@ export default function App() {
       const targetSid = (sessionId || "").trim() || "default";
       if (aiIsStreamingRef.current) return;
       if (targetSid === activeAiSessionIdRef.current) return;
+      const prevSid = activeAiSessionIdRef.current;
+      clearAiToolActivitiesForSession(prevSid);
+      clearAiToolActivitiesForSession(targetSid);
       selectActiveAiSessionId(targetSid);
       setAiError(null);
       setAiStreamingText("");
@@ -2363,7 +2403,7 @@ export default function App() {
         }
       }
     },
-    [selectActiveAiSessionId],
+    [selectActiveAiSessionId, clearAiToolActivitiesForSession],
   );
 
   const handleAiCreateSession = useCallback(async () => {
@@ -2372,6 +2412,7 @@ export default function App() {
       const created = await bridge.aiCreateSession();
       aiSessionsReqSeqRef.current += 1;
       aiMsgFetchSeqRef.current += 1;
+      clearAiToolActivitiesForSession(activeAiSessionIdRef.current);
       selectActiveAiSessionId(created.id);
       setAiMessages([]);
       setAiStreamingText("");
@@ -2387,7 +2428,7 @@ export default function App() {
       setAiError(err instanceof Error ? err.message : String(err));
       throw err;
     }
-  }, [selectActiveAiSessionId, refreshAiSessions]);
+  }, [selectActiveAiSessionId, refreshAiSessions, clearAiToolActivitiesForSession]);
 
   const handleAiRenameSession = useCallback(
     async (sessionId: string, title: string) => {
@@ -2405,6 +2446,7 @@ export default function App() {
     async (sessionId: string) => {
       if (aiIsStreamingRef.current && sessionId === activeAiSessionIdRef.current) return;
       await bridge.aiDeleteSession(sessionId);
+      clearAiToolActivitiesForSession(sessionId);
       let remaining: AiSessionDto[];
       try {
         remaining = await refreshAiSessions();
@@ -2415,6 +2457,7 @@ export default function App() {
       }
       if (activeAiSessionIdRef.current === sessionId) {
         const nextSid = remaining[0]?.id || "default";
+        clearAiToolActivitiesForSession(nextSid);
         selectActiveAiSessionId(nextSid);
         setAiError(null);
         setAiStreamingText("");
@@ -2437,7 +2480,7 @@ export default function App() {
         }
       }
     },
-    [refreshAiSessions, selectActiveAiSessionId],
+    [refreshAiSessions, selectActiveAiSessionId, clearAiToolActivitiesForSession],
   );
 
   const handleAiClearHistory = useCallback(async () => {
@@ -2446,6 +2489,7 @@ export default function App() {
     try {
       await bridge.aiClearMessages(targetSid);
       aiMsgFetchSeqRef.current += 1;
+      clearAiToolActivitiesForSession(targetSid);
       if (activeAiSessionIdRef.current === targetSid) {
         setAiMessages([]);
         setAiStreamingText("");
@@ -2457,13 +2501,58 @@ export default function App() {
         setAiError(err instanceof Error ? err.message : String(err));
       }
     }
-  }, [refreshAiSessions]);
+  }, [refreshAiSessions, clearAiToolActivitiesForSession]);
 
   const handleAiCancelStream = useCallback(() => {
     if (!aiIsStreamingRef.current) return;
     aiCancelRequestedRef.current = true;
     void bridge.aiChatCancel(activeAiSessionIdRef.current || "default").catch(() => undefined);
   }, []);
+
+  const handleResolveAiApproval = useCallback(
+    async (approvalId: string, decision: AiApprovalDecision) => {
+      if (!approvalId) return;
+      try {
+        const resolved = await bridge.aiResolveToolApproval(approvalId, decision);
+        setPendingAiApprovals((prev) => prev.filter((item) => item.approval_id !== approvalId));
+        if (!resolved) {
+          showSocialNotice(tRef.current("aiApprovalAlreadyExpired"), "warn");
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        showError(tRef.current("aiApprovalResolveFailed", { error: msg }));
+        throw err;
+      }
+    },
+    [showError, showSocialNotice],
+  );
+
+  const handleAiEmergencyStop = useCallback(async () => {
+    if (aiEmergencyStoppingRef.current) return;
+    aiEmergencyStoppingRef.current = true;
+    setAiEmergencyStopping(true);
+    aiCancelRequestedRef.current = true;
+    try {
+      const res = await bridge.aiEmergencyStop();
+      setPendingAiApprovals([]);
+      setAiToolActivitiesBySession({});
+      setAiStreamingText("");
+      setAiIsStreaming(false);
+      setAiError(null);
+      showSocialNotice(
+        tRef.current("aiEstopDoneToast", {
+          approvals: res?.cancelled_approvals ?? 0,
+          processes: res?.killed_processes ?? 0,
+        }),
+        "warn",
+      );
+    } catch (err) {
+      showError(err);
+    } finally {
+      aiEmergencyStoppingRef.current = false;
+      setAiEmergencyStopping(false);
+    }
+  }, [showError, showSocialNotice]);
 
   const handleAiRunZeroClawCommand = useCallback(
     async (command: "memory" | "memory_clear" | "skills" | "status"): Promise<AiCommandResultDto> => {
@@ -2672,6 +2761,71 @@ export default function App() {
     );
 
     register(
+      bridge.onAiToolActivity((ev) => {
+        if (disposed || !ev || !ev.tool_call_id) return;
+        const sid = (ev.session_id || "").trim() || activeAiSessionIdRef.current || "default";
+        const normalizedEv: AiToolActivityEvent = { ...ev, session_id: sid };
+        setAiToolActivitiesBySession((prev) => ({
+          ...prev,
+          [sid]: mergeToolActivities([...(prev[sid] ?? EMPTY_AI_TOOL_ACTIVITIES), normalizedEv]),
+        }));
+      }),
+    );
+
+    register(
+      bridge.onAiToolApproval((ev) => {
+        if (disposed || !ev || !ev.approval_id) return;
+        setPendingAiApprovals((prev) => {
+          const idx = prev.findIndex((item) => item.approval_id === ev.approval_id);
+          if (idx >= 0) {
+            const next = [...prev];
+            next[idx] = ev;
+            return next;
+          }
+          return [...prev, ev];
+        });
+      }),
+    );
+
+    register(
+      bridge.onAiToolApprovalResolved((ev) => {
+        if (disposed || !ev || !ev.approval_id) return;
+        setPendingAiApprovals((prev) => {
+          if (!prev.some((item) => item.approval_id === ev.approval_id)) return prev;
+          return prev.filter((item) => item.approval_id !== ev.approval_id);
+        });
+      }),
+    );
+
+    register(
+      bridge.onAiComposeDraft((ev) => {
+        if (disposed || !ev || !ev.thread_id) return;
+        const tid = ev.thread_id.trim();
+        if (!tid) return;
+        setDraftForThread(tid, typeof ev.text === "string" ? ev.text : "");
+        if (!effectiveLockedRef.current) {
+          if (ev.open_thread) {
+            openThreadByIdRef.current(tid);
+          }
+          const targetThread = threadsRef.current.find((th) => th.id === tid);
+          showSocialNotice(
+            tRef.current("aiComposeDraftToast", { title: targetThread?.title || tid }),
+            "info",
+          );
+        }
+      }),
+    );
+
+    register(
+      bridge.onAiOpenThread((ev) => {
+        if (disposed || !ev || !ev.thread_id) return;
+        const tid = ev.thread_id.trim();
+        if (!tid || effectiveLockedRef.current) return;
+        openThreadByIdRef.current(tid);
+      }),
+    );
+
+    register(
       bridge.onScheduleUpdated((ev) => {
         if (disposed) return;
         void refreshSchedules();
@@ -2699,7 +2853,7 @@ export default function App() {
         }
       }
     };
-  }, [authed, refreshSchedules, showScheduleAlert]);
+  }, [authed, refreshSchedules, setDraftForThread, showScheduleAlert, showSocialNotice]);
 
   useEffect(() => {
     if (!authed || isLocked || callState.phase !== "incoming_ringing") return;
@@ -3345,6 +3499,7 @@ export default function App() {
     },
     [leaveWebApps, selectAndRevealThread],
   );
+  openThreadByIdRef.current = openThreadById;
 
   useEffect(() => {
     if (!authed || isLocked) return;
@@ -6631,28 +6786,30 @@ export default function App() {
         }}
       >
         {showInlineCallBar && callState.active && (
-          <ActiveCallBar
-            inline
-            active={callState.active}
-            telemetry={callTelemetry}
-            devices={callDevices}
-            devicesLoading={callDevicesLoading}
-            busy={callActionBusy}
-            hangupBusy={callHangupBusy}
-            localCameraStatus={localCameraStatus}
-            onToggleMute={(nextMuted) => void handleToggleCallMute(nextMuted)}
-            onToggleCamera={(nextEnabled) => void handleToggleCallCamera(nextEnabled)}
-            onExpandVideo={() => {
-              setVideoOverlayMode("floating");
-              remoteVideoRendererRef.current?.repaintCachedFrame();
-              remoteVideoRendererRef.current?.requestKeyframe();
-            }}
-            onHangup={() => void handleHangupCall()}
-            onSelectThread={(partnerId) => openThreadById(partnerId)}
-            onRefreshDevices={refreshCallDevices}
-            onSelectDevices={(inp, out) => void handleSelectCallDevices(inp, out)}
-            onDevicesPopoverChange={setActiveCallDevicesOpen}
-          />
+          <Suspense fallback={null}>
+            <ActiveCallBar
+              inline
+              active={callState.active}
+              telemetry={callTelemetry}
+              devices={callDevices}
+              devicesLoading={callDevicesLoading}
+              busy={callActionBusy}
+              hangupBusy={callHangupBusy}
+              localCameraStatus={localCameraStatus}
+              onToggleMute={(nextMuted) => void handleToggleCallMute(nextMuted)}
+              onToggleCamera={(nextEnabled) => void handleToggleCallCamera(nextEnabled)}
+              onExpandVideo={() => {
+                setVideoOverlayMode("floating");
+                remoteVideoRendererRef.current?.repaintCachedFrame();
+                remoteVideoRendererRef.current?.requestKeyframe();
+              }}
+              onHangup={() => void handleHangupCall()}
+              onSelectThread={(partnerId) => openThreadById(partnerId)}
+              onRefreshDevices={refreshCallDevices}
+              onSelectDevices={(inp, out) => void handleSelectCallDevices(inp, out)}
+              onDevicesPopoverChange={setActiveCallDevicesOpen}
+            />
+          </Suspense>
         )}
         {toastError && (
           <div
@@ -6981,6 +7138,8 @@ export default function App() {
               setAiConfig(cfg);
             }}
             onOpenAiChat={handleOpenAiChat}
+            emergencyStopping={aiEmergencyStopping}
+            onEmergencyStop={handleAiEmergencyStop}
             blockedStickersConfig={blockedStickersCfg}
             onBlockedStickerModeChange={handleBlockedStickerModeChange}
             onUnblockStickerRule={handleUnblockSticker}
@@ -7172,66 +7331,68 @@ export default function App() {
     <div className={`relative flex h-full w-full overflow-hidden ${buzzShaking ? "buzz-shaking" : ""}`}>
       <div ref={appShellRef} className="relative flex h-full w-full min-w-0 flex-1 overflow-hidden">
       <TriforceEffects enabled={fxEnabled} dustEnabled={fxEnabled && theme === "triforce"} />
-      <NavDrawer
-        open={navDrawerOpen}
-        isLocked={effectiveLocked}
-        onClose={() => setNavDrawerOpen(false)}
-        myProfile={myProfile}
-        connStatus={connStatus}
-        theme={theme}
-        appVersion={appVersion}
-        availableUpdate={availableUpdate}
-        archivedCount={archivedThreads.length}
-        hasPasscode={passcodeCfg.enabled}
-        aiEnabled={Boolean(aiConfig?.enabled)}
-        pendingSchedulesCount={pendingSchedulesCount}
-        attentionScheduleCount={attentionScheduleCount}
-        onOpenMyProfile={() => {
-          if (myProfile?.uid) setProfileUid(myProfile.uid);
-        }}
-        onOpenSavedMessages={() => {
-          const cloudId = threads.find((t) => t.kind === "cloud")?.id || "cloud-me";
-          openThreadById(cloudId);
-        }}
-        onOpenAiChat={handleOpenAiChat}
-        onOpenScheduledMessages={() => {
-          setScheduledInitialThreadId(selectedId);
-          setScheduledModalOpen(true);
-        }}
-        onOpenArchived={() => {
-          leaveWebApps();
-          setFolder("archived");
-        }}
-        onOpenFindUser={() => {
-          setFindUserInitialPhone("");
-          setFindUserOpen(true);
-        }}
-        onOpenFriendRequests={() => setFriendRequestsOpen(true)}
-        pendingFriendRequestsCount={pendingFriendRequestsCount}
-        onOpenFolders={() => {
-          setEditingFolder(null);
-          setFolderModalOpen(true);
-        }}
-        onLockApp={() => {
-          if (passcodeCfg.enabled) setIsLocked(true);
-        }}
-        onOpenSettings={(tab) => {
-          setSettingsInitialTab(tab || "notifications");
-          setSettingsOpen(true);
-        }}
-        onCycleTheme={cycleTheme}
-        onOpenUpdateModal={() => setUpdateModalOpen(true)}
-        onLogout={() => {
-          void bridge
-            .logout()
-            .then(() => {
-              setAuthed(false);
-              resetSessionUi();
-              void refreshQr();
-            })
-            .catch(showError);
-        }}
-      />
+      <Suspense fallback={null}>
+        <NavDrawer
+          open={navDrawerOpen}
+          isLocked={effectiveLocked}
+          onClose={() => setNavDrawerOpen(false)}
+          myProfile={myProfile}
+          connStatus={connStatus}
+          theme={theme}
+          appVersion={appVersion}
+          availableUpdate={availableUpdate}
+          archivedCount={archivedThreads.length}
+          hasPasscode={passcodeCfg.enabled}
+          aiEnabled={Boolean(aiConfig?.enabled)}
+          pendingSchedulesCount={pendingSchedulesCount}
+          attentionScheduleCount={attentionScheduleCount}
+          onOpenMyProfile={() => {
+            if (myProfile?.uid) setProfileUid(myProfile.uid);
+          }}
+          onOpenSavedMessages={() => {
+            const cloudId = threads.find((t) => t.kind === "cloud")?.id || "cloud-me";
+            openThreadById(cloudId);
+          }}
+          onOpenAiChat={handleOpenAiChat}
+          onOpenScheduledMessages={() => {
+            setScheduledInitialThreadId(selectedId);
+            setScheduledModalOpen(true);
+          }}
+          onOpenArchived={() => {
+            leaveWebApps();
+            setFolder("archived");
+          }}
+          onOpenFindUser={() => {
+            setFindUserInitialPhone("");
+            setFindUserOpen(true);
+          }}
+          onOpenFriendRequests={() => setFriendRequestsOpen(true)}
+          pendingFriendRequestsCount={pendingFriendRequestsCount}
+          onOpenFolders={() => {
+            setEditingFolder(null);
+            setFolderModalOpen(true);
+          }}
+          onLockApp={() => {
+            if (passcodeCfg.enabled) setIsLocked(true);
+          }}
+          onOpenSettings={(tab) => {
+            setSettingsInitialTab(tab || "notifications");
+            setSettingsOpen(true);
+          }}
+          onCycleTheme={cycleTheme}
+          onOpenUpdateModal={() => setUpdateModalOpen(true)}
+          onLogout={() => {
+            void bridge
+              .logout()
+              .then(() => {
+                setAuthed(false);
+                resetSessionUi();
+                void refreshQr();
+              })
+              .catch(showError);
+          }}
+        />
+      </Suspense>
       {/* Column 1: Folder Rail */}
       <aside
         className={`tf-rail relative z-10 shrink-0 flex-col overflow-hidden ${
@@ -7421,16 +7582,21 @@ export default function App() {
             )}
           </button>
 
-          {showTezaAiCard && (
+          {(showTezaAiCard || pendingAiApprovals.length > 0) && (
             <>
               <div className="my-1 h-px w-8 shrink-0" style={{ background: "var(--border-subtle)" }} />
               {(() => {
                 const active = aiChatOpen && !activeWebApp && !webAppHubOpen;
                 const isTextOnly = railDisplayMode === "text-only";
+                const pendingCount = pendingAiApprovals.length;
                 return (
                   <button
                     type="button"
-                    title="Teza AI"
+                    title={
+                      pendingCount > 0
+                        ? t("aiRailPendingApprovalTooltip", { count: pendingCount })
+                        : "Teza AI"
+                    }
                     onClick={handleOpenAiChat}
                     className={`tf-rail-btn ${active ? "tf-rail-btn-active" : ""} relative flex w-full shrink-0 rounded-xl ${
                       railDisplayMode === "icon-only"
@@ -7459,6 +7625,23 @@ export default function App() {
                         }
                       >
                         Teza AI
+                      </span>
+                    )}
+                    {pendingCount > 0 && (
+                      <span
+                        aria-label={t("aiRailPendingApprovalTooltip", { count: pendingCount })}
+                        className={
+                          isTextOnly
+                            ? "animate-pulse shrink-0 min-w-[18px] rounded-full px-1.5 py-0.5 text-center text-[10px] font-bold leading-none"
+                            : "animate-pulse absolute right-1 top-1 min-w-[16px] rounded-full px-1 py-0.5 text-center text-[10px] font-bold leading-none shadow-sm"
+                        }
+                        style={{
+                          background: "#f59e0b",
+                          color: "#1c1917",
+                          boxShadow: "0 0 0 2px var(--bg-rail, rgba(245,158,11,0.35))",
+                        }}
+                      >
+                        {pendingCount > 9 ? "9+" : pendingCount}
                       </span>
                     )}
                   </button>
@@ -7904,13 +8087,17 @@ export default function App() {
             </div>
           )}
 
-          {showTezaAiCard && folder === "all" && !filterText.trim() && (
+          {(showTezaAiCard || pendingAiApprovals.length > 0) && folder === "all" && !filterText.trim() && (
             layout.mode === "compact" ? (
               <button
                 type="button"
                 onClick={handleOpenAiChat}
-                title={`Teza AI${aiConfig?.enabled ? ` · ${getAiBackendBadgeLabel(aiConfig)}` : ""}`}
-                className={`mb-1.5 flex w-full items-center justify-center rounded-xl py-2 transition ${
+                title={
+                  pendingAiApprovals.length > 0
+                    ? t("aiRailPendingApprovalTooltip", { count: pendingAiApprovals.length })
+                    : `Teza AI${aiConfig?.enabled ? ` · ${getAiBackendBadgeLabel(aiConfig)}` : ""}`
+                }
+                className={`relative mb-1.5 flex w-full items-center justify-center rounded-xl py-2 transition ${
                   aiChatOpen ? "" : "hover-surface"
                 }`}
                 style={{
@@ -7919,13 +8106,21 @@ export default function App() {
                 }}
               >
                 <div
-                  className="flex h-10 w-10 items-center justify-center rounded-full"
+                  className="relative flex h-10 w-10 items-center justify-center rounded-full"
                   style={{
                     background: aiChatOpen ? "rgba(255,255,255,0.18)" : "var(--accent-soft)",
                     color: aiChatOpen ? "var(--text-on-active)" : "var(--accent)",
                   }}
                 >
                   <Sparkles className="h-5 w-5" />
+                  {pendingAiApprovals.length > 0 && (
+                    <span
+                      className="animate-pulse absolute -right-1 -top-1 min-w-[16px] rounded-full px-1 py-0.5 text-center text-[10px] font-bold leading-none"
+                      style={{ background: "#f59e0b", color: "#1c1917" }}
+                    >
+                      {pendingAiApprovals.length > 9 ? "9+" : pendingAiApprovals.length}
+                    </span>
+                  )}
                 </div>
               </button>
             ) : (
@@ -7942,13 +8137,21 @@ export default function App() {
                 }}
               >
                 <div
-                  className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full"
+                  className="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-full"
                   style={{
                     background: aiChatOpen ? "rgba(255,255,255,0.18)" : "var(--accent-soft)",
                     color: aiChatOpen ? "var(--text-on-active)" : "var(--accent)",
                   }}
                 >
                   <Sparkles className="h-5 w-5" />
+                  {pendingAiApprovals.length > 0 && (
+                    <span
+                      className="animate-pulse absolute -right-1 -top-1 min-w-[16px] rounded-full px-1 py-0.5 text-center text-[10px] font-bold leading-none"
+                      style={{ background: "#f59e0b", color: "#1c1917" }}
+                    >
+                      {pendingAiApprovals.length > 9 ? "9+" : pendingAiApprovals.length}
+                    </span>
+                  )}
                 </div>
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center justify-between gap-2">
@@ -7961,13 +8164,23 @@ export default function App() {
                       Teza AI
                     </span>
                     <span
-                      className="shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-semibold"
-                      style={{
-                        background: aiChatOpen ? "rgba(255,255,255,0.2)" : "var(--accent-soft)",
-                        color: aiChatOpen ? "var(--text-on-active)" : "var(--accent)",
-                      }}
+                      className={`shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${
+                        pendingAiApprovals.length > 0 ? "animate-pulse" : ""
+                      }`}
+                      style={
+                        pendingAiApprovals.length > 0
+                          ? { background: "#f59e0b", color: "#1c1917" }
+                          : {
+                              background: aiChatOpen ? "rgba(255,255,255,0.2)" : "var(--accent-soft)",
+                              color: aiChatOpen ? "var(--text-on-active)" : "var(--accent)",
+                            }
+                      }
                     >
-                      {aiConfig?.enabled ? getAiBackendBadgeLabel(aiConfig) : "AI"}
+                      {pendingAiApprovals.length > 0
+                        ? t("aiMcpPendingApprovalsBadge", { count: pendingAiApprovals.length })
+                        : aiConfig?.enabled
+                          ? getAiBackendBadgeLabel(aiConfig)
+                          : "AI"}
                     </span>
                   </div>
                   <div
@@ -8494,6 +8707,11 @@ export default function App() {
               streamingText={aiStreamingText}
               isStreaming={aiIsStreaming}
               error={aiError}
+              tezaAccessLevel={aiConfig?.teza_access_level}
+              systemAccessLevel={aiConfig?.system_access_level}
+              toolActivities={aiToolActivitiesBySession[activeAiSessionId] ?? EMPTY_AI_TOOL_ACTIVITIES}
+              pendingApprovals={pendingAiApprovals}
+              emergencyStopping={aiEmergencyStopping}
               onSend={(prompt) => void handleAiSend(prompt)}
               onCancelStream={handleAiCancelStream}
               onClearHistory={() => void handleAiClearHistory()}
@@ -8514,6 +8732,8 @@ export default function App() {
               onListModels={handleAiListModels}
               onInstallZeroClaw={handleAiInstallZeroClaw}
               onSubscribeInstallProgress={handleSubscribeZeroClawProgress}
+              onResolveApproval={handleResolveAiApproval}
+              onEmergencyStop={handleAiEmergencyStop}
             />
           </Suspense>
         ) : activeThread ? (
@@ -10763,16 +10983,18 @@ export default function App() {
         </Suspense>
       )}
 
-      {!effectiveLocked && (
-        <DownloadOverlay
-          isLocked={effectiveLocked}
-          activeDownloads={activeDownloads}
-          completedDownload={completedDownload}
-          onDismissCompleted={() => setCompletedDownload(null)}
-          onOpenFile={(path) => bridge.openSavedFile(path)}
-          onRevealFile={(path) => bridge.revealSavedFile(path)}
-          onError={showError}
-        />
+      {!effectiveLocked && (activeDownloads.length > 0 || completedDownload !== null) && (
+        <Suspense fallback={null}>
+          <DownloadOverlay
+            isLocked={effectiveLocked}
+            activeDownloads={activeDownloads}
+            completedDownload={completedDownload}
+            onDismissCompleted={() => setCompletedDownload(null)}
+            onOpenFile={(path) => bridge.openSavedFile(path)}
+            onRevealFile={(path) => bridge.revealSavedFile(path)}
+            onError={showError}
+          />
+        </Suspense>
       )}
 
       {webNotifyToast && !isLocked && (
@@ -10907,43 +11129,47 @@ export default function App() {
         callState.phase !== "idle" &&
         callState.phase !== "incoming_ringing" &&
         !(showVideoOverlay && videoOverlayMode !== "minimized") && (
-          <ActiveCallBar
-            active={callState.active}
-            telemetry={callTelemetry}
-            devices={callDevices}
-            devicesLoading={callDevicesLoading}
-            busy={callActionBusy}
-            hangupBusy={callHangupBusy}
-            localCameraStatus={localCameraStatus}
-            onToggleMute={(nextMuted) => void handleToggleCallMute(nextMuted)}
-            onToggleCamera={(nextEnabled) => void handleToggleCallCamera(nextEnabled)}
-            onExpandVideo={() => {
-              setVideoOverlayMode("floating");
-              remoteVideoRendererRef.current?.repaintCachedFrame();
-              remoteVideoRendererRef.current?.requestKeyframe();
-            }}
-            onHangup={() => void handleHangupCall()}
-            onSelectThread={(partnerId) => openThreadById(partnerId)}
-            onRefreshDevices={refreshCallDevices}
-            onSelectDevices={(inp, out) => void handleSelectCallDevices(inp, out)}
-            onDevicesPopoverChange={setActiveCallDevicesOpen}
-          />
+          <Suspense fallback={null}>
+            <ActiveCallBar
+              active={callState.active}
+              telemetry={callTelemetry}
+              devices={callDevices}
+              devicesLoading={callDevicesLoading}
+              busy={callActionBusy}
+              hangupBusy={callHangupBusy}
+              localCameraStatus={localCameraStatus}
+              onToggleMute={(nextMuted) => void handleToggleCallMute(nextMuted)}
+              onToggleCamera={(nextEnabled) => void handleToggleCallCamera(nextEnabled)}
+              onExpandVideo={() => {
+                setVideoOverlayMode("floating");
+                remoteVideoRendererRef.current?.repaintCachedFrame();
+                remoteVideoRendererRef.current?.requestKeyframe();
+              }}
+              onHangup={() => void handleHangupCall()}
+              onSelectThread={(partnerId) => openThreadById(partnerId)}
+              onRefreshDevices={refreshCallDevices}
+              onSelectDevices={(inp, out) => void handleSelectCallDevices(inp, out)}
+              onDevicesPopoverChange={setActiveCallDevicesOpen}
+            />
+          </Suspense>
         )}
 
       {authed &&
         !isLocked &&
         callState.phase === "incoming_ringing" &&
         callState.active && (
-          <IncomingCallModal
-            active={callState.active}
-            devices={callDevices}
-            devicesLoading={callDevicesLoading}
-            busy={callActionBusy}
-            onAnswer={(cid) => void handleAnswerCall(cid)}
-            onDecline={(cid) => void handleDeclineCall(cid)}
-            onRefreshDevices={refreshCallDevices}
-            onSelectDevices={(inp, out) => void handleSelectCallDevices(inp, out)}
-          />
+          <Suspense fallback={null}>
+            <IncomingCallModal
+              active={callState.active}
+              devices={callDevices}
+              devicesLoading={callDevicesLoading}
+              busy={callActionBusy}
+              onAnswer={(cid) => void handleAnswerCall(cid)}
+              onDecline={(cid) => void handleDeclineCall(cid)}
+              onRefreshDevices={refreshCallDevices}
+              onSelectDevices={(inp, out) => void handleSelectCallDevices(inp, out)}
+            />
+          </Suspense>
         )}
 
       {callNotice && !isLocked && !webAppInlineTopActive && (

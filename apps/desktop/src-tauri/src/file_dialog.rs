@@ -32,13 +32,20 @@ pub fn pick_save_file(
 }
 
 pub fn pick_directory(owner_hwnd: Option<usize>) -> Result<Option<PathBuf>, String> {
+    pick_directory_with_title(owner_hwnd, "Chọn thư mục lưu trữ Media cục bộ cho Teza")
+}
+
+pub fn pick_directory_with_title(
+    owner_hwnd: Option<usize>,
+    title: &str,
+) -> Result<Option<PathBuf>, String> {
     #[cfg(target_os = "windows")]
     {
-        win32::run_pick_directory(owner_hwnd)
+        win32::run_pick_directory(owner_hwnd, title)
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = owner_hwnd;
+        let _ = (owner_hwnd, title);
         Err("Chọn thư mục bản địa hiện chỉ hỗ trợ Windows".into())
     }
 }
@@ -1486,7 +1493,10 @@ mod win32 {
     const COINIT_DISABLE_OLE1DDE: u32 = 0x4;
     const SW_SHOWNORMAL: i32 = 1;
 
-    pub fn run_pick_directory(owner_hwnd: Option<usize>) -> Result<Option<PathBuf>, String> {
+    pub fn run_pick_directory(
+        owner_hwnd: Option<usize>,
+        title_str: &str,
+    ) -> Result<Option<PathBuf>, String> {
         let hr = unsafe {
             CoInitializeEx(
                 null_mut(),
@@ -1494,9 +1504,8 @@ mod win32 {
             )
         };
         let mut display_buf = vec![0u16; 260];
-        let title: Vec<u16> = "Chọn thư mục lưu trữ Media cục bộ cho Teza\0"
-            .encode_utf16()
-            .collect();
+        let clean_title = title_str.replace('\0', " ");
+        let title: Vec<u16> = format!("{clean_title}\0").encode_utf16().collect();
         let flags = if hr >= 0 {
             BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX
         } else {

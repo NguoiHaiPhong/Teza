@@ -1102,4 +1102,98 @@ export const en: Record<TranslationKey, string> = {
     "Lock the E2EE vault and clear the cached master key without disconnecting Google Drive",
   gdriveVaultLockedNotice: "E2EE vault locked and cached key cleared.",
   navSchedulesAttentionTitle: "{count} scheduled messages need attention",
+
+  // ZeroClaw Teza MCP Bridge & 2-Axis Permissions
+  aiPermSectionTitle: "ZeroClaw 2-Axis Permissions (Teza MCP)",
+  aiPermSectionSubtitle:
+    "Separately control Teza chat permissions and Windows system tool access. Save settings to apply.",
+  aiPermTezaAxisLabel: "Axis 1 — Teza Access",
+  aiPermSystemAxisLabel: "Axis 2 — Windows & ZeroClaw System Access",
+  aiPermBadgeDefault: "Default",
+  aiPermBadgeRecommended: "Recommended",
+  aiPermBadgeSystemRecommended: "Recommended — PowerShell, Excel, Word",
+  aiPermBadgeAutoExec: "Auto-execute",
+  aiPermBadgeAdvancedRisk: "Advanced · High risk",
+  aiPermTezaT0Title: "T0 — Isolated",
+  aiPermTezaT0Desc: "No Teza MCP tools attached. ZeroClaw chats independently only.",
+  aiPermTezaT1Title: "T1 — Read & Draft",
+  aiPermTezaT1Desc:
+    "Read account, friends/groups, chat history, FTS5 search, export attachments, and fill composer drafts.",
+  aiPermTezaT2Title: "T2 — Supervised Control",
+  aiPermTezaT2Desc:
+    "All T1 + send messages/files, schedules, polls, reminders, friends/groups. Every outbound action shows a 1-click Approval Card.",
+  aiPermTezaT3Title: "T3 — Full Autonomous",
+  aiPermTezaT3Desc:
+    "Executes Teza actions automatically without per-action approval (supports thread allowlist; leaving/removing group members still confirms).",
+  aiPermSysS0Title: "S0 — Safe",
+  aiPermSysS0Desc:
+    "No Shell/PowerShell or Windows file access; only safe web/calculator/memory tools when enabled.",
+  aiPermSysS1Title: "S1 — Supervised Windows & Office",
+  aiPermSysS1Desc:
+    "Enables PowerShell, Python, Excel, Word, PDF tools inside allowed folders. Every PowerShell, file write, or open action shows a verbatim Approval Card.",
+  aiPermSysS2Title: "S2 — Full Windows Access",
+  aiPermSysS2Desc:
+    "Unlocks all native ZeroClaw tools (powershell, python, node, git...) with unrestricted filesystem and auto-approved win_* calls (OS core & Teza keys stay blocked).",
+  aiPermHighRiskTitle: "Security Warning: Prompt Injection & Auto-Execution Risk",
+  aiPermHighRiskBody:
+    "When AI reads Teza messages while having Full Windows (S2) or Autonomous (T3) access, untrusted instructions hidden in incoming chats could trigger unintended messages or system commands. Restrict scope below and use the red E-Stop button in AI Chat anytime to halt immediately.",
+  aiPermAllowedRootsTitle: "Allowed Windows Workspace Folders",
+  aiPermAllowedRootsEmpty:
+    "Leave empty to use safe defaults (Desktop, Documents, Downloads, and the AI workspace folder).",
+  aiPermAllowedRootsPlaceholder:
+    "Enter a Windows folder path (e.g. C:\\Users\\You\\Documents\\Reports)...",
+  aiPermPickFolderBtn: "Browse folder...",
+  aiPermWorkspaceDirLabel: "AI workspace folder (ai_workspace):",
+  aiPermProtectedPathsLabel: "Always hard-blocked (protected paths):",
+  aiPermAllowedThreadsTitle: "Allowed Conversations for Autonomous Mode (T3)",
+  aiPermAllowedThreadsHint:
+    "Leave empty to allow all conversations. Add specific chats to restrict where ZeroClaw can act autonomously.",
+  aiPermSelectThreadPlaceholder: "Select a conversation to allow...",
+  aiPermManualThreadIdPlaceholder: "Or enter conversation ID...",
+  aiPermClearAllThreads: "Clear filter (all chats)",
+  aiMcpStatusRunning: "MCP Bridge running · {count} tools ready",
+  aiMcpStatusIdle: "MCP Bridge standby (no tools exposed)",
+  aiMcpStatusReadyHint: "MCP Bridge starts automatically when T1–T3 or S1–S2 is enabled.",
+  aiMcpPendingApprovalsBadge: "{count} pending approval",
+  aiMcpActivePsBadge: "{count} active PowerShell",
+  aiAuditLogToggleTitle: "AI Action Audit Log ({count})",
+  aiAuditLogEmpty: "No AI tool actions recorded yet.",
+  aiAuditColTime: "Time",
+  aiAuditColTool: "Tool",
+  aiAuditColDecision: "Decision",
+  aiAuditColSummary: "Summary",
+  aiPermPillTooltip: "Click to configure ZeroClaw 2-axis permissions",
+  aiEstopBtn: "E-Stop",
+  aiEstopStopping: "Stopping...",
+  aiEstopTooltip:
+    "Emergency Stop: immediately abort active AI turn, reject pending approvals, and terminate child PowerShell processes",
+  aiToolActivityTitle: "Tool activity",
+  aiApprovalCategoryTeza: "Teza",
+  aiApprovalCategorySystem: "Windows / PowerShell",
+  aiApprovalRiskMedium: "Needs confirmation",
+  aiApprovalRiskHigh: "High risk",
+  aiApprovalExpired: "Expired",
+  aiApprovalCountdown: "{secs}s left",
+  aiApprovalAllowOnce: "Allow once",
+  aiApprovalAllowSession: "Always allow this tool in session",
+  aiApprovalDeny: "Deny",
+  aiApprovalDetailCwd: "Working dir:",
+  aiApprovalDetailCommand: "Exact PowerShell command:",
+  aiApprovalDetailTargetPath: "Target file path:",
+  aiApprovalDetailContentPreview: "Content preview:",
+  aiApprovalDetailRecipient: "Recipient / Chat:",
+  aiApprovalDetailMessage: "Message text:",
+  aiApprovalDetailAttachment: "Attachment:",
+  aiApprovalDetailScheduleTime: "Scheduled time:",
+  aiApprovalOtherSessionNotice:
+    "{count} pending approval(s) waiting in another AI conversation ({session}).",
+  aiApprovalSwitchSessionBtn: "Switch to session",
+  aiApprovalHighRiskNoSessionHint: "High-risk actions always require per-action confirmation.",
+  aiEstopDoneToast:
+    "AI Emergency Stop completed ({approvals} pending approvals cancelled, {processes} processes terminated).",
+  aiApprovalResolveFailed: "Failed to submit AI approval decision: {error}",
+  aiApprovalAlreadyExpired: "This approval request has already expired or been handled.",
+  aiRailPendingApprovalTooltip: "Teza AI · {count} action(s) waiting for your approval",
+  aiComposeDraftToast:
+    "Teza AI drafted a message for {title} — review and press Enter to send.",
 };

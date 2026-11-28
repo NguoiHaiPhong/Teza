@@ -4,19 +4,26 @@ import {
   AlertTriangle,
   Bot,
   Check,
+  CheckCircle2,
   ChevronDown,
+  CircleX,
+  Clock,
   Copy,
   CornerDownLeft,
   Cpu,
   Download,
+  FileCode2,
   KeyRound,
   Loader2,
   Lock,
   MessageSquare,
+  OctagonX,
   Pencil,
   Plus,
   RefreshCw,
   Send,
+  Shield,
+  ShieldAlert,
   SlidersHorizontal,
   Sparkles,
   Square,
@@ -24,7 +31,29 @@ import {
   Trash2,
   X,
 } from "lucide-react";
+import { useI18n, type TranslationKey } from "../i18n";
 import { copyTextReliable } from "../utils/clipboard";
+import {
+  computeApprovalRemainingSecs,
+  extractApprovalDetailView,
+  formatSystemAccessShortLabel,
+  formatTezaAccessShortLabel,
+  formatToolDisplayName,
+  getAccessBadgeTone,
+  isAllowSessionPermitted,
+  mergeToolActivities,
+  normalizeSystemAccessLevel,
+  normalizeTezaAccessLevel,
+  shouldShowEmergencyStop,
+  type AccessBadgeTone,
+  type AiApprovalDecision,
+  type AiConfigUpdateWithPermissions,
+  type AiConfigWithPermissions,
+  type AiToolActivityEvent,
+  type AiToolApprovalRequest,
+  type SystemAccessLevel,
+  type TezaAccessLevel,
+} from "../utils/aiPermissions";
 import {
   AI_CLOUD_PROVIDERS,
   DEFAULT_CLOUD_API_BASE_URL,
@@ -47,8 +76,6 @@ import {
   type AiBackendKind,
   type AiCloudProviderId,
   type AiCommandResultDto,
-  type AiConfigDto,
-  type AiConfigUpdateDto,
   type AiInstallZeroClawResponseDto,
   type AiModelInfoDto,
   type AiSessionDto,
@@ -57,6 +84,36 @@ import {
   type AiStoredMessageDto,
   type ZeroClawInstallProgressDto,
 } from "../utils/automationHelpers";
+
+function accessPillStyle(tone: AccessBadgeTone): React.CSSProperties {
+  switch (tone) {
+    case "danger":
+      return {
+        background: "rgba(239, 68, 68, 0.14)",
+        color: "#f87171",
+        border: "1px solid rgba(239, 68, 68, 0.42)",
+      };
+    case "warn":
+      return {
+        background: "rgba(245, 158, 11, 0.14)",
+        color: "#fbbf24",
+        border: "1px solid rgba(245, 158, 11, 0.38)",
+      };
+    case "info":
+      return {
+        background: "var(--accent-soft)",
+        color: "var(--accent)",
+        border: "1px solid var(--chip-border)",
+      };
+    case "neutral":
+    default:
+      return {
+        background: "var(--chip-bg)",
+        color: "var(--text-secondary)",
+        border: "1px solid var(--chip-border)",
+      };
+  }
+}
 
 interface PopoverViewportPos {
   left: number;
@@ -91,7 +148,7 @@ function computeClampedPopoverPos(
 }
 
 export interface AiChatPanelProps {
-  config: AiConfigDto | null;
+  config: AiConfigWithPermissions | null;
   relayEnabled?: boolean;
   messages: AiStoredMessageDto[];
   sessions?: AiSessionDto[];
@@ -99,6 +156,11 @@ export interface AiChatPanelProps {
   streamingText: string;
   isStreaming: boolean;
   error: string | null;
+  tezaAccessLevel?: TezaAccessLevel;
+  systemAccessLevel?: SystemAccessLevel;
+  toolActivities?: AiToolActivityEvent[];
+  pendingApprovals?: AiToolApprovalRequest[];
+  emergencyStopping?: boolean;
   onSend: (prompt: string) => void;
   onCancelStream?: () => void;
   onClearHistory: () => void;
@@ -111,12 +173,16 @@ export interface AiChatPanelProps {
   ) => Promise<AiCommandResultDto>;
   onOpenSettings: () => void;
   onClose?: () => void;
-  onQuickSwitchConfig?: (update: AiConfigUpdateDto) => Promise<AiConfigDto | void>;
+  onQuickSwitchConfig?: (
+    update: AiConfigUpdateWithPermissions,
+  ) => Promise<AiConfigWithPermissions | void>;
   onListModels?: (baseUrl?: string, apiKey?: string) => Promise<AiModelInfoDto[]>;
   onInstallZeroClaw?: () => Promise<AiInstallZeroClawResponseDto>;
   onSubscribeInstallProgress?: (
     handler: (ev: ZeroClawInstallProgressDto) => void,
   ) => Promise<() => void>;
+  onResolveApproval?: (approvalId: string, decision: AiApprovalDecision) => Promise<void> | void;
+  onEmergencyStop?: () => Promise<void> | void;
 }
 
 interface LocalCommandCardState extends AiCommandResultDto {
@@ -352,6 +418,11 @@ export function AiChatPanel({
   streamingText,
   isStreaming,
   error,
+  tezaAccessLevel,
+  systemAccessLevel,
+  toolActivities = [],
+  pendingApprovals = [],
+  emergencyStopping = false,
   onSend,
   onCancelStream,
   onClearHistory,
@@ -366,12 +437,38 @@ export function AiChatPanel({
   onListModels,
   onInstallZeroClaw,
   onSubscribeInstallProgress,
+  onResolveApproval,
+  onEmergencyStop,
 }: AiChatPanelProps) {
+  const { t, lang } = useI18n();
+  const tr = useCallback(
+    (key: string, fallback: string, vars?: Record<string, string | number>): string => {
+      const translated = t(key as TranslationKey, vars);
+      if (translated !== key) return translated;
+      if (!vars) return fallback;
+      let text = fallback;
+      for (const [k, v] of Object.entries(vars)) {
+        text = text.replaceAll(`{${k}}`, String(v));
+      }
+      return text;
+    },
+    [t],
+  );
+
   const [draft, setDraft] = useState("");
   const [confirmClear, setConfirmClear] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [copiedCodeKey, setCopiedCodeKey] = useState<string | null>(null);
   const [cancellingStream, setCancellingStream] = useState(false);
+
+  // Live approvals & E-Stop local state
+  const [approvalNowMs, setApprovalNowMs] = useState(() => Date.now());
+  const [busyApprovalDecisions, setBusyApprovalDecisions] = useState<
+    Record<string, AiApprovalDecision>
+  >({});
+  const [approvalErrors, setApprovalErrors] = useState<Record<string, string>>({});
+  const [localEstopBusy, setLocalEstopBusy] = useState(false);
+  const busyApprovalSetRef = useRef<Set<string>>(new Set());
 
   // Multi-session switcher popover state
   const [sessionPickerOpen, setSessionPickerOpen] = useState(false);
@@ -423,6 +520,134 @@ export function AiChatPanel({
   const needsZeroClawKeyBanner = needsZeroClawApiKeyLink(config, relayEnabled);
   const backendLabel = getAiBackendBadgeLabel(config);
   const shortModelLabel = enabled && config ? formatShortAiModelLabel(config.model) : "";
+
+  const effectiveTezaLevel = normalizeTezaAccessLevel(tezaAccessLevel ?? config?.teza_access_level);
+  const effectiveSystemLevel = normalizeSystemAccessLevel(
+    systemAccessLevel ?? config?.system_access_level,
+  );
+  const accessBadge = useMemo(
+    () => getAccessBadgeTone(effectiveTezaLevel, effectiveSystemLevel),
+    [effectiveTezaLevel, effectiveSystemLevel],
+  );
+  const showPermissionPills =
+    enabled && isZeroClawMode && !relayBlocksChat && accessBadge.isElevated;
+  const estopBusy = emergencyStopping || localEstopBusy;
+  const showEstopButton =
+    Boolean(onEmergencyStop) &&
+    shouldShowEmergencyStop({
+      isStreaming,
+      pendingApprovalsCount: pendingApprovals.length,
+      tezaAccessLevel: effectiveTezaLevel,
+      systemAccessLevel: effectiveSystemLevel,
+    });
+
+  const currentSessionActivities = useMemo(() => {
+    const filtered = toolActivities.filter(
+      (ev) => !ev.session_id || ev.session_id === activeSessionId,
+    );
+    return mergeToolActivities(filtered);
+  }, [toolActivities, activeSessionId]);
+
+  const currentSessionApprovals = useMemo(
+    () =>
+      pendingApprovals.filter((req) => !req.session_id || req.session_id === activeSessionId),
+    [pendingApprovals, activeSessionId],
+  );
+
+  const otherSessionApprovals = useMemo(
+    () =>
+      pendingApprovals.filter(
+        (req) => Boolean(req.session_id) && req.session_id !== activeSessionId,
+      ),
+    [pendingApprovals, activeSessionId],
+  );
+
+  const firstOtherApprovalSession = useMemo(() => {
+    const first = otherSessionApprovals[0];
+    if (!first) return null;
+    const match = sessions.find((s) => s.id === first.session_id);
+    return {
+      id: first.session_id,
+      title: match?.title?.trim() || first.session_id,
+    };
+  }, [otherSessionApprovals, sessions]);
+
+  // Live 1s countdown tick only while at least one approval card is pending
+  useEffect(() => {
+    if (pendingApprovals.length === 0) return;
+    setApprovalNowMs(Date.now());
+    const timer = window.setInterval(() => {
+      setApprovalNowMs(Date.now());
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [pendingApprovals.length]);
+
+  // Prune stale per-card errors/busy states when approvals are resolved or expire
+  useEffect(() => {
+    const activeIds = new Set(pendingApprovals.map((a) => a.approval_id));
+    for (const id of Array.from(busyApprovalSetRef.current)) {
+      if (!activeIds.has(id)) busyApprovalSetRef.current.delete(id);
+    }
+    setBusyApprovalDecisions((prev) => {
+      const keys = Object.keys(prev);
+      if (keys.every((k) => activeIds.has(k))) return prev;
+      const next: Record<string, AiApprovalDecision> = {};
+      for (const k of keys) {
+        if (activeIds.has(k)) next[k] = prev[k];
+      }
+      return next;
+    });
+    setApprovalErrors((prev) => {
+      const keys = Object.keys(prev);
+      if (keys.every((k) => activeIds.has(k))) return prev;
+      const next: Record<string, string> = {};
+      for (const k of keys) {
+        if (activeIds.has(k)) next[k] = prev[k];
+      }
+      return next;
+    });
+  }, [pendingApprovals]);
+
+  const handleResolveApprovalClick = async (
+    approvalId: string,
+    decision: AiApprovalDecision,
+  ) => {
+    if (!onResolveApproval || busyApprovalSetRef.current.has(approvalId)) return;
+    busyApprovalSetRef.current.add(approvalId);
+    setBusyApprovalDecisions((prev) => ({ ...prev, [approvalId]: decision }));
+    setApprovalErrors((prev) => {
+      if (!(approvalId in prev)) return prev;
+      const next = { ...prev };
+      delete next[approvalId];
+      return next;
+    });
+    try {
+      await onResolveApproval(approvalId, decision);
+    } catch (err) {
+      setApprovalErrors((prev) => ({
+        ...prev,
+        [approvalId]: err instanceof Error ? err.message : String(err),
+      }));
+    } finally {
+      busyApprovalSetRef.current.delete(approvalId);
+      setBusyApprovalDecisions((prev) => {
+        if (!(approvalId in prev)) return prev;
+        const next = { ...prev };
+        delete next[approvalId];
+        return next;
+      });
+    }
+  };
+
+  const handleEmergencyStopClick = async () => {
+    if (!onEmergencyStop || estopBusy) return;
+    setLocalEstopBusy(true);
+    try {
+      await onEmergencyStop();
+    } finally {
+      setLocalEstopBusy(false);
+    }
+  };
 
   const activeSession = useMemo(
     () => sessions.find((s) => s.id === activeSessionId) ?? null,
@@ -760,15 +985,28 @@ export function AiChatPanel({
             ? 100
             : null;
 
-  // Auto-scroll to bottom on new messages, streaming chunks, or command results
+  // Auto-scroll to bottom on new messages, streaming chunks, tool activities, or command results
   useEffect(() => {
     const el = listRef.current;
     if (!el) return;
     const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    if (distanceToBottom < 220 || isStreaming || commandOutput || commandRunning) {
+    if (
+      distanceToBottom < 220 ||
+      isStreaming ||
+      currentSessionActivities.length > 0 ||
+      commandOutput ||
+      commandRunning
+    ) {
       el.scrollTop = el.scrollHeight;
     }
-  }, [messages.length, streamingText, isStreaming, commandOutput, commandRunning]);
+  }, [
+    messages.length,
+    streamingText,
+    isStreaming,
+    currentSessionActivities.length,
+    commandOutput,
+    commandRunning,
+  ]);
 
   // Reset clear confirmation when messages empty
   useEffect(() => {
@@ -1699,6 +1937,33 @@ export function AiChatPanel({
                     )}
                 </div>
               )}
+
+              {/* 2-Axis Permission Status Pills (clickable to open AI Settings) */}
+              {showPermissionPills && (
+                <button
+                  type="button"
+                  onClick={onOpenSettings}
+                  className="inline-flex max-w-full flex-wrap items-center gap-1 rounded-full px-2 py-0.5 text-[10.5px] font-semibold transition hover:opacity-90"
+                  style={accessPillStyle(accessBadge.tone)}
+                  title={tr(
+                    "aiPermPillTooltip",
+                    "Bấm để mở Cài đặt phân quyền 2 trục cho ZeroClaw",
+                  )}
+                >
+                  {accessBadge.isHighRisk ? (
+                    <ShieldAlert className="h-3 w-3 shrink-0" />
+                  ) : (
+                    <Shield className="h-3 w-3 shrink-0" />
+                  )}
+                  <span className="truncate">
+                    Teza: {formatTezaAccessShortLabel(effectiveTezaLevel, lang)}
+                  </span>
+                  <span className="opacity-65">·</span>
+                  <span className="truncate">
+                    Windows: {formatSystemAccessShortLabel(effectiveSystemLevel, lang)}
+                  </span>
+                </button>
+              )}
             </div>
             <p className="truncate text-[11.5px]" style={{ color: "var(--text-secondary)" }}>
               Trợ lý tùy chọn · Lịch sử mã hóa cục bộ trên thiết bị
@@ -1707,6 +1972,29 @@ export function AiChatPanel({
         </div>
 
         <div className="flex shrink-0 items-center gap-1.5">
+          {showEstopButton && (
+            <button
+              type="button"
+              disabled={estopBusy}
+              onClick={() => void handleEmergencyStopClick()}
+              className="inline-flex items-center gap-1 rounded-xl bg-rose-600 px-2.5 py-1.5 text-xs font-semibold text-white shadow-xs transition hover:bg-rose-500 disabled:cursor-not-allowed disabled:opacity-60"
+              title={tr(
+                "aiEstopTooltip",
+                "Dừng khẩn cấp: hủy ngay lượt AI đang chạy, từ chối thẻ chờ duyệt và diệt mọi tiến trình PowerShell con",
+              )}
+            >
+              {estopBusy ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <OctagonX className="h-3.5 w-3.5" />
+              )}
+              <span>
+                {estopBusy
+                  ? tr("aiEstopStopping", "Đang dừng khẩn cấp...")
+                  : tr("aiEstopBtn", "E-Stop")}
+              </span>
+            </button>
+          )}
           {enabled && onCreateSession && (
             <button
               type="button"
@@ -2102,6 +2390,59 @@ export function AiChatPanel({
                       color: "var(--text-primary)",
                     }}
                   >
+                    {/* Live Tool Activity Chips inside streaming turn */}
+                    {currentSessionActivities.length > 0 && (
+                      <div className="mb-2 flex flex-wrap gap-1.5">
+                        {currentSessionActivities.map((act) => {
+                          const label = formatToolDisplayName(act.tool_name, lang);
+                          const borderStyle =
+                            act.status === "failed"
+                              ? "1px solid rgba(239, 68, 68, 0.4)"
+                              : act.status === "completed"
+                                ? "1px solid rgba(34, 197, 94, 0.35)"
+                                : "1px solid var(--chip-border)";
+                          const bgStyle =
+                            act.status === "failed"
+                              ? "rgba(239, 68, 68, 0.10)"
+                              : act.status === "completed"
+                                ? "rgba(34, 197, 94, 0.10)"
+                                : "var(--chip-bg)";
+                          return (
+                            <span
+                              key={act.tool_call_id}
+                              className="inline-flex max-w-full items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium"
+                              style={{
+                                background: bgStyle,
+                                border: borderStyle,
+                                color: "var(--text-primary)",
+                              }}
+                              title={act.summary ? `${label} — ${act.summary}` : label}
+                            >
+                              {act.status === "pending" ? (
+                                <Loader2
+                                  className="h-3 w-3 shrink-0 animate-spin"
+                                  style={{ color: "var(--accent)" }}
+                                />
+                              ) : act.status === "completed" ? (
+                                <CheckCircle2 className="h-3 w-3 shrink-0 text-emerald-500" />
+                              ) : (
+                                <CircleX className="h-3 w-3 shrink-0 text-rose-500" />
+                              )}
+                              <span className="shrink-0 font-semibold">{label}</span>
+                              {act.summary && (
+                                <span
+                                  className="max-w-[220px] truncate"
+                                  style={{ color: "var(--text-secondary)" }}
+                                >
+                                  · {act.summary}
+                                </span>
+                              )}
+                            </span>
+                          );
+                        })}
+                      </div>
+                    )}
+
                     {streamingText ? (
                       <div className="selectable-text wrap-anywhere">
                         <SafeMarkdownView
@@ -2149,6 +2490,61 @@ export function AiChatPanel({
                         </button>
                       </div>
                     )}
+                  </div>
+                </div>
+              )}
+
+              {/* Tool Activity Chips retained when not streaming */}
+              {!isStreaming && currentSessionActivities.length > 0 && (
+                <div className="flex w-full justify-start">
+                  <div
+                    className="flex max-w-[78%] flex-wrap items-center gap-1.5 rounded-xl px-3 py-2"
+                    style={{
+                      background: "var(--bg-surface)",
+                      border: "1px solid var(--border-subtle)",
+                    }}
+                  >
+                    <span
+                      className="text-[10.5px] font-semibold uppercase tracking-wide"
+                      style={{ color: "var(--text-secondary)" }}
+                    >
+                      {tr("aiToolActivityTitle", "Công cụ đang chạy")}
+                    </span>
+                    {currentSessionActivities.map((act) => {
+                      const label = formatToolDisplayName(act.tool_name, lang);
+                      return (
+                        <span
+                          key={act.tool_call_id}
+                          className="inline-flex max-w-full items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-medium"
+                          style={{
+                            background: "var(--chip-bg)",
+                            border: "1px solid var(--chip-border)",
+                            color: "var(--text-primary)",
+                          }}
+                          title={act.summary ? `${label} — ${act.summary}` : label}
+                        >
+                          {act.status === "pending" ? (
+                            <Loader2
+                              className="h-3 w-3 shrink-0 animate-spin"
+                              style={{ color: "var(--accent)" }}
+                            />
+                          ) : act.status === "completed" ? (
+                            <CheckCircle2 className="h-3 w-3 shrink-0 text-emerald-500" />
+                          ) : (
+                            <CircleX className="h-3 w-3 shrink-0 text-rose-500" />
+                          )}
+                          <span className="shrink-0 font-semibold">{label}</span>
+                          {act.summary && (
+                            <span
+                              className="max-w-[200px] truncate"
+                              style={{ color: "var(--text-secondary)" }}
+                            >
+                              · {act.summary}
+                            </span>
+                          )}
+                        </span>
+                      );
+                    })}
                   </div>
                 </div>
               )}
@@ -2284,6 +2680,507 @@ export function AiChatPanel({
               )}
             </div>
           </div>
+
+          {/* Pinned Interactive Action Approval Cards (right above composer) */}
+          {pendingApprovals.length > 0 && (
+            <div
+              className="max-h-[45%] shrink-0 space-y-2.5 overflow-y-auto px-5 py-3"
+              style={{
+                background: "var(--bg-sidebar)",
+                borderTop: "1px solid var(--border-subtle)",
+              }}
+            >
+              {/* Notice when another AI session has pending approval(s) */}
+              {otherSessionApprovals.length > 0 && firstOtherApprovalSession && (
+                <div
+                  className="flex flex-wrap items-center justify-between gap-2 rounded-xl px-3 py-2 text-xs"
+                  style={{
+                    background: "rgba(245, 158, 11, 0.12)",
+                    border: "1px solid rgba(245, 158, 11, 0.38)",
+                    color: "var(--text-primary)",
+                  }}
+                >
+                  <span className="flex min-w-0 flex-1 items-center gap-2">
+                    <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500" />
+                    <span className="truncate font-medium">
+                      {tr(
+                        "aiApprovalOtherSessionNotice",
+                        "Có {count} yêu cầu duyệt đang chờ ở cuộc trò chuyện AI khác ({session}).",
+                        {
+                          count: otherSessionApprovals.length,
+                          session: firstOtherApprovalSession.title,
+                        },
+                      )}
+                    </span>
+                  </span>
+                  {onSelectSession && (
+                    <button
+                      type="button"
+                      disabled={isStreaming}
+                      onClick={() => onSelectSession(firstOtherApprovalSession.id)}
+                      className="shrink-0 rounded-lg px-2.5 py-1 text-[11px] font-semibold transition hover:opacity-90 disabled:opacity-50"
+                      style={{
+                        background: "var(--accent)",
+                        color: "var(--text-on-accent)",
+                      }}
+                    >
+                      {tr("aiApprovalSwitchSessionBtn", "Mở phiên đó")}
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {/* Current session pending approval cards */}
+              {currentSessionApprovals.map((req) => {
+                const isHighRisk = req.risk === "high";
+                const allowSessionOk = isAllowSessionPermitted(req);
+                const remainingSecs = computeApprovalRemainingSecs(
+                  req.created_ts,
+                  req.timeout_secs,
+                  approvalNowMs,
+                );
+                const detailView = extractApprovalDetailView(req);
+                const busyDecision = busyApprovalDecisions[req.approval_id];
+                const isCardBusy = Boolean(busyDecision);
+                const cardError = approvalErrors[req.approval_id];
+                const copyKey = `approval-cmd-${req.approval_id}`;
+                const isCmdCopied = copiedCodeKey === copyKey;
+                const displayTitle =
+                  req.title?.trim() || formatToolDisplayName(req.tool_name, lang);
+
+                return (
+                  <div
+                    key={req.approval_id}
+                    className="space-y-2.5 rounded-2xl p-3.5 shadow-md"
+                    style={{
+                      background: isHighRisk
+                        ? "rgba(239, 68, 68, 0.08)"
+                        : "var(--bg-surface)",
+                      border: isHighRisk
+                        ? "1.5px solid rgba(239, 68, 68, 0.55)"
+                        : "1.5px solid rgba(245, 158, 11, 0.52)",
+                      color: "var(--text-primary)",
+                    }}
+                  >
+                    {/* Header badges & live countdown */}
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span
+                          className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10.5px] font-semibold"
+                          style={{
+                            background: "var(--accent-soft)",
+                            color: "var(--accent)",
+                            border: "1px solid var(--chip-border)",
+                          }}
+                        >
+                          {req.category === "system" ? (
+                            <Terminal className="h-3 w-3" />
+                          ) : (
+                            <MessageSquare className="h-3 w-3" />
+                          )}
+                          <span>
+                            {req.category === "system"
+                              ? tr("aiApprovalCategorySystem", "Windows / PowerShell")
+                              : tr("aiApprovalCategoryTeza", "Teza")}
+                          </span>
+                        </span>
+
+                        <span
+                          className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10.5px] font-semibold"
+                          style={
+                            isHighRisk
+                              ? {
+                                  background: "rgba(239, 68, 68, 0.16)",
+                                  color: "#f87171",
+                                }
+                              : {
+                                  background: "rgba(245, 158, 11, 0.16)",
+                                  color: "#fbbf24",
+                                }
+                          }
+                        >
+                          {isHighRisk ? (
+                            <ShieldAlert className="h-3 w-3" />
+                          ) : (
+                            <AlertTriangle className="h-3 w-3" />
+                          )}
+                          <span>
+                            {isHighRisk
+                              ? tr("aiApprovalRiskHigh", "Rủi ro cao")
+                              : tr("aiApprovalRiskMedium", "Cần xác nhận")}
+                          </span>
+                        </span>
+
+                        <span
+                          className="text-[11px] font-medium"
+                          style={{ color: "var(--text-secondary)" }}
+                        >
+                          {formatToolDisplayName(req.tool_name, lang)}
+                        </span>
+                      </div>
+
+                      <span
+                        className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10.5px] font-semibold tabular-nums"
+                        style={{
+                          background:
+                            remainingSecs <= 15
+                              ? "rgba(239, 68, 68, 0.14)"
+                              : "var(--chip-bg)",
+                          color:
+                            remainingSecs <= 15
+                              ? "#f87171"
+                              : "var(--text-secondary)",
+                        }}
+                      >
+                        <Clock className="h-3 w-3" />
+                        <span>
+                          {remainingSecs > 0
+                            ? tr("aiApprovalCountdown", "Còn {secs}s", {
+                                secs: remainingSecs,
+                              })
+                            : tr("aiApprovalExpired", "Đã hết hạn")}
+                        </span>
+                      </span>
+                    </div>
+
+                    {/* Title & summary */}
+                    <div className="space-y-0.5">
+                      <div className="text-[13px] font-semibold leading-snug">
+                        {displayTitle}
+                      </div>
+                      {req.summary && (
+                        <p
+                          className="text-xs leading-relaxed"
+                          style={{ color: "var(--text-secondary)" }}
+                        >
+                          {req.summary}
+                        </p>
+                      )}
+                    </div>
+
+                    {/* Structured detail box tailored per tool kind */}
+                    {detailView.kind === "powershell" && (
+                      <div
+                        className="overflow-hidden rounded-xl"
+                        style={{
+                          background: "var(--bg-stage)",
+                          border: "1px solid var(--border-subtle)",
+                        }}
+                      >
+                        <div
+                          className="flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 text-[11px]"
+                          style={{
+                            background: "var(--card-bg)",
+                            borderBottom: "1px solid var(--border-subtle)",
+                            color: "var(--text-secondary)",
+                          }}
+                        >
+                          <span className="inline-flex items-center gap-1.5 font-semibold">
+                            <Terminal className="h-3 w-3" style={{ color: "var(--accent)" }} />
+                            <span>
+                              {tr("aiApprovalDetailCommand", "Lệnh PowerShell nguyên văn:")}
+                            </span>
+                          </span>
+                          {detailView.command && (
+                            <button
+                              type="button"
+                              onClick={() => handleCopyCode(copyKey, detailView.command)}
+                              className="hover-menu inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10.5px] font-medium"
+                              style={{
+                                color: isCmdCopied ? "#22c55e" : "var(--text-secondary)",
+                              }}
+                            >
+                              {isCmdCopied ? (
+                                <Check className="h-3 w-3" />
+                              ) : (
+                                <Copy className="h-3 w-3" />
+                              )}
+                              <span>{isCmdCopied ? "Đã chép" : "Sao chép"}</span>
+                            </button>
+                          )}
+                        </div>
+                        {detailView.cwd && (
+                          <div
+                            className="border-b px-3 py-1 text-[11px]"
+                            style={{
+                              borderColor: "var(--border-subtle)",
+                              color: "var(--text-secondary)",
+                            }}
+                          >
+                            <span className="font-semibold">
+                              {tr("aiApprovalDetailCwd", "Thư mục chạy:")}{" "}
+                            </span>
+                            <code className="break-all font-mono">{detailView.cwd}</code>
+                          </div>
+                        )}
+                        <pre className="selectable-text max-h-40 overflow-auto p-3 font-mono text-[12px] leading-relaxed">
+                          <code>{detailView.command || "(trống)"}</code>
+                        </pre>
+                      </div>
+                    )}
+
+                    {detailView.kind === "write_file" && (
+                      <div
+                        className="space-y-1.5 rounded-xl p-2.5 text-xs"
+                        style={{
+                          background: "var(--bg-stage)",
+                          border: "1px solid var(--border-subtle)",
+                        }}
+                      >
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <FileCode2
+                            className="h-3.5 w-3.5 shrink-0"
+                            style={{ color: "var(--accent)" }}
+                          />
+                          <span
+                            className="font-semibold"
+                            style={{ color: "var(--text-secondary)" }}
+                          >
+                            {tr("aiApprovalDetailTargetPath", "Đường dẫn tệp:")}
+                          </span>
+                          <code className="selectable-text break-all font-mono text-[11.5px]">
+                            {detailView.path}
+                          </code>
+                          {detailView.mode && (
+                            <span
+                              className="rounded-full px-2 py-0.5 font-mono text-[10px] font-semibold"
+                              style={{
+                                background: "var(--chip-bg)",
+                                color: "var(--text-secondary)",
+                              }}
+                            >
+                              {detailView.mode}
+                            </span>
+                          )}
+                        </div>
+                        {detailView.contentPreview && (
+                          <div className="space-y-1">
+                            <div
+                              className="text-[11px] font-semibold"
+                              style={{ color: "var(--text-secondary)" }}
+                            >
+                              {tr("aiApprovalDetailContentPreview", "Nội dung xem trước:")}
+                            </div>
+                            <pre
+                              className="selectable-text max-h-32 overflow-auto rounded-lg p-2 font-mono text-[11.5px] leading-relaxed"
+                              style={{
+                                background: "var(--bg-sidebar)",
+                                border: "1px solid var(--border-subtle)",
+                              }}
+                            >
+                              <code>{detailView.contentPreview}</code>
+                            </pre>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {detailView.kind === "open_path" && detailView.path && (
+                      <div
+                        className="flex flex-wrap items-center gap-1.5 rounded-xl px-3 py-2 text-xs"
+                        style={{
+                          background: "var(--bg-stage)",
+                          border: "1px solid var(--border-subtle)",
+                        }}
+                      >
+                        <span
+                          className="font-semibold"
+                          style={{ color: "var(--text-secondary)" }}
+                        >
+                          {tr("aiApprovalDetailTargetPath", "Đường dẫn tệp:")}
+                        </span>
+                        <code className="selectable-text break-all font-mono text-[11.5px]">
+                          {detailView.path}
+                        </code>
+                      </div>
+                    )}
+
+                    {detailView.kind === "message" && (
+                      <div
+                        className="space-y-1.5 rounded-xl p-2.5 text-xs"
+                        style={{
+                          background: "var(--bg-stage)",
+                          border: "1px solid var(--border-subtle)",
+                        }}
+                      >
+                        {detailView.recipient && (
+                          <div className="flex flex-wrap items-baseline gap-1.5">
+                            <span
+                              className="font-semibold"
+                              style={{ color: "var(--text-secondary)" }}
+                            >
+                              {tr("aiApprovalDetailRecipient", "Người nhận / Hội thoại:")}
+                            </span>
+                            <span className="font-semibold">{detailView.recipient}</span>
+                          </div>
+                        )}
+                        {detailView.scheduleTime && (
+                          <div className="flex flex-wrap items-baseline gap-1.5">
+                            <span
+                              className="font-semibold"
+                              style={{ color: "var(--text-secondary)" }}
+                            >
+                              {tr("aiApprovalDetailScheduleTime", "Thời gian hẹn gửi:")}
+                            </span>
+                            <span className="font-mono text-[11.5px]">
+                              {detailView.scheduleTime}
+                              {detailView.recurrence ? ` (${detailView.recurrence})` : ""}
+                            </span>
+                          </div>
+                        )}
+                        {detailView.text && (
+                          <div className="space-y-1">
+                            <div
+                              className="text-[11px] font-semibold"
+                              style={{ color: "var(--text-secondary)" }}
+                            >
+                              {tr("aiApprovalDetailMessage", "Nội dung tin nhắn:")}
+                            </div>
+                            <div
+                              className="selectable-text max-h-28 overflow-auto whitespace-pre-wrap break-words rounded-lg px-2.5 py-2 text-xs leading-relaxed"
+                              style={{
+                                background: "var(--bg-sidebar)",
+                                border: "1px solid var(--border-subtle)",
+                              }}
+                            >
+                              {detailView.text}
+                            </div>
+                          </div>
+                        )}
+                        {detailView.filePath && (
+                          <div className="flex flex-wrap items-baseline gap-1.5">
+                            <span
+                              className="font-semibold"
+                              style={{ color: "var(--text-secondary)" }}
+                            >
+                              {tr("aiApprovalDetailAttachment", "Tệp đính kèm:")}
+                            </span>
+                            <code className="selectable-text break-all font-mono text-[11.5px]">
+                              {detailView.filePath}
+                            </code>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {detailView.kind === "generic" && detailView.entries.length > 0 && (
+                      <div
+                        className="max-h-32 space-y-1 overflow-auto rounded-xl p-2.5 text-[11.5px]"
+                        style={{
+                          background: "var(--bg-stage)",
+                          border: "1px solid var(--border-subtle)",
+                        }}
+                      >
+                        {detailView.entries.map((item) => (
+                          <div key={item.key} className="flex flex-wrap items-baseline gap-1.5">
+                            <span
+                              className="font-mono text-[11px] font-semibold"
+                              style={{ color: "var(--text-secondary)" }}
+                            >
+                              {item.key}:
+                            </span>
+                            <span className="selectable-text break-all">{item.value}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {cardError && (
+                      <div
+                        className="rounded-lg px-2.5 py-1.5 text-[11.5px]"
+                        style={{
+                          background: "var(--danger-bg)",
+                          color: "var(--danger-text)",
+                        }}
+                      >
+                        {cardError}
+                      </div>
+                    )}
+
+                    {/* Action buttons with per-card busy lock */}
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={isCardBusy || !onResolveApproval}
+                          onClick={() =>
+                            void handleResolveApprovalClick(req.approval_id, "allow_once")
+                          }
+                          className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-55"
+                        >
+                          {busyDecision === "allow_once" ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <Check className="h-3.5 w-3.5" />
+                          )}
+                          <span>{tr("aiApprovalAllowOnce", "Cho phép lần này")}</span>
+                        </button>
+
+                        {allowSessionOk && (
+                          <button
+                            type="button"
+                            disabled={isCardBusy || !onResolveApproval}
+                            onClick={() =>
+                              void handleResolveApprovalClick(req.approval_id, "allow_session")
+                            }
+                            className="hover-menu inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-55"
+                            style={{
+                              background: "var(--accent-soft)",
+                              border: "1px solid var(--chip-border)",
+                              color: "var(--accent)",
+                            }}
+                          >
+                            {busyDecision === "allow_session" && (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            )}
+                            <span>
+                              {tr(
+                                "aiApprovalAllowSession",
+                                "Luôn cho phép loại này trong phiên",
+                              )}
+                            </span>
+                          </button>
+                        )}
+
+                        <button
+                          type="button"
+                          disabled={isCardBusy || !onResolveApproval}
+                          onClick={() =>
+                            void handleResolveApprovalClick(req.approval_id, "deny")
+                          }
+                          className="inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-semibold transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-55"
+                          style={{
+                            background: "var(--danger-bg)",
+                            color: "var(--danger-text)",
+                            border: "1px solid rgba(239, 68, 68, 0.35)",
+                          }}
+                        >
+                          {busyDecision === "deny" ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <X className="h-3.5 w-3.5" />
+                          )}
+                          <span>{tr("aiApprovalDeny", "Từ chối")}</span>
+                        </button>
+                      </div>
+
+                      {!allowSessionOk && (
+                        <span
+                          className="text-[10.5px] italic"
+                          style={{ color: "var(--text-secondary)" }}
+                        >
+                          {tr(
+                            "aiApprovalHighRiskNoSessionHint",
+                            "Thao tác rủi ro cao luôn yêu cầu xác nhận từng lần.",
+                          )}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
 
           {/* Composer */}
           <div

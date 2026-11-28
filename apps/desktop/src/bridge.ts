@@ -3,14 +3,23 @@ import { listen } from "@tauri-apps/api/event";
 import type {
   AccountProfile,
   AddGroupMembersResultDto,
+  AiApprovalDecision,
   AiCliProbeDto,
+  AiComposeDraftEvent,
   AiConfigDto,
   AiConfigUpdateDto,
+  AiEmergencyStopResult,
   AiInstallZeroClawResponseDto,
+  AiMcpStatusDto,
+  AiOpenThreadEvent,
   AiStoredMessageDto,
   AiStreamDeltaEvent,
   AiSummaryDeltaEvent,
   AiSummaryDto,
+  AiToolActivityEvent,
+  AiToolApprovalRequest,
+  AiToolApprovalResolvedEvent,
+  AiToolAuditEntry,
   ApiAuditLogDto,
   ApiClientDto,
   AppUpdateInfo,
@@ -149,6 +158,10 @@ let DEMO_AI_CONFIG: AiConfigDto = {
   has_zeroclaw_token: false,
   zeroclaw_token_preview: "",
   zeroclaw_safe_tools: false,
+  teza_access_level: "isolated",
+  system_access_level: "safe",
+  zeroclaw_allowed_roots: [],
+  zeroclaw_allowed_thread_ids: [],
   system_prompt: DEFAULT_AI_SYSTEM_PROMPT,
   summary_language: "vi",
   max_summary_messages: 40,
@@ -165,8 +178,17 @@ let DEMO_AI_SESSIONS: AiSessionDto[] = [
   },
 ];
 let DEMO_AI_MESSAGES: AiStoredMessageDto[] = [];
+let DEMO_AI_PENDING_APPROVALS: AiToolApprovalRequest[] = [];
+const DEMO_AI_TOOL_AUDIT_LOGS: AiToolAuditEntry[] = [];
 const DEMO_AI_STREAM_LISTENERS = new Set<(ev: AiStreamDeltaEvent) => void>();
 const DEMO_AI_SUMMARY_LISTENERS = new Set<(ev: AiSummaryDeltaEvent) => void>();
+const DEMO_AI_TOOL_ACTIVITY_LISTENERS = new Set<(ev: AiToolActivityEvent) => void>();
+const DEMO_AI_TOOL_APPROVAL_LISTENERS = new Set<(ev: AiToolApprovalRequest) => void>();
+const DEMO_AI_TOOL_APPROVAL_RESOLVED_LISTENERS = new Set<
+  (ev: AiToolApprovalResolvedEvent) => void
+>();
+const DEMO_AI_COMPOSE_DRAFT_LISTENERS = new Set<(ev: AiComposeDraftEvent) => void>();
+const DEMO_AI_OPEN_THREAD_LISTENERS = new Set<(ev: AiOpenThreadEvent) => void>();
 
 function normalizeDemoAiPreview(raw: string, maxLen = 96): string {
   const collapsed = (raw || "").replace(/\s+/g, " ").trim();
@@ -2668,13 +2690,21 @@ export const bridge = {
   // ==================== Item #1: Optional AI Assistant ====================
   async aiGetConfig(): Promise<AiConfigDto> {
     if (!isTauri()) {
-      return { ...DEMO_AI_CONFIG };
+      return {
+        ...DEMO_AI_CONFIG,
+        zeroclaw_allowed_roots: [...(DEMO_AI_CONFIG.zeroclaw_allowed_roots ?? [])],
+        zeroclaw_allowed_thread_ids: [...(DEMO_AI_CONFIG.zeroclaw_allowed_thread_ids ?? [])],
+      };
     }
     return invoke<AiConfigDto>("ai_get_config");
   },
   async aiUpdateConfig(update: AiConfigUpdateDto): Promise<AiConfigDto> {
     if (!isTauri()) {
-      const next: AiConfigDto = { ...DEMO_AI_CONFIG };
+      const next: AiConfigDto = {
+        ...DEMO_AI_CONFIG,
+        zeroclaw_allowed_roots: [...(DEMO_AI_CONFIG.zeroclaw_allowed_roots ?? [])],
+        zeroclaw_allowed_thread_ids: [...(DEMO_AI_CONFIG.zeroclaw_allowed_thread_ids ?? [])],
+      };
       if (typeof update.enabled === "boolean") next.enabled = update.enabled;
       if (update.backend === "cloud_api" || update.backend === "zeroclaw") {
         next.backend = update.backend;
@@ -2707,6 +2737,49 @@ export const bridge = {
       if (typeof update.zeroclaw_safe_tools === "boolean") {
         next.zeroclaw_safe_tools = update.zeroclaw_safe_tools;
       }
+      if (
+        update.teza_access_level === "isolated" ||
+        update.teza_access_level === "read_only" ||
+        update.teza_access_level === "supervised" ||
+        update.teza_access_level === "autonomous"
+      ) {
+        next.teza_access_level = update.teza_access_level;
+      }
+      if (
+        update.system_access_level === "safe" ||
+        update.system_access_level === "supervised" ||
+        update.system_access_level === "full"
+      ) {
+        next.system_access_level = update.system_access_level;
+      }
+      if (Array.isArray(update.zeroclaw_allowed_roots)) {
+        const seenRoots = new Set<string>();
+        const cleanedRoots: string[] = [];
+        for (const raw of update.zeroclaw_allowed_roots) {
+          if (cleanedRoots.length >= 32) break;
+          if (typeof raw !== "string") continue;
+          const clean = raw.trim().replace(/^"(.*)"$/, "$1").trim();
+          if (!clean || clean.length > 512) continue;
+          const key = clean.replace(/[\\/]+$/, "").replace(/\//g, "\\").toLowerCase();
+          if (seenRoots.has(key)) continue;
+          seenRoots.add(key);
+          cleanedRoots.push(clean);
+        }
+        next.zeroclaw_allowed_roots = cleanedRoots;
+      }
+      if (Array.isArray(update.zeroclaw_allowed_thread_ids)) {
+        const seenIds = new Set<string>();
+        const cleanedIds: string[] = [];
+        for (const raw of update.zeroclaw_allowed_thread_ids) {
+          if (cleanedIds.length >= 200) break;
+          if (typeof raw !== "string") continue;
+          const clean = raw.trim();
+          if (!clean || seenIds.has(clean)) continue;
+          seenIds.add(clean);
+          cleanedIds.push(clean);
+        }
+        next.zeroclaw_allowed_thread_ids = cleanedIds;
+      }
       if (typeof update.system_prompt === "string") {
         next.system_prompt = update.system_prompt;
       }
@@ -2726,7 +2799,11 @@ export const bridge = {
           cleanTok.length > 8 ? `${cleanTok.slice(0, 4)}••••${cleanTok.slice(-4)}` : "••••";
       }
       DEMO_AI_CONFIG = next;
-      return { ...next };
+      return {
+        ...next,
+        zeroclaw_allowed_roots: [...(next.zeroclaw_allowed_roots ?? [])],
+        zeroclaw_allowed_thread_ids: [...(next.zeroclaw_allowed_thread_ids ?? [])],
+      };
     }
     return invoke<AiConfigDto>("ai_update_config", {
       update: {
@@ -3042,6 +3119,153 @@ export const bridge = {
       };
     }
     return listen<AiSummaryDeltaEvent>("core://ai-summary-delta", (event) => {
+      handler(event.payload);
+    });
+  },
+  async aiResolveToolApproval(
+    approvalId: string,
+    decision: AiApprovalDecision,
+  ): Promise<boolean> {
+    if (!isTauri()) {
+      const idx = DEMO_AI_PENDING_APPROVALS.findIndex((a) => a.approval_id === approvalId);
+      if (idx < 0) return false;
+      const [removed] = DEMO_AI_PENDING_APPROVALS.splice(idx, 1);
+      for (const fn of DEMO_AI_TOOL_APPROVAL_RESOLVED_LISTENERS) {
+        try {
+          fn({ approval_id: approvalId, session_id: removed.session_id, decision });
+        } catch {
+          // Ignore demo listener error
+        }
+      }
+      return true;
+    }
+    return invoke<boolean>("ai_resolve_tool_approval", { approvalId, decision });
+  },
+  async aiEmergencyStop(): Promise<AiEmergencyStopResult> {
+    if (!isTauri()) {
+      const cleared = DEMO_AI_PENDING_APPROVALS;
+      DEMO_AI_PENDING_APPROVALS = [];
+      for (const req of cleared) {
+        for (const fn of DEMO_AI_TOOL_APPROVAL_RESOLVED_LISTENERS) {
+          try {
+            fn({
+              approval_id: req.approval_id,
+              session_id: req.session_id,
+              decision: "cancelled",
+            });
+          } catch {
+            // Ignore demo listener error
+          }
+        }
+      }
+      return {
+        cancelled_approvals: cleared.length,
+        killed_processes: 0,
+      };
+    }
+    return invoke<AiEmergencyStopResult>("ai_emergency_stop");
+  },
+  async aiListToolAuditLogs(limit?: number): Promise<AiToolAuditEntry[]> {
+    if (!isTauri()) {
+      return (limit && limit > 0
+        ? DEMO_AI_TOOL_AUDIT_LOGS.slice(0, limit)
+        : DEMO_AI_TOOL_AUDIT_LOGS
+      ).map((row) => ({ ...row }));
+    }
+    return invoke<AiToolAuditEntry[]>("ai_list_tool_audit_logs", {
+      limit: limit ?? null,
+    });
+  },
+  async aiMcpStatus(): Promise<AiMcpStatusDto> {
+    if (!isTauri()) {
+      const tezaLevel = DEMO_AI_CONFIG.teza_access_level ?? "isolated";
+      const sysLevel = DEMO_AI_CONFIG.system_access_level ?? "safe";
+      const tezaCount =
+        tezaLevel === "read_only" ? 10 : tezaLevel === "supervised" || tezaLevel === "autonomous" ? 21 : 0;
+      const sysCount = sysLevel === "supervised" || sysLevel === "full" ? 5 : 0;
+      const totalTools = tezaCount + sysCount;
+      const running = Boolean(
+        DEMO_AI_CONFIG.enabled && DEMO_AI_CONFIG.backend === "zeroclaw" && totalTools > 0,
+      );
+      return {
+        running,
+        exposed_tools_count: running ? totalTools : 0,
+        pending_approvals_count: DEMO_AI_PENDING_APPROVALS.length,
+        active_powershell_count: 0,
+        workspace_dir: "LocalAppData/Teza/ai_workspace",
+        forbidden_paths: [
+          "C:\\Windows",
+          "C:\\Windows\\System32",
+          "C:\\Program Files",
+          "~/.ssh",
+          "~/.gnupg",
+          "~/.aws",
+          "Teza DB & DPAPI keys",
+        ],
+      };
+    }
+    return invoke<AiMcpStatusDto>("ai_mcp_status");
+  },
+  async aiPickAllowedRootDir(): Promise<string | null> {
+    if (!isTauri()) {
+      return null;
+    }
+    return invoke<string | null>("ai_pick_allowed_root_dir");
+  },
+  async onAiToolActivity(handler: (ev: AiToolActivityEvent) => void): Promise<() => void> {
+    if (!isTauri()) {
+      DEMO_AI_TOOL_ACTIVITY_LISTENERS.add(handler);
+      return () => {
+        DEMO_AI_TOOL_ACTIVITY_LISTENERS.delete(handler);
+      };
+    }
+    return listen<AiToolActivityEvent>("core://ai-tool-activity", (event) => {
+      handler(event.payload);
+    });
+  },
+  async onAiToolApproval(handler: (ev: AiToolApprovalRequest) => void): Promise<() => void> {
+    if (!isTauri()) {
+      DEMO_AI_TOOL_APPROVAL_LISTENERS.add(handler);
+      return () => {
+        DEMO_AI_TOOL_APPROVAL_LISTENERS.delete(handler);
+      };
+    }
+    return listen<AiToolApprovalRequest>("core://ai-tool-approval", (event) => {
+      handler(event.payload);
+    });
+  },
+  async onAiToolApprovalResolved(
+    handler: (ev: AiToolApprovalResolvedEvent) => void,
+  ): Promise<() => void> {
+    if (!isTauri()) {
+      DEMO_AI_TOOL_APPROVAL_RESOLVED_LISTENERS.add(handler);
+      return () => {
+        DEMO_AI_TOOL_APPROVAL_RESOLVED_LISTENERS.delete(handler);
+      };
+    }
+    return listen<AiToolApprovalResolvedEvent>("core://ai-tool-approval-resolved", (event) => {
+      handler(event.payload);
+    });
+  },
+  async onAiComposeDraft(handler: (ev: AiComposeDraftEvent) => void): Promise<() => void> {
+    if (!isTauri()) {
+      DEMO_AI_COMPOSE_DRAFT_LISTENERS.add(handler);
+      return () => {
+        DEMO_AI_COMPOSE_DRAFT_LISTENERS.delete(handler);
+      };
+    }
+    return listen<AiComposeDraftEvent>("core://ai-compose-draft", (event) => {
+      handler(event.payload);
+    });
+  },
+  async onAiOpenThread(handler: (ev: AiOpenThreadEvent) => void): Promise<() => void> {
+    if (!isTauri()) {
+      DEMO_AI_OPEN_THREAD_LISTENERS.add(handler);
+      return () => {
+        DEMO_AI_OPEN_THREAD_LISTENERS.delete(handler);
+      };
+    }
+    return listen<AiOpenThreadEvent>("core://ai-open-thread", (event) => {
       handler(event.payload);
     });
   },

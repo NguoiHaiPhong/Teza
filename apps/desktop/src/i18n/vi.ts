@@ -1112,6 +1112,100 @@ export const vi = {
     "Khóa lại kho E2EE và xóa khóa mã hóa khỏi bộ nhớ tạm mà không ngắt kết nối Google Drive",
   gdriveVaultLockedNotice: "Đã khóa kho E2EE và xóa khóa khỏi bộ nhớ tạm.",
   navSchedulesAttentionTitle: "{count} tin nhắn hẹn giờ cần xử lý",
+
+  // ZeroClaw Teza MCP Bridge & 2-Axis Permissions
+  aiPermSectionTitle: "Phân quyền 2 trục cho ZeroClaw (Teza MCP)",
+  aiPermSectionSubtitle:
+    "Tách riêng quyền thao tác với dữ liệu Teza và quyền chạy công cụ trên Windows. Luôn lưu cài đặt để áp dụng.",
+  aiPermTezaAxisLabel: "Trục 1 — Quyền với Teza",
+  aiPermSystemAxisLabel: "Trục 2 — Quyền Hệ thống Windows & ZeroClaw",
+  aiPermBadgeDefault: "Mặc định",
+  aiPermBadgeRecommended: "Khuyên dùng",
+  aiPermBadgeSystemRecommended: "Khuyên dùng — PowerShell, Excel, Word",
+  aiPermBadgeAutoExec: "Tự thực thi",
+  aiPermBadgeAdvancedRisk: "Nâng cao · Rủi ro cao",
+  aiPermTezaT0Title: "T0 — Cô lập",
+  aiPermTezaT0Desc: "Không gắn công cụ Teza MCP nào. ZeroClaw chỉ trò chuyện độc lập.",
+  aiPermTezaT1Title: "T1 — Đọc & Soạn nháp",
+  aiPermTezaT1Desc:
+    "Đọc tài khoản, bạn/nhóm, lịch sử chat, tìm kiếm FTS5, xuất tệp đính kèm và điền bản nháp vào ô soạn thảo.",
+  aiPermTezaT2Title: "T2 — Toàn quyền có duyệt",
+  aiPermTezaT2Desc:
+    "Toàn bộ T1 + gửi tin/tệp, lịch hẹn, bình chọn, nhắc hẹn, kết bạn/nhóm. Mọi thao tác gửi/thay đổi đều hiện Thẻ duyệt 1 chạm.",
+  aiPermTezaT3Title: "T3 — Tự động hoàn toàn",
+  aiPermTezaT3Desc:
+    "Tự thực thi lệnh điều khiển Teza không cần bấm duyệt từng lần (hỗ trợ giới hạn hội thoại; rời nhóm/mời khỏi nhóm vẫn hỏi xác nhận).",
+  aiPermSysS0Title: "S0 — An toàn",
+  aiPermSysS0Desc:
+    "Không chạy Shell/PowerShell và không truy cập tệp Windows; chỉ dùng công cụ mạng/tính toán an toàn (nếu bật).",
+  aiPermSysS1Title: "S1 — Windows & Office có duyệt",
+  aiPermSysS1Desc:
+    "Mở bộ công cụ PowerShell, Python, Excel, Word, PDF trong các thư mục được phép. Mọi lệnh ghi tệp/PowerShell/mở tệp đều hiện Thẻ duyệt nguyên văn.",
+  aiPermSysS2Title: "S2 — Toàn quyền Windows",
+  aiPermSysS2Desc:
+    "Mở 100% công cụ gốc ZeroClaw (powershell, python, node, git…) không giới hạn thư mục và tự duyệt lệnh win_* (vẫn chặn thư mục lõi OS & khóa Teza).",
+  aiPermHighRiskTitle: "Cảnh báo bảo mật: Nguy cơ Prompt Injection & Tự động thực thi",
+  aiPermHighRiskBody:
+    "Khi AI vừa đọc nội dung hội thoại Teza vừa có toàn quyền Windows (S2) hoặc chế độ tự động (T3), tin nhắn chứa lệnh ẩn từ người khác có thể kích hoạt gửi tin hoặc chạy lệnh máy tính ngoài ý muốn. Hãy giới hạn phạm vi bên dưới và dùng nút đỏ E-Stop trong khung chat AI để dừng khẩn cấp bất cứ lúc nào.",
+  aiPermAllowedRootsTitle: "Thư mục Windows được phép truy cập",
+  aiPermAllowedRootsEmpty:
+    "Để trống để dùng mặc định an toàn (Desktop, Documents, Downloads và thư mục làm việc AI).",
+  aiPermAllowedRootsPlaceholder:
+    "Nhập đường dẫn thư mục Windows (ví dụ: C:\\Users\\TenBan\\Documents\\BaoCao)...",
+  aiPermPickFolderBtn: "Chọn thư mục...",
+  aiPermWorkspaceDirLabel: "Thư mục làm việc AI (ai_workspace):",
+  aiPermProtectedPathsLabel: "Luôn được bảo vệ cứng (không thể truy cập):",
+  aiPermAllowedThreadsTitle: "Giới hạn hội thoại cho chế độ Tự động (T3)",
+  aiPermAllowedThreadsHint:
+    "Để trống = áp dụng cho tất cả hội thoại. Thêm hội thoại cụ thể để chỉ cho phép ZeroClaw tự động thao tác trong các đoạn chat đó.",
+  aiPermSelectThreadPlaceholder: "Chọn cuộc hội thoại cần cho phép...",
+  aiPermManualThreadIdPlaceholder: "Hoặc nhập ID hội thoại...",
+  aiPermClearAllThreads: "Bỏ giới hạn (mọi hội thoại)",
+  aiMcpStatusRunning: "MCP Bridge đang chạy · {count} công cụ sẵn sàng",
+  aiMcpStatusIdle: "MCP Bridge đang chờ (chưa kích hoạt công cụ)",
+  aiMcpStatusReadyHint: "MCP Bridge sẽ tự khởi chạy khi bật quyền T1–T3 hoặc S1–S2.",
+  aiMcpPendingApprovalsBadge: "{count} chờ duyệt",
+  aiMcpActivePsBadge: "{count} PowerShell đang chạy",
+  aiAuditLogToggleTitle: "Nhật ký hành động AI ({count})",
+  aiAuditLogEmpty: "Chưa ghi nhận hành động công cụ nào.",
+  aiAuditColTime: "Thời gian",
+  aiAuditColTool: "Công cụ",
+  aiAuditColDecision: "Quyết định",
+  aiAuditColSummary: "Tóm tắt",
+  aiPermPillTooltip: "Bấm để mở Cài đặt phân quyền 2 trục cho ZeroClaw",
+  aiEstopBtn: "E-Stop",
+  aiEstopStopping: "Đang dừng khẩn cấp...",
+  aiEstopTooltip:
+    "Dừng khẩn cấp: hủy ngay lượt AI đang chạy, từ chối thẻ chờ duyệt và diệt mọi tiến trình PowerShell con",
+  aiToolActivityTitle: "Công cụ đang chạy",
+  aiApprovalCategoryTeza: "Teza",
+  aiApprovalCategorySystem: "Windows / PowerShell",
+  aiApprovalRiskMedium: "Cần xác nhận",
+  aiApprovalRiskHigh: "Rủi ro cao",
+  aiApprovalExpired: "Đã hết hạn",
+  aiApprovalCountdown: "Còn {secs}s",
+  aiApprovalAllowOnce: "Cho phép lần này",
+  aiApprovalAllowSession: "Luôn cho phép loại này trong phiên",
+  aiApprovalDeny: "Từ chối",
+  aiApprovalDetailCwd: "Thư mục chạy:",
+  aiApprovalDetailCommand: "Lệnh PowerShell nguyên văn:",
+  aiApprovalDetailTargetPath: "Đường dẫn tệp:",
+  aiApprovalDetailContentPreview: "Nội dung xem trước:",
+  aiApprovalDetailRecipient: "Người nhận / Hội thoại:",
+  aiApprovalDetailMessage: "Nội dung tin nhắn:",
+  aiApprovalDetailAttachment: "Tệp đính kèm:",
+  aiApprovalDetailScheduleTime: "Thời gian hẹn gửi:",
+  aiApprovalOtherSessionNotice:
+    "Có {count} yêu cầu duyệt đang chờ ở cuộc trò chuyện AI khác ({session}).",
+  aiApprovalSwitchSessionBtn: "Mở phiên đó",
+  aiApprovalHighRiskNoSessionHint: "Thao tác rủi ro cao luôn yêu cầu xác nhận từng lần.",
+  aiEstopDoneToast:
+    "Đã dừng khẩn cấp AI (hủy {approvals} thẻ chờ duyệt, dừng {processes} tiến trình).",
+  aiApprovalResolveFailed: "Không thể gửi quyết định duyệt hành động AI: {error}",
+  aiApprovalAlreadyExpired: "Yêu cầu duyệt này đã hết hạn hoặc đã được xử lý trước đó.",
+  aiRailPendingApprovalTooltip: "Teza AI · {count} hành động đang chờ bạn duyệt",
+  aiComposeDraftToast:
+    "Teza AI đã soạn bản nháp cho {title} — hãy kiểm tra và bấm Enter để gửi.",
 } as const;
 
 export type TranslationKey = keyof typeof vi;

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  AlertTriangle,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
@@ -7,15 +8,47 @@ import {
   Download,
   Eye,
   EyeOff,
+  FolderOpen,
+  FolderPlus,
   Globe,
   KeyRound,
   Loader2,
+  Lock,
+  MessageSquare,
+  OctagonX,
+  Plus,
   RefreshCw,
   RotateCcw,
   Save,
+  ScrollText,
+  Shield,
   ShieldAlert,
   Sparkles,
+  Terminal,
+  X,
 } from "lucide-react";
+import { useI18n, type TranslationKey } from "../i18n";
+import type { ThreadDto } from "../types";
+import {
+  DEFAULT_FORBIDDEN_PATHS_SUMMARY,
+  DEFAULT_SYSTEM_ACCESS_LEVEL,
+  DEFAULT_TEZA_ACCESS_LEVEL,
+  MAX_ALLOWED_ROOTS,
+  formatAuditDecisionLabel,
+  formatToolDisplayName,
+  getAuditDecisionTone,
+  isHighRiskCombination,
+  normalizeAllowedRoots,
+  normalizeAllowedThreadIds,
+  normalizeSystemAccessLevel,
+  normalizeTezaAccessLevel,
+  type AiConfigUpdateWithPermissions,
+  type AiConfigWithPermissions,
+  type AiMcpStatusDto,
+  type AiToolAuditEntry,
+  type SystemAccessLevel,
+  type TezaAccessLevel,
+} from "../utils/aiPermissions";
 import {
   AI_CLOUD_PROVIDERS,
   AI_SUMMARY_LANGUAGES,
@@ -27,6 +60,8 @@ import {
   clampSummaryMessageCount,
   detectAiCloudProvider,
   formatInstallSizeMb,
+  formatLocalDateTime,
+  formatThreadKindLabel,
   getAiCloudProviderPreset,
   isPublicCloudModelsProvider,
   isSameCloudApiHost,
@@ -35,18 +70,21 @@ import {
   type AiBackendKind,
   type AiCliProbeDto,
   type AiCloudProviderPreset,
-  type AiConfigDto,
-  type AiConfigUpdateDto,
   type AiInstallZeroClawResponseDto,
   type AiModelInfoDto,
+  type BadgeTone,
   type ZeroClawInstallProgressDto,
 } from "../utils/automationHelpers";
 
 export interface AiSettingsSectionProps {
-  config: AiConfigDto | null;
+  config: AiConfigWithPermissions | null;
   loading?: boolean;
   relayEnabled?: boolean;
-  onSave: (update: AiConfigUpdateDto) => Promise<AiConfigDto | void>;
+  threads?: ThreadDto[];
+  mcpStatus?: AiMcpStatusDto | null;
+  auditLogs?: AiToolAuditEntry[];
+  emergencyStopping?: boolean;
+  onSave: (update: AiConfigUpdateWithPermissions) => Promise<AiConfigWithPermissions | void>;
   onProbeCli: (cliPath: string, gatewayUrl: string) => Promise<AiCliProbeDto>;
   onInstallZeroClaw: () => Promise<AiInstallZeroClawResponseDto>;
   onListModels?: (baseUrl?: string, apiKey?: string) => Promise<AiModelInfoDto[]>;
@@ -54,6 +92,25 @@ export interface AiSettingsSectionProps {
     handler: (ev: ZeroClawInstallProgressDto) => void,
   ) => Promise<() => void>;
   onOpenAiChat?: () => void;
+  onPickAllowedRootDir?: () => Promise<string | null>;
+  onRefreshMcpAudit?: () => Promise<void> | void;
+  onEmergencyStop?: () => Promise<void> | void;
+}
+
+function auditBadgeStyle(tone: BadgeTone): React.CSSProperties {
+  switch (tone) {
+    case "success":
+      return { background: "rgba(34, 197, 94, 0.14)", color: "#4ade80" };
+    case "warn":
+      return { background: "rgba(245, 158, 11, 0.16)", color: "#fbbf24" };
+    case "danger":
+      return { background: "var(--danger-bg)", color: "var(--danger-text)" };
+    case "info":
+      return { background: "var(--accent-soft)", color: "var(--accent)" };
+    case "neutral":
+    default:
+      return { background: "var(--chip-bg)", color: "var(--text-secondary)" };
+  }
 }
 
 function describeInstallProgress(progress: ZeroClawInstallProgressDto | null): string {
@@ -85,13 +142,35 @@ export function AiSettingsSection({
   config,
   loading = false,
   relayEnabled = false,
+  threads = [],
+  mcpStatus = null,
+  auditLogs = [],
+  emergencyStopping = false,
   onSave,
   onProbeCli,
   onInstallZeroClaw,
   onListModels,
   onSubscribeInstallProgress,
   onOpenAiChat,
+  onPickAllowedRootDir,
+  onRefreshMcpAudit,
+  onEmergencyStop,
 }: AiSettingsSectionProps) {
+  const { t, lang } = useI18n();
+  const tr = useCallback(
+    (key: string, fallback: string, vars?: Record<string, string | number>): string => {
+      const translated = t(key as TranslationKey, vars);
+      if (translated !== key) return translated;
+      if (!vars) return fallback;
+      let text = fallback;
+      for (const [k, v] of Object.entries(vars)) {
+        text = text.replaceAll(`{${k}}`, String(v));
+      }
+      return text;
+    },
+    [t],
+  );
+
   const [enabled, setEnabled] = useState(false);
   const [backend, setBackend] = useState<AiBackendKind>("zeroclaw");
 
@@ -110,13 +189,28 @@ export function AiSettingsSection({
     text: string;
   } | null>(null);
 
-  // ZeroClaw local state
+  // ZeroClaw local & 2-axis MCP permission state
   const [zeroclawPath, setZeroclawPath] = useState(DEFAULT_ZEROCLAW_PATH);
   const [zeroclawGatewayUrl, setZeroclawGatewayUrl] = useState("");
   const [zeroclawTokenInput, setZeroclawTokenInput] = useState("");
   const [showZeroclawToken, setShowZeroclawToken] = useState(false);
   const [clearZeroclawToken, setClearZeroclawToken] = useState(false);
   const [zeroclawSafeTools, setZeroclawSafeTools] = useState(false);
+  const [tezaAccessLevel, setTezaAccessLevel] = useState<TezaAccessLevel>(
+    DEFAULT_TEZA_ACCESS_LEVEL,
+  );
+  const [systemAccessLevel, setSystemAccessLevel] = useState<SystemAccessLevel>(
+    DEFAULT_SYSTEM_ACCESS_LEVEL,
+  );
+  const [allowedRoots, setAllowedRoots] = useState<string[]>([]);
+  const [allowedRootInput, setAllowedRootInput] = useState("");
+  const [pickingRootDir, setPickingRootDir] = useState(false);
+  const [allowedThreadIds, setAllowedThreadIds] = useState<string[]>([]);
+  const [selectedThreadIdToAdd, setSelectedThreadIdToAdd] = useState("");
+  const [manualThreadIdInput, setManualThreadIdInput] = useState("");
+  const [showAuditLog, setShowAuditLog] = useState(false);
+  const [refreshingAudit, setRefreshingAudit] = useState(false);
+  const [localEstopBusy, setLocalEstopBusy] = useState(false);
 
   // Shared preferences
   const [systemPrompt, setSystemPrompt] = useState(DEFAULT_AI_SYSTEM_PROMPT);
@@ -172,11 +266,93 @@ export function AiSettingsSection({
     setZeroclawTokenInput("");
     setClearZeroclawToken(false);
     setZeroclawSafeTools(Boolean(config.zeroclaw_safe_tools));
+    setTezaAccessLevel(normalizeTezaAccessLevel(config.teza_access_level));
+    setSystemAccessLevel(normalizeSystemAccessLevel(config.system_access_level));
+    setAllowedRoots(normalizeAllowedRoots(config.zeroclaw_allowed_roots));
+    setAllowedThreadIds(normalizeAllowedThreadIds(config.zeroclaw_allowed_thread_ids));
 
     setSystemPrompt(config.system_prompt || DEFAULT_AI_SYSTEM_PROMPT);
     setSummaryLanguage(config.summary_language || "vi");
     setMaxSummaryMessages(clampSummaryMessageCount(config.max_summary_messages));
   }, [config]);
+
+  const threadTitleMap = useMemo(() => {
+    const map = new Map<string, ThreadDto>();
+    for (const th of threads) {
+      map.set(th.id, th);
+    }
+    return map;
+  }, [threads]);
+
+  const availableThreadsToAdd = useMemo(() => {
+    const chosen = new Set(allowedThreadIds);
+    return threads.filter((th) => !chosen.has(th.id));
+  }, [threads, allowedThreadIds]);
+
+  const handleAddAllowedRoot = (rawPath: string) => {
+    const next = normalizeAllowedRoots([...allowedRoots, rawPath]);
+    setAllowedRoots(next);
+    setAllowedRootInput("");
+  };
+
+  const handleRemoveAllowedRoot = (rootToRemove: string) => {
+    setAllowedRoots((prev) => prev.filter((item) => item !== rootToRemove));
+  };
+
+  const handlePickAllowedRoot = async () => {
+    if (!onPickAllowedRootDir || pickingRootDir) return;
+    setPickingRootDir(true);
+    try {
+      const picked = await onPickAllowedRootDir();
+      if (picked && picked.trim()) {
+        setAllowedRoots((prev) => normalizeAllowedRoots([...prev, picked]));
+      }
+    } catch (err) {
+      setFeedback({
+        tone: "error",
+        text: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setPickingRootDir(false);
+    }
+  };
+
+  const handleAddAllowedThread = (rawId: string) => {
+    const clean = rawId.trim();
+    if (!clean) return;
+    setAllowedThreadIds((prev) => normalizeAllowedThreadIds([...prev, clean]));
+    setSelectedThreadIdToAdd("");
+    setManualThreadIdInput("");
+  };
+
+  const handleRemoveAllowedThread = (threadId: string) => {
+    setAllowedThreadIds((prev) => prev.filter((id) => id !== threadId));
+  };
+
+  const handleRefreshMcpAuditClick = async () => {
+    if (!onRefreshMcpAudit || refreshingAudit) return;
+    setRefreshingAudit(true);
+    try {
+      await onRefreshMcpAudit();
+    } finally {
+      setRefreshingAudit(false);
+    }
+  };
+
+  const handleEmergencyStopClick = async () => {
+    if (!onEmergencyStop || emergencyStopping || localEstopBusy) return;
+    setLocalEstopBusy(true);
+    try {
+      await onEmergencyStop();
+    } catch (err) {
+      setFeedback({
+        tone: "error",
+        text: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setLocalEstopBusy(false);
+    }
+  };
 
   const runProbe = useCallback(
     async (cliPath: string, gwUrl: string) => {
@@ -445,7 +621,7 @@ export function AiSettingsSection({
       setSaving(true);
       setFeedback(null);
       try {
-        const payload: AiConfigUpdateDto = {
+        const payload: AiConfigUpdateWithPermissions = {
           enabled,
           backend: "cloud_api",
           api_base_url: cleanUrl,
@@ -500,7 +676,9 @@ export function AiSettingsSection({
     setSaving(true);
     setFeedback(null);
     try {
-      const payload: AiConfigUpdateDto = {
+      const normalizedRoots = normalizeAllowedRoots(allowedRoots);
+      const normalizedThreadIds = normalizeAllowedThreadIds(allowedThreadIds);
+      const payload: AiConfigUpdateWithPermissions = {
         enabled,
         backend: "zeroclaw",
         api_base_url: cleanUrl,
@@ -508,6 +686,10 @@ export function AiSettingsSection({
         zeroclaw_path: zeroclawPath.trim() || DEFAULT_ZEROCLAW_PATH,
         zeroclaw_gateway_url: zeroclawGatewayUrl.trim(),
         zeroclaw_safe_tools: zeroclawSafeTools,
+        teza_access_level: tezaAccessLevel,
+        system_access_level: systemAccessLevel,
+        zeroclaw_allowed_roots: normalizedRoots,
+        zeroclaw_allowed_thread_ids: normalizedThreadIds,
         system_prompt: systemPrompt.trim() || DEFAULT_AI_SYSTEM_PROMPT,
         summary_language: summaryLanguage || "vi",
         max_summary_messages: clampSummaryMessageCount(maxSummaryMessages),
@@ -584,6 +766,122 @@ export function AiSettingsSection({
             : null;
 
   const canOpenChatNow = enabled && (!relayEnabled || backend === "cloud_api") && Boolean(onOpenAiChat);
+  const highRiskCombo = isHighRiskCombination(tezaAccessLevel, systemAccessLevel);
+  const estopBusy = emergencyStopping || localEstopBusy;
+  const protectedPaths =
+    mcpStatus && mcpStatus.forbidden_paths.length > 0
+      ? mcpStatus.forbidden_paths
+      : DEFAULT_FORBIDDEN_PATHS_SUMMARY;
+  const showSettingsEstop =
+    Boolean(onEmergencyStop) &&
+    (Boolean(mcpStatus?.running) ||
+      Boolean(mcpStatus && mcpStatus.pending_approvals_count > 0) ||
+      Boolean(mcpStatus && mcpStatus.active_powershell_count > 0) ||
+      tezaAccessLevel !== "isolated" ||
+      systemAccessLevel !== "safe");
+
+  const tezaAccessOptions: {
+    id: TezaAccessLevel;
+    title: string;
+    desc: string;
+    badge?: { text: string; tone: "neutral" | "recommended" | "warn" | "danger" };
+  }[] = [
+    {
+      id: "isolated",
+      title: tr("aiPermTezaT0Title", "T0 — Cô lập"),
+      desc: tr(
+        "aiPermTezaT0Desc",
+        "Không gắn công cụ Teza MCP nào. ZeroClaw chỉ trò chuyện độc lập.",
+      ),
+      badge: { text: tr("aiPermBadgeDefault", "Mặc định"), tone: "neutral" },
+    },
+    {
+      id: "read_only",
+      title: tr("aiPermTezaT1Title", "T1 — Đọc & Soạn nháp"),
+      desc: tr(
+        "aiPermTezaT1Desc",
+        "Đọc tài khoản, bạn/nhóm, lịch sử chat, tìm kiếm FTS5, xuất tệp đính kèm và điền bản nháp vào ô soạn thảo.",
+      ),
+    },
+    {
+      id: "supervised",
+      title: tr("aiPermTezaT2Title", "T2 — Toàn quyền có duyệt"),
+      desc: tr(
+        "aiPermTezaT2Desc",
+        "Toàn bộ T1 + gửi tin/tệp, lịch hẹn, bình chọn, nhắc hẹn, kết bạn/nhóm. Mọi thao tác gửi/thay đổi đều hiện Thẻ duyệt 1 chạm.",
+      ),
+      badge: { text: tr("aiPermBadgeRecommended", "Khuyên dùng"), tone: "recommended" },
+    },
+    {
+      id: "autonomous",
+      title: tr("aiPermTezaT3Title", "T3 — Tự động hoàn toàn"),
+      desc: tr(
+        "aiPermTezaT3Desc",
+        "Tự thực thi lệnh điều khiển Teza không cần bấm duyệt từng lần (hỗ trợ giới hạn hội thoại; rời nhóm/mời khỏi nhóm vẫn hỏi xác nhận).",
+      ),
+      badge: { text: tr("aiPermBadgeAutoExec", "Tự thực thi"), tone: "warn" },
+    },
+  ];
+
+  const systemAccessOptions: {
+    id: SystemAccessLevel;
+    title: string;
+    desc: string;
+    badge?: { text: string; tone: "neutral" | "recommended" | "warn" | "danger" };
+  }[] = [
+    {
+      id: "safe",
+      title: tr("aiPermSysS0Title", "S0 — An toàn"),
+      desc: tr(
+        "aiPermSysS0Desc",
+        "Không chạy Shell/PowerShell và không truy cập tệp Windows; chỉ dùng công cụ mạng/tính toán an toàn (nếu bật).",
+      ),
+      badge: { text: tr("aiPermBadgeDefault", "Mặc định"), tone: "neutral" },
+    },
+    {
+      id: "supervised",
+      title: tr("aiPermSysS1Title", "S1 — Windows & Office có duyệt"),
+      desc: tr(
+        "aiPermSysS1Desc",
+        "Mở bộ công cụ PowerShell, Python, Excel, Word, PDF trong các thư mục được phép. Mọi lệnh ghi tệp/PowerShell/mở tệp đều hiện Thẻ duyệt nguyên văn.",
+      ),
+      badge: {
+        text: tr("aiPermBadgeSystemRecommended", "Khuyên dùng — PowerShell, Excel, Word"),
+        tone: "recommended",
+      },
+    },
+    {
+      id: "full",
+      title: tr("aiPermSysS2Title", "S2 — Toàn quyền Windows"),
+      desc: tr(
+        "aiPermSysS2Desc",
+        "Mở 100% công cụ gốc ZeroClaw (powershell, python, node, git…) không giới hạn thư mục và tự duyệt lệnh win_* (vẫn chặn thư mục lõi OS & khóa Teza).",
+      ),
+      badge: { text: tr("aiPermBadgeAdvancedRisk", "Nâng cao · Rủi ro cao"), tone: "danger" },
+    },
+  ];
+
+  const renderPermBadge = (badge: {
+    text: string;
+    tone: "neutral" | "recommended" | "warn" | "danger";
+  }) => {
+    const style: React.CSSProperties =
+      badge.tone === "recommended"
+        ? { background: "rgba(16, 185, 129, 0.16)", color: "#34d399" }
+        : badge.tone === "warn"
+          ? { background: "rgba(245, 158, 11, 0.18)", color: "#fbbf24" }
+          : badge.tone === "danger"
+            ? { background: "rgba(239, 68, 68, 0.16)", color: "#f87171" }
+            : { background: "var(--chip-bg)", color: "var(--text-secondary)" };
+    return (
+      <span
+        className="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold"
+        style={style}
+      >
+        {badge.text}
+      </span>
+    );
+  };
 
   return (
     <form onSubmit={(e) => void handleSubmit(e)} className="space-y-4">
@@ -912,6 +1210,700 @@ export function AiSettingsSection({
                 className="mt-1 h-4 w-4 shrink-0 cursor-pointer accent-[var(--accent)]"
               />
             </label>
+          </div>
+
+          {/* 3C. Phân quyền 2 trục cho ZeroClaw (Teza MCP & Hệ thống Windows) */}
+          <div
+            className="space-y-4 border-t pt-4"
+            style={{ borderColor: "var(--border-subtle)" }}
+          >
+            <div className="flex items-start gap-2.5">
+              <span
+                className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg"
+                style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
+              >
+                <Shield className="h-3.5 w-3.5" />
+              </span>
+              <div className="min-w-0">
+                <div className="text-[13.5px] font-semibold">
+                  {tr("aiPermSectionTitle", "Phân quyền 2 trục cho ZeroClaw (Teza MCP)")}
+                </div>
+                <p className="mt-0.5 text-xs leading-relaxed" style={{ color: "var(--text-secondary)" }}>
+                  {tr(
+                    "aiPermSectionSubtitle",
+                    "Tách riêng quyền thao tác với dữ liệu Teza và quyền chạy công cụ trên Windows. Luôn lưu cài đặt để áp dụng.",
+                  )}
+                </p>
+              </div>
+            </div>
+
+            {/* Trục 1 — Quyền với Teza */}
+            <div className="space-y-2">
+              <div className="flex items-center gap-1.5 text-xs font-semibold">
+                <MessageSquare className="h-3.5 w-3.5" style={{ color: "var(--accent)" }} />
+                <span>{tr("aiPermTezaAxisLabel", "Trục 1 — Quyền với Teza")}</span>
+              </div>
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                {tezaAccessOptions.map((opt) => {
+                  const selected = tezaAccessLevel === opt.id;
+                  const isWarnSelected = selected && opt.id === "autonomous";
+                  return (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => {
+                        setTezaAccessLevel(opt.id);
+                        setFeedback(null);
+                      }}
+                      className="flex flex-col items-start gap-1.5 rounded-xl p-3 text-left transition"
+                      style={{
+                        background: isWarnSelected
+                          ? "rgba(245, 158, 11, 0.12)"
+                          : selected
+                            ? "var(--accent-soft)"
+                            : "var(--bg-sidebar)",
+                        border: isWarnSelected
+                          ? "1.5px solid rgba(245, 158, 11, 0.7)"
+                          : selected
+                            ? "1.5px solid var(--accent)"
+                            : "1px solid var(--border-subtle)",
+                      }}
+                    >
+                      <div className="flex w-full flex-wrap items-center justify-between gap-1.5">
+                        <span className="text-[12.5px] font-semibold">{opt.title}</span>
+                        <div className="flex items-center gap-1.5">
+                          {opt.badge && renderPermBadge(opt.badge)}
+                          {selected && (
+                            <CheckCircle2
+                              className="h-3.5 w-3.5 shrink-0"
+                              style={{ color: isWarnSelected ? "#f59e0b" : "var(--accent)" }}
+                            />
+                          )}
+                        </div>
+                      </div>
+                      <p
+                        className="text-[11.5px] leading-relaxed"
+                        style={{ color: "var(--text-secondary)" }}
+                      >
+                        {opt.desc}
+                      </p>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Trục 2 — Quyền Hệ thống Windows & ZeroClaw */}
+            <div className="space-y-2">
+              <div className="flex items-center gap-1.5 text-xs font-semibold">
+                <Terminal className="h-3.5 w-3.5" style={{ color: "var(--accent)" }} />
+                <span>
+                  {tr("aiPermSystemAxisLabel", "Trục 2 — Quyền Hệ thống Windows & ZeroClaw")}
+                </span>
+              </div>
+              <div className="grid grid-cols-1 gap-2">
+                {systemAccessOptions.map((opt) => {
+                  const selected = systemAccessLevel === opt.id;
+                  const isDangerSelected = selected && opt.id === "full";
+                  return (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => {
+                        setSystemAccessLevel(opt.id);
+                        setFeedback(null);
+                      }}
+                      className="flex flex-col items-start gap-1.5 rounded-xl p-3 text-left transition"
+                      style={{
+                        background: isDangerSelected
+                          ? "rgba(239, 68, 68, 0.12)"
+                          : selected
+                            ? "var(--accent-soft)"
+                            : "var(--bg-sidebar)",
+                        border: isDangerSelected
+                          ? "1.5px solid rgba(239, 68, 68, 0.65)"
+                          : selected
+                            ? "1.5px solid var(--accent)"
+                            : "1px solid var(--border-subtle)",
+                      }}
+                    >
+                      <div className="flex w-full flex-wrap items-center justify-between gap-1.5">
+                        <span className="text-[12.5px] font-semibold">{opt.title}</span>
+                        <div className="flex items-center gap-1.5">
+                          {opt.badge && renderPermBadge(opt.badge)}
+                          {selected && (
+                            <CheckCircle2
+                              className="h-3.5 w-3.5 shrink-0"
+                              style={{ color: isDangerSelected ? "#ef4444" : "var(--accent)" }}
+                            />
+                          )}
+                        </div>
+                      </div>
+                      <p
+                        className="text-[11.5px] leading-relaxed"
+                        style={{ color: "var(--text-secondary)" }}
+                      >
+                        {opt.desc}
+                      </p>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Cảnh báo rủi ro tổ hợp (Prompt Injection / T3 / S2) */}
+            {highRiskCombo && (
+              <div
+                className="flex items-start gap-2.5 rounded-xl p-3 text-xs leading-relaxed"
+                style={{
+                  background: "rgba(239, 68, 68, 0.12)",
+                  border: "1px solid rgba(239, 68, 68, 0.42)",
+                  color: "var(--text-primary)",
+                }}
+              >
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-rose-500" />
+                <div className="space-y-0.5">
+                  <div className="font-semibold text-rose-400">
+                    {tr(
+                      "aiPermHighRiskTitle",
+                      "Cảnh báo bảo mật: Nguy cơ Prompt Injection & Tự động thực thi",
+                    )}
+                  </div>
+                  <p className="text-[11.5px] leading-relaxed">
+                    {tr(
+                      "aiPermHighRiskBody",
+                      "Khi AI vừa đọc nội dung hội thoại Teza vừa có toàn quyền Windows (S2) hoặc chế độ tự động (T3), tin nhắn chứa lệnh ẩn từ người khác có thể kích hoạt gửi tin hoặc chạy lệnh máy tính ngoài ý muốn. Hãy giới hạn phạm vi bên dưới và dùng nút đỏ E-Stop trong khung chat AI để dừng khẩn cấp bất cứ lúc nào.",
+                    )}
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* Thư mục Windows được phép truy cập (zeroclaw_allowed_roots) */}
+            {systemAccessLevel !== "safe" && (
+              <div
+                className="space-y-2.5 rounded-xl p-3"
+                style={{
+                  background: "var(--bg-sidebar)",
+                  border: "1px solid var(--border-subtle)",
+                }}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5 text-xs font-semibold">
+                    <FolderOpen className="h-3.5 w-3.5" style={{ color: "var(--accent)" }} />
+                    <span>
+                      {tr("aiPermAllowedRootsTitle", "Thư mục Windows được phép truy cập")}
+                    </span>
+                  </div>
+                  <span
+                    className="rounded-full px-2 py-0.5 text-[10.5px] font-semibold tabular-nums"
+                    style={{ background: "var(--chip-bg)", color: "var(--text-secondary)" }}
+                  >
+                    {allowedRoots.length}/{MAX_ALLOWED_ROOTS}
+                  </span>
+                </div>
+
+                {allowedRoots.length === 0 ? (
+                  <p className="text-[11.5px] leading-relaxed" style={{ color: "var(--text-secondary)" }}>
+                    {tr(
+                      "aiPermAllowedRootsEmpty",
+                      "Để trống để dùng mặc định an toàn (Desktop, Documents, Downloads và thư mục làm việc AI).",
+                    )}
+                  </p>
+                ) : (
+                  <div className="flex flex-wrap gap-1.5">
+                    {allowedRoots.map((root) => (
+                      <span
+                        key={root}
+                        className="inline-flex max-w-full items-center gap-1.5 rounded-lg px-2 py-1 font-mono text-[11px]"
+                        style={{
+                          background: "var(--bg-surface)",
+                          border: "1px solid var(--border-subtle)",
+                          color: "var(--text-primary)",
+                        }}
+                      >
+                        <span className="truncate" title={root}>
+                          {root}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveAllowedRoot(root)}
+                          className="shrink-0 rounded p-0.5 opacity-70 transition hover:bg-rose-500/15 hover:text-rose-400 hover:opacity-100"
+                          title={t("delete")}
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <input
+                    type="text"
+                    value={allowedRootInput}
+                    disabled={allowedRoots.length >= MAX_ALLOWED_ROOTS}
+                    onChange={(e) => setAllowedRootInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        if (allowedRootInput.trim()) {
+                          handleAddAllowedRoot(allowedRootInput);
+                        }
+                      }
+                    }}
+                    placeholder={tr(
+                      "aiPermAllowedRootsPlaceholder",
+                      "Nhập đường dẫn thư mục Windows (ví dụ: C:\\Users\\TenBan\\Documents\\BaoCao)...",
+                    )}
+                    className="min-w-[200px] flex-1 rounded-xl px-3 py-1.5 font-mono text-xs outline-none disabled:opacity-50"
+                    style={{
+                      background: "var(--bg-input)",
+                      border: "1px solid var(--border-subtle)",
+                      color: "var(--text-primary)",
+                    }}
+                  />
+                  <button
+                    type="button"
+                    disabled={!allowedRootInput.trim() || allowedRoots.length >= MAX_ALLOWED_ROOTS}
+                    onClick={() => handleAddAllowedRoot(allowedRootInput)}
+                    className="hover-menu inline-flex items-center gap-1 rounded-xl px-3 py-1.5 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-45"
+                    style={{
+                      background: "var(--accent-soft)",
+                      border: "1px solid var(--chip-border)",
+                      color: "var(--accent)",
+                    }}
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                    <span>{t("add")}</span>
+                  </button>
+                  {onPickAllowedRootDir && (
+                    <button
+                      type="button"
+                      disabled={pickingRootDir || allowedRoots.length >= MAX_ALLOWED_ROOTS}
+                      onClick={() => void handlePickAllowedRoot()}
+                      className="hover-menu inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-medium disabled:cursor-not-allowed disabled:opacity-50"
+                      style={{
+                        background: "var(--bg-surface)",
+                        border: "1px solid var(--border-subtle)",
+                        color: "var(--text-primary)",
+                      }}
+                    >
+                      {pickingRootDir ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <FolderPlus className="h-3.5 w-3.5" style={{ color: "var(--accent)" }} />
+                      )}
+                      <span>{tr("aiPermPickFolderBtn", "Chọn thư mục...")}</span>
+                    </button>
+                  )}
+                </div>
+
+                {/* Read-only note showing workspace_dir & protected forbidden_paths */}
+                <div
+                  className="space-y-1 rounded-lg px-2.5 py-2 text-[11px] leading-relaxed"
+                  style={{
+                    background: "var(--bg-surface)",
+                    border: "1px solid var(--border-subtle)",
+                    color: "var(--text-secondary)",
+                  }}
+                >
+                  {mcpStatus?.workspace_dir && (
+                    <div className="flex flex-wrap items-baseline gap-1.5">
+                      <span className="font-semibold">
+                        {tr("aiPermWorkspaceDirLabel", "Thư mục làm việc AI (ai_workspace):")}
+                      </span>
+                      <code className="break-all font-mono text-[10.5px]">
+                        {mcpStatus.workspace_dir}
+                      </code>
+                    </div>
+                  )}
+                  <div className="flex items-start gap-1.5">
+                    <Lock className="mt-0.5 h-3 w-3 shrink-0 opacity-80" />
+                    <div className="min-w-0">
+                      <span className="font-semibold">
+                        {tr(
+                          "aiPermProtectedPathsLabel",
+                          "Luôn được bảo vệ cứng (không thể truy cập):",
+                        )}{" "}
+                      </span>
+                      <span className="break-all font-mono text-[10.5px]">
+                        {protectedPaths.join(" · ")}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Giới hạn hội thoại cho T3 Autonomous (zeroclaw_allowed_thread_ids) */}
+            {tezaAccessLevel === "autonomous" && (
+              <div
+                className="space-y-2.5 rounded-xl p-3"
+                style={{
+                  background: "var(--bg-sidebar)",
+                  border: "1px solid var(--border-subtle)",
+                }}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5 text-xs font-semibold">
+                    <Lock className="h-3.5 w-3.5 text-amber-500" />
+                    <span>
+                      {tr("aiPermAllowedThreadsTitle", "Giới hạn hội thoại cho chế độ Tự động (T3)")}
+                    </span>
+                  </div>
+                  {allowedThreadIds.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setAllowedThreadIds([])}
+                      className="text-[11px] font-medium text-rose-400 hover:underline"
+                    >
+                      {tr("aiPermClearAllThreads", "Bỏ giới hạn (mọi hội thoại)")}
+                    </button>
+                  )}
+                </div>
+                <p className="text-[11.5px] leading-relaxed" style={{ color: "var(--text-secondary)" }}>
+                  {tr(
+                    "aiPermAllowedThreadsHint",
+                    "Để trống = áp dụng cho tất cả hội thoại. Thêm hội thoại cụ thể để chỉ cho phép ZeroClaw tự động thao tác trong các đoạn chat đó.",
+                  )}
+                </p>
+
+                {allowedThreadIds.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {allowedThreadIds.map((tid) => {
+                      const th = threadTitleMap.get(tid);
+                      const label = th
+                        ? `${th.title || tid} (${formatThreadKindLabel(th.kind)})`
+                        : tid;
+                      return (
+                        <span
+                          key={tid}
+                          className="inline-flex max-w-full items-center gap-1.5 rounded-lg px-2 py-1 text-[11px] font-medium"
+                          style={{
+                            background: "var(--bg-surface)",
+                            border: "1px solid var(--border-subtle)",
+                            color: "var(--text-primary)",
+                          }}
+                        >
+                          <span className="truncate" title={tid}>
+                            {label}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveAllowedThread(tid)}
+                            className="shrink-0 rounded p-0.5 opacity-70 transition hover:bg-rose-500/15 hover:text-rose-400 hover:opacity-100"
+                            title={t("delete")}
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        </span>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {threads.length > 0 ? (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <select
+                      value={selectedThreadIdToAdd}
+                      onChange={(e) => setSelectedThreadIdToAdd(e.target.value)}
+                      className="min-w-[200px] flex-1 rounded-xl px-3 py-1.5 text-xs outline-none"
+                      style={{
+                        background: "var(--bg-input)",
+                        border: "1px solid var(--border-subtle)",
+                        color: "var(--text-primary)",
+                      }}
+                    >
+                      <option value="">
+                        {tr("aiPermSelectThreadPlaceholder", "Chọn cuộc hội thoại cần cho phép...")}
+                      </option>
+                      {availableThreadsToAdd.map((th) => (
+                        <option key={th.id} value={th.id}>
+                          {th.title || th.id} · {formatThreadKindLabel(th.kind)}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      disabled={!selectedThreadIdToAdd}
+                      onClick={() => handleAddAllowedThread(selectedThreadIdToAdd)}
+                      className="hover-menu inline-flex items-center gap-1 rounded-xl px-3 py-1.5 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-45"
+                      style={{
+                        background: "var(--accent-soft)",
+                        border: "1px solid var(--chip-border)",
+                        color: "var(--accent)",
+                      }}
+                    >
+                      <Plus className="h-3.5 w-3.5" />
+                      <span>{t("add")}</span>
+                    </button>
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <input
+                      type="text"
+                      value={manualThreadIdInput}
+                      onChange={(e) => setManualThreadIdInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          if (manualThreadIdInput.trim()) {
+                            handleAddAllowedThread(manualThreadIdInput);
+                          }
+                        }
+                      }}
+                      placeholder={tr("aiPermManualThreadIdPlaceholder", "Hoặc nhập ID hội thoại...")}
+                      className="min-w-[200px] flex-1 rounded-xl px-3 py-1.5 font-mono text-xs outline-none"
+                      style={{
+                        background: "var(--bg-input)",
+                        border: "1px solid var(--border-subtle)",
+                        color: "var(--text-primary)",
+                      }}
+                    />
+                    <button
+                      type="button"
+                      disabled={!manualThreadIdInput.trim()}
+                      onClick={() => handleAddAllowedThread(manualThreadIdInput)}
+                      className="hover-menu inline-flex items-center gap-1 rounded-xl px-3 py-1.5 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-45"
+                      style={{
+                        background: "var(--accent-soft)",
+                        border: "1px solid var(--chip-border)",
+                        color: "var(--accent)",
+                      }}
+                    >
+                      <Plus className="h-3.5 w-3.5" />
+                      <span>{t("add")}</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Trạng thái MCP Bridge & Nhật ký hành động AI thu gọn */}
+            <div
+              className="overflow-hidden rounded-xl"
+              style={{
+                background: "var(--bg-sidebar)",
+                border: "1px solid var(--border-subtle)",
+              }}
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2.5">
+                <div className="flex flex-wrap items-center gap-2 text-xs">
+                  <span
+                    className={`h-2 w-2 shrink-0 rounded-full ${
+                      mcpStatus?.running ? "animate-pulse bg-emerald-400" : "bg-zinc-400"
+                    }`}
+                  />
+                  <span className="font-medium">
+                    {mcpStatus?.running
+                      ? tr("aiMcpStatusRunning", "MCP Bridge đang chạy · {count} công cụ sẵn sàng", {
+                          count: mcpStatus.exposed_tools_count,
+                        })
+                      : mcpStatus
+                        ? tr("aiMcpStatusIdle", "MCP Bridge đang chờ (chưa kích hoạt công cụ)")
+                        : tr(
+                            "aiMcpStatusReadyHint",
+                            "MCP Bridge sẽ tự khởi chạy khi bật quyền T1–T3 hoặc S1–S2.",
+                          )}
+                  </span>
+                  {mcpStatus && mcpStatus.pending_approvals_count > 0 && (
+                    <span
+                      className="rounded-full px-2 py-0.5 text-[10.5px] font-semibold"
+                      style={{ background: "rgba(245, 158, 11, 0.16)", color: "#fbbf24" }}
+                    >
+                      {tr("aiMcpPendingApprovalsBadge", "{count} chờ duyệt", {
+                        count: mcpStatus.pending_approvals_count,
+                      })}
+                    </span>
+                  )}
+                  {mcpStatus && mcpStatus.active_powershell_count > 0 && (
+                    <span
+                      className="rounded-full px-2 py-0.5 text-[10.5px] font-semibold"
+                      style={{ background: "var(--accent-soft)", color: "var(--accent)" }}
+                    >
+                      {tr("aiMcpActivePsBadge", "{count} PowerShell đang chạy", {
+                        count: mcpStatus.active_powershell_count,
+                      })}
+                    </span>
+                  )}
+                </div>
+
+                <div className="flex shrink-0 items-center gap-1.5">
+                  {onRefreshMcpAudit && (
+                    <button
+                      type="button"
+                      disabled={refreshingAudit}
+                      onClick={() => void handleRefreshMcpAuditClick()}
+                      className="hover-menu inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-medium disabled:opacity-50"
+                      style={{
+                        background: "var(--bg-surface)",
+                        border: "1px solid var(--border-subtle)",
+                        color: "var(--text-secondary)",
+                      }}
+                      title={t("friendRequestsRefresh")}
+                    >
+                      <RefreshCw
+                        className={`h-3 w-3 ${refreshingAudit ? "animate-spin" : ""}`}
+                      />
+                      <span>{t("friendRequestsRefresh")}</span>
+                    </button>
+                  )}
+                  {showSettingsEstop && (
+                    <button
+                      type="button"
+                      disabled={estopBusy}
+                      onClick={() => void handleEmergencyStopClick()}
+                      className="inline-flex items-center gap-1 rounded-lg bg-rose-600 px-2.5 py-1 text-[11px] font-semibold text-white transition hover:bg-rose-500 disabled:cursor-not-allowed disabled:opacity-60"
+                      title={tr(
+                        "aiEstopTooltip",
+                        "Dừng khẩn cấp: hủy ngay lượt AI đang chạy, từ chối thẻ chờ duyệt và diệt mọi tiến trình PowerShell con",
+                      )}
+                    >
+                      {estopBusy ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : (
+                        <OctagonX className="h-3 w-3" />
+                      )}
+                      <span>
+                        {estopBusy
+                          ? tr("aiEstopStopping", "Đang dừng khẩn cấp...")
+                          : tr("aiEstopBtn", "E-Stop")}
+                      </span>
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="border-t" style={{ borderColor: "var(--border-subtle)" }}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const nextOpen = !showAuditLog;
+                    setShowAuditLog(nextOpen);
+                    if (nextOpen && onRefreshMcpAudit && auditLogs.length === 0) {
+                      void handleRefreshMcpAuditClick();
+                    }
+                  }}
+                  className="flex w-full items-center justify-between px-3 py-2 text-left text-[11.5px] font-semibold transition hover:opacity-90"
+                  style={{ color: "var(--text-secondary)" }}
+                >
+                  <span className="inline-flex items-center gap-1.5">
+                    <ScrollText className="h-3.5 w-3.5" style={{ color: "var(--accent)" }} />
+                    <span>
+                      {tr("aiAuditLogToggleTitle", "Nhật ký hành động AI ({count})", {
+                        count: auditLogs.length,
+                      })}
+                    </span>
+                  </span>
+                  {showAuditLog ? (
+                    <ChevronDown className="h-3.5 w-3.5" />
+                  ) : (
+                    <ChevronRight className="h-3.5 w-3.5" />
+                  )}
+                </button>
+
+                {showAuditLog && (
+                  <div
+                    className="border-t px-3 pb-3 pt-2"
+                    style={{ borderColor: "var(--border-subtle)" }}
+                  >
+                    {auditLogs.length === 0 ? (
+                      <div
+                        className="rounded-lg px-3 py-3 text-center text-[11.5px]"
+                        style={{
+                          background: "var(--bg-surface)",
+                          color: "var(--text-secondary)",
+                        }}
+                      >
+                        {tr("aiAuditLogEmpty", "Chưa ghi nhận hành động công cụ nào.")}
+                      </div>
+                    ) : (
+                      <div
+                        className="max-h-60 overflow-auto rounded-lg"
+                        style={{
+                          background: "var(--bg-surface)",
+                          border: "1px solid var(--border-subtle)",
+                        }}
+                      >
+                        <table className="w-full border-collapse text-left text-[11px]">
+                          <thead>
+                            <tr
+                              className="border-b"
+                              style={{
+                                borderColor: "var(--border-subtle)",
+                                color: "var(--text-secondary)",
+                              }}
+                            >
+                              <th className="whitespace-nowrap px-2.5 py-1.5 font-semibold">
+                                {tr("aiAuditColTime", "Thời gian")}
+                              </th>
+                              <th className="whitespace-nowrap px-2.5 py-1.5 font-semibold">
+                                {tr("aiAuditColTool", "Công cụ")}
+                              </th>
+                              <th className="whitespace-nowrap px-2.5 py-1.5 font-semibold">
+                                {tr("aiAuditColDecision", "Quyết định")}
+                              </th>
+                              <th className="px-2.5 py-1.5 font-semibold">
+                                {tr("aiAuditColSummary", "Tóm tắt")}
+                              </th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {auditLogs.map((entry) => {
+                              const tone = getAuditDecisionTone(entry.decision, entry.ok);
+                              return (
+                                <tr
+                                  key={entry.id}
+                                  className="border-b last:border-b-0"
+                                  style={{ borderColor: "var(--border-subtle)" }}
+                                >
+                                  <td
+                                    className="whitespace-nowrap px-2.5 py-1.5 align-top font-mono text-[10.5px]"
+                                    style={{ color: "var(--text-secondary)" }}
+                                  >
+                                    {formatLocalDateTime(entry.ts, true)}
+                                  </td>
+                                  <td className="whitespace-nowrap px-2.5 py-1.5 align-top">
+                                    <div className="font-medium">
+                                      {formatToolDisplayName(entry.tool_name, lang)}
+                                    </div>
+                                    <div
+                                      className="text-[10px]"
+                                      style={{ color: "var(--text-secondary)" }}
+                                    >
+                                      {entry.category === "system"
+                                        ? tr("aiApprovalCategorySystem", "Windows / PowerShell")
+                                        : tr("aiApprovalCategoryTeza", "Teza")}
+                                    </div>
+                                  </td>
+                                  <td className="whitespace-nowrap px-2.5 py-1.5 align-top">
+                                    <span
+                                      className="inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold"
+                                      style={auditBadgeStyle(tone)}
+                                    >
+                                      {formatAuditDecisionLabel(entry.decision, lang)}
+                                    </span>
+                                  </td>
+                                  <td className="max-w-[260px] px-2.5 py-1.5 align-top">
+                                    <div className="break-words">{entry.summary}</div>
+                                    {entry.error && (
+                                      <div className="mt-0.5 break-words text-[10.5px] text-rose-400">
+                                        {entry.error}
+                                      </div>
+                                    )}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
           </div>
         </section>
       )}

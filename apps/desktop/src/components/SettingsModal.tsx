@@ -52,6 +52,8 @@ import { RetroEmoticon } from "./RetroEmoticon";
 import type {
   AccountProfile,
   AiConfigDto,
+  AiMcpStatusDto,
+  AiToolAuditEntry,
   ApiAuditLogDto,
   ApiClientDto,
   AppUpdateInfo,
@@ -163,6 +165,8 @@ interface Props {
   aiConfig?: AiConfigDto | null;
   onAiConfigChange?: (cfg: AiConfigDto) => void;
   onOpenAiChat?: () => void;
+  emergencyStopping?: boolean;
+  onEmergencyStop?: () => Promise<void> | void;
   showTezaAiCard?: boolean;
   onToggleShowTezaAiCard?: (show: boolean) => void;
   relayCfg: RelayConfigSummary | null;
@@ -323,6 +327,8 @@ export function SettingsModal({
   aiConfig = null,
   onAiConfigChange,
   onOpenAiChat,
+  emergencyStopping = false,
+  onEmergencyStop,
   showTezaAiCard,
   onToggleShowTezaAiCard,
   relayCfg,
@@ -382,6 +388,9 @@ export function SettingsModal({
   );
   const [aiLocalConfig, setAiLocalConfig] = useState<AiConfigDto | null>(aiConfig);
   const [aiLoading, setAiLoading] = useState(false);
+  const [aiMcpStatus, setAiMcpStatus] = useState<AiMcpStatusDto | null>(null);
+  const [aiToolAuditLogs, setAiToolAuditLogs] = useState<AiToolAuditEntry[]>([]);
+  const aiMcpReqSeqRef = useRef(0);
   const [localApiConfig, setLocalApiConfig] = useState<LocalApiConfigDto | null>(null);
   const [localApiStatus, setLocalApiStatus] = useState<LocalApiStatusDto | null>(null);
   const [localApiClients, setLocalApiClients] = useState<ApiClientDto[]>([]);
@@ -408,6 +417,7 @@ export function SettingsModal({
   useEffect(() => {
     if (!open) {
       storageReqSeqRef.current += 1;
+      aiMcpReqSeqRef.current += 1;
       localApiHasUnsavedSecretRef.current = false;
       setStorageLoading(false);
       return;
@@ -486,18 +496,44 @@ export function SettingsModal({
     setAiLocalConfig(aiConfig);
   }, [aiConfig]);
 
+  const refreshAiMcpAndAudit = async () => {
+    const seq = ++aiMcpReqSeqRef.current;
+    const [statusRes, logsRes] = await Promise.allSettled([
+      bridge.aiMcpStatus(),
+      bridge.aiListToolAuditLogs(100),
+    ]);
+    if (!mountedRef.current || seq !== aiMcpReqSeqRef.current) return;
+    if (statusRes.status === "fulfilled") {
+      setAiMcpStatus(statusRes.value);
+    }
+    if (logsRes.status === "fulfilled") {
+      setAiToolAuditLogs(logsRes.value);
+    }
+  };
+
   useEffect(() => {
     if (!open || activeTab !== "ai") return;
     let cancelled = false;
+    const seq = ++aiMcpReqSeqRef.current;
     setAiLoading(true);
-    void bridge
-      .aiGetConfig()
-      .then((cfg) => {
-        if (cancelled || !mountedRef.current) return;
-        setAiLocalConfig(cfg);
-        onAiConfigChangeRef.current?.(cfg);
+    void Promise.allSettled([
+      bridge.aiGetConfig(),
+      bridge.aiMcpStatus(),
+      bridge.aiListToolAuditLogs(100),
+    ])
+      .then(([cfgRes, statusRes, logsRes]) => {
+        if (cancelled || !mountedRef.current || seq !== aiMcpReqSeqRef.current) return;
+        if (cfgRes.status === "fulfilled") {
+          setAiLocalConfig(cfgRes.value);
+          onAiConfigChangeRef.current?.(cfgRes.value);
+        }
+        if (statusRes.status === "fulfilled") {
+          setAiMcpStatus(statusRes.value);
+        }
+        if (logsRes.status === "fulfilled") {
+          setAiToolAuditLogs(logsRes.value);
+        }
       })
-      .catch(() => undefined)
       .finally(() => {
         if (!cancelled && mountedRef.current) setAiLoading(false);
       });
@@ -2279,6 +2315,10 @@ export function SettingsModal({
                     config={aiLocalConfig}
                     loading={aiLoading}
                     relayEnabled={Boolean(relayCfg?.enabled)}
+                    threads={threads}
+                    mcpStatus={aiMcpStatus}
+                    auditLogs={aiToolAuditLogs}
+                    emergencyStopping={emergencyStopping}
                     onSave={async (update) => {
                       const saved = await bridge.aiUpdateConfig(update);
                       try {
@@ -2288,6 +2328,7 @@ export function SettingsModal({
                       }
                       setAiLocalConfig(saved);
                       onAiConfigChange?.(saved);
+                      void refreshAiMcpAndAudit();
                       return saved;
                     }}
                     onProbeCli={(cliPath, gatewayUrl) => bridge.aiProbeCli(cliPath, gatewayUrl)}
@@ -2309,6 +2350,19 @@ export function SettingsModal({
                           }
                         : undefined
                     }
+                    onPickAllowedRootDir={() => bridge.aiPickAllowedRootDir()}
+                    onRefreshMcpAudit={refreshAiMcpAndAudit}
+                    onEmergencyStop={async () => {
+                      try {
+                        if (onEmergencyStop) {
+                          await onEmergencyStop();
+                        } else {
+                          await bridge.aiEmergencyStop();
+                        }
+                      } finally {
+                        await refreshAiMcpAndAudit();
+                      }
+                    }}
                   />
                 </Suspense>
               </div>
